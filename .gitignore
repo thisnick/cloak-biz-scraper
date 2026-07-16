@@ -1,0 +1,19 @@
+# Secrets — THIS REPO IS PUBLIC. Never commit real credentials.
+.env
+.env.*
+!.env.example
+
+# Local runtime state
+data/
+.dek
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# OS
+.DS_Store
