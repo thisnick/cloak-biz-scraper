@@ -243,17 +243,20 @@ class InstanceManager:
         proxy_ip, tz, locale = probe.exit_ip, probe.timezone, probe.locale
 
         if req.geoip and not probe.geo_resolved:
-            # geoip=True is a request for geographic coherence, and we cannot
-            # honour it. Launching anyway would put a browser reporting the
-            # container's UTC behind a residential exit somewhere else entirely —
-            # the exact incoherence the proxy exists to avoid — so refuse rather
-            # than substitute a plausible default. Callers that genuinely do not
-            # care can pass geoip=false and get an honest timezone of None.
+            # geoip=True asks for geographic coherence and we cannot deliver it.
+            #
+            # Launching anyway is not "degraded but working": a browser reporting
+            # the container's UTC from behind a residential exit in California is
+            # itself an anti-bot tell. It would trade a visible failure for an
+            # invisible one — silent blocks, with nothing in the logs to explain
+            # them. So refuse, and never substitute a plausible default.
             raise GeoUnresolved(
                 f"The proxy routes (exit IP {proxy_ip}), but its location could not be "
-                f"resolved, so the browser's timezone would contradict its exit IP. "
-                f"This usually means the GeoLite2 database could not be downloaded. "
-                f"Retry, or launch with geoip disabled to accept an unknown timezone."
+                f"resolved. Launching now would give the browser a timezone that "
+                f"contradicts its exit IP, which is exactly what listing sites look for. "
+                f"This usually means the GeoLite2 database could not be downloaded — "
+                f"retry in a moment. To launch anyway and accept an unknown timezone, "
+                f"pass geoip=false."
             )
 
         display = await self.displays.allocate()
