@@ -14,6 +14,11 @@ services:
         required: false
     environment:
       APP_SECRET: ${APP_SECRET:-}
+      # The recovery path for a forgotten secret. Compose only forwards what it
+      # names, so without this line `APP_SECRET_RESET=true docker compose up`
+      # silently does nothing and the recovery looks broken when it is not —
+      # Railway passes its variables straight through and never had the gap.
+      APP_SECRET_RESET: ${APP_SECRET_RESET:-}
     # 18800 on the host: 18791/18792 belong to browserd.
     ports:
       - "18800:8000"

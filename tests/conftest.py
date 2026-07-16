@@ -14,6 +14,10 @@ for _leak in (
     "PROXY_COUNTRY", "PROXY_REGION",
     "EVOMI_PROXY_USER", "EVOMI_PROXY_PASSWORD", "EVOMI_PROXY_HOST",
     "EVOMI_PROXY_PORT", "EVOMI_DEFAULT_COUNTRY", "EVOMI_DEFAULT_REGION",
+    "NOTION_API_TOKEN", "NOTION_DB_ID",
     "MAX_INSTANCES", "INTERACTIVE_RESERVE",
+    # A real secret in the ambient environment would seed the store and make the
+    # login tests pass against the wrong value — or, worse, quietly pass.
+    "APP_SECRET", "APP_SECRET_RESET",
 ):
     os.environ.pop(_leak, None)
