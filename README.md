@@ -5,9 +5,9 @@ ChatGPT or Claude over MCP. You bring a CloakBrowser Pro license, a residential
 proxy account, and a Notion workspace; you deploy one container; you configure it
 in a web form. No terminal.
 
-> **Status: early.** Step 1 of 7 is built — the scaffold, the settings store, and
-> the browser core. There is no UI, no MCP server, and no scraping yet. See
-> "What works today".
+> **Status: early.** Steps 1–2 of 7 are built — the scaffold, the settings store,
+> the browser core, the settings UI, and the Notion store. There is no MCP server
+> and no scraping yet. See "What works today".
 
 ## Why it exists
 
@@ -26,15 +26,21 @@ for sale this week. This packages the hard part.
   residential proxy each, with a reserve so interactive sessions are never starved
   by a batch sweep.
 - On-demand download of the CloakBrowser Pro binary into the volume.
+- **A settings UI** behind a login: licence (with a "verify" that proves the key
+  works and pre-downloads the browser), proxy (with a "test" that reports the
+  measured exit IP and geo), Notion, pool sizes, and secret rotation.
+- **The Notion store**: pick an existing database and see exactly what its schema
+  is missing, or create one explicitly. Never auto-created; never writes a column
+  you added yourself.
 
-Not built yet: the settings UI, the Notion store, the scrape and archive tools,
-the MCP server, OAuth, live VNC.
+Not built yet: the scrape and archive tools, the MCP server, OAuth, live VNC.
 
 ## Design
 
 ```
-GET /healthz          Railway healthcheck (unauthenticated)
-/data (volume)        settings, the Chromium binary cache, profiles
+GET  /healthz         Railway healthcheck (unauthenticated)
+/  /login  /settings/* the web UI (cookie session)
+/data (volume)        settings, the secret, the Chromium binary cache, profiles
 ```
 
 **One service layer.** Everything lives in `app/services/`. Routes are façades —
@@ -49,6 +55,23 @@ revert on the next restart.
 
 Env vars still *seed* the settings on first boot, which is a convenience for local
 dev and CI. After that the volume wins and the environment is ignored.
+
+That applies to `APP_SECRET` too: you can rotate it in the UI, and the rotation
+survives restarts because the volume's copy is the real one. If you forget the
+secret you rotated to, set a new `APP_SECRET` **and** `APP_SECRET_RESET=true` and
+restart — the next boot adopts it. The reset is consumed once, so a flag left set
+afterwards will not keep reverting later rotations.
+
+**What "test proxy" does and does not tell you.** It reports the exit IP and geo
+it actually measured through the proxy. It does *not* verify your credentials:
+Evomi accepts any password and only rejects a wrong username, so a typo'd
+password still yields a working residential exit. Nothing in the UI claims
+otherwise, because nothing measured it.
+
+**Nothing reports a value it did not measure.** If the exit IP cannot be read back
+through the proxy, launching fails immediately rather than holding a pool slot on
+a browser whose every page load would fail — and the timezone is reported as
+unknown rather than defaulted to something plausible.
 
 **The binary is not in the image.** The Pro Chromium is proprietary and
 non-redistributable, and a mounted volume shadows the image layer anyway, so
@@ -74,6 +97,7 @@ Needs Docker. You do not need a Python environment on your machine.
 cp .env.example .env     # fill in your license + proxy
 docker compose up -d
 curl localhost:18800/healthz
+open http://localhost:18800   # log in with APP_SECRET
 ```
 
 `.env` is gitignored and must stay that way — this repo is public.
@@ -91,11 +115,18 @@ IP, the geo, which binary ran, and what the page itself saw.
 **Never launch a browser outside the container.** It would go out over your own IP
 and burn its reputation with the listing sites.
 
+To exercise the Notion store against a real workspace — it creates a scratch page,
+does everything under it, and archives it again, so it leaves nothing behind:
+
+```bash
+python scripts/verify_notion.py --parent <page-id> [--readonly-db <db-id>]
+```
+
 Tests:
 
 ```bash
 docker run --rm -v "$PWD":/src -w /src cloak-biz-scraper:local \
-  sh -c "pip install -q pytest pytest-asyncio httpx && python -m pytest -q"
+  sh -c "pip install -q -r requirements-dev.txt && python -m pytest -q"
 ```
 
 ## Credits
