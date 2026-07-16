@@ -19,9 +19,12 @@ services:
       # silently does nothing and the recovery looks broken when it is not —
       # Railway passes its variables straight through and never had the gap.
       APP_SECRET_RESET: ${APP_SECRET_RESET:-}
-    # 18800 on the host: 18791/18792 belong to browserd.
+    # 18800 on the host: 18791/18792 belong to browserd. Overridable because a
+    # hardcoded host port means two checkouts — or two people — cannot run this
+    # at once: the second bind fails and the container stalls in "Created", which
+    # looks exactly like a broken image rather than a taken port.
     ports:
-      - "18800:8000"
+      - "${HOST_PORT:-18800}:8000"
     volumes:
       - data:/data
     healthcheck:
