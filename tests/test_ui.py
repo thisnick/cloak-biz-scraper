@@ -270,6 +270,77 @@ class TestProxyTest:
         assert "exit IP is unknown" in response.text
         assert "America/Los_Angeles" not in response.text, "never a timezone we did not measure"
 
+    @respx.mock
+    def test_a_failed_test_leaves_the_page_saying_it_is_broken(self, auth):
+        """The defect: a user who walks away must not come back to a green light.
+
+        Every field is filled in, so any status derived from the form says
+        "configured" — while the config cannot route and the error banner died
+        with the response that carried it. Saving what they typed is right; the
+        page just has to keep saying it does not work.
+        """
+        respx.get("https://api.ipify.org").mock(side_effect=httpx.ConnectError("refused"))
+        respx.get("https://checkip.amazonaws.com").mock(side_effect=httpx.ConnectError("refused"))
+        auth.post(
+            "/settings/proxy",
+            data={"action": "test", "proxy_user": "u", "proxy_password": "pw",
+                  "proxy_host": "192.0.2.1", "proxy_port": "1000"},
+        )
+        # Come back later. Fresh GET, no banner from the POST.
+        page = shown(auth.get("/"))
+        assert "not working" in page
+        assert "did not work when it was last tested" in page
+        assert "Scrapes will fail until it does" in page
+        assert '<span class="pill unset">not working</span>' in auth.get("/").text
+        # And the values they typed are still there to fix, not thrown away.
+        assert app.state.settings.load().proxy_host == "192.0.2.1"
+
+    @respx.mock
+    def test_a_passing_test_is_remembered_too(self, auth, monkeypatch):
+        from app.services import geo
+
+        respx.get("https://api.ipify.org").mock(return_value=httpx.Response(200, text="45.12.3.4"))
+        monkeypatch.setattr(geo, "_geolocate", lambda ip: ("America/Los_Angeles", "en-US", "US", "San Jose"))
+        auth.post(
+            "/settings/proxy",
+            data={"action": "test", "proxy_user": "u", "proxy_password": "pw",
+                  "proxy_host": "h.example.com", "proxy_port": "1000"},
+        )
+        page = shown(auth.get("/"))
+        assert '<span class="pill set">working</span>' in auth.get("/").text
+        assert "45.12.3.4" in page and "Last tested" in page
+
+    def test_filling_the_form_in_is_not_evidence_of_anything(self, auth):
+        auth.post(
+            "/settings/proxy",
+            data={"proxy_user": "u", "proxy_password": "pw", "proxy_host": "h.example.com",
+                  "proxy_port": "1000"},
+        )
+        response = auth.get("/")
+        page = shown(response)
+        assert '<span class="pill warn">not tested yet</span>' in response.text
+        assert "Filling the form in does not prove the proxy routes" in page
+        assert '<span class="pill set">working</span>' not in response.text
+
+    @respx.mock
+    def test_editing_the_proxy_retires_the_old_verdict(self, auth, monkeypatch):
+        """A 'working' measured against a different host is not a measurement of
+        this one."""
+        from app.services import geo
+
+        respx.get("https://api.ipify.org").mock(return_value=httpx.Response(200, text="45.12.3.4"))
+        monkeypatch.setattr(geo, "_geolocate", lambda ip: ("America/Los_Angeles", "en-US", "US", "San Jose"))
+        auth.post("/settings/proxy", data={"action": "test", "proxy_user": "u",
+                                           "proxy_password": "pw", "proxy_host": "h.example.com",
+                                           "proxy_port": "1000"})
+        assert app.state.settings.load().proxy_status() == "working"
+
+        auth.post("/settings/proxy", data={"proxy_user": "u", "proxy_password": "pw",
+                                           "proxy_host": "somewhere-else.example.com",
+                                           "proxy_port": "1000"})
+        assert app.state.settings.load().proxy_status() == "untested"
+        assert "not tested yet" in shown(auth.get("/"))
+
     def test_incomplete_proxy_is_not_tested(self, auth):
         response = auth.post("/settings/proxy", data={"action": "test", "proxy_user": "u"})
         assert response.status_code == 400

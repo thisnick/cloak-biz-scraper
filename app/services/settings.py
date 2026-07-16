@@ -50,6 +50,19 @@ class Settings(BaseModel):
     proxy_country: str = "US"
     proxy_region: str = "california"
 
+    # The last "Test proxy" result, remembered across page loads.
+    #
+    # Necessary because "configured" and "working" are different things, and only
+    # one of them can be known by looking at the form. A proxy that failed its
+    # test still has every field filled in, so a status derived from the fields
+    # shows a confident green for a config that cannot route — and the error
+    # banner disappears the moment the user navigates away. Someone who tests,
+    # sees it fail, and comes back tomorrow must not find a page telling them
+    # everything is fine.
+    proxy_last_check_at: float = 0.0
+    proxy_last_check_ok: bool | None = None
+    proxy_last_check_summary: str = ""
+
     # Notion. The database is chosen or created explicitly in the UI and its id
     # stored here — never discovered, never created on the fly (decision #5).
     notion_api_token: str = ""
@@ -106,7 +119,21 @@ class Settings(BaseModel):
         )
 
     def proxy_configured(self) -> bool:
+        """Whether the form is filled in. Says nothing about whether it works."""
         return bool(self.proxy_user and self.proxy_password and self.proxy_host and self.proxy_port)
+
+    def proxy_status(self) -> str:
+        """unconfigured | untested | working | broken — what we actually know.
+
+        'untested' is a real state and not a polite way of saying fine: filling
+        the form in is not evidence of anything, and claiming otherwise would be
+        the same sin as reporting an unmeasured timezone.
+        """
+        if not self.proxy_configured():
+            return "unconfigured"
+        if self.proxy_last_check_ok is None:
+            return "untested"
+        return "working" if self.proxy_last_check_ok else "broken"
 
     def notion_configured(self) -> bool:
         """A token alone is not enough: without a chosen database there is

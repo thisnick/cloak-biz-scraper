@@ -81,14 +81,40 @@
 </section>
 
 {# ── Proxy ────────────────────────────────────────────────────────────────── #}
+{# The pill reports the last measurement, never the fact that the boxes are
+   filled in. A config with every field set and no working route is the exact
+   thing a green "configured" would hide, and the error banner is gone the
+   moment they navigate away. #}
+{% set st = s.proxy_status() %}
+{% set pill = {'working': ('set', 'working'), 'broken': ('unset', 'not working'),
+               'untested': ('warn', 'not tested yet'),
+               'unconfigured': ('unset', 'not configured')}[st] %}
 <section>
   <h2>Residential proxy
-    <span class="pill {{ 'set' if s.proxy_configured() else 'unset' }}">{{ 'configured' if s.proxy_configured() else 'not configured' }}</span>
+    <span class="pill {{ pill[0] }}">{{ pill[1] }}</span>
   </h2>
   <p class="hint">
     Every browser goes out through your proxy. Without one, nothing launches — this
     server never browses from its own address.
   </p>
+
+  {% if st == 'broken' %}
+    <div class="banner bad">
+      <strong>This proxy did not work when it was last tested.</strong>
+      Scrapes will fail until it does — a browser cannot launch without a route out.
+      <br><span class="hint">{{ s.proxy_last_check_summary }} (tested {{ proxy_checked_at }})</span>
+    </div>
+  {% elif st == 'working' %}
+    <p class="hint">
+      Last tested {{ proxy_checked_at }}: <span class="mono">{{ s.proxy_last_check_summary }}</span>
+    </p>
+  {% elif st == 'untested' %}
+    <div class="banner warn">
+      Saved, but never tested. Filling the form in does not prove the proxy routes —
+      click <em>Save &amp; test proxy</em> to find out.
+    </div>
+  {% endif %}
+
   {{ banner('proxy') }}
   {% if result and result.section == 'proxy' and result.ok and result.detail %}
     {# Report the measurement, and be explicit about its limit. Evomi accepts any

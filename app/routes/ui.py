@@ -14,7 +14,9 @@ looks like logic belongs in services/ or stores/.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -81,9 +83,18 @@ def _render(request: Request, result: Result | None = None, status: int = 200) -
             "has_license": bool(settings.cloakbrowser_license_key),
             "has_proxy_password": bool(settings.proxy_password),
             "has_notion_token": bool(settings.notion_api_token),
+            "proxy_checked_at": _when(settings.proxy_last_check_at),
         },
         status_code=status,
     )
+
+
+def _when(epoch: float) -> str:
+    """UTC, spelled out. The container's clock is UTC and the reader's may not
+    be, so an unlabelled local-looking time would be a small lie."""
+    if not epoch:
+        return ""
+    return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
 def _first_error(exc: Exception) -> str:
@@ -234,10 +245,23 @@ async def save_proxy(
         proxy_port=proxy_port.strip(),
         proxy_country=proxy_country.strip() or current.proxy_country,
         proxy_region=proxy_region.strip() or current.proxy_region,
+        # Saving invalidates the previous verdict, which described the values
+        # that were there before. Carrying a "working" over an edited host would
+        # be a measurement attributed to something we never measured.
+        proxy_last_check_at=0.0,
+        proxy_last_check_ok=None,
+        proxy_last_check_summary="",
     )
 
     if action != "test":
-        return _render(request, Result("proxy", True, "Saved."))
+        return _render(
+            request,
+            Result(
+                "proxy", True,
+                "Saved — but not tested. Use 'Save & test proxy' to check it can actually route.",
+                level="warn" if settings.proxy_configured() else "ok",
+            ),
+        )
 
     if not settings.proxy_configured():
         return _render(
@@ -253,9 +277,25 @@ async def save_proxy(
     try:
         measured = await probe(url)
     except ProxyUnreachable as exc:
+        store.update(
+            proxy_last_check_at=time.time(),
+            proxy_last_check_ok=False,
+            proxy_last_check_summary=_first_sentence(str(exc)),
+        )
         return _render(request, Result("proxy", False, str(exc)), status=400)
 
+    store.update(
+        proxy_last_check_at=time.time(),
+        proxy_last_check_ok=True,
+        proxy_last_check_summary=measured.describe(),
+    )
     return _render(request, Result("proxy", True, measured.describe(), measured))
+
+
+def _first_sentence(text: str) -> str:
+    """Enough to recognise the failure on a later visit, without the full essay."""
+    head = text.split(". ")[0].strip()
+    return head if head.endswith(".") else head + "."
 
 
 @router.post("/settings/pool", response_class=HTMLResponse)
