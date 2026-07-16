@@ -31,7 +31,6 @@ def _int(name: str, default: int) -> int:
 class Config:
     data_dir: Path
     port: int
-    app_secret: str | None
 
     @property
     def settings_path(self) -> Path:
@@ -40,6 +39,13 @@ class Config:
     @property
     def dek_path(self) -> Path:
         return self.data_dir / ".dek"
+
+    @property
+    def secret_path(self) -> Path:
+        """The authoritative APP_SECRET. Kept apart from settings.json because it
+        is auth material, not user configuration: different lifecycle, different
+        blast radius, and it must never ride along in a settings dump."""
+        return self.data_dir / "auth.json"
 
     @property
     def profiles_dir(self) -> Path:
@@ -51,10 +57,14 @@ class Config:
 
     @classmethod
     def from_env(cls) -> "Config":
+        # Deliberately no app_secret field. APP_SECRET only *seeds* the volume's
+        # secret on first boot (see services/secret.py), so a Config attribute
+        # holding the env value would be a stale copy the moment anyone rotates
+        # in the UI — and exactly the thing a caller would reach for thinking it
+        # was the real secret. Read it through SecretService only.
         return cls(
             data_dir=Path(os.environ.get("DATA_DIR", "/data")),
             port=_int("PORT", 8000),
-            app_secret=os.environ.get("APP_SECRET") or None,
         )
 
 

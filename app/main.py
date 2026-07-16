@@ -12,12 +12,14 @@ import contextlib
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import RedirectResponse
 
 from . import __version__
 from .config import CONFIG, bootstrap_binary_cache, purge_binary_env
-from .routes import health
+from .routes import health, ui
 from .services.instances import InstanceManager
+from .services.secret import SecretService
 from .services.settings import SettingsService
 
 logging.basicConfig(
@@ -46,17 +48,21 @@ async def lifespan(app: FastAPI):
     settings = settings_service.load()  # first boot seeds from env; volume wins after
     purge_binary_env()  # only after seeding, or the seed would find nothing
 
-    if not CONFIG.app_secret:
-        # Not fatal yet: nothing in Step 1 is authenticated. It becomes fatal once
-        # login exists, so say so loudly rather than failing mysteriously later.
-        logger.warning("APP_SECRET is not set — required for login and token signing")
+    # The volume's secret is authoritative; APP_SECRET seeds it once and
+    # APP_SECRET_RESET recovers a forgotten one. Never fatal when absent: the
+    # login page explains itself, whereas a crash loop explains nothing.
+    secret_service = SecretService(CONFIG.secret_path, CONFIG.dek_path)
+    secret = secret_service.bootstrap()
 
     app.state.settings = settings_service
+    app.state.secret = secret_service
     app.state.instances = InstanceManager(settings_service)
     logger.info(
-        "ready: license=%s proxy=%s pool max=%d reserve=%d",
+        "ready: secret=%s license=%s proxy=%s notion=%s pool max=%d reserve=%d",
+        "set" if secret else "MISSING",
         "set" if settings.cloakbrowser_license_key else "MISSING",
         "set" if settings.proxy_configured() else "MISSING",
+        "set" if settings.notion_configured() else "MISSING",
         settings.max_instances,
         settings.interactive_reserve,
     )
@@ -72,4 +78,17 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="cloak-biz-scraper", version=__version__, lifespan=lifespan)
+
+
+@app.exception_handler(ui.NotAuthenticated)
+async def _login_redirect(request: Request, exc: ui.NotAuthenticated) -> RedirectResponse:
+    """Send a signed-out browser to the login page rather than a JSON 401.
+
+    303 so the browser re-issues as GET: a POST that lost its session (an expired
+    cookie, a rotated secret) must not replay itself against /login.
+    """
+    return RedirectResponse("/login", status_code=303)
+
+
 app.include_router(health.router)
+app.include_router(ui.router)

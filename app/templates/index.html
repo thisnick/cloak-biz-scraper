@@ -1,0 +1,284 @@
+{% extends "base.html" %}
+{% block title %}Settings — cloak-biz-scraper{% endblock %}
+
+{% macro banner(name) %}
+  {% if result and result.section == name %}
+    <div class="banner {{ result.level }}">
+      {{ result.message }}
+      {% if name == 'notion' and result.detail and result.detail.problems is defined %}
+        {% set r = result.detail %}
+        {# Two grades, never merged. Required = nothing syncs until you fix it.
+           Recommended = everything syncs except this column. Presenting them as
+           one list of "schema problems" is how someone ends up hunting for a
+           blocker they don't have. #}
+        {% if r.missing_required or r.mismatched_required %}
+          <p style="margin:10px 0 2px"><strong>Add these before syncing can work:</strong></p>
+          <ul>
+            {% for i in r.missing_required %}<li>{{ i.describe() }}</li>{% endfor %}
+            {% for i in r.mismatched_required %}<li>{{ i.describe() }}</li>{% endfor %}
+          </ul>
+        {% endif %}
+        {% if r.missing_recommended or r.mismatched_recommended %}
+          <p style="margin:10px 0 2px"><strong>These columns will be left empty — everything else still syncs:</strong></p>
+          <ul>
+            {% for i in r.missing_recommended %}<li>{{ i.describe() }}</li>{% endfor %}
+            {% for i in r.mismatched_recommended %}<li>{{ i.describe() }}</li>{% endfor %}
+          </ul>
+        {% endif %}
+        {% if r.untouched %}
+          <p class="hint" style="margin-bottom:0">
+            Your own {{ r.untouched|length }} column(s) — {{ r.untouched|join(', ') }} —
+            are left exactly as they are. This app only ever writes the columns listed above.
+          </p>
+        {% endif %}
+      {% endif %}
+    </div>
+  {% endif %}
+{% endmacro %}
+
+{% block body %}
+<header>
+  <div>
+    <h1>cloak-biz-scraper</h1>
+    <p class="sub">Everything this server needs, configured here. Nothing to install.</p>
+  </div>
+  <form method="post" action="/logout"><button type="submit">Sign out</button></form>
+</header>
+
+{# ── CloakBrowser ─────────────────────────────────────────────────────────── #}
+<section>
+  <h2>CloakBrowser
+    <span class="pill {{ 'set' if has_license else 'unset' }}">{{ 'licence saved' if has_license else 'no licence' }}</span>
+  </h2>
+  <p class="hint">
+    Your own CloakBrowser Pro licence. The browser itself (~150 MB) is downloaded
+    on demand and kept on this server's disk — verifying below fetches it now, so
+    your first scrape doesn't wait for it.
+  </p>
+  {{ banner('cloakbrowser') }}
+  {% if result and result.section == 'cloakbrowser' and result.ok and result.detail and result.detail.version %}
+    <p class="hint mono">Resolved version: {{ result.detail.version }} · cached in {{ result.detail.cache_dir }}</p>
+  {% endif %}
+
+  <form method="post" action="/settings/cloakbrowser">
+    <label for="lic">Licence key</label>
+    <input type="password" id="lic" name="cloakbrowser_license_key" autocomplete="off"
+           placeholder="{{ '•••••••••• (saved — leave blank to keep it)' if has_license else 'cb_...' }}">
+
+    <label for="pin">Version pin <span style="font-weight:400;color:var(--muted)">— optional</span></label>
+    <input type="text" id="pin" name="cloakbrowser_version" class="mono"
+           value="{{ s.cloakbrowser_version }}" placeholder="e.g. 148.0.7778.215.5">
+    <p class="hint">
+      Leave empty to always get the latest build. Pin it only if you need to freeze
+      a specific version — pinned versions are withdrawn once superseded, and a
+      withdrawn pin stops working until you clear it.
+    </p>
+    <div class="actions">
+      <button type="submit" name="action" value="save">Save</button>
+      <button class="primary" type="submit" name="action" value="verify">Save &amp; verify licence</button>
+    </div>
+  </form>
+</section>
+
+{# ── Proxy ────────────────────────────────────────────────────────────────── #}
+<section>
+  <h2>Residential proxy
+    <span class="pill {{ 'set' if s.proxy_configured() else 'unset' }}">{{ 'configured' if s.proxy_configured() else 'not configured' }}</span>
+  </h2>
+  <p class="hint">
+    Every browser goes out through your proxy. Without one, nothing launches — this
+    server never browses from its own address.
+  </p>
+  {{ banner('proxy') }}
+  {% if result and result.section == 'proxy' and result.ok and result.detail %}
+    {# Report the measurement, and be explicit about its limit. Evomi accepts any
+       password: a typo'd one still returns a working exit IP, so a green result
+       here is not evidence the credentials are right. Saying "credentials OK"
+       would be a lie we measured nothing to support. #}
+    <p class="hint">
+      Measured through the proxy just now: exit IP <span class="mono">{{ result.detail.exit_ip }}</span>,
+      {% if result.detail.geo_resolved %}
+        located in {{ result.detail.city or 'an unnamed city' }}{% if result.detail.country %}, {{ result.detail.country }}{% endif %},
+        timezone <span class="mono">{{ result.detail.timezone }}</span>.
+      {% else %}
+        location <strong>unknown</strong> — the IP could not be geolocated.
+      {% endif %}
+      This proves traffic routes and where it comes out. It does <strong>not</strong>
+      prove your password is right: this provider accepts any password and only
+      rejects a wrong username, so a typo would still look like this.
+    </p>
+  {% endif %}
+
+  <form method="post" action="/settings/proxy">
+    <div class="row">
+      <div>
+        <label for="pu">Username</label>
+        <input type="text" id="pu" name="proxy_user" value="{{ s.proxy_user }}" autocomplete="off">
+      </div>
+      <div>
+        <label for="pp">Password</label>
+        <input type="password" id="pp" name="proxy_password" autocomplete="off"
+               placeholder="{{ '•••••••••• (saved)' if has_proxy_password else '' }}">
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label for="ph">Host</label>
+        <input type="text" id="ph" name="proxy_host" value="{{ s.proxy_host }}" class="mono">
+      </div>
+      <div>
+        <label for="po">Port</label>
+        <input type="text" id="po" name="proxy_port" value="{{ s.proxy_port }}" class="mono">
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label for="pc">Country</label>
+        <input type="text" id="pc" name="proxy_country" value="{{ s.proxy_country }}">
+      </div>
+      <div>
+        <label for="pr">Region</label>
+        <input type="text" id="pr" name="proxy_region" value="{{ s.proxy_region }}">
+      </div>
+    </div>
+    <div class="actions">
+      <button type="submit" name="action" value="save">Save</button>
+      <button class="primary" type="submit" name="action" value="test">Save &amp; test proxy</button>
+    </div>
+  </form>
+</section>
+
+{# ── Notion ───────────────────────────────────────────────────────────────── #}
+<section>
+  <h2>Notion
+    <span class="pill {{ 'set' if s.notion_configured() else 'unset' }}">{{ 'ready' if s.notion_configured() else 'incomplete' }}</span>
+  </h2>
+  <p class="hint">
+    Where found listings are saved. Create an integration at
+    <a href="https://www.notion.so/my-integrations" target="_blank" rel="noreferrer">notion.so/my-integrations</a>,
+    paste its token, then <em>share</em> your database or page with it from Notion's
+    ••• menu — an unshared database is invisible to the API.
+  </p>
+  {{ banner('notion') }}
+
+  <form method="post" action="/settings/notion">
+    <label for="nt">API token</label>
+    <input type="password" id="nt" name="notion_api_token" autocomplete="off"
+           placeholder="{{ '•••••••••• (saved — leave blank to keep it)' if has_notion_token else 'ntn_...' }}">
+    <div class="actions">
+      <button type="submit" name="action" value="save">Save</button>
+      <button class="primary" type="submit" name="action" value="list">Save &amp; find my databases</button>
+    </div>
+  </form>
+
+  {% if s.notion_db_id %}
+    <hr>
+    <p class="hint">
+      Selected database: <span class="mono">{{ s.notion_db_id }}</span>
+    </p>
+    <form method="post" action="/settings/notion/verify">
+      <div class="actions"><button type="submit">Verify schema</button></div>
+    </form>
+  {% endif %}
+
+  {% if result and result.section == 'notion' and result.detail and result.detail.databases is defined %}
+    <hr>
+    <h2 style="font-size:14px">Use an existing database</h2>
+    <p class="hint">Its schema is checked before anything is written. Nothing is changed for you.</p>
+    <form method="post" action="/settings/notion/select">
+      <select name="db_id" aria-label="Database">
+        {% for db in result.detail.databases %}
+          <option value="{{ db.id }}" {{ 'selected' if db.id == s.notion_db_id }}>{{ db.title }}</option>
+        {% endfor %}
+      </select>
+      <div class="actions"><button class="primary" type="submit">Use this database</button></div>
+    </form>
+
+    <hr>
+    <h2 style="font-size:14px">Or create a new one</h2>
+    <p class="hint">
+      Created only when you click — this app never adds a database to your workspace
+      on its own.
+    </p>
+    <form method="post" action="/settings/notion/create">
+      <label for="pp2">Under which page</label>
+      <select id="pp2" name="parent_page_id">
+        {% for pg in result.detail.pages %}
+          <option value="{{ pg.id }}">{{ pg.title }}</option>
+        {% endfor %}
+      </select>
+      <label for="dbt">Name it</label>
+      <input type="text" id="dbt" name="title" value="Business Listings">
+      <div class="actions"><button type="submit">Create database</button></div>
+    </form>
+  {% endif %}
+</section>
+
+{# ── Pool ─────────────────────────────────────────────────────────────────── #}
+<section>
+  <h2>Browser pool</h2>
+  {# The guidance from the plan, verbatim in spirit: the ceiling here is cost,
+     not memory, and the honest framing is that it's cheap because it sleeps. #}
+  <p class="hint">
+    Each running browser uses roughly <strong>0.5–1 GB</strong>. You're billed on
+    <strong>actual usage</strong> (about $10/GB per month), and because the service
+    sleeps when idle, <strong>you only pay while a sweep is actually running</strong>
+    — a 3-minute sweep with 4 browsers costs pennies. Raise this for faster
+    multi-page sweeps; lower it if you want a tighter cap.
+  </p>
+  {{ banner('pool') }}
+  {% if pool_warning %}<div class="banner warn">{{ pool_warning }}</div>{% endif %}
+
+  <form method="post" action="/settings/pool">
+    <div class="row">
+      <div>
+        <label for="mi">Maximum browsers</label>
+        <input type="number" id="mi" name="max_instances" min="1" value="{{ s.max_instances }}">
+      </div>
+      <div>
+        <label for="ir">Reserved for interactive use</label>
+        <input type="number" id="ir" name="interactive_reserve" min="0" value="{{ s.interactive_reserve }}">
+      </div>
+    </div>
+    <p class="hint">
+      Reserved slots are kept free so you can always open a browser and look at it
+      by hand, even while a sweep is running. Scraping gets the rest
+      ({{ s.task_budget }} right now).
+    </p>
+    <div class="actions"><button class="primary" type="submit">Save</button></div>
+  </form>
+</section>
+
+{# ── Security ─────────────────────────────────────────────────────────────── #}
+<section>
+  <h2>Deployment secret</h2>
+  <p class="hint">
+    The secret you signed in with. Changing it here takes effect immediately and is
+    remembered on this server's disk — it stays in force even if the
+    <code>APP_SECRET</code> variable in Railway still says something else.
+  </p>
+  {{ banner('secret') }}
+  <form method="post" action="/settings/secret">
+    <label for="cs">Current secret</label>
+    <input type="password" id="cs" name="current_secret" autocomplete="off" required>
+    <label for="ns">New secret</label>
+    <input type="password" id="ns" name="new_secret" autocomplete="off" required>
+    <p class="hint">
+      At least 16 characters — this is the only thing standing between the internet
+      and your browsers, proxy, and Notion token. Signs out every other session.
+      <br>
+      <strong>Forgotten it?</strong> In Railway, set <code>APP_SECRET</code> to a new
+      value <em>and</em> add <code>APP_SECRET_RESET=true</code>, then redeploy. The
+      next start adopts the new value. Your settings survive — they aren't encrypted
+      with this secret.
+    </p>
+    <div class="actions"><button class="primary" type="submit">Rotate secret</button></div>
+  </form>
+</section>
+
+<p class="foot">
+  Settings are stored encrypted on this server's disk. Anyone with access to the
+  disk can read them regardless — the encryption guards against a stray backup or
+  snapshot, not against someone who already has the volume.
+</p>
+{% endblock %}

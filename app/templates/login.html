@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}Sign in — cloak-biz-scraper{% endblock %}
+{% block body %}
+<h1>cloak-biz-scraper</h1>
+<p class="sub">Sign in with the deployment secret to configure this server.</p>
+
+<section>
+  {% if unconfigured %}
+    {# Not a crash: healthz stays green and the page explains itself, because a
+       crash-looping container on Railway tells the user nothing at all. #}
+    <div class="banner bad">
+      <strong>This deployment has no secret set.</strong>
+      Nobody can sign in until it does. In Railway, open this service's
+      <em>Variables</em> tab, add <code>APP_SECRET</code> with a long random value,
+      and let it redeploy. Then come back and sign in with that value.
+    </div>
+  {% else %}
+    {% if error %}<div class="banner bad">{{ error }}</div>{% endif %}
+    <form method="post" action="/login">
+      <label for="secret">APP_SECRET</label>
+      <input type="password" id="secret" name="secret" autocomplete="current-password"
+             autofocus required>
+      <p class="hint">
+        Copy it from your Railway service's <em>Variables</em> tab. If you changed it
+        here after deploying, use the changed one — this server's stored secret wins
+        over the variable.
+      </p>
+      <div class="actions">
+        <button class="primary" type="submit">Sign in</button>
+      </div>
+    </form>
+  {% endif %}
+</section>
+{% endblock %}

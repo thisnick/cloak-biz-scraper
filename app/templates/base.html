@@ -1,0 +1,82 @@
+{# Everything is inline and self-contained: no CDN, no build step, no fonts to
+   fetch. The container is not guaranteed outbound access to anything except the
+   user's own proxy and APIs, and a settings form is not worth a bundler. #}
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}cloak-biz-scraper{% endblock %}</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #fff; --ink: #14181f; --muted: #5c6673;
+    --line: #dfe3e8; --accent: #2f6fed; --ok: #1a7f4b; --bad: #c0392b;
+    --warn: #8a6100; --warn-bg: #fff8e6; --ok-bg: #eefaf3; --bad-bg: #fdeeec;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14171c; --card: #1c2028; --ink: #e8ecf1; --muted: #98a2b0;
+      --line: #2e3540; --accent: #6f9bff; --ok: #4cc98a; --bad: #ff8a7a;
+      --warn: #e8b95c; --warn-bg: #2b2415; --ok-bg: #16281f; --bad-bg: #2b1a18;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  .wrap { max-width: 720px; margin: 0 auto; padding: 32px 20px 64px; }
+  header { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; }
+  h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: -0.01em; }
+  h2 { font-size: 16px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 28px; font-size: 14px; }
+  section {
+    background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+    padding: 20px; margin-bottom: 16px;
+  }
+  .hint { color: var(--muted); font-size: 13px; margin: 4px 0 14px; }
+  label { display: block; font-weight: 600; font-size: 13px; margin: 12px 0 4px; }
+  input[type=text], input[type=password], input[type=number], select {
+    width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px;
+    background: var(--bg); color: var(--ink); font: inherit; font-size: 14px;
+  }
+  input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; }
+  .row > div { flex: 1 1 140px; }
+  .actions { margin-top: 16px; display: flex; gap: 8px; flex-wrap: wrap; }
+  button {
+    padding: 8px 14px; border-radius: 6px; border: 1px solid var(--line);
+    background: var(--card); color: var(--ink); font: inherit; font-size: 14px;
+    font-weight: 600; cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .banner {
+    border-radius: 8px; padding: 12px 14px; margin: 0 0 16px; font-size: 14px;
+    border: 1px solid;
+  }
+  .banner.ok { background: var(--ok-bg); border-color: var(--ok); color: var(--ok); }
+  .banner.bad { background: var(--bad-bg); border-color: var(--bad); color: var(--bad); }
+  .banner.warn { background: var(--warn-bg); border-color: var(--warn); color: var(--warn); }
+  .banner ul { margin: 8px 0 0; padding-left: 20px; }
+  .banner li { margin: 2px 0; }
+  code, .mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px;
+  }
+  .pill {
+    display: inline-block; font-size: 11px; font-weight: 700; padding: 2px 7px;
+    border-radius: 20px; vertical-align: middle; margin-left: 6px;
+  }
+  .pill.set { background: var(--ok-bg); color: var(--ok); }
+  .pill.unset { background: var(--bad-bg); color: var(--bad); }
+  hr { border: 0; border-top: 1px solid var(--line); margin: 20px 0; }
+  a { color: var(--accent); }
+  .foot { color: var(--muted); font-size: 12px; text-align: center; margin-top: 28px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+{% block body %}{% endblock %}
+</div>
+</body>
+</html>
