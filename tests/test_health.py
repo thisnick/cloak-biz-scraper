@@ -1,0 +1,29 @@
+"""/healthz — Railway's prober hits this unauthenticated, so watch what it says."""
+from __future__ import annotations
+
+from fastapi.testclient import TestClient
+
+from app.main import app
+
+
+def test_healthz_is_ok_with_nothing_configured():
+    # The deploy must come up before the user has filled in a single setting;
+    # otherwise Railway marks it unhealthy and they never reach the form.
+    with TestClient(app) as client:
+        response = client.get("/healthz")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["configured"] is False
+    assert body["instances"] == 0
+
+
+def test_healthz_leaks_no_secret():
+    with TestClient(app) as client:
+        app.state.settings.update(
+            cloakbrowser_license_key="cb_leakme",
+            proxy_user="u", proxy_password="pw_leakme", proxy_host="h", proxy_port="1000",
+        )
+        response = client.get("/healthz")
+    assert response.json()["configured"] is True
+    assert "leakme" not in response.text

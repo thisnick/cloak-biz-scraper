@@ -1,0 +1,72 @@
+"""The Evomi proxy URL builder, and the promise that credentials never get logged."""
+from __future__ import annotations
+
+import pytest
+
+from app.services.proxy import (
+    ProxyNotConfigured,
+    ProxyParts,
+    build_proxy_url,
+    masked,
+    new_session_token,
+)
+from app.services.settings import Settings
+
+FULL = Settings(
+    proxy_user="user1",
+    proxy_password="s3cret",
+    proxy_host="core-residential.example.com",
+    proxy_port="1000",
+    proxy_country="US",
+    proxy_region="california",
+)
+
+
+def test_url_carries_geo_and_session_in_the_password_suffix():
+    url = build_proxy_url("ABC123XYZ", ProxyParts.from_settings(FULL))
+    assert url == (
+        "http://user1:s3cret_country-US_region-california_session-ABC123XYZ_lifetime-2"
+        "@core-residential.example.com:1000"
+    )
+
+
+def test_per_profile_geo_overrides_the_default():
+    url = build_proxy_url(
+        "TOK", ProxyParts.from_settings(FULL), country="CA", region="ontario"
+    )
+    assert "_country-CA_region-ontario_" in url
+
+
+def test_session_tokens_are_unique_and_evomi_shaped():
+    tokens = {new_session_token() for _ in range(200)}
+    assert len(tokens) == 200
+    assert all(len(t) == 9 and t.isalnum() and t.isupper() for t in tokens)
+
+
+def test_missing_proxy_names_what_is_missing_rather_than_launching_bare():
+    # Launching without a proxy would send the host's real IP to the target.
+    with pytest.raises(ProxyNotConfigured, match="proxy_password, proxy_host, proxy_port"):
+        ProxyParts.from_settings(Settings(proxy_user="only-user"))
+
+
+class TestMasked:
+    def test_password_is_hidden_and_host_kept(self):
+        url = build_proxy_url("TOK", ProxyParts.from_settings(FULL))
+        assert masked(url) == "http://user1:***@core-residential.example.com:1000"
+
+    def test_no_fragment_of_the_secret_survives(self):
+        url = build_proxy_url("TOK", ProxyParts.from_settings(FULL))
+        out = masked(url)
+        assert "s3cret" not in out
+        assert "lifetime" not in out  # the whole suffix goes, not just the password
+
+    def test_garbage_fails_closed(self):
+        assert masked("this is not a url") == "***"
+
+    def test_password_containing_an_at_sign_leaks_no_fragment(self):
+        # Splitting on the first '@' would mask only "p" and leave "ss_country-US…"
+        # in the log line, disguised as a hostname.
+        parts = ProxyParts.from_settings(FULL.model_copy(update={"proxy_password": "p@ss"}))
+        assert masked(build_proxy_url("TOK", parts)) == (
+            "http://user1:***@core-residential.example.com:1000"
+        )

@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+.git
+.gitignore
+data/
+**/__pycache__/
+**/*.py[cod]
+.venv/
+.pytest_cache/
+.DS_Store
+tests/
+README.md

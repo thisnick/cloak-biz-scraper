@@ -1,0 +1,30 @@
+# Local development. The deployed app needs none of this: Railway sets APP_SECRET,
+# mounts a volume at /data, and everything else is configured in the web UI.
+#
+# `.env` is optional. With it, the variables inside seed the settings on first
+# boot so a local run can skip the UI. Without it, `APP_SECRET=... docker compose
+# up` is a complete deployment — which is the whole product bet, so it stays
+# testable here.
+services:
+  app:
+    build: .
+    image: cloak-biz-scraper:local
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      APP_SECRET: ${APP_SECRET:-}
+    # 18800 on the host: 18791/18792 belong to browserd.
+    ports:
+      - "18800:8000"
+    volumes:
+      - data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  data:
