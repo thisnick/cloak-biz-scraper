@@ -13,7 +13,9 @@ Changes made in the port:
   * the license key and version pin are passed as launch arguments from settings
     — we write no install logic, ensure_binary() downloads on demand into the
     volume (CLOAKBROWSER_CACHE_DIR, set at process start);
-  * timezone/locale follow the exit IP instead of being hardcoded;
+  * timezone/locale are measured at the proxy's exit or reported as unknown —
+    never defaulted, and an unroutable proxy fails fast rather than holding a
+    pool slot on a browser that cannot load a page (see geo.py);
   * Xvfb stands in for KasmVNC until live inspection is built.
 
 Two consumer classes share one memory-bound pool via a reservation:
@@ -33,7 +35,9 @@ from pathlib import Path
 from typing import Any, Literal
 
 from ..config import CONFIG
+from . import geo
 from .display import DisplayManager
+from .geo import GeoUnresolved
 from .profiles import ProfileStore
 from .proxy import ProxyParts, build_proxy_url, masked
 from .settings import SettingsService
@@ -44,11 +48,6 @@ _BASE_CDP_PORT = 9222
 _CDP_RANGE = 100
 _IDLE_TTL_MIN = 15
 _HARD_TTL_MIN = 60
-
-# Used only when the exit IP cannot be geolocated. A browser with no timezone at
-# all reports the container's UTC, which contradicts a California exit IP.
-_FALLBACK_TZ = "America/Los_Angeles"
-_FALLBACK_LOCALE = "en-US"
 
 Origin = Literal["task", "interactive"]
 
@@ -213,7 +212,7 @@ class InstanceManager:
         return inst
 
     async def _do_launch(self, req, origin: Origin, owner: str | None) -> Instance:
-        from cloakbrowser import launch_persistent_context_async, maybe_resolve_geoip
+        from cloakbrowser import launch_persistent_context_async
 
         settings = self._settings.load()
         if not settings.cloakbrowser_license_key:
@@ -235,14 +234,27 @@ class InstanceManager:
         )
         logger.info("launch profile=%s proxy=%s", profile.name, masked(proxy_url))
 
-        # Let the exit IP drive timezone/locale: a California IP reporting UTC is
-        # exactly the incoherence the proxy is there to avoid.
-        proxy_ip = tz = locale = None
-        if req.geoip:
-            tz, locale, proxy_ip = await asyncio.to_thread(
-                maybe_resolve_geoip, True, proxy_url, None, None)
-        tz = tz or _FALLBACK_TZ
-        locale = locale or _FALLBACK_LOCALE
+        # Measure the proxy before spending a display and a pool slot on it. A
+        # proxy that cannot route is not a slow proxy, it is a broken one: every
+        # page load would fail while the instance sat in the pool looking healthy.
+        # Fail fast instead, and report only what was measured — see geo.py for
+        # why a None check on the package's own resolver is not sufficient.
+        probe = await geo.probe(proxy_url, geo=req.geoip)
+        proxy_ip, tz, locale = probe.exit_ip, probe.timezone, probe.locale
+
+        if req.geoip and not probe.geo_resolved:
+            # geoip=True is a request for geographic coherence, and we cannot
+            # honour it. Launching anyway would put a browser reporting the
+            # container's UTC behind a residential exit somewhere else entirely —
+            # the exact incoherence the proxy exists to avoid — so refuse rather
+            # than substitute a plausible default. Callers that genuinely do not
+            # care can pass geoip=false and get an honest timezone of None.
+            raise GeoUnresolved(
+                f"The proxy routes (exit IP {proxy_ip}), but its location could not be "
+                f"resolved, so the browser's timezone would contradict its exit IP. "
+                f"This usually means the GeoLite2 database could not be downloaded. "
+                f"Retry, or launch with geoip disabled to accept an unknown timezone."
+            )
 
         display = await self.displays.allocate()
         try:

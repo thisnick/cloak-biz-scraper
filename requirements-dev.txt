@@ -1,4 +1,6 @@
 -r requirements.txt
 pytest==8.3.4
 pytest-asyncio==0.25.2
-httpx==0.28.1
+# Fakes the Notion API and the IP echo services, so the suite exercises the real
+# request/response shapes without a network or a live workspace.
+respx==0.22.0
