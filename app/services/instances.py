@@ -62,31 +62,36 @@ class LicenseNotConfigured(RuntimeError):
 
 
 class PinUnavailable(RuntimeError):
-    """The pinned version has no build for this machine's platform."""
+    """The pinned version could not be downloaded."""
 
 
 def _diagnose_pin(exc: BaseException, pin: str) -> str | None:
-    """Explain a pin that has no build for this platform, or return None.
+    """Correct the retry advice on a 404 for a pinned version, or return None.
 
-    Worth the string matching. Version pins are per-platform, and the two Linux
-    arches sit on different builds — so a pin someone copied from an x64 box can
-    404 on arm64 and vice versa. The package reports that as "the Pro binary
-    could not be downloaded right now. Retry in a moment", which sends you off
-    debugging your network or your license for a condition that is permanent and
-    entirely about the pin. Say so instead, and name the platform.
+    Worth the string matching. The package reports a pinned version it cannot
+    fetch as "the Pro binary could not be downloaded right now. Retry in a
+    moment", which sends you off debugging your network or your license for a
+    condition that is permanent and entirely about the pin.
+
+    Deliberately names no cause. A 404 tells us only that the version is not
+    downloadable — not whether it was retired, mistyped, or never existed. The
+    platform tag is included as context because it forms part of the request,
+    NOT because it is implicated: probing the download API shows withdrawn
+    versions return 404 on every architecture, so architecture is not the
+    discriminator and guessing that it is would send the reader hunting for an
+    arch-specific build that exists for nobody.
     """
     if not pin or "404" not in str(exc):
         return None
 
     from cloakbrowser.config import get_platform_tag
 
-    tag = get_platform_tag()
     return (
-        f"CloakBrowser {pin} has no build for this machine ({tag}), so the pin can "
-        f"never be satisfied here and retrying will not help. Version pins are "
-        f"per-platform: a build published for one architecture may have no "
-        f"counterpart on another. Clear the pin in Settings to track the latest "
-        f"build, or pin a version that exists for {tag}. (Underlying error: {exc})"
+        f"CloakBrowser {pin} is not available for download, so this pin cannot be "
+        f"satisfied and retrying will not help. Check that the version exists and is "
+        f"spelled as published — builds are withdrawn once superseded. Clear the pin "
+        f"in Settings to track the latest build instead. "
+        f"(Resolved platform: {get_platform_tag()}. Underlying error: {exc})"
     )
 
 
