@@ -24,6 +24,12 @@ from .crypto import Cipher
 
 logger = logging.getLogger("cloakbiz.settings")
 
+# Above this we warn and still obey. The ceiling here is cost, not memory —
+# Railway's Hobby plan allows 48 GB per service, so a pool of 12 fits fine and
+# simply bills more. A cap we invented would be us guessing at someone else's
+# budget; a warning tells them what they are choosing and lets them choose it.
+POOL_WARN_ABOVE = 8
+
 
 class Settings(BaseModel):
     """Everything the user configures. Extended in later steps (Notion, etc.)."""
@@ -43,6 +49,11 @@ class Settings(BaseModel):
     proxy_port: str = ""
     proxy_country: str = "US"
     proxy_region: str = "california"
+
+    # Notion. The database is chosen or created explicitly in the UI and its id
+    # stored here — never discovered, never created on the fly (decision #5).
+    notion_api_token: str = ""
+    notion_db_id: str = ""
 
     # Pool budget. Task budget = max_instances - interactive_reserve; interactive
     # sessions are never starved by a running sweep.
@@ -83,13 +94,29 @@ class Settings(BaseModel):
         """Slots all tasks combined may hold; the rest is the interactive floor."""
         return max(1, self.max_instances - self.interactive_reserve)
 
+    def pool_warning(self) -> str | None:
+        """Advice for an unusually large pool, or None. Never a refusal."""
+        if self.max_instances <= POOL_WARN_ABOVE:
+            return None
+        return (
+            f"{self.max_instances} browsers is a lot — roughly "
+            f"{self.max_instances // 2}–{self.max_instances} GB while a sweep runs. That "
+            f"is allowed and will work; it just costs more per minute of sweeping. Most "
+            f"people find 4 is plenty."
+        )
+
     def proxy_configured(self) -> bool:
         return bool(self.proxy_user and self.proxy_password and self.proxy_host and self.proxy_port)
+
+    def notion_configured(self) -> bool:
+        """A token alone is not enough: without a chosen database there is
+        nowhere to sync, and we will not pick one for the user."""
+        return bool(self.notion_api_token and self.notion_db_id)
 
     def redacted(self) -> dict[str, Any]:
         """A view safe to log or return over the wire."""
         data = self.model_dump()
-        for secret in ("cloakbrowser_license_key", "proxy_password"):
+        for secret in ("cloakbrowser_license_key", "proxy_password", "notion_api_token"):
             data[secret] = "***" if data[secret] else ""
         return data
 
@@ -106,6 +133,8 @@ _ENV_SEEDS: dict[str, tuple[str, ...]] = {
     "proxy_port": ("PROXY_PORT", "EVOMI_PROXY_PORT"),
     "proxy_country": ("PROXY_COUNTRY", "EVOMI_DEFAULT_COUNTRY"),
     "proxy_region": ("PROXY_REGION", "EVOMI_DEFAULT_REGION"),
+    "notion_api_token": ("NOTION_API_TOKEN",),
+    "notion_db_id": ("NOTION_DB_ID",),
     "max_instances": ("MAX_INSTANCES",),
     "interactive_reserve": ("INTERACTIVE_RESERVE",),
 }
