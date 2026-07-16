@@ -61,6 +61,35 @@ class LicenseNotConfigured(RuntimeError):
     """No Pro license in settings."""
 
 
+class PinUnavailable(RuntimeError):
+    """The pinned version has no build for this machine's platform."""
+
+
+def _diagnose_pin(exc: BaseException, pin: str) -> str | None:
+    """Explain a pin that has no build for this platform, or return None.
+
+    Worth the string matching. Version pins are per-platform, and the two Linux
+    arches sit on different builds — so a pin someone copied from an x64 box can
+    404 on arm64 and vice versa. The package reports that as "the Pro binary
+    could not be downloaded right now. Retry in a moment", which sends you off
+    debugging your network or your license for a condition that is permanent and
+    entirely about the pin. Say so instead, and name the platform.
+    """
+    if not pin or "404" not in str(exc):
+        return None
+
+    from cloakbrowser.config import get_platform_tag
+
+    tag = get_platform_tag()
+    return (
+        f"CloakBrowser {pin} has no build for this machine ({tag}), so the pin can "
+        f"never be satisfied here and retrying will not help. Version pins are "
+        f"per-platform: a build published for one architecture may have no "
+        f"counterpart on another. Clear the pin in Settings to track the latest "
+        f"build, or pin a version that exists for {tag}. (Underlying error: {exc})"
+    )
+
+
 @dataclass
 class Instance:
     id: str
@@ -227,13 +256,19 @@ class InstanceManager:
             # license_key/browser_version come from settings, never from the env:
             # ensure_binary() resolves the version and downloads on demand into
             # CLOAKBROWSER_CACHE_DIR (the volume). We write no install logic.
-            context = await launch_persistent_context_async(
-                user_data_dir=profile.user_data_dir, headless=not req.headed,
-                proxy=proxy_url, args=args, timezone=tz, locale=locale,
-                humanize=req.humanize, human_preset=req.human_preset, geoip=req.geoip,
-                viewport=None, env={**os.environ, "DISPLAY": f":{display}"},
-                license_key=settings.cloakbrowser_license_key,
-                browser_version=settings.cloakbrowser_version or None)
+            try:
+                context = await launch_persistent_context_async(
+                    user_data_dir=profile.user_data_dir, headless=not req.headed,
+                    proxy=proxy_url, args=args, timezone=tz, locale=locale,
+                    humanize=req.humanize, human_preset=req.human_preset, geoip=req.geoip,
+                    viewport=None, env={**os.environ, "DISPLAY": f":{display}"},
+                    license_key=settings.cloakbrowser_license_key,
+                    browser_version=settings.cloakbrowser_version or None)
+            except Exception as exc:
+                diagnosis = _diagnose_pin(exc, settings.cloakbrowser_version)
+                if diagnosis:
+                    raise PinUnavailable(diagnosis) from exc
+                raise
         except BaseException:
             await self.displays.stop(display)
             raise
