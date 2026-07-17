@@ -74,8 +74,14 @@ ENV DATA_DIR=/data \
     PYTHONUNBUFFERED=1
 
 EXPOSE 8000
-# Settings, the Chromium binary cache, profiles, and (later) jobs + evidence.
-VOLUME /data
+
+# No `VOLUME /data` here, deliberately. /data holds the settings, the Chromium
+# binary cache, profiles, jobs and evidence — but Railway *rejects the image at
+# parse time* if the Dockerfile declares it: "docker VOLUME at Line 78 is not
+# supported, use Railway Volumes". The build fails in ~3s before a single layer
+# runs, so it cannot be caught by any local build. The mount is supplied from
+# outside instead: `data:/data` in docker-compose.yml, a Railway Volume in the
+# template.
 
 # Railway injects PORT; honour it without needing a rebuild.
 #
