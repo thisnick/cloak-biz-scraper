@@ -26,7 +26,11 @@ from app.models import Listing, SyncResult
 from conftest import mint_access
 
 HEADERS = {"Content-Type": "application/json",
-           "Accept": "application/json, text/event-stream"}
+           "Accept": "application/json, text/event-stream",
+           # A real MCP client sends an Origin, and /mcp validates it. Sending our
+           # own keeps this call representative of the real one and immune to the
+           # rebinding guard rejecting an absent Origin for the wrong-reason later.
+           "Origin": "https://testserver"}
 
 
 @pytest.fixture
@@ -88,6 +92,10 @@ class TestScrapeResultParity:
         job = _rich_job()
         rest = _rest_payload(client, job.id)
         mcp = _mcp_payload(client, job.id)
+        # Control first: prove the comparison is running on the real job, not on
+        # two empty or error payloads that would be trivially equal. A pass below
+        # means nothing unless this holds.
+        assert rest["job_id"] == job.id and rest["pages_crawled"] == 3, rest
         assert rest == mcp, (
             "MCP and REST disagree about a completed sweep. If a field was added to "
             "ScrapeResult at a call site instead of in ScrapeResult.of(), this is how "
