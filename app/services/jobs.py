@@ -58,7 +58,14 @@ class JobStore:
             raise ValueError(f"not a job id: {job_id!r}")
         return self.root / f"{job_id}.json"
 
-    def create(self, **fields) -> Job:
+    def create(self, *, summary=None, **fields) -> Job:
+        """Write a new job down.
+
+        `summary` may be a callable taking the new id: the message that tells a
+        model how to collect this sweep has to name the job, and the id is minted
+        here — so this lets the caller fill it in within the same write rather
+        than saving once and immediately saving again.
+        """
         job = Job(
             id=uuid.uuid4().hex[:12],
             boot_id=self.boot_id,
@@ -66,6 +73,8 @@ class JobStore:
             updated_at=time.time(),
             **fields,
         )
+        if summary is not None:
+            job.summary = summary(job.id) if callable(summary) else summary
         self.save(job)
         return job
 

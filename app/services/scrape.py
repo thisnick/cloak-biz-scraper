@@ -97,12 +97,12 @@ class ScrapeService:
                     "read the listings back without saving them."
                 )
 
+        # The instruction names the job id, and the id is minted by create(), so
+        # the summary is filled in by the same write rather than a second one.
         job = self._jobs.create(
             source=source.name, url=url, max_pages=max_pages, sync=sync, db_id=target_db,
-            status="working", summary=_collect_message(""),
+            status="working", summary=_collect_message,
         )
-        job.summary = _collect_message(job.id)
-        self._jobs.save(job)
 
         task = asyncio.create_task(self._run(job, source))
         self._running.add(task)
