@@ -30,10 +30,20 @@ echo service through the proxy is also the only honest proof the proxy routes at
 all, which is what lets a launch fail fast instead of holding a slot.
 
 **What this cannot tell you.** Evomi does not validate passwords (verified): a
-garbage password still returns a working residential exit, and only a bad
-*username* yields 407. A successful probe therefore proves the proxy routes and
-says where it exits. It does **not** prove the credentials are correct, and
-nothing in the UI may claim it does.
+garbage password still returns a working residential exit. A successful probe
+therefore proves the proxy routes and says where it exits. It does **not** prove
+the credentials are correct, and nothing in the UI may claim it does.
+
+**A 407 does not mean "bad username."** An earlier version of this note said only
+a bad username could produce one. That was measured from a single machine, and it
+is wrong. The same credential string — byte-identical, sha256-compared, down to
+the session token — was accepted from one address and refused with 407 from
+another, so a provider may also gate on *which source address may authenticate*.
+The wire cannot tell the two apart: the refusal is a bare
+`407 / proxy-authenticate: Basic realm=auth`, naming no reason. So this module
+reports what a 407 means (the proxy answered and rejected the credentials as
+presented) and names both causes, rather than sending someone to re-check a
+username that was never wrong.
 
 The GeoLite2 database is the `cloakbrowser` package's own cached copy — one ~70
 MB file on the volume, refreshed on its schedule, giving the same tz the package
@@ -114,11 +124,28 @@ async def measure_exit_ip(proxy_url: str) -> str:
             except Exception as exc:
                 errors.append(f"{url}: {type(exc).__name__}: {exc}")
                 continue
+    # A 407 is a different failure from an unroutable host, and the two need
+    # different advice. Telling someone whose proxy answered to "check the host
+    # and port" sends them to re-check settings that are demonstrably fine.
+    refused = any("407" in e for e in errors)
+    if refused:
+        why = (
+            "The proxy answered but rejected the sign-in (407). That means either the "
+            "username is wrong, or your proxy account only allows certain IP addresses "
+            "to connect and this server is not one of them — the password is not the "
+            "likely cause, and the proxy does not say which it is. If the username is "
+            "right, check your proxy provider's dashboard for an IP allowlist. Note "
+            "this server's address can change, so allowlisting it is not a lasting fix."
+        )
+    else:
+        why = (
+            "Nothing came back through the proxy at all, so check the host and port. "
+            "An unroutable proxy cannot be used, and launching a browser on it would "
+            "fail every page load."
+        )
     raise ProxyUnreachable(
         "Could not reach the internet through the proxy, so its exit IP is unknown. "
-        "Check the host, port, and username — an unroutable proxy cannot be used, and "
-        "launching a browser on it would fail every page load. "
-        "Tried " + "; ".join(errors)
+        + why + " Tried " + "; ".join(errors)
     )
 
 

@@ -78,6 +78,45 @@ class TestFailsFastRatherThanGuessing:
         with pytest.raises(ProxyUnreachable, match="exit IP is unknown"):
             await measure_exit_ip(PROXY)
 
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_a_407_does_not_send_you_hunting_for_a_typo(self):
+        """Measured on Railway: the same credential string — sha256-identical,
+        session token and all — was accepted from one address and 407'd from
+        another. So a 407 is not evidence of a bad username, and the old advice
+        ("check the host, port, and username") sent the reader to re-check
+        settings that were provably correct. Both real causes get named, and the
+        password is ruled out because Evomi does not validate it.
+        """
+        respx.get("https://api.ipify.org").mock(
+            side_effect=httpx.ProxyError("407 Proxy Authentication Required")
+        )
+        respx.get("https://checkip.amazonaws.com").mock(
+            side_effect=httpx.ProxyError("407 Proxy Authentication Required")
+        )
+        with pytest.raises(ProxyUnreachable) as exc:
+            await measure_exit_ip(PROXY)
+        msg = str(exc.value)
+        assert "IP address" in msg and "username" in msg
+        assert "allowlist" in msg
+        # the address can change under you, so "just allowlist it" is not a fix
+        assert "not a lasting fix" in msg
+        # and it must not blame the one thing the provider never checks
+        assert "password is not the likely cause" in msg
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_an_unroutable_proxy_still_says_check_host_and_port(self):
+        """The other branch: nothing answered, so host/port really is the advice."""
+        respx.get("https://api.ipify.org").mock(side_effect=httpx.ConnectError("refused"))
+        respx.get("https://checkip.amazonaws.com").mock(side_effect=httpx.ConnectError("refused"))
+        with pytest.raises(ProxyUnreachable) as exc:
+            await measure_exit_ip(PROXY)
+        msg = str(exc.value)
+        assert "check the host and port" in msg
+        # a connection error is not a sign-in failure; don't cross the wires
+        assert "allowlist" not in msg
+
 
 class TestUnknownIsNotADefault:
     @respx.mock
