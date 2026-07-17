@@ -100,37 +100,73 @@ alternatives:
   provably a probe branch's tip. **Verify a pin by `commitHash`, or by `RAILWAY_GIT_COMMIT_SHA`
   inside the container — never by `meta.branch`.**
 
-## 🔴 Generating the template requires a GitHub connection
+## 🔴 Generating the template requires GitHub — *and a reconnect afterwards*
 
-`templateGenerate` **refuses a repo-sourced service** unless the workspace has a GitHub App
-installation:
+`templateGenerate` **refuses a repo-sourced service** whose source Railway cannot resolve
+through the GitHub App:
 
 ```
 Service cloak-biz-scraper does not have a source that can be used to generate a template
 ```
 
 Measured as a matched pair on the same account: an **image**-sourced service generates fine;
-a **repo**-sourced one is refused — including for an unrelated public repo, so it is not
-about this repo. `githubRepoDeploy` fails the same way (`Could not find latest commit for
-repo`), and `repoTriggers` is empty (`NO_INSTALLATION`).
+a **repo**-sourced one is refused — including for an unrelated public repo, so it was never
+about this repo.
 
-The coherent model:
+**The sharp edge: installing the GitHub App is not sufficient.** After Nick installed it,
+`serviceInstanceAutoDeployStatus` flipped `{canEnable:false, reason:"NO_INSTALLATION"}` →
+`{canEnable:true, reason:null}` — and `templateGenerate` **still refused**. The service had
+been connected *before* the install, and that earlier `serviceConnect` had silently stored a
+source Railway would not template. Re-running the identical `serviceConnect` afterwards
+created the `repoTrigger` and generation was accepted immediately:
+
+```
+repoTriggers: [{branch: "release", repository: "thisnick/cloak-biz-scraper", provider: "github"}]
+templateGenerate -> ACCEPTED (code rXxuD5, UNPUBLISHED)
+```
+
+So the real requirement is **a `repoTrigger`**, which needs the App installed *and* the
+service connected after it. Anyone who installs the App and sees the same refusal will
+conclude the install failed. It didn't — reconnect the service.
+
+The model, corrected:
 
 - **Without** a GitHub install, Railway will *anonymously clone a public repo to build*, and
-  nothing more. (This is proven — the image builds and deploys.)
-- **With** one, the repo-aware features work: template generation, branch pinning,
-  `repoTriggers`, autodeploy.
+  nothing more. (Proven — the image built and deployed for hours this way.)
+- **With** one, plus a reconnect, the repo-aware features work: template generation, a real
+  `repoTrigger`, branch pinning, autodeploy.
 
-**This is a one-time action for the template author (Nick). It does not touch the user
-story: deployers still need no GitHub account** — Railway clones this public repo for them
+**This is a one-time action for the template author. It does not touch the user story:
+deployers still need no GitHub account** — Railway clones this public repo for them
 anonymously. Those two roles are easy to conflate; they are not the same.
 
-There is no way around it: the live schema has **no `templateCreate` and no `templateUpdate`**
-(only `templateGenerate|Clone|Delete|Publish|Unpublish|DeployV2|VolumeUpdate`), and
-`templateClone` takes only `{code, workspaceId}` with no config override. A template's stored
-config can *only* come from generation, and the deploy button serves that **stored** config —
-`templateDeployV2(serializedConfig=…)` passes config at deploy time, which is not what a user
-clicking the button gets.
+Note there is **no `templateCreate` and no `templateUpdate`** in the live schema (only
+`templateGenerate|Clone|Delete|Publish|Unpublish|DeployV2|VolumeUpdate`), and `templateClone`
+takes only `{code, workspaceId}` with no config override. A template's stored config can
+*only* come from generation, and the deploy button serves that **stored** config —
+`templateDeployV2(serializedConfig=…)` passes config at deploy time, which is *not* what a
+user clicking the button gets. That constraint is what makes the strips below dangerous.
+
+## 🔴 What generation actually stripped (measured on OUR repo source)
+
+Generated config for our service, audited field by field against the table above:
+
+| field | intended | generated |
+|---|---|---|
+| `deploy.healthcheckPath` | `/healthz` | ✅ `/healthz` |
+| `variables.APP_SECRET` | `${{secret(32)}}` | ✅ `${{secret(32)}}`, `isOptional:false` |
+| `volumeMounts.<id>.mountPath` | `/data` | ✅ `/data` |
+| `networking.serviceDomains` | `<hasDomain>` | ✅ present |
+| **`deploy.sleepApplication`** | **`true`** | 🔴 **ABSENT** |
+| **`source.branch`** | **`release`** | 🔴 **ABSENT** |
+
+`sleepApplication` was expected. **`source.branch` was not** — and it is the more dangerous of
+the two, because it is silent in a different way. The service *is* pinned: `repoTriggers` says
+`branch: "release"`. Generation reads that and **emits no branch key at all**, so the template
+falls back to the repo's **default branch** for every user who clicks the button. The entire
+"track `release`, never `main`" strategy evaporates without a single error message.
+
+`secret()` values survive — they are stored literals, not live expressions.
 
 ## Do NOT publish
 
