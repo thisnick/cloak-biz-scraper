@@ -55,6 +55,17 @@ class Config:
     def binary_cache_dir(self) -> Path:
         return self.data_dir / ".cloakbrowser"
 
+    @property
+    def jobs_dir(self) -> Path:
+        """Sweep results. On the volume because a finished job has to survive the
+        container sleeping — see services/jobs.py."""
+        return self.data_dir / "jobs"
+
+    @property
+    def evidence_dir(self) -> Path:
+        """What each attempt actually saw: snapshot, HTML, screenshot."""
+        return self.data_dir / "evidence"
+
     @classmethod
     def from_env(cls) -> "Config":
         # Deliberately no app_secret field. APP_SECRET only *seeds* the volume's

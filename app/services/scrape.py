@@ -1,0 +1,232 @@
+"""Sweeping a search-results page for listings.
+
+The shape of this service is set by one constraint: **a sweep is longer than any
+MCP client will wait.** Multiple pages, a warmup, deliberate pacing, and up to
+three attempts with a fresh exit IP each — that is minutes, against a client wall
+of roughly four. So starting a sweep and collecting it are two calls, and
+`start` returns the moment the job is written down.
+
+The other constraint is that the scrape half must not know where listings land.
+`sync=false` is a pure scrape: no store is constructed, no token is read, and
+nothing is written. That is not a flag on a Notion code path, it is the absence
+of one — which is what makes this usable by someone who has not configured
+Notion at all.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+from pathlib import Path
+from urllib.parse import urlparse
+
+from .. import sources
+from ..config import CONFIG
+from ..models import Job, Listing, ScrapeResult, SyncResult
+from ..stores.base import ListingStore
+from .blocker import text_contains_blocker
+from .browsing import capture, gesture, scrape_with_retry, slug
+from .jobs import JobStore
+from .settings import SettingsService
+
+logger = logging.getLogger("cloakbiz.scrape")
+
+# Time on the page before reading it. Long enough for the cards to render and
+# for the visit not to look instantaneous.
+_WAIT_MS = 12_000
+_ATTEMPTS = 3
+_MAX_PAGES_CEILING = 20
+
+
+class NotionNotConfigured(RuntimeError):
+    """sync=true was asked for without a database to sync into."""
+
+
+def _collect_message(job_id: str) -> str:
+    """The instruction the model reads when a sweep starts.
+
+    Phrased as an instruction rather than a status because it is one: the tool
+    has returned but the work has not, and a model that does not call back will
+    silently report zero listings for a sweep that is running fine.
+    """
+    return (
+        f"Sweep started (job {job_id}). Call get_scrape_listing_results with "
+        f"job_id={job_id} to collect. It runs for a few minutes — if the status "
+        f"is still 'working', wait a little and call again."
+    )
+
+
+class ScrapeService:
+    def __init__(self, instances, jobs: JobStore, settings: SettingsService,
+                 store_factory=None) -> None:
+        self._instances = instances
+        self._jobs = jobs
+        self._settings = settings
+        # Injected so the sweep never imports Notion. The default is resolved
+        # lazily and only when sync=true, so a user with no Notion token can
+        # still scrape.
+        self._store_factory = store_factory or _default_store
+        self._running: set[asyncio.Task] = set()
+
+    @property
+    def in_flight(self) -> int:
+        """Sweeps currently running. The heartbeat asks this to decide whether the
+        machine must be kept awake."""
+        return len(self._running)
+
+    def start(self, url: str, *, max_pages: int = 1, sync: bool = False,
+              db_id: str | None = None) -> Job:
+        """Validate, write the job down, and return without waiting for it.
+
+        Everything that can be known to be wrong before the browser starts is
+        decided here, so the caller gets a real error instead of a job id that
+        fails a minute later: an unreadable URL, or a sync with nowhere to sync
+        to. A job record is only created once the sweep is genuinely going to run.
+        """
+        source = sources.for_url(url)  # raises UnsupportedURL, naming what works
+        max_pages = max(1, min(int(max_pages), _MAX_PAGES_CEILING))
+
+        target_db = ""
+        if sync:
+            settings = self._settings.load()
+            target_db = (db_id or settings.notion_db_id or "").strip()
+            if not settings.notion_api_token or not target_db:
+                raise NotionNotConfigured(
+                    "sync=true asks for the listings to be saved, but no Notion database is "
+                    "set up. Either add your Notion token and pick a database under "
+                    "Settings, pass db_id explicitly, or call this with sync=false to just "
+                    "read the listings back without saving them."
+                )
+
+        job = self._jobs.create(
+            source=source.name, url=url, max_pages=max_pages, sync=sync, db_id=target_db,
+            status="working", summary=_collect_message(""),
+        )
+        job.summary = _collect_message(job.id)
+        self._jobs.save(job)
+
+        task = asyncio.create_task(self._run(job, source))
+        self._running.add(task)
+        task.add_done_callback(self._running.discard)
+        return job
+
+    def result(self, job_id: str) -> ScrapeResult | None:
+        """The job as it stands. Never blocks, never waits, never launches anything."""
+        job = self._jobs.get(job_id)
+        return ScrapeResult.of(job) if job else None
+
+    async def _run(self, job: Job, source) -> None:
+        try:
+            res = await self._sweep(job, source)
+            listings: list[Listing] = res.get("data", {}).get("listings", [])
+            job.pages_crawled = res.get("data", {}).get("pages_crawled", 0)
+            job.listings = listings
+
+            if res.get("blocked"):
+                job.status = "failed"
+                job.error = (
+                    f"{urlparse(job.url).hostname} served an anti-bot page instead of "
+                    f"results on every attempt, each from a different exit IP. This "
+                    f"usually clears on its own — try again in a few minutes."
+                )
+                job.summary = "Blocked by the site."
+            elif res.get("error"):
+                job.status = "failed"
+                job.error = res["error"]
+                job.summary = "Sweep failed."
+            else:
+                job.status = "completed"
+                if job.sync:
+                    job.synced = await self._sync(job, listings)
+                job.summary = self._summarize(job)
+        except Exception as exc:  # noqa: BLE001 — the job must record its own failure
+            logger.exception("sweep %s failed", job.id)
+            job.status = "failed"
+            job.error = str(exc)
+            job.summary = "Sweep failed."
+        finally:
+            self._jobs.save(job)
+            logger.info("job %s -> %s (%d listings)", job.id, job.status, len(job.listings))
+
+    def _summarize(self, job: Job) -> str:
+        pages = f"{job.pages_crawled} page{'s' if job.pages_crawled != 1 else ''}"
+        head = f"Found {len(job.listings)} listing(s) across {pages}."
+        if job.synced is None:
+            return f"{head} Nothing was saved (sync=false)."
+        out = f"{head} Saved {job.synced.new} new, {job.synced.existing} already known."
+        if job.synced.skipped:
+            out += (
+                f" These columns could not be filled: {', '.join(job.synced.skipped)}"
+                f" — see Settings for why."
+            )
+        return out
+
+    async def _sync(self, job: Job, listings: list[Listing]) -> SyncResult:
+        store: ListingStore = self._store_factory(self._settings.load())
+        result = await store.upsert_new(job.db_id, listings)
+        return SyncResult(
+            new=result.new, existing=result.existing, db_id=result.db_id,
+            skipped=result.skipped_names,
+        )
+
+    async def _sweep(self, job: Job, source) -> dict:
+        evidence = CONFIG.evidence_dir / job.id
+        return await scrape_with_retry(
+            self._instances,
+            # Per-URL, never per-host: two sweeps of the same site at once would
+            # otherwise share a user-data-dir and collide on Chromium's singleton
+            # lock. The URL is what distinguishes them.
+            profile=f"serp-{slug(urlparse(job.url).path)}",
+            owner=f"job:{job.id}",
+            wait_ms=_WAIT_MS,
+            attempts=_ATTEMPTS,
+            warmup_url=getattr(source, "warmup_url", None),
+            scrape_once=lambda inst, page: self._sweep_once(inst, page, job, source, evidence),
+        )
+
+    async def _sweep_once(self, inst, page, job: Job, source, evidence: Path) -> dict:
+        listings: list[Listing] = []
+        seen: set[str] = set()
+        pages_done = 0
+
+        for n in range(1, job.max_pages + 1):
+            inst.touch()
+            url = source.page_url(job.url, n)
+            await page.goto(url, wait_until="domcontentloaded", timeout=120_000)
+            await page.wait_for_timeout(_WAIT_MS)
+            await gesture(page)
+
+            result = await source.cards(page)
+            pages_done += 1
+            if result.blocked or text_contains_blocker(result.title):
+                await capture(page, evidence / f"page-{n:02d}-blocked",
+                              {"url": url, "reason": "blocked", "proxy_ip": inst.proxy_ip})
+                return {"blocked": True, "error": None,
+                        "data": {"listings": listings, "pages_crawled": pages_done}}
+
+            # Paging stops on cards this crawl has already seen, not on cards the
+            # store already has: a feed whose first two pages are all known
+            # listings still has new ones on page three, and dedupe is a separate
+            # question answered at the end.
+            fresh = 0
+            for listing in result.listings:
+                if listing.url in seen:
+                    continue
+                seen.add(listing.url)
+                fresh += 1
+                listings.append(listing)
+            if fresh == 0 and n > 1:
+                break
+
+        await capture(page, evidence / "final",
+                      {"url": job.url, "reason": "success", "found": len(listings),
+                       "pages_crawled": pages_done, "proxy_ip": inst.proxy_ip})
+        return {"blocked": False, "error": None,
+                "data": {"listings": listings, "pages_crawled": pages_done}}
+
+
+def _default_store(settings) -> ListingStore:
+    """Resolved here, and only on the sync path, so importing this module never
+    imports Notion."""
+    from ..stores.notion import NotionStore
+
+    return NotionStore(settings.notion_api_token)

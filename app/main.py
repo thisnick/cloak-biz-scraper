@@ -15,10 +15,15 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import RedirectResponse
 
-from . import __version__
+from . import __version__, mcp_server
 from .config import CONFIG, bootstrap_binary_cache, purge_binary_env
-from .routes import health, ui
+from .routes import api, health, ui
+from .routes.mcp import MCPEndpoint
+from .services import heartbeat
+from .services.archive import ArchiveService
 from .services.instances import InstanceManager
+from .services.jobs import JobStore
+from .services.scrape import ScrapeService
 from .services.secret import SecretService
 from .services.settings import SettingsService
 
@@ -54,27 +59,55 @@ async def lifespan(app: FastAPI):
     secret_service = SecretService(CONFIG.secret_path, CONFIG.dek_path)
     secret = secret_service.bootstrap()
 
+    # Jobs live on the volume so a finished sweep survives the container
+    # sleeping. Anything still "working" belongs to a process that no longer
+    # exists, so it is failed here — before the first poll can be told to keep
+    # waiting for it. Both must happen before any request is served.
+    jobs = JobStore(CONFIG.jobs_dir)
+    interrupted = jobs.adopt()
+    jobs.prune()
+
     app.state.settings = settings_service
     app.state.secret = secret_service
+    app.state.jobs = jobs
     app.state.instances = InstanceManager(settings_service)
+    app.state.scrape = ScrapeService(app.state.instances, jobs, settings_service)
+    app.state.archive = ArchiveService(app.state.instances, settings_service)
     logger.info(
-        "ready: secret=%s license=%s proxy=%s notion=%s pool max=%d reserve=%d",
+        "ready: secret=%s license=%s proxy=%s notion=%s pool max=%d reserve=%d "
+        "jobs=%d interrupted=%d",
         "set" if secret else "MISSING",
         "set" if settings.cloakbrowser_license_key else "MISSING",
         "set" if settings.proxy_configured() else "MISSING",
         "set" if settings.notion_configured() else "MISSING",
         settings.max_instances,
         settings.interactive_reserve,
+        len(jobs.all()),
+        interrupted,
     )
 
+    # Built here, not at import: the SDK's session manager is single-use, so one
+    # per lifespan is what lets this app be started more than once in a process.
+    # streamable_http_app() is what constructs it from the FastMCP settings
+    # (stateless, JSON responses); the Starlette app it returns is deliberately
+    # discarded — its GET handler opens an SSE stream we refuse, and its routing
+    # cannot see the Origin check. MCPEndpoint drives the same manager instead.
+    mcp = mcp_server.build(app)
+    mcp.streamable_http_app()
+    app.state.mcp_manager = mcp.session_manager
+
     reaper = asyncio.create_task(_reap_loop(app.state.instances))
-    try:
-        yield
-    finally:
-        reaper.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await reaper
-        await app.state.instances.cleanup_all()
+    pulse = asyncio.create_task(heartbeat.loop(lambda: app.state.scrape.in_flight))
+    # The manager owns the task group every MCP request runs inside.
+    async with app.state.mcp_manager.run():
+        try:
+            yield
+        finally:
+            for task in (reaper, pulse):
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            await app.state.instances.cleanup_all()
 
 
 app = FastAPI(title="cloak-biz-scraper", version=__version__, lifespan=lifespan)
@@ -91,4 +124,10 @@ async def _login_redirect(request: Request, exc: ui.NotAuthenticated) -> Redirec
 
 
 app.include_router(health.router)
+app.include_router(api.router)
 app.include_router(ui.router)
+
+# Mounted rather than routed: the endpoint enforces the transport rules (GET →
+# 405, Origin) itself, and a Mount hands it every request to /mcp whatever the
+# method or trailing slash.
+app.mount("/mcp", MCPEndpoint(lambda: getattr(app.state, "mcp_manager", None)))
