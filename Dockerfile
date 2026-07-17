@@ -17,7 +17,14 @@ FROM python:3.12-slim-bookworm
 # Chromium runtime libraries, fontconfig, and Xvfb (headed Chromium needs a
 # display; headless is a fingerprint). Xvfb stays as the fallback for when Xvnc
 # is unavailable — the pool still runs, just without live view.
-# novnc is the viewer page served at /novnc; it is static assets, no build step.
+# novnc is the viewer served at /novnc; static assets, no build step. Its version
+# is PINNED (`novnc=1:1.3.0-1`, what bookworm ships) rather than floating: an
+# unpinned viewer is one that can change its client behaviour under us between two
+# identical builds, and the live-view panes speak to it directly. Pinning matches
+# how the in-page JS libraries (readability.js, turndown.js) are already handled.
+# If a bookworm point release ever retires this exact version and the build fails
+# to find it, that is the signal to vendor a known noVNC release instead — the
+# same call the CloakBrowser pin taught us to make deliberately.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
     libdbus-1-3 libdrm2 libxkbcommon0 libatspi2.0-0 libxcomposite1 \
@@ -27,7 +34,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libglib2.0-0 libgtk-3-0 libpangocairo-1.0-0 libcairo-gobject2 \
     libgdk-pixbuf-2.0-0 libxss1 libxtst6 \
     libgl1-mesa-dri libegl-mesa0 \
-    xvfb fontconfig procps ca-certificates wget novnc \
+    xvfb fontconfig procps ca-certificates wget "novnc=1:1.3.0-1" \
     && rm -rf /var/lib/apt/lists/*
 
 # KasmVNC — Xvnc: an X server that also serves its framebuffer over a websocket,
