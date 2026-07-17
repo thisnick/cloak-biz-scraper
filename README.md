@@ -1,15 +1,32 @@
 # cloak-biz-scraper
 
-A self-hosted scraper for business-for-sale listings that you drive from your own
-ChatGPT or Claude over MCP. You bring a CloakBrowser Pro license, a residential
-proxy account, and a Notion workspace; you deploy one container; you configure it
-in a web form. No terminal.
+**Ask your assistant what came on the market this week, and have the answer land
+in your own Notion.**
 
-> **Status: early.** Steps 1–3 of 7 are built — the scaffold, the settings store,
-> the browser core, the settings UI, the Notion store, and the scrape/archive
-> tools behind both an MCP server and a REST API. The MCP endpoint is **not
-> authenticated yet** (Step 4), so do not put this on a public URL. See "What
-> works today".
+You tell ChatGPT or Claude to check a search you care about — Bay Area
+businesses, $750k to $10M, say — and a few minutes later the new listings are in
+a Notion database you own: title, location, asking price, cash flow, EBITDA, a
+link back to the listing. Ones you have already seen are not added again, so the
+database is your deal flow rather than a pile of duplicates. Ask it to pull a
+full listing page and it writes the whole thing into the Notion page for you to
+read and mark up.
+
+It is your server, your Notion, your data. Nobody else's account is involved and
+there is nothing to log into but your own. Setting it up is a deploy button and
+four web forms — **no terminal, ever.**
+
+You bring three things you already pay for or can sign up for in a few minutes: a
+CloakBrowser Pro licence, a residential proxy account, and a Notion workspace.
+See **What you need before you start**.
+
+> **Status: not shippable yet.** The server itself is built and tested — the
+> browser core, the settings UI, the Notion store, the scrape and archive tools,
+> and OAuth 2.1 on `/mcp` and `/api/*`. It has been deployed to Railway and run
+> end to end there against real listings.
+>
+> **What's missing is the one-click part**: the deploy button below has no
+> template behind it yet, and connecting ChatGPT and Claude has not been tested
+> (Step 6). If you are reading this expecting to click and go, you are early.
 
 ## Why it exists
 
@@ -43,13 +60,72 @@ for sale this week. This packages the hard part.
   each carrying a freshly minted, short-lived CDP URL you can drive the browser
   through.
 
-Not built yet: OAuth (so nothing is authenticated yet), live VNC, the Railway
-template.
+- **OAuth 2.1** on `/mcp` and `/api/*` — dynamic client registration, PKCE, and a
+  login that proves `APP_SECRET`. Unauthenticated calls get a 401.
+- **Runs on Railway**, proven rather than assumed: the image builds there, the
+  browser downloads and launches, and a real sweep of 955 listings across 20 pages
+  completed through a residential proxy. The server sleeps when idle and wakes on
+  the next request in about a second, with jobs kept on disk so results survive
+  the nap.
+
+Not built yet: **the Railway template** (so no deploy button), live VNC, and any
+testing against real ChatGPT or Claude connectors.
+
+## What you need before you start
+
+Four things. Read the proxy one **before you buy a proxy** — it rules some
+providers out entirely, and you cannot work around it afterwards.
+
+**1. A CloakBrowser Pro licence.** You buy this yourself and paste it into the
+settings page; the browser downloads itself onto your server the first time you
+verify the licence. Pro is required — the free build is a different, older
+browser that we have not tested against these sites.
+
+> **If your licence has an expiry date, know this one thing.** Your server caches
+> the licence check, so if CloakBrowser's servers go down, your scraping keeps
+> working. **That does not rescue an expired licence** — an expired one is
+> reported as invalid even while offline. So if your renewal happens to fall
+> during a CloakBrowser outage, your server stops scraping until both are back.
+> Licences with no expiry date are not affected.
+
+**2. A residential proxy account — that allows username/password sign-in from any
+IP address.**
+
+> 🔴 **This is a hard requirement, and it is the one that catches people out.**
+> Some proxy providers make you register the IP addresses allowed to connect.
+> **That cannot work here.** Your server's outbound address is assigned by the
+> hosting platform and **changes without warning** — across three checks of the
+> same deployment we saw three different addresses. There is no address to
+> register, and no setting on our side that helps.
+>
+> **Before you pay for a proxy, ask the provider: "can I authenticate with just a
+> username and password, from any IP?"** If the answer is no, or if their plan
+> requires IP allowlisting, pick a different provider or plan.
+
+Everything is scraped through your proxy — the server never browses from its own
+address, and if the proxy is not working it refuses to launch a browser at all
+rather than leak.
+
+**3. A Notion workspace**, and an integration token for it. The app can either use
+a database you already have (it checks the columns and tells you exactly what is
+missing) or create one for you under a page you choose. It never creates anything
+you did not ask for, and it never touches columns it does not own — so you can add
+your own notes, ratings and views freely.
+
+**4. A Railway account.** The Hobby plan is $5/month and includes $5 of usage. See
+**What it costs**.
 
 ## Setting it up
 
 No terminal. You will be in the Railway dashboard once, and everything else
 happens in this app's own web pages.
+
+<!-- PLACEHOLDER: screenshots for each step — need a real dashboard to capture. -->
+<!-- PLACEHOLDER: deploy button — needs a published template code, which does not
+     exist yet. Do NOT invent a URL here; an incorrect one deploys someone's
+     server from the wrong branch with no error. See docs/railway-template.md. -->
+> **The deploy button is not here yet.** It needs a Railway template that has not
+> been created. Until then this section describes the flow rather than enabling it.
 
 > The one-click deploy button is not published yet. When it is, it goes here.
 
@@ -108,6 +184,125 @@ up, whether or not you ever use it again.
 For scale: a full 20-page sweep of the Bay Area — 955 listings — takes about six
 minutes. Run one of those every day and, with Serverless on, you are billed for
 roughly three hours of compute a month.
+
+## Connecting ChatGPT or Claude
+
+> ⚠️ **Untested.** The server speaks the standard protocol and its login flow has
+> been driven end to end by a test client against the live URL, but **neither
+> ChatGPT nor Claude has actually been connected to it yet.** The steps below are
+> what we expect to work, not what we have seen work. Expect rough edges, and do
+> not treat a failure here as your mistake.
+
+Add your server as a **connector** (ChatGPT) or **custom connector** (Claude)
+using your Railway URL with `/mcp` on the end:
+
+```
+https://your-server.up.railway.app/mcp
+```
+
+Your assistant registers itself and sends you to your own server's login page,
+where you paste `APP_SECRET` — the same one from setup. Approve it, and the tools
+appear in the assistant.
+
+**Unverified specifics, flagged rather than guessed:**
+- Whether either client's connector UI accepts this server without complaint.
+- **ChatGPT's tool-call time limit is undocumented and we have not measured it.**
+  If a long call fails there, that is the first thing to suspect — but we cannot
+  yet tell you the number.
+
+### If you use Claude Code
+
+**Claude Code's default tool timeout is 60 seconds**, which matters for
+`archive_page` — it reads a full listing page and writes it into Notion, so it is
+the slow one.
+
+**Measured: 20.5s on Railway** for a QuietLight listing (23.6s on a laptop). That
+fits inside 60s with room to spare, so the default is usually fine. A slower or
+much longer page could still exceed it. If you hit a timeout, raise it:
+
+```bash
+MCP_TOOL_TIMEOUT=180000 claude    # milliseconds
+```
+
+Sweeps are not affected: `scrape_listings` returns immediately with a job id and
+you collect the results with a second call, so a five-minute sweep never sits in
+a tool call waiting.
+
+## Pinning the browser version
+
+The settings page has an optional **version pin**. Leave it **empty** and you get
+the latest CloakBrowser release, which is what you want unless a specific version
+has caused you a problem.
+
+To pin, give a **full dotted version** exactly as CloakBrowser publishes it:
+
+```
+148.0.7778.215.5      ✅
+148.0.7778            ❌ rejected immediately — not a full version
+latest                ❌ rejected immediately — leave the box empty instead
+```
+
+A malformed pin is rejected as soon as you save it, not silently ignored.
+
+> **If a valid-looking pin fails to download, the version has been retired.**
+> CloakBrowser removes old builds; when one is gone it is gone for every kind of
+> computer, so this is never a problem with your server or its architecture. We
+> checked: retired versions 404 identically on both Intel and ARM. **Clear the
+> box to get the latest build.** If any error message ever tells you this is an
+> architecture problem, that message is wrong — please report it.
+
+## When something goes wrong
+
+### "Test proxy" fails with a 407 — your password is almost certainly wrong
+
+**Check your username and password first**, and copy them from your proxy
+provider's dashboard rather than retyping them.
+
+> **This one cost us most of a day, so it is worth a paragraph.** Some proxy
+> providers **skip the password check for addresses they already trust** — often
+> including your home or office. So a password can be *wrong*, and still work
+> perfectly when you test it from your own computer, and then be refused the
+> moment your server tries the same thing. **A proxy that works from your laptop
+> is not evidence your password is right.** If your server says 407 and your
+> laptop says fine, believe the server.
+
+A 407 means the proxy answered and rejected the sign-in. It does not tell us
+which credential it disliked, and it is not caused by anything on this server.
+
+### A sweep finishes with no listings
+
+First, run **Test proxy** on the settings page. It reports the exit IP it actually
+measured, so a green result means traffic really is getting out. Most empty sweeps
+are a proxy that has stopped working.
+
+If the proxy is fine, the site may be showing a block page instead of results, or
+the URL may not be a listings search page — a browse or category page can look
+right and contain no listing cards. Try the search URL you would use yourself,
+with the filters already applied.
+
+> **Being straight with you: there is currently no way to see *why* from the web
+> UI.** The server does save screenshots and page snapshots when a page is blocked
+> — to `/data/evidence/` on its disk — but nothing serves them to you, and you
+> have no terminal. `archive_page` at least returns the folder it wrote to;
+> a sweep does not report one at all. **So today this is a gap, not a workflow.**
+> If you are stuck, the job's error message is what you have.
+
+### You forgot `APP_SECRET`
+
+You are not locked out. In Railway → Variables, set `APP_SECRET` to whatever you
+want it to be now, **and** add:
+
+```
+APP_SECRET_RESET = true
+```
+
+Deploy, and the next boot adopts the new secret. Your settings, licence, proxy and
+Notion configuration are all untouched — they are not encrypted with this secret,
+precisely so that changing it can never strand them.
+
+You can leave `APP_SECRET_RESET` set afterwards; it is consumed once. Leaving it
+does **not** mean every future restart overwrites your secret, so if you later
+change the secret from inside the app, that change sticks.
 
 ## The tools
 
