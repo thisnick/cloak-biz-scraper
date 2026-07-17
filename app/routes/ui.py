@@ -131,7 +131,8 @@ def _job_result(job) -> tuple[str, str]:
     return "live", "Running"
 
 
-def _render(request: Request, result: Result | None = None, status: int = 200) -> Response:
+def _render(request: Request, result: Result | None = None, status: int = 200,
+            active: str | None = None) -> Response:
     settings: Settings = request.app.state.settings.load()
     from ..services.urls import public_base
     from ..services.views import instance_view
@@ -162,6 +163,7 @@ def _render(request: Request, result: Result | None = None, status: int = 200) -
             "running_jobs": running,
             "history_jobs": history,
             "server_url": base.rstrip("/") + "/mcp",
+            "active_hint": active,
             "ago": _ago,
             "dur": _dur,
             "job_result": _job_result,
@@ -304,10 +306,17 @@ async def logout(request: Request) -> Response:
 # ── the settings page ───────────────────────────────────────────────────────
 
 
+# The dashboard's tabs are one page; a `?view=` hint lets a server redirect land
+# on a specific section (see the PRG redirects below). Unknown values fall back
+# to Overview in the template, so this need not police the value.
+_VIEWS = {"overview", "browsers", "tasks", "connect", "settings"}
+
+
 @router.get("/", response_class=HTMLResponse)
 async def index(request: Request) -> Response:
     _require(request)
-    return _render(request)
+    view = request.query_params.get("view")
+    return _render(request, active=view if view in _VIEWS else None)
 
 
 # ── Runs: the evidence a sweep already captured, finally reachable ───────────
@@ -406,8 +415,14 @@ async def get_evidence(request: Request, job_id: str, name: str) -> Response:
 # these redirect to (PRG); it is built to the settled IA separately.
 
 
-def _sessions_redirect() -> Response:
-    return RedirectResponse("/sessions", status_code=303)
+def _sessions_redirect(view: str = "browsers") -> Response:
+    """Post/Redirect/Get back to the dashboard, landing on the relevant section.
+
+    The dashboard is the single page at `/` (client-side tabs); there is no
+    `/sessions` route, so redirecting there would send a *successful* action to a
+    404 — a worse outcome than the error it was meant to avoid. `?view=` is a
+    server-read hint the page honours on load."""
+    return RedirectResponse(f"/?view={view}", status_code=303)
 
 
 @router.post("/sessions/instances")
@@ -422,6 +437,7 @@ async def ui_new_instance(
     from ..models import InstanceCreate
     from ..services.geo import GeoUnresolved, ProxyUnreachable
     from ..services.instances import CapExceeded, PinUnavailable
+    from ..services.license import LicenseNotConfigured, LicenseNotPro
     from ..services.proxy import ProxyNotConfigured
     from ..services.tokens import OWNER
 
@@ -436,7 +452,12 @@ async def ui_new_instance(
         )
     except CapExceeded as exc:
         raise HTTPException(status_code=429, detail=str(exc)) from exc
-    except (ProxyNotConfigured, ProxyUnreachable, GeoUnresolved, PinUnavailable) as exc:
+    # Mirrors POST /api/instances exactly — same exceptions, same 400, no drift.
+    # A missing or unusable licence is the first-boot footgun the dashboard's
+    # "New browser" button reaches; without this it is a raw 500. Its message
+    # already names the fix ("Add it under Settings").
+    except (LicenseNotConfigured, LicenseNotPro, ProxyNotConfigured, ProxyUnreachable,
+            GeoUnresolved, PinUnavailable) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return _sessions_redirect()
 
@@ -462,7 +483,7 @@ async def ui_run_sweep(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except NotionNotConfigured as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return _sessions_redirect()
+    return _sessions_redirect("tasks")
 
 
 @router.post("/sessions/instances/{instance_id}/close")

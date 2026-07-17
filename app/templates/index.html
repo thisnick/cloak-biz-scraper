@@ -34,8 +34,11 @@
   {% endif %}
 {% endmacro %}
 
-{% set active = 'settings' if result else 'overview' %}
 {% set titles = {'overview':'Overview','browsers':'Browsers','tasks':'Tasks','connect':'Connect','settings':'Settings'} %}
+{# A settings POST forces its own section; otherwise the server may hint which
+   one to land on (e.g. a redirect after "New browser" → Browsers), falling back
+   to Overview. active_hint is already validated against titles server-side. #}
+{% set active = 'settings' if result else (active_hint if active_hint in titles else 'overview') %}
 
 {% block shell %}
 <div class="app" id="app">

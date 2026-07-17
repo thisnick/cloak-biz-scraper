@@ -785,7 +785,7 @@ class TestSessionsControls:
         calls = self._stub_services(monkeypatch)
         r = auth.post("/sessions/instances", data={"profile": "p"},
                       follow_redirects=False)
-        assert r.status_code == 303 and r.headers["location"] == "/sessions"
+        assert r.status_code == 303 and r.headers["location"] == "/?view=browsers"
         assert calls["launch"] == 1
 
     def test_run_sweep_reaches_the_service_layer(self, auth, monkeypatch):
@@ -793,7 +793,7 @@ class TestSessionsControls:
         r = auth.post("/sessions/sweep",
                       data={"url": "https://www.bizbuysell.com/x", "max_pages": "2"},
                       follow_redirects=False)
-        assert r.status_code == 303 and r.headers["location"] == "/sessions"
+        assert r.status_code == 303 and r.headers["location"] == "/?view=tasks"
         assert calls["start"] == 1
 
     def test_close_instance_reaches_the_service_layer(self, auth, monkeypatch):
@@ -801,6 +801,24 @@ class TestSessionsControls:
         r = auth.post("/sessions/instances/abc123/close", follow_redirects=False)
         assert r.status_code == 303
         assert calls["stop"] == 1
+
+    # ── the PRG target must be a real 200 page, not a 404 ──
+    def test_a_successful_action_lands_on_the_dashboard_not_a_404(self, auth, monkeypatch):
+        """A successful click redirected to /sessions, which is a 404 — the
+        dashboard is the single page at /. A "it worked" that lands on a blank
+        404 is a worse first impression than the error case, so follow the
+        redirect the whole way and prove the page is real."""
+        self._stub_services(monkeypatch)
+        r = auth.post("/sessions/instances", data={"profile": "p"})  # follows the 303
+        assert r.status_code == 200
+        assert 'class="app"' in r.text, "landed on the real dashboard"
+        assert 'data-section="browsers" class="on"' in r.text, "and on the Browsers section"
+
+    def test_a_sweep_lands_on_the_tasks_section(self, auth, monkeypatch):
+        self._stub_services(monkeypatch)
+        r = auth.post("/sessions/sweep", data={"url": "https://x"})
+        assert r.status_code == 200
+        assert 'data-section="tasks" class="on"' in r.text
 
     # ── guard 1: no session → nothing happens ──
     def test_signed_out_cannot_launch_anything(self, client, monkeypatch):
@@ -861,6 +879,55 @@ class TestSessionsControls:
     def test_logout_rejects_a_foreign_origin(self, auth):
         assert auth.post("/logout", headers={"Origin": "https://evil.example"},
                          follow_redirects=False).status_code == 403
+
+
+class TestNewBrowserWithoutALicence:
+    """The first-boot footgun. Clicking "New browser" — or calling its REST twin
+    — before a licence is set must be a helpful 400 that names the fix, never a
+    raw 500. The dashboard and the API share the same failure, so they must
+    answer the same way; these test both, so the two cannot drift.
+    """
+
+    def _launch_raises(self, monkeypatch, exc):
+        async def boom(req, **kw):
+            raise exc
+
+        monkeypatch.setattr(app.state.instances, "launch", boom)
+
+    def test_the_dashboard_button_gets_a_helpful_400(self, auth, monkeypatch):
+        from app.services.license import LicenseNotConfigured
+
+        self._launch_raises(monkeypatch, LicenseNotConfigured(
+            "CloakBrowser licence key is not configured. Add it under Settings — "
+            "without it only the free binary is available, which this app does not use."
+        ))
+        r = auth.post("/sessions/instances", data={"profile": "p"}, follow_redirects=False)
+        assert r.status_code == 400, "a missing licence must be a 400, not a 500"
+        assert "Settings" in r.json()["detail"], "the message must point at the fix"
+
+    def test_the_rest_twin_answers_the_same(self, client, monkeypatch):
+        from conftest import mint_access
+
+        from app.services.license import LicenseNotConfigured
+
+        self._launch_raises(monkeypatch, LicenseNotConfigured(
+            "CloakBrowser licence key is not configured. Add it under Settings."
+        ))
+        r = client.post("/api/instances", json={"profile": "p"},
+                        headers={"Authorization": f"Bearer {mint_access(app)}"})
+        assert r.status_code == 400, "REST must mirror the UI — same failure, same 400"
+        assert "Settings" in r.json()["detail"]
+
+    def test_an_unusable_key_is_also_a_400(self, auth, monkeypatch):
+        """A mistyped or expired key is the very next first-boot moment, and it
+        raises LicenseNotPro from the same launch path — also a 400, not a 500."""
+        from app.services.license import LicenseNotPro
+
+        self._launch_raises(monkeypatch, LicenseNotPro(
+            "CloakBrowser rejected this licence key. Check it was copied whole."
+        ))
+        r = auth.post("/sessions/instances", data={"profile": "p"}, follow_redirects=False)
+        assert r.status_code == 400
 
 
 class TestLivePaneTokens:
