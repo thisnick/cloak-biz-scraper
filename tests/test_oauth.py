@@ -203,6 +203,25 @@ class TestDynamicClientRegistration:
         })
         assert r.status_code == 201, r.text
 
+    def test_omitting_grant_types_entirely_still_works(self, client):
+        """The other half of the pair: don't fix the explicit case and break the
+        implicit one.
+
+        This path already worked and must keep working — the SDK's model supplies
+        `["authorization_code","refresh_token"]` when the field is absent, so the
+        check passes without us touching anything. Our substitution deliberately
+        ignores this shape (`body.get("grant_types")` is None, not a list), and
+        that has to stay true: a fix that rewrote every registration would be
+        indistinguishable from this one until the day it wasn't.
+
+        Measured against the deployed server before the fix: omitted -> 201.
+        """
+        r = client.post("/register", json={
+            "redirect_uris": [REDIRECT], "client_name": "Silent Client",
+        })
+        assert r.status_code == 201, r.text
+        assert set(r.json()["grant_types"]) == {"authorization_code", "refresh_token"}
+
     def test_the_substitution_is_told_to_the_client(self, client):
         """We hand it a grant it did not ask for, so it must be able to see that.
 
