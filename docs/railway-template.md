@@ -226,12 +226,49 @@ Gotcha while setting it: **`gh repo edit --default-branch release` silently does
 exit 0, no output, no change. `gh api -X PATCH repos/<owner>/<repo> -f default_branch=release`
 works.
 
-⚠️ **Sleep has no documented dashboard control.** Railway's template docs never mention sleep /
-serverless / `sleepApplication`. The key is real — the validator accepts it and a deployed
-service honours it — but if the editor does not expose it, a template may be **unable** to ship
-scale-to-zero, and users would have to enable it themselves after deploying. That would need to
-be a documented step in the setup guide, and it would change the cost story this product is
-sold on. **Unresolved — do not assume either way.**
+## 🔴 Sleep appears to be UNSHIPPABLE in a template. Measured against the whole marketplace.
+
+Railway's template docs never mention sleep / serverless / `sleepApplication`, so rather than
+guess, every public template was surveyed (read-only; `templates` + `serializedConfig` need no
+auth). **N = 1500 templates, 2964 services.**
+
+**`sleepApplication`: 0 occurrences.** Not in `deploy.*`, not at service level, not anywhere —
+and the search was for `sleep|serverless|scale|idle` case-insensitively, not just our one
+hypothesis, precisely because the UI calls this "Serverless"/"App Sleeping" and might store it
+under another name. The 50 raw-text matches are all false positives: shell `sleep 3` in start
+commands, "scale to multiple replicas" in a variable description, and the word "Tail**scale**".
+
+The complete observed vocabulary of `services.<id>.deploy.*` in stored configs:
+
+| key | services | | key | services |
+|---|---|---|---|---|
+| `startCommand` | 1882 | | `preDeployCommand` | 47 |
+| `healthcheckPath` | 1854 | | `cronSchedule` | 10 |
+| `restartPolicyMaxRetries` | 1669 | | `healthcheckTimeout` | 9 |
+| `restartPolicyType` | 1663 | | `drainingSeconds` | **2** |
+| `requiredMountPath` | 229 | | `numReplicas` | **1** |
+| | | | **`sleepApplication`** | **0** |
+
+**The tail is what makes this convincing.** "Nobody wanted sleep" would be a fair objection to a
+bare zero — plenty of templates are databases that *shouldn't* sleep. But it does not survive
+the tail: `numReplicas` appears **once** in 2964 services and `drainingSeconds` twice, so rare
+keys *are* visible when they are expressible. That not one author in 1500 managed to store the
+platform's headline scale-to-zero feature is far better explained by **no authoring path emits
+it** than by universal disinterest.
+
+This sits exactly alongside the other measured facts: the validator **accepts**
+`deploy.sleepApplication: true` and a deployed service **honours** it (so the key is real), but
+that was only ever achieved through `templateDeployV2`'s *deploy-time* config — which does not
+write back. Valid in the schema; producible by no authoring path.
+
+**Consequence — this changes the cost story, not a setting.** If a template cannot ship
+scale-to-zero, **every user must enable it themselves after deploying**, or they pay 24/7. That
+must be a step in the setup guide with the same weight as pasting `APP_SECRET`, and the README
+cannot claim "you only pay while a sweep runs" until the user has done it.
+
+**Not proof.** A marketplace listing is not a random sample of what the editor permits, and this
+measures what authoring paths *emit*, not what they *allow*. A dashboard check settles it — but
+it now starts from a measured expectation rather than an absent doc line.
 
 ## Do NOT publish
 
