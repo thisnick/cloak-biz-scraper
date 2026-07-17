@@ -216,6 +216,22 @@ class TestSaving:
         auth.post("/settings/pool", data={"max_instances": "6", "interactive_reserve": "2"})
         assert app.state.settings.load().max_instances == 6
 
+    def test_pool_cost_copy_does_not_promise_sleep_we_cannot_ship(self, auth):
+        """The page used to tell the reader, while they chose how many browsers
+        to run, that "you only pay while a sweep is actually running" — as a fact
+        about the product. It is a fact about a switch we cannot set for them: a
+        Railway template cannot carry sleepApplication (0 of 2964 services across
+        every public template), so the deploy leaves it off silently. Measured,
+        idle-after-a-sweep holds ~0.86 GB until the process dies, which is ~$8-9
+        a month for nothing. The copy must make the promise conditional and name
+        the price of the condition, because this is the paragraph someone reads
+        while deciding their bill.
+        """
+        page = auth.get("/").text
+        assert "only pay while a sweep is actually running" not in page
+        assert "Serverless" in page, "the condition must be named"
+        assert "every hour of the month" in page, "and the cost of skipping it"
+
     def test_pool_warns_above_eight_but_obeys(self, auth):
         response = auth.post("/settings/pool", data={"max_instances": "12", "interactive_reserve": "1"})
         assert response.status_code == 200

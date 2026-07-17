@@ -243,14 +243,20 @@
 {# ── Pool ─────────────────────────────────────────────────────────────────── #}
 <section>
   <h2>Browser pool</h2>
-  {# The guidance from the plan, verbatim in spirit: the ceiling here is cost,
-     not memory, and the honest framing is that it's cheap because it sleeps. #}
+  {# The ceiling here is cost, not memory. This used to say it's cheap "because
+     the service sleeps when idle" — stated as a property of the product. It is
+     a property of a switch the user has to find: a Railway template cannot carry
+     sleepApplication (0 of 2964 services across every public template), so the
+     deploy leaves it off and nothing says so. Measured: idle after a sweep holds
+     ~0.86 GB until the process dies, because sleeping is what reclaims it. #}
   <p class="hint">
     Each running browser uses roughly <strong>0.5–1 GB</strong>. You're billed on
-    <strong>actual usage</strong> (about $10/GB per month), and because the service
-    sleeps when idle, <strong>you only pay while a sweep is actually running</strong>
-    — a 3-minute sweep with 4 browsers costs pennies. Raise this for faster
-    multi-page sweeps; lower it if you want a tighter cap.
+    <strong>actual usage</strong> (about $10/GB per month). If you turned on
+    <strong>Serverless</strong> in Railway, the server sleeps when idle and you pay
+    for the minutes a sweep runs — a 3-minute sweep with 4 browsers costs pennies.
+    <strong>If you didn't, you're paying for every hour of the month</strong>
+    (~$8–9) whether you scrape or not. Raise this for faster multi-page sweeps;
+    lower it if you want a tighter cap.
   </p>
   {{ banner('pool') }}
   {% if pool_warning %}<div class="banner warn">{{ pool_warning }}</div>{% endif %}
