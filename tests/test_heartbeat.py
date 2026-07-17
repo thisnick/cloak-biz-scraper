@@ -16,6 +16,7 @@ pin down.
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import httpx
 import pytest
@@ -42,6 +43,33 @@ async def test_a_failed_beat_never_raises():
     prevents."""
     respx.get(heartbeat._BEACON_URL).mock(side_effect=httpx.ConnectError("no network"))
     assert await heartbeat.beat() is False
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_a_failed_beat_is_LOUD(caplog):
+    """Swallowing the error is right; hiding it is not.
+
+    This logged at DEBUG as "harmless" while the sweep's own egress was believed
+    to do the pinning. It cannot be: the beacon and the sweep's traffic run over
+    the same interval by construction — the last beat and the sweep's end can
+    never be more than the 60s cadence apart — so nothing distinguishes them, and
+    at 60s against a 7-10 minute threshold the beacon alone suffices. It is the
+    mechanism. A dead mechanism must not be invisible.
+
+    Measured in production before this change: 21/21 beats returned HTTP 204, all
+    inside sweep windows and none during an idle arm — so this is latent, not
+    live. Which is the only reason it is a log level and not an incident.
+    """
+    respx.get(heartbeat._BEACON_URL).mock(side_effect=httpx.ConnectError("no network"))
+    with caplog.at_level(logging.WARNING, logger="cloakbiz.heartbeat"):
+        assert await heartbeat.beat() is False
+    assert caplog.records, "a failed beacon left no trace at WARNING"
+    msg = caplog.records[0].getMessage()
+    assert caplog.records[0].levelno >= logging.WARNING
+    # it must say what was lost, not just that a request failed
+    assert "guaranteeing" in msg and "sleep mid-job" in msg
+    assert "harmless" not in msg.lower(), "it is not harmless any more"
 
 
 @pytest.mark.asyncio

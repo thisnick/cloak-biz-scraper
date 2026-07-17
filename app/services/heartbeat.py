@@ -35,13 +35,34 @@ _TIMEOUT_SEC = 10
 
 async def beat() -> bool:
     """One outbound request. Never raises: a heartbeat that could fail a sweep
-    would be worse than the sleep it prevents."""
+    would be worse than the sleep it prevents.
+
+    **It fails loudly, though, and that is a deliberate change.** This used to log
+    at DEBUG as "harmless", which was fair while the sweep's own egress was
+    believed to do the pinning and this only covered the gaps. It cannot be
+    believed: the sweep's traffic and this beacon run over the same interval by
+    construction, so no measurement can separate them — and at 60s against a
+    7-10 minute sleep threshold, **this beacon alone is sufficient**. That makes
+    it the mechanism, not the spare.
+
+    A silent beacon is therefore the expensive failure: nothing else is
+    *demonstrably* keeping the container awake through a CPU-bound stretch, and
+    at DEBUG nobody would ever know.
+    """
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT_SEC) as client:
             await client.get(_BEACON_URL)
         return True
     except Exception as exc:  # noqa: BLE001
-        logger.debug("heartbeat failed (harmless): %s", exc)
+        # Not "harmless" and not fatal: a sweep's own traffic may keep the
+        # container awake anyway. What is lost is the guarantee, which is the
+        # only reason this exists.
+        logger.warning(
+            "heartbeat beacon failed (%s: %s) — nothing is now guaranteeing this "
+            "container stays awake while a sweep runs; a long CPU-bound stretch "
+            "could let it sleep mid-job",
+            type(exc).__name__, exc,
+        )
         return False
 
 
