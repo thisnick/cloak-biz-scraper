@@ -46,17 +46,49 @@ for sale this week. This packages the hard part.
 Not built yet: OAuth (so nothing is authenticated yet), live VNC, the Railway
 template.
 
-## What it costs — and the one switch that decides it
+## Setting it up
+
+No terminal. You will be in the Railway dashboard once, and everything else
+happens in this app's own web pages.
+
+> The one-click deploy button is not published yet. When it is, it goes here.
+
+**1. Deploy it.** Click the button. Railway asks for one thing — `APP_SECRET` —
+and fills it in for you. Accept it and let it build (about three minutes).
+
+**2. Copy `APP_SECRET`.** Railway → your service → **Variables**. Copy the value.
+This is your password for the app; there is no other account to make. You can
+change it later on the app's settings page.
+
+**3. Turn on Serverless. ← do not skip this**
+
+Railway → your service → **Settings** → enable **Serverless**.
+
+You are already in the dashboard from step 2, so this is one more click while you
+are standing there. It makes the server switch itself off when nothing is
+happening, and switch back on — in about a second — the next time you use it.
+
+**Skipping it costs about $8–9 a month, forever, for a server doing nothing.**
+That is more than the $5 of usage your plan includes. Nothing will warn you: the
+app works exactly the same either way, and the bill is the only feedback you get.
+
+**The template cannot do this for you.** Not an oversight on our part — Railway
+templates cannot carry the setting at all. (We checked all 1500 public templates:
+not one has it. `docs/railway-template.md` has the evidence.)
+
+**4. Open the app and finish in the browser.** Go to your Railway URL, log in with
+`APP_SECRET`, and fill in the settings pages: your CloakBrowser licence, your
+proxy, and your Notion workspace. Each page tests itself and tells you what it
+actually found.
+
+## What it costs
 
 Railway bills what you actually use: roughly **$10 per GB of memory per month** and
 **$20 per vCPU per month**. The Hobby plan is $5/month and **includes $5 of usage**.
 
-**Turn on "Serverless" for the service after you deploy.** It is one toggle in the
-same Railway tab where you copy `APP_SECRET`, and it is what makes the numbers
-below small. Do not skip it, and do not assume the template did it for you — **it
-cannot**. This has been measured against every public template on Railway (1500 of
-them, 2964 services): **not one carries a sleep setting**, because no template
-authoring path can store it. See `docs/railway-template.md`.
+With Serverless on (step 3), you pay for the minutes a sweep actually runs and
+close to nothing the rest of the time. **Without it, you pay for every hour of the
+month.** Same app, same code — the only difference is that one toggle.
 
 Measured on a real deployment, on Railway's hardware:
 
@@ -67,16 +99,14 @@ Measured on a real deployment, on Railway's hardware:
 | **awake after a sweep, doing nothing** | **0.78–0.92 GB** | **~$8–9/month** |
 | running a sweep | up to 1.6 GB | pennies per sweep |
 
-The row that matters is the third one, and it is the one you would not guess:
-**memory is not handed back when a sweep's browsers exit — sleeping is what
-reclaims it.** So a server that never sleeps does not idle at 0.12 GB, it idles at
-close to a gigabyte, for as long as it stays up. That is **~$8–9/month of paying
-for nothing**, which is more than the $5 your plan includes.
+The third row is the one that catches people out. **Memory is not handed back when
+a sweep's browsers exit — sleeping is what reclaims it.** So a server that never
+sleeps does not sit at 0.12 GB; it sits near a gigabyte for as long as it stays
+up, whether or not you ever use it again.
 
-With Serverless on, the server sleeps a few minutes after it goes quiet and wakes
-on the next request in about a second, so you are billed for the minutes a sweep
-runs and essentially nothing else. A sweep is short: a full 20-page sweep of the
-Bay Area — 955 listings — took **about six minutes**.
+For scale: a full 20-page sweep of the Bay Area — 955 listings — takes about six
+minutes. Run one of those every day and, with Serverless on, you are billed for
+roughly three hours of compute a month.
 
 ## The tools
 

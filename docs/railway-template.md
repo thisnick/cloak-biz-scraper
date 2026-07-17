@@ -291,6 +291,49 @@ run a sweep.
 Don't cry wolf and don't undersell: **~$1.20/mo if it never scrapes, ~$8–9/mo once it has.**
 (The 5 GB volume bills either way and is not part of this delta.)
 
+### 🔴 PENDING: the same false claim is live in the product
+
+`app/templates/index.html` (the Pool section, next to `max_instances`) still says:
+
+> *"…because the service sleeps when idle, **you only pay while a sweep is actually running**
+> — a 3-minute sweep with 4 browsers costs pennies."*
+
+It states as fact the thing the template **cannot** deliver, and it is the copy a user reads
+while deciding how many browsers to run. Untouched only because Step 5's review is in flight
+and this is app code. **Apply the moment the review signs off** — the numbers are measured, and
+the comment above it ("the honest framing is that it's cheap because it sleeps") should go too,
+since that framing is what turned out to be conditional:
+
+```
+  <p class="hint">
+    Each running browser uses roughly <strong>0.5–1 GB</strong>. You're billed on
+    <strong>actual usage</strong> (about $10/GB per month). If you turned on
+    <strong>Serverless</strong> in Railway, the server sleeps when idle and you pay
+    for the minutes a sweep runs — a 3-minute sweep with 4 browsers costs pennies.
+    <strong>If you didn't, you're paying for every hour of the month</strong>
+    (~$8–9) whether you scrape or not. Raise this for faster multi-page sweeps;
+    lower it if you want a tighter cap.
+  </p>
+```
+
+*(Plan §4 Budgets specifies this copy and carries the same unconditional claim; it needs the
+same correction at the source, or the next implementer will faithfully re-add it.)*
+
+### Decided: document the toggle; do not detect the leak *(Nick, 2026-07-17)*
+
+The app could plausibly notice this itself — a wake is a fresh process, so our own uptime is a
+sleep-cycle marker, and "alive for hours with no job in flight" would mean the service never
+slept. It was designed and deliberately **not built**.
+
+**Why not:** the toggle lives in the dashboard tab the user is already in to copy `APP_SECRET`,
+so the README step costs them one click where they are already standing. A detector is new
+logic on the page holding the licence, proxy and Notion credentials — it needs its own review —
+and it would be a second answer to a question the docs already answer.
+
+**The accepted cost, stated plainly so nobody rediscovers it as a surprise:** if a user skips
+the step, **nothing warns them. The bill is the only feedback, and it arrives a month late.**
+Revisit only if that turns out to happen to a real person.
+
 **Not proof.** A marketplace listing is not a random sample of what the editor permits, and this
 measures what authoring paths *emit*, not what they *allow*. A dashboard check settles it — but
 it now starts from a measured expectation rather than an absent doc line.
