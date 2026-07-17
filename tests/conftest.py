@@ -6,7 +6,13 @@ from __future__ import annotations
 import os
 import tempfile
 
-os.environ.setdefault("DATA_DIR", tempfile.mkdtemp(prefix="cloakbiz-test-"))
+# Forced, not setdefault. setdefault lets an ambient DATA_DIR win, so running the
+# suite anywhere one is already set — inside the container, most obviously — points
+# the tests at a REAL volume: they then read live settings, and
+# "healthz reports nothing configured" fails because the deployment is, in fact,
+# configured. Worse than a false failure, it is a suite that would write to a
+# real /data. Tests get their own directory, always.
+os.environ["DATA_DIR"] = tempfile.mkdtemp(prefix="cloakbiz-test-")
 # The store must seed from a clean slate, not from whoever ran pytest.
 for _leak in (
     "CLOAKBROWSER_LICENSE_KEY", "CLOAKBROWSER_VERSION",
