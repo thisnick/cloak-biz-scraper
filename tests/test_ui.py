@@ -282,8 +282,16 @@ class TestProxyTest:
 
     @respx.mock
     def test_never_claims_to_have_checked_the_credentials(self, auth, monkeypatch):
-        """Evomi accepts any password. A green result here is not evidence the
-        credentials are right, and the page must not imply it is."""
+        """A green result is not reliable evidence the credentials are right, and
+        the page must not imply it is.
+
+        The page used to assert the stronger, tidier claim — "this provider accepts
+        any password and only rejects a wrong username" — as though it were a fact
+        about the provider. It is a fact about the *address you ask from*: measured,
+        the password check is skipped from a trusted address and enforced from a
+        deployed one. The app cannot tell which it is, so it says "may not" and
+        names the reason instead of over-claiming in either direction.
+        """
         from app.services import geo
 
         respx.get("https://api.ipify.org").mock(return_value=httpx.Response(200, text="45.12.3.4"))
@@ -297,7 +305,9 @@ class TestProxyTest:
         for lie in ("credentials ok", "credentials verified", "credentials are valid",
                     "password ok", "password verified", "authentication succeeded"):
             assert lie not in lowered
-        assert "does <strong>not</strong>" in page and "prove your password is right" in page
+        assert "may <strong>not</strong>" in page and "prove your password is right" in page
+        # ...and it must not restate the over-claim it replaced
+        assert "accepts any password" not in lowered
 
     @respx.mock
     def test_unreachable_proxy_is_an_error_not_a_shrug(self, auth):

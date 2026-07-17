@@ -129,9 +129,9 @@
       {% else %}
         location <strong>unknown</strong> — the IP could not be geolocated.
       {% endif %}
-      This proves traffic routes and where it comes out. It does <strong>not</strong>
-      prove your password is right: this provider accepts any password and only
-      rejects a wrong username, so a typo would still look like this.
+      This proves traffic routes and where it comes out. It may <strong>not</strong>
+      prove your password is right — some providers skip the password check for
+      addresses they already trust, so on those a typo would still look like this.
     </p>
   {% endif %}
 

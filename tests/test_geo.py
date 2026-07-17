@@ -80,13 +80,19 @@ class TestFailsFastRatherThanGuessing:
 
     @respx.mock
     @pytest.mark.asyncio
-    async def test_a_407_does_not_send_you_hunting_for_a_typo(self):
-        """Measured on Railway: the same credential string — sha256-identical,
-        session token and all — was accepted from one address and 407'd from
-        another. So a 407 is not evidence of a bad username, and the old advice
-        ("check the host, port, and username") sent the reader to re-check
-        settings that were provably correct. Both real causes get named, and the
-        password is ruled out because Evomi does not validate it.
+    async def test_a_407_leads_with_the_credentials(self):
+        """A 407 is nearly always a wrong username or password, so say that first.
+
+        Measured 2x2 (source address x password): the provider skips the password
+        check from a trusted address — a deliberately wrong password still returned
+        a working exit there — while the same wrong password is refused from a
+        deployed server, and the correct one succeeds from both. That asymmetry let
+        a stale password sit in a local .env for the life of the project with no
+        symptom, then look like "the provider blocks cloud hosts" on first deploy.
+
+        So the copy leads with the credentials and warns about the asymmetry, rather
+        than sending the reader to hunt for an IP allowlist — which is the rarer
+        cause and, for residential proxies, may not even exist.
         """
         respx.get("https://api.ipify.org").mock(
             side_effect=httpx.ProxyError("407 Proxy Authentication Required")
@@ -97,12 +103,11 @@ class TestFailsFastRatherThanGuessing:
         with pytest.raises(ProxyUnreachable) as exc:
             await measure_exit_ip(PROXY)
         msg = str(exc.value)
-        assert "IP address" in msg and "username" in msg
-        assert "allowlist" in msg
-        # the address can change under you, so "just allowlist it" is not a fix
-        assert "not a lasting fix" in msg
-        # and it must not blame the one thing the provider never checks
-        assert "password is not the likely cause" in msg
+        assert "username and password" in msg
+        # the trap that cost us a day: works locally != password is right
+        assert "works on your own computer can still be refused" in msg
+        # and it must not send them hunting for a setting that may not exist
+        assert "allowlist" not in msg
 
     @respx.mock
     @pytest.mark.asyncio

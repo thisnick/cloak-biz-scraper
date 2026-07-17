@@ -29,21 +29,28 @@ an IP we did not read back through the tunnel is not an exit IP. Reaching an
 echo service through the proxy is also the only honest proof the proxy routes at
 all, which is what lets a launch fail fast instead of holding a slot.
 
-**What this cannot tell you.** Evomi does not validate passwords (verified): a
-garbage password still returns a working residential exit. A successful probe
-therefore proves the proxy routes and says where it exits. It does **not** prove
-the credentials are correct, and nothing in the UI may claim it does.
+**What this cannot tell you.** A successful probe proves the proxy routes and says
+where it exits. It does **not** prove the credentials are correct, and nothing in
+the UI may claim it does.
 
-**A 407 does not mean "bad username."** An earlier version of this note said only
-a bad username could produce one. That was measured from a single machine, and it
-is wrong. The same credential string — byte-identical, sha256-compared, down to
-the session token — was accepted from one address and refused with 407 from
-another, so a provider may also gate on *which source address may authenticate*.
-The wire cannot tell the two apart: the refusal is a bare
-`407 / proxy-authenticate: Basic realm=auth`, naming no reason. So this module
-reports what a 407 means (the proxy answered and rejected the credentials as
-presented) and names both causes, rather than sending someone to re-check a
-username that was never wrong.
+**Why a pass here is weaker than it looks — measured, and it bit us.** The
+provider **skips the password check from addresses it already trusts**. From the
+machine this was originally measured on, a deliberately wrong password still
+returned a working residential exit, which was written down as "the provider does
+not validate passwords." That generalisation was false. The same wrong password,
+from a *deployed* server's address, is refused with a 407 — and the same
+*correct* password succeeds from both. So the password is checked; it just isn't
+checked everywhere.
+
+The cost of believing the generalisation: a stale password sat in a local `.env`
+for the life of this project without a symptom, because the machine it was tested
+on never checked it. It surfaced only on first deploy, as a 407 that looked like
+the provider refusing cloud hosts. **A probe that passes on your own machine is
+not evidence the password is right.**
+
+So on a 407 this module leads with the credentials, which is what it almost always
+is. The wire cannot narrow it further: the refusal is a bare
+`407 / proxy-authenticate: Basic realm=auth`, naming no reason.
 
 The GeoLite2 database is the `cloakbrowser` package's own cached copy — one ~70
 MB file on the volume, refreshed on its schedule, giving the same tz the package
@@ -130,12 +137,12 @@ async def measure_exit_ip(proxy_url: str) -> str:
     refused = any("407" in e for e in errors)
     if refused:
         why = (
-            "The proxy answered but rejected the sign-in (407). That means either the "
-            "username is wrong, or your proxy account only allows certain IP addresses "
-            "to connect and this server is not one of them — the password is not the "
-            "likely cause, and the proxy does not say which it is. If the username is "
-            "right, check your proxy provider's dashboard for an IP allowlist. Note "
-            "this server's address can change, so allowlisting it is not a lasting fix."
+            "The proxy answered but rejected the sign-in (407), so check your username "
+            "and password — that is nearly always what this is. Copy them from your "
+            "proxy provider's dashboard rather than retyping. Worth knowing: some "
+            "providers skip the password check for addresses they already trust, so a "
+            "password that works on your own computer can still be refused here. The "
+            "proxy does not say which credential it disliked."
         )
     else:
         why = (
