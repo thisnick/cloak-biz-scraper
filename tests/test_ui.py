@@ -747,3 +747,118 @@ class TestRunEvidenceIsReachableButNotPublic:
     def test_an_unknown_run_is_refused_before_the_filesystem(self, auth):
         assert auth.get("/runs/../settings").status_code == 404
         assert auth.get("/runs/not-a-real-job-id").status_code == 404
+
+
+class TestSessionsControls:
+    """The full-control actions on the dashboard: new instance, run sweep, close.
+
+    They go through the one service layer, and they carry both CSRF layers — the
+    SameSite=lax session cookie (via _require) and an Origin check (via
+    _require_same_origin). These launch browsers and spend proxy money, so the
+    guards matter; each is watched failing below.
+    """
+
+    def _stub_services(self, monkeypatch):
+        """Neuter the real browser/sweep launch — this tests the route + guards,
+        not CloakBrowser. Records the calls so the happy path can prove the
+        service layer was actually reached."""
+        calls = {"launch": 0, "start": 0, "stop": 0}
+
+        async def fake_launch(req, **kw):
+            calls["launch"] += 1
+            return object()
+
+        def fake_start(url, **kw):
+            calls["start"] += 1
+            return object()
+
+        async def fake_stop(iid):
+            calls["stop"] += 1
+            return True
+
+        monkeypatch.setattr(app.state.instances, "launch", fake_launch)
+        monkeypatch.setattr(app.state.scrape, "start", fake_start)
+        monkeypatch.setattr(app.state.instances, "stop", fake_stop)
+        return calls
+
+    # ── happy path: signed in, same origin → the service layer is reached ──
+    def test_new_instance_reaches_the_service_layer(self, auth, monkeypatch):
+        calls = self._stub_services(monkeypatch)
+        r = auth.post("/sessions/instances", data={"profile": "p"},
+                      follow_redirects=False)
+        assert r.status_code == 303 and r.headers["location"] == "/sessions"
+        assert calls["launch"] == 1
+
+    def test_run_sweep_reaches_the_service_layer(self, auth, monkeypatch):
+        calls = self._stub_services(monkeypatch)
+        r = auth.post("/sessions/sweep",
+                      data={"url": "https://www.bizbuysell.com/x", "max_pages": "2"},
+                      follow_redirects=False)
+        assert r.status_code == 303 and r.headers["location"] == "/sessions"
+        assert calls["start"] == 1
+
+    def test_close_instance_reaches_the_service_layer(self, auth, monkeypatch):
+        calls = self._stub_services(monkeypatch)
+        r = auth.post("/sessions/instances/abc123/close", follow_redirects=False)
+        assert r.status_code == 303
+        assert calls["stop"] == 1
+
+    # ── guard 1: no session → nothing happens ──
+    def test_signed_out_cannot_launch_anything(self, client, monkeypatch):
+        calls = self._stub_services(monkeypatch)
+        for path, data in (
+            ("/sessions/instances", {"profile": "p"}),
+            ("/sessions/sweep", {"url": "https://x"}),
+            ("/sessions/instances/abc/close", {}),
+        ):
+            r = client.post(path, data=data, follow_redirects=False)
+            assert r.status_code == 303 and r.headers["location"] == "/login"
+        assert calls == {"launch": 0, "start": 0, "stop": 0}, "a signed-out call reached the service"
+
+    # ── guard 2: foreign Origin → refused, even with a valid session ──
+    def test_a_foreign_origin_is_refused(self, auth, monkeypatch):
+        calls = self._stub_services(monkeypatch)
+        for path, data in (
+            ("/sessions/instances", {"profile": "p"}),
+            ("/sessions/sweep", {"url": "https://x"}),
+            ("/sessions/instances/abc/close", {}),
+        ):
+            r = auth.post(path, data=data, headers={"Origin": "https://evil.example"},
+                          follow_redirects=False)
+            assert r.status_code == 403, f"{path} allowed a cross-origin POST"
+        assert calls == {"launch": 0, "start": 0, "stop": 0}, "a cross-origin call reached the service"
+
+    # ── the absent-Origin policy the lead asked to pin: allowed ──
+    def test_an_absent_origin_is_allowed(self, auth, monkeypatch):
+        """SameSite=lax is the floor; a same-origin request that omits Origin (or a
+        server-side caller) must not be blocked for a threat the cookie already
+        stops."""
+        calls = self._stub_services(monkeypatch)
+        r = auth.post("/sessions/instances", data={"profile": "p"},
+                      follow_redirects=False)  # TestClient sends no Origin
+        assert r.status_code == 303 and calls["launch"] == 1
+
+    # ── the same-origin case is allowed ──
+    def test_our_own_origin_is_allowed(self, auth, monkeypatch):
+        calls = self._stub_services(monkeypatch)
+        r = auth.post("/sessions/sweep", data={"url": "https://x"},
+                      headers={"Origin": "https://testserver"}, follow_redirects=False)
+        assert r.status_code == 303 and calls["start"] == 1
+
+    # ── guard 3: a state change must not be reachable by GET ──
+    def test_state_changers_reject_GET(self, auth):
+        for path in ("/sessions/instances", "/sessions/sweep",
+                     "/sessions/instances/abc/close"):
+            assert auth.get(path, follow_redirects=False).status_code == 405, (
+                f"{path} answered a GET — SameSite=lax leaks the cookie on cross-site GET"
+            )
+
+    # ── the Origin check is UNIFORM: settings POSTs get it too ──
+    def test_settings_posts_also_reject_a_foreign_origin(self, auth):
+        r = auth.post("/settings/pool", data={"max_instances": "4", "interactive_reserve": "1"},
+                      headers={"Origin": "https://evil.example"}, follow_redirects=False)
+        assert r.status_code == 403, "settings mutate credentials; they get the same Origin rule"
+
+    def test_logout_rejects_a_foreign_origin(self, auth):
+        assert auth.post("/logout", headers={"Origin": "https://evil.example"},
+                         follow_redirects=False).status_code == 403

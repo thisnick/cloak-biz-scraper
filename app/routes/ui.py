@@ -72,6 +72,28 @@ def _require(request: Request) -> None:
         raise NotAuthenticated()
 
 
+def _require_same_origin(request: Request) -> None:
+    """CSRF defence-in-depth for a cookie-authenticated state change.
+
+    The session cookie is `SameSite=lax`, which already stops a cross-site POST
+    from carrying it — so this is a second layer, not the only one. It reuses the
+    exact rule `/mcp` and the WS upgrades apply (routes/mcp.py `origin_allowed`),
+    which matters because these actions launch browsers and spend proxy money and
+    the reviewer will compare the two.
+
+    **Absent Origin is allowed, on purpose.** `origin_allowed` returns True when
+    no `Origin` is present, and that is the right policy here: a foreign `Origin`
+    is the attack a browser actually sends, whereas *hard*-requiring the header
+    would reject legitimate same-origin requests that omit it and break real
+    users for a threat `SameSite` already covers. A present, foreign `Origin` is
+    refused. Verified as `origin_allowed`'s own behaviour, not re-derived.
+    """
+    from .mcp import origin_allowed
+
+    if not origin_allowed(request.headers):
+        raise HTTPException(status_code=403, detail="cross-origin request refused")
+
+
 def _render(request: Request, result: Result | None = None, status: int = 200) -> Response:
     settings: Settings = request.app.state.settings.load()
     return templates.TemplateResponse(
@@ -210,7 +232,11 @@ def _set_session(response: Response, token: str) -> None:
 
 
 @router.post("/logout")
-async def logout() -> Response:
+async def logout(request: Request) -> Response:
+    # A cross-site page must not be able to force a logout. Low-severity CSRF, but
+    # it is a state-changing cookie POST, so it takes the same Origin check as the
+    # rest — one rule, no exceptions to remember.
+    _require_same_origin(request)
     response = RedirectResponse("/login", status_code=303)
     response.delete_cookie(sessions.COOKIE_NAME, path="/")
     return response
@@ -306,6 +332,88 @@ async def get_evidence(request: Request, job_id: str, name: str) -> Response:
     return FileResponse(target)
 
 
+# ── Sessions: full control from the cookie-authed page ───────────────────────
+#
+# The same three actions the MCP/REST tools expose, but driven by a human on the
+# dashboard rather than an agent with a bearer token. They go through the one
+# service layer (never logic here) so a browser started from the page and one
+# started from a tool are the same object in the same pool.
+#
+# Every one is state-changing, so every one is POST and carries both CSRF layers:
+# `_require` (the SameSite=lax session cookie) and `_require_same_origin` (a
+# foreign Origin is refused). There is deliberately no GET form of any of these —
+# SameSite=lax leaks the cookie on a top-level cross-site GET, so a state change
+# behind GET would be reachable cross-site. The results page is /sessions, which
+# these redirect to (PRG); it is built to the settled IA separately.
+
+
+def _sessions_redirect() -> Response:
+    return RedirectResponse("/sessions", status_code=303)
+
+
+@router.post("/sessions/instances")
+async def ui_new_instance(
+    request: Request,
+    profile: str = Form(""),
+    country: str = Form(""),
+    region: str = Form(""),
+) -> Response:
+    _require(request)
+    _require_same_origin(request)
+    from ..models import InstanceCreate
+    from ..services.geo import GeoUnresolved, ProxyUnreachable
+    from ..services.instances import CapExceeded, PinUnavailable
+    from ..services.proxy import ProxyNotConfigured
+    from ..services.tokens import OWNER
+
+    req = InstanceCreate(
+        profile=profile.strip() or f"session-{int(time.time())}",
+        country=country.strip() or None,
+        region=region.strip() or None,
+    )
+    try:
+        await request.app.state.instances.launch(
+            req, origin="interactive", subject=OWNER
+        )
+    except CapExceeded as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    except (ProxyNotConfigured, ProxyUnreachable, GeoUnresolved, PinUnavailable) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _sessions_redirect()
+
+
+@router.post("/sessions/sweep")
+async def ui_run_sweep(
+    request: Request,
+    url: str = Form(""),
+    max_pages: int = Form(1),
+    sync: bool = Form(False),
+    db_id: str = Form(""),
+) -> Response:
+    _require(request)
+    _require_same_origin(request)
+    from ..services.scrape import NotionNotConfigured
+    from ..sources import UnsupportedURL
+
+    try:
+        request.app.state.scrape.start(
+            url.strip(), max_pages=max_pages, sync=sync, db_id=db_id.strip() or None
+        )
+    except UnsupportedURL as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except NotionNotConfigured as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return _sessions_redirect()
+
+
+@router.post("/sessions/instances/{instance_id}/close")
+async def ui_close_instance(request: Request, instance_id: str) -> Response:
+    _require(request)
+    _require_same_origin(request)
+    await request.app.state.instances.stop(instance_id)
+    return _sessions_redirect()
+
+
 @router.post("/settings/cloakbrowser", response_class=HTMLResponse)
 async def save_cloakbrowser(
     request: Request,
@@ -314,6 +422,7 @@ async def save_cloakbrowser(
     cloakbrowser_version: str = Form(""),
 ) -> Response:
     _require(request)
+    _require_same_origin(request)
     store = request.app.state.settings
     current = store.load()
 
@@ -354,6 +463,7 @@ async def save_proxy(
     proxy_region: str = Form(""),
 ) -> Response:
     _require(request)
+    _require_same_origin(request)
     store = request.app.state.settings
     current = store.load()
     changes = dict(
@@ -448,6 +558,7 @@ async def save_pool(
     request: Request, max_instances: int = Form(4), interactive_reserve: int = Form(1)
 ) -> Response:
     _require(request)
+    _require_same_origin(request)
     try:
         request.app.state.settings.update(
             max_instances=max_instances, interactive_reserve=interactive_reserve
@@ -465,6 +576,7 @@ async def save_notion(
     request: Request, action: str = Form("save"), notion_api_token: str = Form("")
 ) -> Response:
     _require(request)
+    _require_same_origin(request)
     store = request.app.state.settings
     current = store.load()
     settings = store.update(
@@ -517,6 +629,7 @@ async def select_database(request: Request, db_id: str = Form("")) -> Response:
     press Verify again rather than lose their selection.
     """
     _require(request)
+    _require_same_origin(request)
     from ..stores.notion import NotionError, NotionStore
 
     db_id = db_id.strip()
@@ -537,6 +650,7 @@ async def select_database(request: Request, db_id: str = Form("")) -> Response:
 @router.post("/settings/notion/verify", response_class=HTMLResponse)
 async def verify_database(request: Request) -> Response:
     _require(request)
+    _require_same_origin(request)
     from ..stores.notion import NotionError, NotionStore
 
     settings = request.app.state.settings.load()
@@ -588,6 +702,7 @@ async def create_database(
 ) -> Response:
     """Create a database — only ever from this explicit click (decision #5)."""
     _require(request)
+    _require_same_origin(request)
     from ..stores.notion import NotionError, NotionStore
 
     parent_page_id = parent_page_id.strip()
