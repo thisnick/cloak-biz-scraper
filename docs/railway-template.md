@@ -168,6 +168,64 @@ falls back to the repo's **default branch** for every user who clicks the button
 
 `secret()` values survive — they are stored literals, not live expressions.
 
+**Both strips are proven, not inferred.** With `main` at `3b0bd45` and `release` at `0a5eb98`,
+deploying the template's **stored** config — exactly what the button does — produced:
+
+```
+commitHash : 3b0bd456   -> main, NOT release
+deployed sleepApplication: False   -> pays 24/7
+```
+
+And the hand-edit fixes both. The same config with `deploy.sleepApplication: true` and
+`source.branch: "release"` added deploys:
+
+```
+commit 0a5eb98d -> RELEASE ✅      sleepApplication: True ✅      healthcheckPath: /healthz
+```
+
+So the two keys are **valid and sufficient** — the strict validator accepts them and the
+deployed service honours them. The problem is not knowing what to write. It is where to put it.
+
+## 🔴 The API cannot ship this template. The dashboard has to.
+
+**`templateDeployV2(serializedConfig=…)` is deploy-time only — it does not write back.**
+Measured: deploy the hand-edited config, then re-read the template — **the stored config is
+byte-identical to before**. Combined with there being no `templateCreate`/`templateUpdate`, and
+`templateClone` taking only `{code, workspaceId}`:
+
+> Every API path that can *store* a template config is generation, and generation strips the
+> two keys that matter. The hand-edit can only ever be passed at deploy time, which is not
+> what a user clicking the button gets.
+
+**The branch has a documented dashboard-only form.** Railway's template editor takes *"the full
+URL to the desired branch in the Source Repo configuration"*:
+
+```
+https://github.com/thisnick/cloak-biz-scraper/tree/release
+```
+
+This is **not** a service-source form — `serviceConnect` rejects that URL outright (`Problem
+processing request`) and leaves the plain `owner/repo`. It only means something in the template
+editor. Railway's docs also confirm templates can be edited from the workspace template page.
+
+**So the template must be authored/edited in the Railway dashboard**, which is consistent with
+the rest of this file: the one-click contract lives there, not in git. That is exactly why this
+document exists.
+
+**Belt and braces — consider making `release` the repo's default branch.** Generation drops the
+branch *silently*, and any future regeneration will drop it again. If `release` is the default,
+a branch-less template deploys `release` anyway, and the failure mode becomes harmless instead
+of invisible. Develop on `main`, ship by merging to `release`, and the repo's front page then
+shows what users actually deploy. This costs nothing and removes a whole class of silent
+breakage.
+
+⚠️ **Sleep has no documented dashboard control.** Railway's template docs never mention sleep /
+serverless / `sleepApplication`. The key is real — the validator accepts it and a deployed
+service honours it — but if the editor does not expose it, a template may be **unable** to ship
+scale-to-zero, and users would have to enable it themselves after deploying. That would need to
+be a documented step in the setup guide, and it would change the cost story this product is
+sold on. **Unresolved — do not assume either way.**
+
 ## Do NOT publish
 
 An **unpublished** template is deployable by link, invisible to `templateSearch`, and **still
