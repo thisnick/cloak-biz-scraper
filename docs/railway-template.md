@@ -212,12 +212,19 @@ editor. Railway's docs also confirm templates can be edited from the workspace t
 the rest of this file: the one-click contract lives there, not in git. That is exactly why this
 document exists.
 
-**Belt and braces — consider making `release` the repo's default branch.** Generation drops the
-branch *silently*, and any future regeneration will drop it again. If `release` is the default,
-a branch-less template deploys `release` anyway, and the failure mode becomes harmless instead
-of invisible. Develop on `main`, ship by merging to `release`, and the repo's front page then
-shows what users actually deploy. This costs nothing and removes a whole class of silent
-breakage.
+**`release` IS the repo's default branch — and that is load-bearing, not cosmetic.** Generation
+drops the branch *silently*, and every future regeneration will drop it again. Because `release`
+is the default, a branch-less template deploys `release` anyway: the failure mode is now
+harmless instead of invisible. Develop on `main`; **merging to `release` is what ships**, and the
+repo's front page shows what users actually deploy.
+
+> ⚠️ **Do not "tidy" the default branch back to `main`.** That single settings change would
+> silently repoint every future one-click deploy at development code, with no error anywhere.
+> This is the only thing standing between a regenerated template and shipping `main` to users.
+
+Gotcha while setting it: **`gh repo edit --default-branch release` silently does nothing** —
+exit 0, no output, no change. `gh api -X PATCH repos/<owner>/<repo> -f default_branch=release`
+works.
 
 ⚠️ **Sleep has no documented dashboard control.** Railway's template docs never mention sleep /
 serverless / `sleepApplication`. The key is real — the validator accepts it and a deployed
