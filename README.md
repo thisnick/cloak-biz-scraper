@@ -5,9 +5,11 @@ ChatGPT or Claude over MCP. You bring a CloakBrowser Pro license, a residential
 proxy account, and a Notion workspace; you deploy one container; you configure it
 in a web form. No terminal.
 
-> **Status: early.** Steps 1–2 of 7 are built — the scaffold, the settings store,
-> the browser core, the settings UI, and the Notion store. There is no MCP server
-> and no scraping yet. See "What works today".
+> **Status: early.** Steps 1–3 of 7 are built — the scaffold, the settings store,
+> the browser core, the settings UI, the Notion store, and the scrape/archive
+> tools behind both an MCP server and a REST API. The MCP endpoint is **not
+> authenticated yet** (Step 4), so do not put this on a public URL. See "What
+> works today".
 
 ## Why it exists
 
@@ -32,15 +34,71 @@ for sale this week. This packages the hard part.
 - **The Notion store**: pick an existing database and see exactly what its schema
   is missing, or create one explicitly. Never auto-created; never writes a column
   you added yourself.
+- **An MCP server** at `POST /mcp` — stateless Streamable HTTP, no session id —
+  and a REST API at `/api/*`, both over the same service layer.
+- **`scrape_listings`**: sweep a BizBuySell search-results page. Starts a job and
+  returns immediately; collect it with `get_scrape_listing_results`.
+- **`archive_page`**: read any page and append its content to a Notion page.
+- **`create_instance` / `list_instances` / `get_instance` / `close_instance`**,
+  each carrying a freshly minted, short-lived CDP URL you can drive the browser
+  through.
 
-Not built yet: the scrape and archive tools, the MCP server, OAuth, live VNC.
+Not built yet: OAuth (so nothing is authenticated yet), live VNC, the Railway
+template.
+
+## The tools
+
+```
+scrape_listings(url, max_pages=1, sync=false, db_id=null) -> ScrapeResult
+get_scrape_listing_results(job_id)                        -> ScrapeResult
+archive_page(url, notion_page_id)                         -> ArchiveResult
+create_instance(profile?, country?, region?, geoip?)      -> InstanceView
+list_instances() / get_instance(id) / close_instance(id)
+```
+
+Every one is mirrored in REST (`POST /api/scrape`, `GET /api/scrape/{job_id}`,
+`POST /api/archive`, `/api/instances`) over the same services, so the two return
+the same payloads.
+
+**A sweep is asynchronous, an archive is not.** A multi-page sweep with
+block-retries takes minutes, which is past every MCP client's wall — so
+`scrape_listings` returns a `job_id` immediately and the model is told to collect
+it. A single page archive takes about a minute and fits, so it blocks. That is
+right at Claude Code's 60s default: raise `MCP_TOOL_TIMEOUT` if you use it there.
+
+**Jobs live on the volume.** Railway sleeps a service after ten minutes with no
+outbound traffic and wakes it on inbound — which is exactly the shape of "sweep
+finishes, agent comes back later, poll wakes the container". A finished job has
+to outlive the process that ran it. A job interrupted by a restart is reported as
+failed, not left claiming to be working forever.
+
+**`sync=false` needs no Notion at all.** It reads listings back and writes
+nothing — not a Notion code path behind a flag, but the absence of one, so this
+is usable before you have configured a database. `sync=true` dedupes against the
+store and inserts only what is new.
+
+**Money is quoted, not interpreted.** A listing's `asking_price` is the string
+the card showed — `"$1,258,000"`, `"Not Disclosed"`, `"$81,000 + Inventory"`.
+Turning that into a number is the *store's* job, because being a number is a fact
+about a Notion column rather than about the listing: `NotionStore` parses on the
+way in and leaves the cell empty when it cannot be sure, since `81000` for
+"$81,000 + Inventory" is a wrong number that looks like a right one.
+
+**Only BizBuySell search pages, and unsupported URLs fail loudly.** The adapter is
+chosen by URL pattern; anything else is a hard error naming what is supported. A
+best-effort scrape of a page we do not understand returns an empty result that
+looks exactly like "nothing matched".
 
 ## Design
 
 ```
-GET  /healthz         Railway healthcheck (unauthenticated)
+POST /mcp              MCP, stateless Streamable HTTP; GET -> 405; Origin validated
+/api/*                 REST mirror of every tool
+ws   /instances/{id}/cdp   drive a browser (short-lived signed token in the URL)
+GET  /healthz          Railway healthcheck (unauthenticated)
 /  /login  /settings/* the web UI (cookie session)
-/data (volume)        settings, the secret, the Chromium binary cache, profiles
+/data (volume)         settings, the secret, the Chromium binary cache, profiles,
+                       jobs, evidence
 ```
 
 **One service layer.** Everything lives in `app/services/`. Routes are façades —
@@ -115,6 +173,19 @@ IP, the geo, which binary ran, and what the page itself saw.
 **Never launch a browser outside the container.** It would go out over your own IP
 and burn its reputation with the listing sites.
 
+To exercise the MCP endpoint's transport rules against a running server:
+
+```bash
+python scripts/verify_mcp.py --base http://127.0.0.1:18800
+python scripts/verify_parity.py --base http://127.0.0.1:18800 --job <job_id>
+```
+
+Or point the official inspector at it:
+
+```bash
+npx @modelcontextprotocol/inspector --cli http://127.0.0.1:18800/mcp --method tools/list
+```
+
 To exercise the Notion store against a real workspace — it creates a scratch page,
 does everything under it, and archives it again, so it leaves nothing behind:
 
@@ -128,6 +199,11 @@ Tests:
 docker run --rm -v "$PWD":/src -w /src cloak-biz-scraper:local \
   sh -c "pip install -q -r requirements-dev.txt && python -m pytest -q"
 ```
+
+A handful of tests assert what **martian** does with our markdown and need node,
+so they skip outside the container and run inside it. That is deliberate: what
+martian silently drops is the whole reason those tests exist, and asserting it
+from memory would defeat the point — the memory was wrong.
 
 ## Credits
 
