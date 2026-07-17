@@ -127,6 +127,33 @@ async def protected_resource_metadata(request: Request) -> Response:
 
 @router.post("/register")
 async def register(request: Request) -> Response:
+    """Dynamic Client Registration — open, because it has to be.
+
+    ChatGPT and Claude register themselves; requiring a credential here would
+    mean they could never connect, which is the whole point of DCR.
+
+    **Open is not the same as unlimited, and this endpoint writes to disk.** Every
+    registration re-encrypts and rewrites the whole client store, so an
+    unthrottled flood is not just rows in a file — it is O(n) disk work per
+    request against a file the flood itself is growing, on a volume the user
+    pays for. Throttled, it is a trickle.
+
+    Registrations are counted whether or not they succeed. Unlike the login,
+    there is no "wrong" registration to single out: the flood is made of
+    perfectly valid ones.
+    """
+    limiter = request.app.state.register_limiter
+    key = client_key(request)
+    wait = limiter.retry_after(key)
+    if wait:
+        logger.warning("throttled /register from %s for %.1fs", key, wait)
+        return JSONResponse(
+            {"error": "temporarily_unavailable",
+             "error_description": "Too many registrations. Try again shortly."},
+            status_code=429,
+            headers={"Retry-After": str(int(wait) + 1)},
+        )
+    limiter.record(key)
     return await RegistrationHandler(_provider(request), options=REGISTRATION_OPTIONS).handle(request)
 
 

@@ -131,6 +131,44 @@ class TestTheLoginFlood:
         ]
         assert 429 in codes
 
+class TestRegistrationIsThrottled:
+    """DCR must stay open — ChatGPT and Claude register themselves — but open is
+    not unlimited, and this endpoint writes to disk.
+
+    Every registration re-encrypts and rewrites the whole client store, so an
+    unthrottled flood is O(n) disk work per request against a file the flood is
+    growing, on a volume the user pays for. It is the one unauthenticated
+    write path in the app.
+    """
+
+    def test_a_registration_flood_is_throttled(self, client):
+        codes = [
+            client.post("/register", json={"redirect_uris": ["https://c.example/cb"]},
+                        headers={"X-Forwarded-For": "6.6.6.6"}).status_code
+            for _ in range(25)
+        ]
+        assert 429 in codes, "an unauthenticated endpoint that writes to disk must be bounded"
+        assert codes.count(201) <= 10
+
+    def test_a_handful_of_real_registrations_still_work(self, client):
+        """A user connecting ChatGPT and Claude registers twice, ever."""
+        for _ in range(3):
+            r = client.post("/register", json={"redirect_uris": ["https://c.example/cb"]})
+            assert r.status_code == 201
+
+    def test_registration_has_its_own_budget(self, client):
+        """A login flood must not stop a legitimate client from registering, and
+        vice versa — they are different kinds of traffic with different limits."""
+        for i in range(15):
+            client.post("/login", data={"secret": f"guess-{i}"},
+                        headers={"X-Forwarded-For": "4.4.4.4"})
+        assert app.state.login_limiter.retry_after("4.4.4.4") > 0
+        r = client.post("/register", json={"redirect_uris": ["https://c.example/cb"]},
+                        headers={"X-Forwarded-For": "4.4.4.4"})
+        assert r.status_code == 201
+
+
+class TestTheLoginFloodContinued:
     def test_the_two_doors_share_one_budget(self, client):
         """Otherwise an attacker alternates between them and gets double the
         guesses for free."""

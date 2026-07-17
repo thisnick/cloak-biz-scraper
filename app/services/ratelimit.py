@@ -101,12 +101,22 @@ class RateLimiter:
                 self._forget_if_empty(candidate)
             return round(max(wait, 0.0), 1)
 
-    def fail(self, key: str, *, now: float | None = None) -> None:
-        """Record one wrong secret against this key and the global budget."""
+    def record(self, key: str, *, now: float | None = None) -> None:
+        """Charge one event against this key and the global budget.
+
+        What counts as an event differs by door, and the difference is the point.
+        The login records only *failures*, so no amount of correct use throttles
+        anyone. Registration records **every** attempt, because there is no such
+        thing as a wrong registration — the flood is made of successful ones.
+        """
         now = time.time() if now is None else now
         with self._lock:
             for candidate in (key, _GLOBAL):
                 self._live(candidate, now).append(now)
+
+    def fail(self, key: str, *, now: float | None = None) -> None:
+        """Record one wrong secret. Reads better than `record` at a login."""
+        self.record(key, now=now)
 
     def reset(self, key: str) -> None:
         """Forget this key's failures — called when the secret was right.

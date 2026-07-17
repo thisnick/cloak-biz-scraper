@@ -55,6 +55,7 @@ def isolate_auth(app, tmp_path):
         OAuthStore(tmp_path / "oauth.json", tmp_path / ".dek"), app.state.secret
     )
     app.state.login_limiter.__init__()
+    app.state.register_limiter.__init__(max_failures=10, window_sec=60, global_max=20)
 
 
 def mint_access(app, *, subject: str = "owner", client_id: str = "test-client",

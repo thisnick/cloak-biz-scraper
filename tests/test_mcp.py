@@ -171,6 +171,58 @@ class TestOriginIsValidated:
         r = client.get("/mcp", headers={**HEADERS, "Origin": "https://evil.example"})
         assert r.status_code == 403
 
+
+class TestLoopbackOriginRule:
+    """The Step 3 review's recommendation: a loopback Host demands a loopback
+    Origin, restoring the local/LAN protection FastMCP's `allowed_hosts` gave —
+    without the 421 that would 421 every Railway request.
+
+    What it adds on top of `Origin == Host` is narrow and worth being precise
+    about: the equality rule already refuses a foreign Origin. This rule is what
+    stops `MCP_ALLOWED_ORIGINS` — the operator's own escape hatch — from being
+    the foot-gun that lets a public site reach a server bound to localhost.
+    """
+
+    def test_a_loopback_host_refuses_a_foreign_origin(self, client):
+        r = client.post("/mcp", json=INIT, headers={
+            **HEADERS, "Host": "127.0.0.1:8000", "Origin": "https://evil.example",
+        })
+        assert r.status_code == 403
+
+    def test_a_loopback_host_allows_a_loopback_origin(self, client):
+        r = client.post("/mcp", json=INIT, headers={
+            **HEADERS, "Host": "127.0.0.1:8000", "Origin": "http://127.0.0.1:8000",
+        })
+        assert r.status_code == 200
+
+    def test_the_operator_allowlist_cannot_open_localhost_to_the_web(self, monkeypatch, client):
+        """The rule's actual job. `MCP_ALLOWED_ORIGINS` exists for a browser-based
+        client on a known origin; it must not become a way for a public site to
+        reach a server on your laptop."""
+        import app.routes.mcp as mcp_routes
+
+        monkeypatch.setattr(mcp_routes, "_EXTRA_ORIGINS", ("https://trusted.example",))
+        # Allowed against a real deployment's host...
+        assert client.post("/mcp", json=INIT, headers={
+            **HEADERS, "Host": "app.up.railway.app", "Origin": "https://trusted.example",
+        }).status_code == 200
+        # ...and still refused against loopback, allowlist or not.
+        assert client.post("/mcp", json=INIT, headers={
+            **HEADERS, "Host": "127.0.0.1:8000", "Origin": "https://trusted.example",
+        }).status_code == 403
+
+    def test_localhost_by_name_counts_as_loopback(self, client):
+        r = client.post("/mcp", json=INIT, headers={
+            **HEADERS, "Host": "localhost:8000", "Origin": "https://evil.example",
+        })
+        assert r.status_code == 403
+
+    def test_a_deployed_host_is_unaffected(self, client):
+        """The rule must not touch a real deployment, which is the whole reason
+        `allowed_hosts` could not be used."""
+        r = client.post("/mcp", json=INIT, headers={**HEADERS, "Host": "app.up.railway.app"})
+        assert r.status_code == 200, "a Railway host must never 421 or 403 again"
+
     def test_a_lookalike_origin_is_refused(self, client):
         """testserver.evil.example ends with nothing we accept — a prefix or
         suffix match here would be the bug."""

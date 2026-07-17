@@ -85,6 +85,12 @@ async def lifespan(app: FastAPI):
     # Shared by both doors that take APP_SECRET (the UI login and OAuth's), so a
     # flood cannot use one to reset the other's budget.
     app.state.login_limiter = RateLimiter()
+    # Registration is a separate budget: it must stay open for DCR (ChatGPT and
+    # Claude register themselves), but each one rewrites the encrypted client
+    # store, so an unthrottled flood is O(n) disk work per request on a file the
+    # flood is growing. Looser than the login — a real user registers a handful
+    # of clients ever, and none of them are guesses.
+    app.state.register_limiter = RateLimiter(max_failures=10, window_sec=60, global_max=20)
     app.state.jobs = jobs
     app.state.instances = InstanceManager(settings_service)
     app.state.scrape = ScrapeService(app.state.instances, jobs, settings_service)
