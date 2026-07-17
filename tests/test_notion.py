@@ -289,11 +289,14 @@ class TestUpsertNew:
     @respx.mock
     @pytest.mark.asyncio
     async def test_money_lands_as_numbers(self):
+        # The listing carries what the card said; turning that into a number is
+        # this store's job, so a verbatim string is the input under test.
         mock_db(FULL_SCHEMA)
         mock_query([])
         route = respx.post(f"{API}/pages").mock(return_value=httpx.Response(200, json={"id": "n"}))
         await NotionStore(TOKEN).upsert_new(
-            DB, [listing(asking_price=1_258_000.0, revenue=3_000_000.0, cashflow=500_000.0)]
+            DB,
+            [listing(asking_price="$1,258,000", revenue="$3,000,000", cashflow="$500,000")],
         )
         props = route.calls[0].request.read().decode()
         import json
@@ -305,16 +308,19 @@ class TestUpsertNew:
 
     @respx.mock
     @pytest.mark.asyncio
-    async def test_undisclosed_money_is_left_empty(self):
+    @pytest.mark.parametrize("verbatim", ["Not Disclosed", "", "$81,000 + Inventory"])
+    async def test_money_we_cannot_be_sure_of_is_left_empty(self, verbatim):
         import json
 
         mock_db(FULL_SCHEMA)
         mock_query([])
         route = respx.post(f"{API}/pages").mock(return_value=httpx.Response(200, json={"id": "n"}))
-        await NotionStore(TOKEN).upsert_new(DB, [listing(asking_price=None)])
+        await NotionStore(TOKEN).upsert_new(DB, [listing(asking_price=verbatim)])
         sent = json.loads(route.calls[0].request.read())["properties"]
-        # Absent, not zero and not "Not Disclosed": an empty cell is visibly
-        # missing, whereas a 0 would quietly join every "under $1M" filter.
+        # Absent, not zero and not the raw text. An empty cell is visibly
+        # missing, whereas a 0 would quietly join every "under $1M" filter — and
+        # "$81,000 + Inventory" written as 81000 would understate the price by an
+        # unknown amount while looking perfectly precise.
         assert "Asking Price" not in sent
 
     @respx.mock
@@ -340,7 +346,7 @@ class TestUpsertNew:
         mock_db(MINIMAL_SCHEMA)
         mock_query([])
         route = respx.post(f"{API}/pages").mock(return_value=httpx.Response(200, json={"id": "n"}))
-        await NotionStore(TOKEN).upsert_new(DB, [listing(asking_price=1000.0)])
+        await NotionStore(TOKEN).upsert_new(DB, [listing(asking_price="$1,000")])
         sent = json.loads(route.calls[0].request.read())["properties"]
         assert set(sent) == {"Listing Title", "URL", "Normalized URL", "Listing ID"}
 
@@ -355,7 +361,7 @@ class TestUpsertNew:
         mock_db(schema)
         mock_query([])
         route = respx.post(f"{API}/pages").mock(return_value=httpx.Response(200, json={"id": "n"}))
-        result = await NotionStore(TOKEN).upsert_new(DB, [listing(asking_price=1_258_000.0)])
+        result = await NotionStore(TOKEN).upsert_new(DB, [listing(asking_price="$1,258,000")])
         sent = json.loads(route.calls[0].request.read())["properties"]
         assert "Asking Price" not in sent
         # The rest of the row still writes — one bad column is not a failed sync.
@@ -380,7 +386,7 @@ class TestUpsertNew:
         })
         mock_query([])
         respx.post(f"{API}/pages").mock(return_value=httpx.Response(200, json={"id": "n"}))
-        result = await NotionStore(TOKEN).upsert_new(DB, [listing(asking_price=1_258_000.0)])
+        result = await NotionStore(TOKEN).upsert_new(DB, [listing(asking_price="$1,258,000")])
 
         assert result.new == 1, "a database full of text prices must still sync"
         assert sorted(result.skipped_names) == ["Asking Price", "EBITDA", "Revenue", "SDE / Cash Flow"]

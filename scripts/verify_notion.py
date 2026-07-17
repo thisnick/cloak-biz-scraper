@@ -35,7 +35,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.models import Listing  # noqa: E402
-from app.stores.money import parse_money  # noqa: E402
 from app.stores.notion import PROPS_BY_NAME, NotionStore  # noqa: E402
 
 # A user's own columns, added after we created the database. Nothing in the app
@@ -97,10 +96,10 @@ def sample_listings() -> list[Listing]:
             normalized_url="bizbuysell.com/business-opportunity/high-margin-digital/2485121",
             title="High Margin Digital Education and Licensing Business",
             location="San Francisco, CA",
-            asking_price=parse_money("$1,258,000"),
-            revenue=parse_money("$3,000,000"),
-            cashflow=parse_money("$500,000"),
-            ebitda=parse_money("Not Disclosed"),      # → must land empty
+            asking_price="$1,258,000",
+            revenue="$3,000,000",
+            cashflow="$500,000",
+            ebitda="Not Disclosed",                   # → the store must leave this empty
             source="bizbuysell_serp",
         ),
         Listing(
@@ -109,8 +108,8 @@ def sample_listings() -> list[Listing]:
             normalized_url="bizbuysell.com/business-opportunity/underground-utility/2321702",
             title="Underground Utility, Earthwork and Concrete Contractor",
             location="Sacramento, CA",
-            asking_price=parse_money("$81,000 + Inventory"),  # → must land empty
-            revenue=parse_money("7350000"),
+            asking_price="$81,000 + Inventory",       # → the store must leave this empty
+            revenue="7350000",
             source="bizbuysell_serp",
         ),
     ]

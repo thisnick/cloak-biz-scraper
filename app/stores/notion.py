@@ -30,6 +30,7 @@ import httpx
 
 from ..models import Listing
 from .base import DedupeIndex, PropIssue, SchemaReport, UpsertResult
+from .money import parse_money
 
 logger = logging.getLogger("cloakbiz.notion")
 
@@ -148,6 +149,25 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _money(value: object) -> dict[str, Any] | None:
+    """A verbatim listing amount rendered into a Notion Number, or nothing.
+
+    This is where the plan's split lands: the scraper hands us "$1,258,000" or
+    "$81,000 + Inventory" exactly as the card said it, and the decision to make
+    that a number belongs here, because being a number is a fact about this
+    column rather than about the listing. A store writing to a text column would
+    keep the string; this one parses.
+
+    Returning None leaves the cell **empty**, which is the deliberate half of the
+    call: "$81,000 + Inventory" is not $81,000, so writing 81000 would silently
+    understate a price by an unknown amount and corrupt the very filter the
+    Number type exists to enable. Nothing is lost — the verbatim text survives on
+    the Listing itself, in the excerpt, and in the archived page.
+    """
+    amount = parse_money(value)
+    return {"number": amount} if amount is not None else None
+
+
 KNOWN_PROPS: tuple[NotionProp, ...] = (
     # The four the machine cannot work without.
     NotionProp(
@@ -187,23 +207,19 @@ KNOWN_PROPS: tuple[NotionProp, ...] = (
     ),
     NotionProp(
         "Asking Price", "number", False, {"number": {"format": "dollar"}}, source="asking_price",
-        render=lambda v: {"number": v} if v is not None else None,
-        consequence=_MONEY_CONSEQUENCE,
+        render=_money, consequence=_MONEY_CONSEQUENCE,
     ),
     NotionProp(
         "Revenue", "number", False, {"number": {"format": "dollar"}}, source="revenue",
-        render=lambda v: {"number": v} if v is not None else None,
-        consequence=_MONEY_CONSEQUENCE,
+        render=_money, consequence=_MONEY_CONSEQUENCE,
     ),
     NotionProp(
         "SDE / Cash Flow", "number", False, {"number": {"format": "dollar"}}, source="cashflow",
-        render=lambda v: {"number": v} if v is not None else None,
-        consequence=_MONEY_CONSEQUENCE,
+        render=_money, consequence=_MONEY_CONSEQUENCE,
     ),
     NotionProp(
         "EBITDA", "number", False, {"number": {"format": "dollar"}}, source="ebitda",
-        render=lambda v: {"number": v} if v is not None else None,
-        consequence=_MONEY_CONSEQUENCE,
+        render=_money, consequence=_MONEY_CONSEQUENCE,
     ),
     NotionProp(
         "Status", "select", False,

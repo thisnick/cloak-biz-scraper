@@ -10,10 +10,17 @@ class Listing(BaseModel):
     Every source adapter emits this same shape, so the stores never learn which
     site a row came from and the scrape adapters never learn where it lands.
 
-    The money fields are numbers or nothing: a value we could not parse exactly
-    is left None rather than guessed at, because the whole reason they are
-    numeric is to make "$1–7M with SDE over $500k" a filter you can trust. The
-    verbatim text survives in `excerpt`. See stores/money.py.
+    **The money fields are verbatim strings — exactly what the card said**:
+    "$1,258,000", "Not Disclosed", "$81,000 + Inventory". A scraper reports what
+    it saw and never discards information, because the moment it parses it has
+    thrown away the difference between "$81,000" and "$81,000 + Inventory" for
+    everyone downstream, including the agent reading this over MCP.
+
+    **Parsing to a number is the STORE's job**, not this model's, because
+    "number" is a property of the Notion column rather than of the listing:
+    NotionStore parses when writing to a Number column and leaves the cell empty
+    when it cannot be sure. See stores/money.py for why an empty cell beats a
+    confident wrong one, and stores/notion.py for where it happens.
     """
 
     listing_id: str = ""
@@ -21,10 +28,10 @@ class Listing(BaseModel):
     normalized_url: str = ""
     title: str = ""
     location: str = ""
-    asking_price: float | None = None
-    revenue: float | None = None
-    cashflow: float | None = None
-    ebitda: float | None = None
+    asking_price: str = ""
+    revenue: str = ""
+    cashflow: str = ""
+    ebitda: str = ""
     excerpt: str = ""
     source: str = ""
 
