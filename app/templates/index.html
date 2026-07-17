@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}Settings — cloak-biz-scraper{% endblock %}
+{% block title %}Settings — Cloak Biz Scraper{% endblock %}
 
 {% macro banner(name) %}
   {% if result and result.section == name %}
@@ -39,7 +39,7 @@
 {% block body %}
 <header>
   <div>
-    <h1>cloak-biz-scraper</h1>
+    <h1>Cloak Biz Scraper</h1>
     <p class="sub">Everything this server needs, configured here. Nothing to install.</p>
   </div>
   <form method="post" action="/logout"><button type="submit">Sign out</button></form>
@@ -287,33 +287,6 @@
       ({{ s.task_budget }} right now).
     </p>
     <div class="actions"><button class="primary" type="submit">Save</button></div>
-  </form>
-</section>
-
-{# ── Security ─────────────────────────────────────────────────────────────── #}
-<section>
-  <h2>Deployment secret</h2>
-  <p class="hint">
-    The secret you signed in with. Changing it here takes effect immediately and is
-    remembered on this server's disk — it stays in force even if the
-    <code>APP_SECRET</code> variable in Railway still says something else.
-  </p>
-  {{ banner('secret') }}
-  <form method="post" action="/settings/secret">
-    <label for="cs">Current secret</label>
-    <input type="password" id="cs" name="current_secret" autocomplete="off" required>
-    <label for="ns">New secret</label>
-    <input type="password" id="ns" name="new_secret" autocomplete="off" required>
-    <p class="hint">
-      At least 16 characters — this is the only thing standing between the internet
-      and your browsers, proxy, and Notion token. Signs out every other session.
-      <br>
-      <strong>Forgotten it?</strong> In Railway, set <code>APP_SECRET</code> to a new
-      value <em>and</em> add <code>APP_SECRET_RESET=true</code>, then redeploy. The
-      next start adopts the new value. Your settings survive — they aren't encrypted
-      with this secret.
-    </p>
-    <div class="actions"><button class="primary" type="submit">Rotate secret</button></div>
   </form>
 </section>
 

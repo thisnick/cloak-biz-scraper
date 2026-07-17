@@ -163,7 +163,6 @@ class TestWriteRoutesRequireAuth:
             "/settings/notion/select",
             "/settings/notion/verify",
             "/settings/notion/create",
-            "/settings/secret",
         ],
     )
     def test_signed_out_post_is_refused(self, client, path):
@@ -625,56 +624,13 @@ class TestNotionUi:
         assert "rejected the API token" in response.text
 
 
-class TestSecretRotation:
-    NEW = "a-brand-new-secret-000001"
-
-    def test_rotate_then_the_old_secret_stops_working(self, auth, client):
-        response = auth.post(
-            "/settings/secret", data={"current_secret": SECRET, "new_secret": self.NEW}
-        )
-        assert response.status_code == 200
-        assert app.state.secret.verify(self.NEW)
-        assert not app.state.secret.verify(SECRET)
-
-    def test_rotating_keeps_the_rotating_user_signed_in(self, auth):
-        auth.post("/settings/secret", data={"current_secret": SECRET, "new_secret": self.NEW})
-        # The cookie was signed with the old secret; without a re-issue the user
-        # would be thrown out of the page they are looking at.
-        assert auth.get("/", follow_redirects=False).status_code == 200
-
-    def test_rotating_signs_out_every_other_session(self, auth, tmp_path):
-        other = TestClient(app, base_url="https://testserver")
-        other.cookies.set(sessions.COOKIE_NAME, sessions.issue(SECRET))
-        assert other.get("/", follow_redirects=False).status_code == 200
-
-        auth.post("/settings/secret", data={"current_secret": SECRET, "new_secret": self.NEW})
-        assert other.get("/", follow_redirects=False).status_code == 303
-
-    def test_wrong_current_secret_refuses(self, auth):
-        response = auth.post(
-            "/settings/secret", data={"current_secret": "wrong", "new_secret": self.NEW}
-        )
-        assert response.status_code == 401
-        assert app.state.secret.verify(SECRET), "a refused rotation must change nothing"
-
-    def test_short_new_secret_refused(self, auth):
-        response = auth.post("/settings/secret", data={"current_secret": SECRET, "new_secret": "abc"})
-        assert response.status_code == 400
-        assert "at least 16 characters" in response.text
-        assert app.state.secret.verify(SECRET)
-
-    def test_rotating_does_not_strand_the_settings(self, auth, tmp_path):
-        """The property that makes rotation safe to offer at all."""
-        auth.post("/settings/proxy", data={"proxy_user": "keepme", "proxy_password": "pw",
-                                           "proxy_host": "h", "proxy_port": "1000"})
-        auth.post("/settings/secret", data={"current_secret": SECRET, "new_secret": self.NEW})
-
-        reopened = SettingsService(tmp_path / "settings.json", tmp_path / ".dek").load()
-        assert reopened.proxy_user == "keepme"
-
-    def test_the_recovery_path_is_documented_on_the_page(self, auth):
-        page = auth.get("/").text
-        assert "APP_SECRET_RESET" in page, "a forgotten secret must not be a dead end"
+# In-app secret rotation was removed from the settings UI (its "volume vs Railway,
+# which wins" explanation was more than this audience should have to read). The
+# backend mechanism it drove is unchanged and still covered by test_secret.py:
+# secret_service.rotate(), the volume-authoritative secret, and APP_SECRET_RESET
+# recovery. The forgotten-secret path is documented in the README, where a
+# locked-out user can actually reach it — the old on-page note sat behind the very
+# login it was meant to rescue.
 
 
 class TestRunEvidenceIsReachableButNotPublic:

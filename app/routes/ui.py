@@ -27,7 +27,6 @@ from fastapi.templating import Jinja2Templates
 from ..config import CONFIG
 from ..services import sessions
 from ..services.ratelimit import client_key
-from ..services.secret import WeakSecret
 from ..services.settings import Settings
 
 logger = logging.getLogger("cloakbiz.ui")
@@ -622,44 +621,10 @@ async def create_database(
     return _render(request, Result("notion", report.complete, message, report))
 
 
-# ── security ────────────────────────────────────────────────────────────────
-
-
-@router.post("/settings/secret", response_class=HTMLResponse)
-async def rotate_secret(
-    request: Request, current_secret: str = Form(""), new_secret: str = Form("")
-) -> Response:
-    """Rotate APP_SECRET.
-
-    Requires the current secret as well as the new one. The session already
-    proves someone knew it, but a session is a cookie and this is the one
-    credential that protects everything else — re-proving it costs a paste and
-    removes a hijacked-cookie lockout from the table.
-    """
-    _require(request)
-    secret_service = request.app.state.secret
-
-    if not secret_service.verify(current_secret):
-        return _render(
-            request, Result("secret", False, "The current secret is wrong."), status=401
-        )
-    try:
-        rotated = secret_service.rotate(new_secret)
-    except WeakSecret as exc:
-        return _render(request, Result("secret", False, str(exc)), status=400)
-
-    # Every cookie signed with the old secret is now void, including this one.
-    # Re-issue immediately so rotating does not log the user out of the page
-    # they are looking at.
-    response = _render(
-        request,
-        Result(
-            "secret",
-            True,
-            "Secret rotated. Every other session is now signed out. Update APP_SECRET in "
-            "Railway's Variables tab too, so a future redeploy does not confuse you — "
-            "though the stored secret stays authoritative either way.",
-        ),
-    )
-    _set_session(response, sessions.issue(rotated))
-    return response
+# In-app APP_SECRET rotation used to live here. It was removed from the UI (the
+# "which secret wins, the volume's or Railway's" explanation was more than a
+# non-technical user should have to parse) but the mechanism it drove is intact:
+# the volume-stored secret stays authoritative, and a forgotten secret is
+# recovered with APP_SECRET_RESET on the backend — see services/secret.py and
+# the README's troubleshooting section. secret_service.rotate() remains for that
+# path; it simply has no web form anymore.
