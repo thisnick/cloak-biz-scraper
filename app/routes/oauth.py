@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
@@ -210,14 +211,37 @@ async def token(request: Request) -> Response:
 # ── the login step (proving APP_SECRET) ─────────────────────────────────────
 
 
-def _login_page(request: Request, blob: str, error: str | None = None,
-                status: int = 200) -> Response:
+def _login_page(request: Request, blob: str, pending: dict | None = None,
+                error: str | None = None, status: int = 200) -> Response:
+    """The consent page. It must say who is asking and where the code goes.
+
+    This is the one place a person types APP_SECRET in response to a link, which
+    makes it the phishing surface every OAuth AS has: send the owner
+    `/authorize/login?p=<your own blob>`, and a "authorize this client?" page
+    they trust asks for the secret — and grants *your* client. Nothing on the
+    server can distinguish that request from a real one, because it *is* a real
+    one; the client genuinely registered and genuinely asked.
+
+    So the defence is the reader, and the reader needs facts rather than a
+    warning. The redirect target is the useful one: a client name is whatever the
+    attacker typed at registration, but the redirect host is where the
+    authorization code physically goes, and "this is about to send access to
+    somewhere I have never heard of" is a thing a careful person can act on.
+    Both are shown, and the name is presented as a claim, not as identification.
+    """
+    client_name = redirect_host = None
+    if pending:
+        client = request.app.state.oauth._store.get_client(pending.get("cid", ""))
+        client_name = getattr(client, "client_name", None)
+        redirect_host = urlparse(pending.get("ru") or "").netloc or None
     return templates.TemplateResponse(
         request,
         "authorize.html",
         {
             "p": blob,
             "error": error,
+            "client_name": client_name,
+            "redirect_host": redirect_host,
             "unconfigured": request.app.state.secret.current() is None,
         },
         status_code=status,
@@ -227,10 +251,10 @@ def _login_page(request: Request, blob: str, error: str | None = None,
 @router.get("/authorize/login", response_class=HTMLResponse)
 async def authorize_login_form(request: Request, p: str = "") -> Response:
     try:
-        _provider(request).read_pending(p)
+        pending = _provider(request).read_pending(p)
     except PendingInvalid as exc:
         return _expired(request, exc)
-    return _login_page(request, p)
+    return _login_page(request, p, pending)
 
 
 @router.post("/authorize/login", response_class=HTMLResponse)
@@ -252,15 +276,15 @@ async def authorize_login(request: Request, p: str = Form(""), secret: str = For
     wait = limiter.retry_after(key)
     if wait:
         logger.warning("throttled /authorize login from %s for %.1fs", key, wait)
-        return _throttled(request, p, wait)
+        return _throttled(request, p, wait, pending)
 
     secret_service = request.app.state.secret
     if secret_service.current() is None:
-        return _login_page(request, p, status=503)
+        return _login_page(request, p, pending, status=503)
     if not secret_service.verify(secret):
         limiter.fail(key)
         logger.warning("failed /authorize login from %s", key)
-        return _login_page(request, p, "That is not the right secret.", status=401)
+        return _login_page(request, p, pending, "That is not the right secret.", status=401)
 
     limiter.reset(key)
     destination = provider.complete(pending)
@@ -277,9 +301,9 @@ def _expired(request: Request, exc: PendingInvalid) -> Response:
     )
 
 
-def _throttled(request: Request, blob: str, wait: float) -> Response:
+def _throttled(request: Request, blob: str, wait: float, pending: dict | None = None) -> Response:
     response = _login_page(
-        request, blob,
+        request, blob, pending,
         f"Too many wrong attempts. Wait {int(wait) + 1} seconds and try again.",
         status=429,
     )

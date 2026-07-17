@@ -70,6 +70,13 @@
   .pill.set { background: var(--ok-bg); color: var(--ok); }
   .pill.unset { background: var(--bad-bg); color: var(--bad); }
   .pill.warn { background: var(--warn-bg); color: var(--warn); }
+  /* What a client is claiming about itself, on the consent page. Deliberately
+     plain: this is evidence for the reader to weigh, not a status to celebrate. */
+  .facts { margin: 0 0 16px; font-size: 14px; }
+  .facts dt { color: var(--muted); font-size: 12px; text-transform: uppercase;
+              letter-spacing: .04em; margin-top: 10px; }
+  .facts dd { margin: 2px 0 0; }
+  .facts .hint { display: inline; }
   hr { border: 0; border-top: 1px solid var(--line); margin: 20px 0; }
   a { color: var(--accent); }
   .foot { color: var(--muted); font-size: 12px; text-align: center; margin-top: 28px; }

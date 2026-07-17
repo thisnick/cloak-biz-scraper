@@ -282,7 +282,38 @@ class TestTheHappyPath:
         ).status_code == 200
 
 
-class TestLoginIsWhatAuthorizes:
+class TestTheConsentPageSaysWhoIsAsking:
+    """Anyone can send the owner a link to this page — that is inherent to OAuth,
+    and no check on the server can tell a phished authorize request from a real
+    one, because it *is* a real one. The defence is what the page tells the
+    reader, so it has to tell them something they can act on.
+    """
+
+    def consent_page(self, client, **overrides):
+        info = register(client, **overrides)
+        r = authorize(client, info, pkce()[1])
+        blob = parse_qs(urlparse(r.headers["location"]).query)["p"][0]
+        return client.get(f"/authorize/login?p={blob}").text
+
+    def test_it_names_the_client(self, client):
+        assert "Test Client" in self.consent_page(client)
+
+    def test_it_shows_where_the_code_would_go(self, client):
+        """The fact worth checking. A name is whatever the attacker typed; the
+        redirect host is where the authorization code physically goes."""
+        assert "client.example" in self.consent_page(client)
+
+    def test_it_does_not_present_the_name_as_proof(self, client):
+        page = self.consent_page(client, client_name="Anthropic Official")
+        assert "Anthropic Official" in page
+        assert "anyone can claim any name" in page, (
+            "a self-declared name shown without caveat is an identity claim we cannot back"
+        )
+
+    def test_it_says_what_approving_costs(self, client):
+        page = self.consent_page(client)
+        assert "full use of this server" in page
+        assert "close this page" in page.lower()
     def test_the_wrong_secret_yields_no_code(self, client):
         _, challenge = pkce()
         info = register(client)

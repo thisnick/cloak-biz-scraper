@@ -30,6 +30,24 @@
       your proxy quota. Only continue if you started this yourself, just now.
     </div>
 
+    {# The facts a person can actually check. The name is whatever the client
+       typed when it registered, so it is shown as a claim and never as proof of
+       identity; the redirect host is where the authorization code physically
+       goes, which is the part worth looking at. Anyone can send you a link to
+       this page — what they cannot do is make the destination look like
+       somewhere you know. #}
+    <dl class="facts">
+      <dt>Calls itself</dt>
+      <dd>{{ client_name or "(it did not give a name)" }}
+        <span class="hint">— a name it chose; anyone can claim any name</span></dd>
+      <dt>Sends access to</dt>
+      <dd><code>{{ redirect_host or "(unknown)" }}</code></dd>
+    </dl>
+    <p class="hint">
+      If you did not just start this from that app, <strong>close this page</strong> —
+      approving it would hand your browser and your Notion to whoever did.
+    </p>
+
     <form method="post" action="/authorize/login">
       {# The signed request this login is for. It carries where the code gets
          delivered, so it is re-verified server-side on POST rather than trusted
