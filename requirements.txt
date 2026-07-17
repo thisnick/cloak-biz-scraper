@@ -23,6 +23,9 @@ starlette==0.41.3
 sse-starlette==2.1.3
 # Notion API + measuring the proxy's exit IP.
 httpx==0.28.1
+# The CDP proxy's upstream leg: uvicorn[standard] speaks WebSocket to the
+# client, but nothing in the stack dials one OUT to the browser.
+websockets==14.1
 # [geoip] pulls geoip2 — without it, geoip=True raises at launch and the browser's
 # timezone would contradict its exit IP.
 cloakbrowser[geoip]==0.4.8

@@ -18,7 +18,7 @@ from starlette.routing import Route
 
 from . import __version__, mcp_server
 from .config import CONFIG, bootstrap_binary_cache, purge_binary_env
-from .routes import api, health, ui
+from .routes import api, cdp, health, ui
 from .routes.mcp import MCPEndpoint
 from .services import heartbeat
 from .services.archive import ArchiveService
@@ -126,6 +126,7 @@ async def _login_redirect(request: Request, exc: ui.NotAuthenticated) -> Redirec
 
 app.include_router(health.router)
 app.include_router(api.router)
+app.include_router(cdp.router)
 app.include_router(ui.router)
 
 # A Route, deliberately, not a Mount. `Mount("/mcp")` compiles to the regex
