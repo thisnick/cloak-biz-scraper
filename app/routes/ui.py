@@ -20,10 +20,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Form, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi import APIRouter, Form, HTTPException, Request
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
+from ..config import CONFIG
 from ..services import sessions
 from ..services.ratelimit import client_key
 from ..services.secret import WeakSecret
@@ -226,6 +227,87 @@ async def logout() -> Response:
 async def index(request: Request) -> Response:
     _require(request)
     return _render(request)
+
+
+# ── Runs: the evidence a sweep already captured, finally reachable ───────────
+#
+# Ported from browserd, which serves the same three shapes — and with the one
+# change that matters. browserd has no auth at all, which was fine: it is a
+# private sidecar on Nick's own machine. This is a public URL, and these files
+# are screenshots of pages fetched through the user's residential proxy. Copying
+# the routes as they stand would publish them.
+#
+# So the gate is the session cookie, the same one the settings pages use. On a
+# single-user server that also settles the "guessable id" question properly: a
+# job id is short hex and should be assumed guessable, and it does not matter,
+# because holding the session *is* being the owner. Nothing rests on an id being
+# hard to find.
+
+
+def _evidence_root(job_id: str) -> Path:
+    return (CONFIG.evidence_dir / job_id).resolve()
+
+
+@router.get("/runs")
+async def list_runs(request: Request, limit: int = 100) -> list[dict[str, Any]]:
+    _require(request)
+    jobs = request.app.state.jobs.all()
+    jobs.sort(key=lambda j: j.created_at, reverse=True)
+    return [
+        {
+            "job_id": j.id, "status": j.status, "source": j.source,
+            "created_at": j.created_at, "pages_crawled": j.pages_crawled,
+            "listings": len(j.listings), "error": j.error,
+            "evidence": _evidence_root(j.id).is_dir(),
+        }
+        for j in jobs[:limit]
+    ]
+
+
+@router.get("/runs/{job_id}")
+async def get_run(request: Request, job_id: str) -> dict[str, Any]:
+    _require(request)
+    # get() validates the id's shape and returns None for anything that isn't
+    # one, so a job_id of "../settings" never reaches the filesystem here.
+    job = request.app.state.jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="no such run")
+    root = _evidence_root(job_id)
+    files = sorted(str(p.relative_to(root)) for p in root.rglob("*") if p.is_file()) \
+        if root.is_dir() else []
+    return {
+        "job_id": job.id, "status": job.status, "source": job.source,
+        "url": job.url, "pages_crawled": job.pages_crawled, "error": job.error,
+        "listings": len(job.listings), "evidence": files,
+    }
+
+
+@router.get("/runs/{job_id}/evidence/{name:path}")
+async def get_evidence(request: Request, job_id: str, name: str) -> Response:
+    """Serve one captured file.
+
+    `{name:path}` accepts slashes, so this is the classic traversal hole, and it
+    is a real one rather than a theoretical one: /data holds `settings.json` and
+    the `.dek` that decrypts it, two directories up from here. Serving
+    `../../.dek` would hand over the licence, proxy and Notion credentials
+    together.
+
+    browserd sidesteps it by accident — it rglobs the last path segment, so the
+    `..` is discarded before it means anything. That works and is impossible to
+    read as deliberate. This resolves the path and requires the result to still
+    be inside the run's own directory, which also covers a symlink pointing out
+    (resolve() follows it, so it lands outside and is refused).
+    """
+    _require(request)
+    if request.app.state.jobs.get(job_id) is None:
+        raise HTTPException(status_code=404, detail="no such run")
+    root = _evidence_root(job_id)
+    target = (root / name).resolve()
+    if not target.is_relative_to(root) or not target.is_file():
+        # One 404 for "escaped", "absent" and "not a file" alike: which of those
+        # it was is not the caller's business.
+        raise HTTPException(status_code=404, detail="no such evidence")
+    return FileResponse(target)
 
 
 @router.post("/settings/cloakbrowser", response_class=HTMLResponse)

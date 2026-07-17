@@ -14,6 +14,7 @@ import pytest
 import respx
 from fastapi.testclient import TestClient
 
+from app.config import CONFIG
 from app.main import app
 from app.services import sessions
 from app.services.secret import SecretService
@@ -639,3 +640,110 @@ class TestSecretRotation:
     def test_the_recovery_path_is_documented_on_the_page(self, auth):
         page = auth.get("/").text
         assert "APP_SECRET_RESET" in page, "a forgotten secret must not be a dead end"
+
+
+class TestRunEvidenceIsReachableButNotPublic:
+    """The evidence a sweep captures, and who may read it.
+
+    Ported from browserd, which serves the same three routes with no auth at
+    all. That was fine there — a private sidecar on one machine. Here the same
+    files are screenshots of pages fetched through the user's residential proxy,
+    on a public URL, so the port is the cookie gate.
+    """
+
+    def _job(self, auth, **fields):
+        job = app.state.jobs.create(url="https://example.com/search", source="bizbuysell_serp", **fields)
+        root = CONFIG.evidence_dir / job.id
+        (root / "page-01-blocked").mkdir(parents=True, exist_ok=True)
+        (root / "page-01-blocked" / "shot.png").write_bytes(b"\x89PNG-pretend")
+        return job
+
+    def test_a_signed_out_client_gets_nothing(self, client):
+        """The whole finding, if it fails: a 200 without a session."""
+        job = self._job(client)
+        for path in (
+            "/runs",
+            f"/runs/{job.id}",
+            f"/runs/{job.id}/evidence/page-01-blocked/shot.png",
+        ):
+            r = client.get(path, follow_redirects=False)
+            assert r.status_code != 200, f"{path} served a logged-out caller"
+            assert b"PNG-pretend" not in r.content
+
+    def test_a_signed_in_owner_can_read_the_screenshot(self, auth):
+        """And the point of the port: the picture of the blocked page."""
+        job = self._job(auth)
+        r = auth.get(f"/runs/{job.id}/evidence/page-01-blocked/shot.png")
+        assert r.status_code == 200
+        assert r.content == b"\x89PNG-pretend"
+
+    def test_a_run_lists_what_it_captured(self, auth):
+        job = self._job(auth)
+        r = auth.get(f"/runs/{job.id}")
+        assert r.status_code == 200
+        assert "page-01-blocked/shot.png" in r.json()["evidence"]
+
+    def test_a_guessed_id_buys_nothing_without_a_session(self, client, auth):
+        """Guessability must not be load-bearing.
+
+        A job id is short hex; assume it is guessable. The defence is the
+        session, not the id — so knowing a real id gets a signed-out caller
+        exactly nowhere.
+        """
+        job = self._job(auth)
+        signed_out = TestClient(app, base_url="https://testserver")
+        r = signed_out.get(f"/runs/{job.id}/evidence/page-01-blocked/shot.png",
+                           follow_redirects=False)
+        assert r.status_code != 200
+        assert b"PNG-pretend" not in r.content
+
+    def test_traversal_cannot_reach_anything_outside_the_run(self, auth):
+        """`{name:path}` takes slashes, and /data holds the keys to everything.
+
+        Two directories above a run's evidence sit `settings.json` — the
+        licence, proxy and Notion credentials — and the `.dek` that decrypts it.
+        This is the one attack that turns a diagnostic route into a credential
+        leak, so it is worth a canary rather than an assertion about 404s alone:
+        the file is planted exactly where `.dek` lives, and reading it would mean
+        reading that.
+
+        (A canary, not a real `.dek`: an earlier draft wrote the secret over the
+        actual key file and broke every later test with a DecryptError. Tests
+        that trample shared state are their own bug — see Step 3.)
+        """
+        job = self._job(auth)
+        canary = CONFIG.evidence_dir.parent / "traversal-canary.txt"
+        canary.write_text("CANARY-WHERE-THE-DEK-LIVES")
+        try:
+            for attempt in (
+                "../../traversal-canary.txt",   # the canary, where .dek sits
+                "../../.dek",
+                "../../settings.json",
+                "..%2f..%2f.dek",
+                "page-01-blocked/../../../traversal-canary.txt",
+                "/etc/passwd",
+            ):
+                r = auth.get(f"/runs/{job.id}/evidence/{attempt}")
+                assert r.status_code == 404, f"traversal reached something: {attempt}"
+                assert b"CANARY" not in r.content, f"LEAKED via {attempt}"
+        finally:
+            canary.unlink(missing_ok=True)
+
+    def test_a_symlink_out_of_the_run_is_refused(self, auth):
+        """resolve() follows links, so a link planted inside the evidence dir
+        lands outside it and fails the containment check like any other escape."""
+        job = self._job(auth)
+        canary = CONFIG.evidence_dir.parent / "traversal-canary.txt"
+        canary.write_text("CANARY-WHERE-THE-DEK-LIVES")
+        try:
+            link = CONFIG.evidence_dir / job.id / "innocent.png"
+            link.symlink_to(canary)
+            r = auth.get(f"/runs/{job.id}/evidence/innocent.png")
+            assert r.status_code == 404
+            assert b"CANARY" not in r.content
+        finally:
+            canary.unlink(missing_ok=True)
+
+    def test_an_unknown_run_is_refused_before_the_filesystem(self, auth):
+        assert auth.get("/runs/../settings").status_code == 404
+        assert auth.get("/runs/not-a-real-job-id").status_code == 404

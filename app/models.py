@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+from .config import CONFIG
+
 
 class Listing(BaseModel):
     """One business listing.
@@ -96,6 +98,12 @@ class ScrapeResult(BaseModel):
     error: str | None = None
     synced: SyncResult | None = None
     listings: list[Listing] = Field(default_factory=list)
+    # Where this sweep's screenshots and page snapshots were written. A sweep
+    # that finds nothing is the failure users hit first, and "it didn't work and
+    # you can't see why" is where they give up: the pictures of the blocked page
+    # are the answer, and until now nothing told anyone they existed.
+    # ArchiveResult has carried this since it was written; a sweep never did.
+    evidence_dir: str = ""
 
     @classmethod
     def of(cls, job: Job) -> "ScrapeResult":
@@ -108,6 +116,7 @@ class ScrapeResult(BaseModel):
             error=job.error,
             synced=job.synced,
             listings=job.listings,
+            evidence_dir=str(CONFIG.evidence_dir / job.id),
         )
 
 
