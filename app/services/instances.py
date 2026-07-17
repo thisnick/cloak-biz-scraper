@@ -110,6 +110,12 @@ class Instance:
     ttl_min: int
     created_wall: float
     created_mono: float
+    # None when this browser has no live view: the display fell back to Xvfb
+    # because Xvnc was absent. Callers omit vnc_url rather than mint one that
+    # would connect to nothing. Defaulted so that "no live view" is what an
+    # instance built without thinking about VNC gets, rather than a port that
+    # was never opened.
+    vnc_port: int | None = None
     last_used_mono: float = field(default=0.0)
 
     def touch(self) -> None:
@@ -266,7 +272,7 @@ class InstanceManager:
         display = await self.displays.allocate()
         try:
             cdp_port = self._alloc_cdp_port()
-            await self.displays.start(display, req.width, req.height)
+            vnc_port = await self.displays.start(display, req.width, req.height)
             udd = Path(profile.user_data_dir)
             for lk in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
                 (udd / lk).unlink(missing_ok=True)
@@ -300,7 +306,7 @@ class InstanceManager:
         now_wall, now_mono = time.time(), time.monotonic()
         inst = Instance(
             id=uuid.uuid4().hex[:12], profile=profile.name, origin=origin, owner=owner,
-            context=context, display=display, cdp_port=cdp_port,
+            context=context, display=display, cdp_port=cdp_port, vnc_port=vnc_port,
             proxy_ip=proxy_ip, timezone=tz, locale=locale,
             headed=req.headed, geoip=req.geoip, humanize=req.humanize,
             seed=profile.fingerprint_seed, ttl_min=req.ttl_min or _HARD_TTL_MIN,

@@ -29,7 +29,11 @@ import logging
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
+from . import __version__
 from .models import ArchiveResult, InstanceCreate, InstanceView, ScrapeResult
+from .routes.guard import subject_of
+from .services.tokens import OWNER
+from .services.urls import public_base
 from .services.views import instance_view
 
 logger = logging.getLogger("cloakbiz.mcp")
@@ -48,13 +52,32 @@ purpose: the card is quoted rather than interpreted.
 """
 
 
-def _base_url(ctx: Context) -> str:
-    """The deployment's own origin, for minting a CDP URL a client can open."""
+def _request(ctx: Context):
     try:
-        request = ctx.request_context.request
-        return str(request.base_url) if request else ""
+        return ctx.request_context.request
     except (ValueError, AttributeError):
-        return ""
+        return None
+
+
+def _base_url(ctx: Context) -> str:
+    """The deployment's own origin, for minting URLs a client can open.
+
+    public_base() rather than request.base_url: behind Railway's TLS termination
+    the request's own scheme is http, and the ws:// URL that produces is blocked
+    as mixed content by any browser on the https page. See services/urls.py.
+    """
+    request = _request(ctx)
+    return public_base(request) if request else ""
+
+
+def _subject(ctx: Context) -> str:
+    """The OAuth subject behind this tool call.
+
+    Read from the scope the guard populated, so it reflects a token that
+    actually verified rather than anything the client asserted.
+    """
+    request = _request(ctx)
+    return (subject_of(request) if request else None) or OWNER
 
 
 def build(app) -> FastMCP:
@@ -91,6 +114,15 @@ def build(app) -> FastMCP:
         # way — that part is not conditional on this setting.
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
     )
+
+    # Say who we actually are. FastMCP takes no `version`, so the lowlevel Server
+    # underneath falls back to `pkg_version("mcp")` and every client was told
+    # this server was version 1.28.1 — the SDK's version, reported as ours. A
+    # client has no way to know that is not us, so it is not cosmetic: it is a
+    # wrong answer to "what am I talking to", and it would silently track the
+    # SDK's releases forever. Set after construction because the constructor
+    # exposes no seam; it is read when a session initializes, which is later.
+    mcp._mcp_server.version = __version__
 
     @mcp.tool()
     async def scrape_listings(
@@ -152,32 +184,37 @@ def build(app) -> FastMCP:
             container's UTC, which contradicts a residential exit and is itself
             something listing sites look for.
         """
+        subject = _subject(ctx)
         inst = await app.state.instances.launch(
             InstanceCreate(profile=profile, country=country, region=region, geoip=geoip),
-            origin="interactive",
+            origin="interactive", owner=subject,
         )
-        return instance_view(inst, secret=app.state.secret.current(), base_url=_base_url(ctx))
+        return instance_view(inst, secret=app.state.secret.current(),
+                             base_url=_base_url(ctx), subject=subject)
 
     @mcp.tool()
     async def list_instances(ctx: Context) -> list[InstanceView]:
-        """Every running browser. Each carries a fresh, short-lived cdp_url."""
+        """Every running browser. Each carries a fresh, short-lived cdp_url and,
+        where the browser has a live view, a vnc_url to watch it."""
         secret = app.state.secret.current()
         base = _base_url(ctx)
+        subject = _subject(ctx)
         return [
-            instance_view(i, secret=secret, base_url=base)
+            instance_view(i, secret=secret, base_url=base, subject=subject)
             for i in app.state.instances.running.values()
         ]
 
     @mcp.tool()
     async def get_instance(ctx: Context, instance_id: str) -> InstanceView:
-        """One running browser, with a fresh, short-lived cdp_url."""
+        """One running browser, with a fresh, short-lived cdp_url and vnc_url."""
         inst = app.state.instances.get(instance_id)
         if inst is None:
             raise ValueError(
                 f"No running browser with instance_id={instance_id!r}. It may have been "
                 f"closed, or reaped after going idle."
             )
-        return instance_view(inst, secret=app.state.secret.current(), base_url=_base_url(ctx))
+        return instance_view(inst, secret=app.state.secret.current(),
+                             base_url=_base_url(ctx), subject=_subject(ctx))
 
     @mcp.tool()
     async def close_instance(instance_id: str) -> dict:

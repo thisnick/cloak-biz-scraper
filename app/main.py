@@ -11,19 +11,24 @@ import asyncio
 import contextlib
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from starlette.routing import Route
 
 from . import __version__, mcp_server
 from .config import CONFIG, bootstrap_binary_cache, purge_binary_env
-from .routes import api, cdp, health, ui
+from .routes import api, cdp, health, oauth, ui, vnc
+from .routes.guard import AuthGuard
 from .routes.mcp import MCPEndpoint
 from .services import heartbeat
 from .services.archive import ArchiveService
 from .services.instances import InstanceManager
 from .services.jobs import JobStore
+from .services.oauth import OAuthProvider, OAuthStore
+from .services.ratelimit import RateLimiter
 from .services.scrape import ScrapeService
 from .services.secret import SecretService
 from .services.settings import SettingsService
@@ -70,13 +75,23 @@ async def lifespan(app: FastAPI):
 
     app.state.settings = settings_service
     app.state.secret = secret_service
+    # The OAuth store holds registered clients and live authorization codes; the
+    # provider signs tokens with whatever the secret service currently says, so
+    # rotating APP_SECRET invalidates every outstanding token with no
+    # revocation list to maintain.
+    app.state.oauth = OAuthProvider(
+        OAuthStore(CONFIG.oauth_path, CONFIG.dek_path), secret_service
+    )
+    # Shared by both doors that take APP_SECRET (the UI login and OAuth's), so a
+    # flood cannot use one to reset the other's budget.
+    app.state.login_limiter = RateLimiter()
     app.state.jobs = jobs
     app.state.instances = InstanceManager(settings_service)
     app.state.scrape = ScrapeService(app.state.instances, jobs, settings_service)
     app.state.archive = ArchiveService(app.state.instances, settings_service)
     logger.info(
         "ready: secret=%s license=%s proxy=%s notion=%s pool max=%d reserve=%d "
-        "jobs=%d interrupted=%d",
+        "jobs=%d interrupted=%d oauth_clients=%d",
         "set" if secret else "MISSING",
         "set" if settings.cloakbrowser_license_key else "MISSING",
         "set" if settings.proxy_configured() else "MISSING",
@@ -85,6 +100,7 @@ async def lifespan(app: FastAPI):
         settings.interactive_reserve,
         len(jobs.all()),
         interrupted,
+        app.state.oauth.client_count(),
     )
 
     # Built here, not at import: the SDK's session manager is single-use, so one
@@ -125,9 +141,25 @@ async def _login_redirect(request: Request, exc: ui.NotAuthenticated) -> Redirec
 
 
 app.include_router(health.router)
+app.include_router(oauth.router)
 app.include_router(api.router)
 app.include_router(cdp.router)
+app.include_router(vnc.router)
 app.include_router(ui.router)
+
+# The noVNC viewer, if the image has it. Mounted rather than proxied because it
+# is static assets: the page is inert until it dials the socket, and the socket
+# is what carries the token and the check. Served from our own origin so the
+# viewer and the websocket share one, which is what the Origin rule expects.
+_NOVNC = Path("/usr/share/novnc")
+if _NOVNC.is_dir():
+    app.mount("/novnc", StaticFiles(directory=str(_NOVNC)), name="novnc")
+else:
+    logger.warning("noVNC is not installed; live view URLs will not be offered")
+
+# Above the router, so it sees /mcp and /api/* before any route does. This is
+# the gate: without it both surfaces answer 200 to anyone with the URL.
+app.add_middleware(AuthGuard, get_provider=lambda: getattr(app.state, "oauth", None))
 
 # A Route, deliberately, not a Mount. `Mount("/mcp")` compiles to the regex
 # ^/mcp/(?P<path>.*)$ — it never matches a bare "/mcp", so Starlette's

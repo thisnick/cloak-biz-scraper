@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 
-from app.services import sessions
+from app.services import sessions, signing, tokens
 
 SECRET = "the-signing-secret-000001"
 
@@ -32,28 +32,35 @@ def test_expiry_is_checked_against_now():
 def test_tampering_with_the_payload_breaks_the_signature():
     token = sessions.issue(SECRET)
     payload, signature = token.split(".", 1)
-    forged = sessions._b64e(b'{"aud":"ui","iat":1,"exp":99999999999}')
+    forged = signing.b64e(b'{"aud":"ui","iat":1,"exp":99999999999}')
     assert not sessions.verify(f"{forged}.{signature}", SECRET)
 
 
 def test_unsigned_token_rejected():
     # An attacker stripping the MAC must not be read as "no signature required".
-    payload = sessions._b64e(b'{"aud":"ui","iat":1,"exp":99999999999}')
+    payload = signing.b64e(b'{"aud":"ui","iat":1,"exp":99999999999}')
     assert not sessions.verify(payload, SECRET)
     assert not sessions.verify(f"{payload}.", SECRET)
 
 
-def test_wrong_audience_rejected():
-    # Step 4 mints CDP/VNC tokens off the same secret. One of those must never
-    # be accepted as a UI session — that would turn "drive this one browser for
-    # ten minutes" into full access to the settings.
-    import json
+def test_a_real_cdp_token_is_not_a_session():
+    """The confusion this must never permit, using the actual other token.
 
-    payload = sessions._b64e(
-        json.dumps({"aud": "instance:abc", "exp": int(time.time() + 600)}).encode()
-    )
-    token = f"{payload}.{sessions._sign(payload, SECRET)}"
-    assert not sessions.verify(token, SECRET)
+    Step 4 mints CDP and VNC tokens off the same APP_SECRET, so a CDP token's
+    signature verifies perfectly here — `aud` is the only thing standing between
+    "drive this one browser for ten minutes" and full access to the settings,
+    including the licence key and the Notion token. Forging a payload by hand
+    would test our idea of what a CDP token looks like; minting a real one tests
+    the thing that actually exists.
+    """
+    assert not sessions.verify(tokens.issue("abc", SECRET), SECRET)
+    assert not sessions.verify(tokens.issue("abc", SECRET, kind=tokens.VNC), SECRET)
+
+
+def test_a_session_is_not_a_cdp_token():
+    """And the same door in the other direction: the session cookie is the
+    longest-lived bearer here (a week), and it must not open a browser."""
+    assert not tokens.verify(sessions.issue(SECRET), "abc", SECRET)
 
 
 def test_garbage_rejected_without_raising():

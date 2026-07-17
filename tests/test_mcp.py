@@ -14,6 +14,8 @@ from fastapi.testclient import TestClient
 
 from app.main import app
 
+from conftest import mint_access
+
 HEADERS = {
     "Content-Type": "application/json",
     "Accept": "application/json, text/event-stream",
@@ -40,6 +42,10 @@ def client(tmp_path, monkeypatch):
     # these tests passed anyway because the client quietly followed it. A real
     # client is entitled not to. The endpoint is /mcp, so /mcp must answer.
     with TestClient(app, base_url="https://testserver", follow_redirects=False) as c:
+        # Since Step 4, /mcp is behind OAuth. These tests are about the transport
+        # contract rather than the gate, so they carry a real token and the gate
+        # gets its own file (test_guard.py).
+        c.headers["Authorization"] = f"Bearer {mint_access(app)}"
         yield c
 
 

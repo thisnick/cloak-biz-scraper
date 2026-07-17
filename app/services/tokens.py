@@ -1,4 +1,4 @@
-"""Ephemeral, instance-scoped tokens for the CDP endpoint.
+"""Ephemeral, instance-scoped tokens for the CDP and VNC endpoints.
 
 CDP is **full control** of a browser holding the user's residential proxy and
 whatever cookies it has collected. So the token that opens it is minted by the
@@ -14,70 +14,79 @@ deployment". `Authorization: Bearer` is still accepted for clients that can.
 Signed with the same APP_SECRET the UI session uses, which buys revocation for
 free: rotating the secret invalidates every outstanding token immediately.
 
-**Step 4 adds `sub`** (the OAuth subject) so a token minted for one user cannot
-be replayed by another. Until OAuth exists there are no subjects to bind to, and
-inventing a placeholder would be a check that looks like it is doing something
-and is not. What is enforced today — signature, expiry, and instance scope — is
-enforced for real.
+**CDP and VNC are separate audiences, and that is not tidiness.** Watching a
+browser and driving it are different privileges, and their tokens leak at very
+different rates: a VNC URL is designed to sit in an `iframe src` on a page, where
+it reaches the DOM, the referrer, and the history of whoever opens the
+dashboard. If both grants were spelled `instance:<id>`, that easily-leaked
+watch URL would be a perfectly valid *drive* token — a privilege escalation
+delivered by copy-paste. `cdp:<id>` and `vnc:<id>` cannot be swapped for one
+another, so a leaked viewer stays a viewer.
+
+**`sub` binds a token to the OAuth subject it was minted for**, and the CDP/VNC
+routes check it against the subject that owns the instance. Step 3 could not do
+this — no OAuth existed, so there were no subjects, and a placeholder would have
+been a check that looked like it was doing something and was not. Now the
+subject is real and arrives from the access token that asked for the URL.
+
+Be precise about what that buys *today*: this deployment has one APP_SECRET and
+therefore exactly one resource owner, so in practice every token has the same
+`sub` and the check cannot fire in production. It is enforced, tested, and real
+— a token bearing another subject is refused — but it is defence in depth
+against a future with more than one subject, not a wall standing between two
+users who exist today. Claiming otherwise would be the fiction this module's
+history has been careful to avoid.
 """
 from __future__ import annotations
 
-import base64
-import hmac
-import json
-import time
-from hashlib import sha256
+from . import signing
 
 # Ten minutes: long enough to attach a debugger and work, short enough that a
 # token found in a log later is worthless.
 TTL_SEC = 10 * 60
 
-_PREFIX = "instance:"
+# The one resource owner. See the docstring: with a single APP_SECRET there is
+# exactly one, and pretending otherwise would overstate the subject check.
+OWNER = "owner"
+
+CDP = "cdp"
+VNC = "vnc"
 
 
-def _b64e(raw: bytes) -> str:
-    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+def _audience(kind: str, instance_id: str) -> str:
+    return f"{kind}:{instance_id}"
 
 
-def _b64d(text: str) -> bytes:
-    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+def issue(instance_id: str, secret: str, *, kind: str = CDP, subject: str = OWNER,
+          ttl_sec: int = TTL_SEC, now: float | None = None) -> str:
+    """A fresh token for one instance and one grant. Minted per call — never
+    cached, never reused."""
+    return signing.issue(
+        {"aud": _audience(kind, instance_id), "sub": subject},
+        secret,
+        ttl_sec=ttl_sec,
+        now=now,
+    )
 
 
-def _sign(payload: str, secret: str) -> str:
-    return _b64e(hmac.new(secret.encode(), payload.encode(), sha256).digest())
-
-
-def issue(instance_id: str, secret: str, *, ttl_sec: int = TTL_SEC,
-          now: float | None = None) -> str:
-    """A fresh token for one instance. Minted per call — never cached, never reused."""
-    now = time.time() if now is None else now
-    claims = {"aud": f"{_PREFIX}{instance_id}", "iat": int(now), "exp": int(now + ttl_sec)}
-    payload = _b64e(json.dumps(claims, separators=(",", ":")).encode())
-    return f"{payload}.{_sign(payload, secret)}"
-
-
-def verify(token: str | None, instance_id: str, secret: str | None,
-           *, now: float | None = None) -> bool:
-    """True only for a live token minted for *this* instance.
+def verify(token: str | None, instance_id: str, secret: str | None, *, kind: str = CDP,
+           subject: str | None = OWNER, now: float | None = None) -> bool:
+    """True only for a live token minted for *this* instance, grant, and subject.
 
     The audience check is what stops a token for a browser the caller is allowed
-    to drive from opening one they are not.
+    to drive from opening one they are not — and what stops a viewer's token
+    from driving anything at all.
+
+    `subject=None` means "any subject", which exists for the instance whose
+    owner was never recorded (one launched before this field existed, or by an
+    internal caller with no OAuth context). It is a deliberate hole and the
+    callers that pass it say why.
     """
-    if not token or not secret or not instance_id:
+    if not instance_id:
         return False
-    try:
-        payload, signature = token.split(".", 1)
-    except ValueError:
+    claims = signing.verify(token, secret, audience=_audience(kind, instance_id), now=now)
+    if claims is None:
         return False
-    # Verify before parsing: until the MAC agrees, the payload is attacker-chosen
-    # input and json.loads on it is a wider surface than a constant-time compare.
-    if not hmac.compare_digest(_sign(payload, secret), signature):
+    if subject is not None and claims.get("sub") != subject:
         return False
-    try:
-        claims = json.loads(_b64d(payload))
-    except (ValueError, json.JSONDecodeError):
-        return False
-    if claims.get("aud") != f"{_PREFIX}{instance_id}":
-        return False
-    now = time.time() if now is None else now
-    return isinstance(claims.get("exp"), int) and claims["exp"] > now
+    return True

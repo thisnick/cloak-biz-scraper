@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block title %}Authorize a client — cloak-biz-scraper{% endblock %}
+{% block body %}
+<h1>Authorize this client</h1>
+<p class="sub">An app wants to drive your scraper. Sign in with the deployment secret to allow it.</p>
+
+<section>
+  {% if dead %}
+    {# The signed request is gone or was never valid. There is nothing to grant,
+       so no form: a password box that cannot lead anywhere would just collect a
+       secret for nothing. #}
+    <div class="banner bad">{{ error }}</div>
+    <p class="hint" style="margin-bottom:0">
+      Nothing has been authorized. Go back to your MCP client (ChatGPT, Claude, or
+      whatever you are connecting) and start the connection again.
+    </p>
+  {% elif unconfigured %}
+    <div class="banner bad">
+      <strong>This deployment has no secret set.</strong>
+      Nothing can be authorized until it does. In Railway, open this service's
+      <em>Variables</em> tab, add <code>APP_SECRET</code> with a long random value,
+      and let it redeploy.
+    </div>
+  {% else %}
+    {% if error %}<div class="banner bad">{{ error }}</div>{% endif %}
+
+    <div class="banner warn">
+      Approving this gives the client <strong>full use of this server</strong>: it can
+      launch browsers through your proxy, read and write your Notion database, and spend
+      your proxy quota. Only continue if you started this yourself, just now.
+    </div>
+
+    <form method="post" action="/authorize/login">
+      {# The signed request this login is for. It carries where the code gets
+         delivered, so it is re-verified server-side on POST rather than trusted
+         from this field. #}
+      <input type="hidden" name="p" value="{{ p }}">
+      <label for="secret">APP_SECRET</label>
+      <input type="password" id="secret" name="secret" autocomplete="current-password"
+             autofocus required>
+      <p class="hint">
+        The same secret you sign in to this server's settings with — copy it from your
+        Railway service's <em>Variables</em> tab. If you changed it here after deploying,
+        use the changed one.
+      </p>
+      <div class="actions">
+        <button class="primary" type="submit">Allow this client</button>
+      </div>
+    </form>
+  {% endif %}
+</section>
+{% endblock %}

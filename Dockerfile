@@ -15,7 +15,9 @@
 FROM python:3.12-slim-bookworm
 
 # Chromium runtime libraries, fontconfig, and Xvfb (headed Chromium needs a
-# display; headless is a fingerprint). Xvfb is where KasmVNC drops in later.
+# display; headless is a fingerprint). Xvfb stays as the fallback for when Xvnc
+# is unavailable — the pool still runs, just without live view.
+# novnc is the viewer page served at /novnc; it is static assets, no build step.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
     libdbus-1-3 libdrm2 libxkbcommon0 libatspi2.0-0 libxcomposite1 \
@@ -25,7 +27,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libglib2.0-0 libgtk-3-0 libpangocairo-1.0-0 libcairo-gobject2 \
     libgdk-pixbuf-2.0-0 libxss1 libxtst6 \
     libgl1-mesa-dri libegl-mesa0 \
-    xvfb fontconfig procps ca-certificates \
+    xvfb fontconfig procps ca-certificates wget novnc \
+    && rm -rf /var/lib/apt/lists/*
+
+# KasmVNC — Xvnc: an X server that also serves its framebuffer over a websocket,
+# which is what makes live inspection possible. A drop-in for Xvfb; the browser
+# cannot tell the difference.
+#
+# TARGETARCH is required here and only here. Everything else in this image is
+# apt or npm and resolves per-architecture on its own; this is a *direct binary
+# download*, so it is the one thing that must name an architecture. Railway
+# builds amd64, a Mac builds arm64, and each has to fetch its own — hardcoding
+# either would produce an image that cannot run on the other.
+ARG TARGETARCH
+RUN wget -q "https://github.com/kasmtech/KasmVNC/releases/download/v1.3.3/kasmvncserver_bookworm_1.3.3_${TARGETARCH}.deb" \
+    && apt-get update \
+    && apt-get install -y -f --no-install-recommends "./kasmvncserver_bookworm_1.3.3_${TARGETARCH}.deb" \
+    && rm "kasmvncserver_bookworm_1.3.3_${TARGETARCH}.deb" \
     && rm -rf /var/lib/apt/lists/*
 
 # Node, for exactly one job: markdown -> Notion blocks via martian. Notion's
@@ -60,4 +78,13 @@ EXPOSE 8000
 VOLUME /data
 
 # Railway injects PORT; honour it without needing a rebuild.
-CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+#
+# --forwarded-allow-ips=*: Railway terminates TLS at its edge and speaks plain
+# HTTP to this container, so without trusting its X-Forwarded-* headers uvicorn
+# reports every request as http and every caller as the edge's address. That
+# breaks two things that are invisible locally — the OAuth issuer would advertise
+# http:// (which RFC 8414 clients refuse) and the login rate limiter would put
+# every user in one bucket. `*` is the right value *here* because nothing can
+# reach this container except through that edge; it would be wrong on a host
+# where the port is exposed directly.
+CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --forwarded-allow-ips='*'"]

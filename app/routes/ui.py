@@ -25,6 +25,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
 from ..services import sessions
+from ..services.ratelimit import client_key
 from ..services.secret import WeakSecret
 from ..services.settings import Settings
 
@@ -159,8 +160,32 @@ async def login(request: Request, secret: str = Form("")) -> Response:
         return templates.TemplateResponse(
             request, "login.html", _login_context(request), status_code=503
         )
+
+    # Throttled before the secret is even looked at. MIN_SECRET_LENGTH allows a
+    # 16-character memorable secret, and this box is on the public internet
+    # guarding the browser, the proxy, and the Notion workspace — Step 3 measured
+    # 30 wrong guesses in 0.0s with nothing in the way. See services/ratelimit.py
+    # for what this does and does not buy.
+    limiter = request.app.state.login_limiter
+    key = client_key(request)
+    wait = limiter.retry_after(key)
+    if wait:
+        logger.warning("throttled login from %s for %.1fs", key, wait)
+        response = templates.TemplateResponse(
+            request,
+            "login.html",
+            _login_context(
+                request,
+                f"Too many wrong attempts. Wait {int(wait) + 1} seconds and try again.",
+            ),
+            status_code=429,
+        )
+        response.headers["Retry-After"] = str(int(wait) + 1)
+        return response
+
     if not secret_service.verify(secret):
-        logger.warning("failed login attempt from %s", request.client.host if request.client else "?")
+        limiter.fail(key)
+        logger.warning("failed login attempt from %s", key)
         return templates.TemplateResponse(
             request,
             "login.html",
@@ -168,6 +193,7 @@ async def login(request: Request, secret: str = Form("")) -> Response:
             status_code=401,
         )
 
+    limiter.reset(key)
     response = RedirectResponse("/", status_code=303)
     _set_session(response, sessions.issue(secret_service.current()))
     return response

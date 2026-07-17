@@ -51,14 +51,58 @@ def _host_of(origin: str) -> str:
     return origin.split("://", 1)[-1].rstrip("/").lower()
 
 
+def _is_loopback(host: str) -> bool:
+    """Whether a host[:port] names this machine.
+
+    Textual on purpose: no DNS lookup. Resolving the name here would *be* the
+    rebinding vulnerability — the attacker owns the record and would simply
+    answer 127.0.0.1.
+    """
+    name = host.rsplit(":", 1)[0].strip("[]").lower() if host else ""
+    return name in ("127.0.0.1", "localhost", "::1") or name.startswith("127.")
+
+
 def origin_allowed(headers: Headers) -> bool:
+    """Whether a request may proceed, on Origin grounds alone.
+
+    Two rules, and the second is the Step 3 review's recommendation:
+
+    1. `Origin` must name the same host it was sent to. A request with no
+       `Origin` is allowed: that is every server-side MCP client, including
+       ChatGPT and Claude, and it is not the attack — a browser always sends
+       `Origin` cross-origin.
+    2. **If the `Host` is loopback, the `Origin` must be loopback too**, and this
+       one outranks the operator's own allowlist. On a laptop or a LAN box,
+       `MCP_ALLOWED_ORIGINS` is the foot-gun: point it at a site you trust and
+       that site — or anything that can inject a script into it — can now reach
+       a server bound to your localhost, which is the one place a browser was
+       never supposed to be able to go. A remote deployment is unaffected,
+       because its Host is a real domain.
+
+    **What this still does not stop, stated plainly:** DNS rebinding, where the
+    attacker points `evil.example` at 127.0.0.1 so that `Origin` and `Host` are
+    *both* `evil.example` and agree. Nothing checkable here can tell that from a
+    legitimate Railway request, because we are not allowed to know our own
+    domain (Railway assigns it; the user sets one variable). A static allowlist
+    is what would catch it, and it is exactly what FastMCP's `allowed_hosts`
+    tried to be — and why it 421'd every real request in Step 3.
+
+    **The reason that residue is acceptable is the gate this step adds.** Since
+    Step 4, `/mcp` requires a bearer token. A rebound page passes the Origin
+    check and then gets a 401, because the token lives in the client's storage
+    on a different origin and the same-origin policy will not hand it over. The
+    Origin rule is defence in depth on top of that; it is not what is holding
+    the door.
+    """
     origin = headers.get("origin")
     if not origin:
         return True  # not a browser; not the attack this defends against
     origin = origin.strip().rstrip("/")
+    host = (headers.get("host") or "").strip().lower()
+    if _is_loopback(host) and not _is_loopback(_host_of(origin)):
+        return False
     if origin.lower() in (o.lower() for o in _EXTRA_ORIGINS):
         return True
-    host = (headers.get("host") or "").strip().lower()
     return bool(host) and _host_of(origin) == host
 
 

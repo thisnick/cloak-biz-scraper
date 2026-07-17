@@ -11,8 +11,11 @@ same `ScrapeResult.of` / `instance_view` the tools use, which is what makes
 "MCP and REST return identical payloads" a property of the code rather than a
 thing we remembered to keep true.
 
-Authentication arrives in Step 4 with OAuth. Until then these routes are open,
-exactly as the MCP endpoint is.
+Every route here requires an OAuth access token. The check is not in this module
+— it is one middleware above the whole router (routes/guard.py), so `/api/*` and
+`/mcp` cannot end up with two different ideas of who is allowed in. What this
+module does with the result is stamp the caller's subject onto the browsers it
+launches, so the CDP and VNC URLs minted later can be bound to whoever asked.
 """
 from __future__ import annotations
 
@@ -26,8 +29,11 @@ from ..services.geo import GeoUnresolved, ProxyUnreachable
 from ..services.instances import CapExceeded, PinUnavailable
 from ..services.proxy import ProxyNotConfigured
 from ..services.scrape import NotionNotConfigured
+from ..services.tokens import OWNER
+from ..services.urls import public_base
 from ..services.views import instance_view
 from ..sources import UnsupportedURL
+from .guard import subject_of
 
 logger = logging.getLogger("cloakbiz.api")
 
@@ -47,7 +53,16 @@ class ArchiveRequest(BaseModel):
 
 
 def _base_url(request: Request) -> str:
-    return str(request.base_url)
+    # Not str(request.base_url): behind Railway's TLS termination that says
+    # http://, and the ws:// URL it produces is blocked as mixed content on an
+    # https page. See services/urls.py.
+    return public_base(request)
+
+
+def _subject(request: Request) -> str:
+    """Who is asking. The guard has already refused anyone without a token, so
+    this is never a guess — `or OWNER` covers only the single-subject default."""
+    return subject_of(request) or OWNER
 
 
 @router.post("/scrape", response_model=ScrapeResult)
@@ -84,14 +99,18 @@ async def archive_page(request: Request, body: ArchiveRequest) -> ArchiveResult:
 
 @router.post("/instances", response_model=InstanceView)
 async def create_instance(request: Request, body: InstanceCreate) -> InstanceView:
+    subject = _subject(request)
     try:
-        inst = await request.app.state.instances.launch(body, origin="interactive")
+        inst = await request.app.state.instances.launch(
+            body, origin="interactive", owner=subject
+        )
     except CapExceeded as exc:
         raise HTTPException(status_code=429, detail=str(exc)) from exc
     except (ProxyNotConfigured, ProxyUnreachable, GeoUnresolved, PinUnavailable) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return instance_view(
-        inst, secret=request.app.state.secret.current(), base_url=_base_url(request)
+        inst, secret=request.app.state.secret.current(), base_url=_base_url(request),
+        subject=subject,
     )
 
 
@@ -99,8 +118,9 @@ async def create_instance(request: Request, body: InstanceCreate) -> InstanceVie
 async def list_instances(request: Request) -> list[InstanceView]:
     secret = request.app.state.secret.current()
     base = _base_url(request)
+    subject = _subject(request)
     return [
-        instance_view(i, secret=secret, base_url=base)
+        instance_view(i, secret=secret, base_url=base, subject=subject)
         for i in request.app.state.instances.running.values()
     ]
 
@@ -111,7 +131,8 @@ async def get_instance(request: Request, instance_id: str) -> InstanceView:
     if inst is None:
         raise HTTPException(status_code=404, detail=f"No running browser {instance_id!r}.")
     return instance_view(
-        inst, secret=request.app.state.secret.current(), base_url=_base_url(request)
+        inst, secret=request.app.state.secret.current(), base_url=_base_url(request),
+        subject=_subject(request),
     )
 
 

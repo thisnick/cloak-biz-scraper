@@ -48,6 +48,16 @@ class Config:
         return self.data_dir / "auth.json"
 
     @property
+    def oauth_path(self) -> Path:
+        """Registered OAuth clients and live authorization codes.
+
+        On the volume because Railway sleeps: an in-memory client registry would
+        de-register ChatGPT every time the service naps, and the connector would
+        appear to log itself out for no reason a user could see.
+        """
+        return self.data_dir / "oauth.json"
+
+    @property
     def profiles_dir(self) -> Path:
         return self.data_dir / "profiles"
 

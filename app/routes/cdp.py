@@ -16,9 +16,13 @@ browser is mid-navigation on a schedule of its own; attaching a debugger to it
 would corrupt the sweep and confuse the attacher. Interactive instances exist
 precisely to be driven, which is why the pool keeps a reserve of them.
 
-Step 4 adds the OAuth subject to the token's claims so one user's URL cannot be
-replayed by another. Until then there are no subjects, and what is enforced here
-— signature, expiry, instance scope, and Origin — is enforced for real.
+**The subject binding Step 3 could not have.** The token now carries the OAuth
+subject it was minted for, and it is checked against the subject that owns the
+instance — a token minted for one owner cannot drive another's browser. With a
+single APP_SECRET there is exactly one subject today, so this check is enforced
+and tested but cannot fire in production; it is defence in depth for a future
+with more than one, not a wall between two users who exist now. Saying it any
+more strongly would be the placeholder Step 3 deliberately refused to write.
 """
 from __future__ import annotations
 
@@ -30,7 +34,8 @@ import websockets
 from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
 
 from ..services import tokens
-from .mcp import origin_allowed
+from ..services.urls import websocket_base
+from .ws_guard import Denied, authorize
 
 logger = logging.getLogger("cloakbiz.cdp")
 
@@ -40,44 +45,8 @@ router = APIRouter()
 _CDP_TIMEOUT_SEC = 5
 
 
-class CDPDenied(Exception):
-    """Close codes are the only thing a WS client can read on a refused upgrade."""
-
-    def __init__(self, code: int, reason: str) -> None:
-        self.code = code
-        self.reason = reason
-        super().__init__(reason)
-
-
-def _bearer(request_headers) -> str | None:
-    auth = request_headers.get("authorization") or ""
-    return auth[7:].strip() if auth.lower().startswith("bearer ") else None
-
-
 def _authorize(app, headers, query_token: str | None, instance_id: str):
-    """Everything that must be true before a socket is accepted.
-
-    The token may arrive in the query string or as a Bearer header: WS clients
-    frequently cannot set headers, which is the whole reason the URL carries one
-    — but a client that can should not be forced into the leakier option.
-    """
-    if not origin_allowed(headers):
-        raise CDPDenied(4403, "origin not allowed")
-
-    secret = app.state.secret.current()
-    token = query_token or _bearer(headers)
-    if not tokens.verify(token, instance_id, secret):
-        # Deliberately one message for missing, expired, forged, and
-        # wrong-instance. Which one it was is only useful to someone who should
-        # not have been here.
-        raise CDPDenied(4401, "invalid or expired token")
-
-    inst = app.state.instances.get(instance_id)
-    if inst is None:
-        raise CDPDenied(4004, "no such instance")
-    if inst.origin == "task":
-        raise CDPDenied(4003, "this browser belongs to a running sweep")
-    return inst
+    return authorize(app, headers, query_token, instance_id, kind=tokens.CDP)
 
 
 async def _cdp_json(inst, path: str):
@@ -94,7 +63,7 @@ async def cdp_version(request: Request, instance_id: str, t: str | None = None):
     address inside the container and useless to the caller."""
     try:
         inst = _authorize(request.app, request.headers, t, instance_id)
-    except CDPDenied as denied:
+    except Denied as denied:
         raise HTTPException(status_code=403 if denied.code != 4004 else 404,
                             detail=denied.reason) from denied
     inst.touch()
@@ -103,9 +72,10 @@ async def cdp_version(request: Request, instance_id: str, t: str | None = None):
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"the browser is not answering: {exc}") from exc
 
-    host = request.headers.get("host", "")
-    scheme = "wss" if request.url.scheme == "https" else "ws"
-    data["webSocketDebuggerUrl"] = f"{scheme}://{host}/instances/{instance_id}/cdp"
+    # websocket_base(), not the request's own scheme: behind Railway's TLS
+    # termination request.url.scheme is http, and a ws:// URL handed to a client
+    # on an https page is blocked as mixed content. See services/urls.py.
+    data["webSocketDebuggerUrl"] = f"{websocket_base(request)}/instances/{instance_id}/cdp"
     if t:
         data["webSocketDebuggerUrl"] += f"?t={t}"
     return data
@@ -148,7 +118,7 @@ async def _pump(ws: WebSocket, upstream) -> None:
 async def cdp_proxy(ws: WebSocket, instance_id: str, t: str | None = None):
     try:
         inst = _authorize(ws.app, ws.headers, t, instance_id)
-    except CDPDenied as denied:
+    except Denied as denied:
         # Refused before accept(), so nothing is ever attached to the browser.
         logger.warning("cdp refused for %s: %s", instance_id, denied.reason)
         await ws.close(code=denied.code, reason=denied.reason)
