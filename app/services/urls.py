@@ -31,17 +31,22 @@ here is an authorization decision.
 from __future__ import annotations
 
 
-def _scheme(request) -> str:
-    forwarded = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip().lower()
-    if forwarded in ("http", "https"):
-        return forwarded
-    return request.url.scheme
+def base_from(headers, fallback_scheme: str, fallback_host: str = "") -> str:
+    """The core: everything here is derived from headers, not from a request.
+
+    Split out because the OAuth guard runs as ASGI middleware, where there is a
+    scope and no Request — and building one just to read two headers invited a
+    fake request object that only pretended to be one.
+    """
+    forwarded = (headers.get("x-forwarded-proto") or "").split(",")[0].strip().lower()
+    scheme = forwarded if forwarded in ("http", "https") else fallback_scheme
+    host = (headers.get("host") or fallback_host or "").strip()
+    return f"{scheme}://{host}"
 
 
 def public_base(request) -> str:
     """`https://host` — no trailing slash, no path."""
-    host = (request.headers.get("host") or request.url.netloc or "").strip()
-    return f"{_scheme(request)}://{host}"
+    return base_from(request.headers, request.url.scheme, request.url.netloc)
 
 
 def websocket_base(request) -> str:

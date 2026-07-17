@@ -42,7 +42,7 @@ import logging
 from starlette.datastructures import Headers
 from starlette.types import Receive, Scope, Send
 
-from ..services.urls import public_base
+from ..services.urls import base_from
 
 logger = logging.getLogger("cloakbiz.guard")
 
@@ -55,23 +55,6 @@ _RESOURCE_METADATA = "/.well-known/oauth-protected-resource/mcp"
 
 def _protected(path: str) -> bool:
     return path == "/mcp" or path.startswith("/api/") or path == "/api"
-
-
-class _FakeRequest:
-    """public_base() wants a request; at middleware depth there is only a scope.
-
-    Building a Starlette Request here would be heavier than the two attributes
-    it actually reads.
-    """
-
-    def __init__(self, scope: Scope) -> None:
-        self.headers = Headers(scope=scope)
-
-        class _URL:
-            scheme = scope.get("scheme", "http")
-            netloc = ""
-
-        self.url = _URL()
 
 
 class AuthGuard:
@@ -97,7 +80,7 @@ class AuthGuard:
 
         access = provider.verify_access(token)
         if access is None:
-            base = public_base(_FakeRequest(scope))
+            base = base_from(headers, scope.get("scheme", "http"))
             logger.info("401 on %s: %s", scope.get("path"),
                         "no bearer token" if not token else "invalid or expired token")
             await _error(
