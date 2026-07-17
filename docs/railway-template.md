@@ -266,6 +266,31 @@ scale-to-zero, **every user must enable it themselves after deploying**, or they
 must be a step in the setup guide with the same weight as pasting `APP_SECRET`, and the README
 cannot claim "you only pay while a sweep runs" until the user has done it.
 
+### What skipping the toggle actually costs — measured, because the guess was wrong twice
+
+Taken from `metrics(MEMORY_USAGE_GB)` on the real deployment, read against windows whose state
+was known independently (an idle sleep-watch; sweeps identified by their job logs):
+
+| state | memory | 24/7 cost at ~$10/GB/mo |
+|---|---|---|
+| asleep | 0 | $0 |
+| awake, fresh boot, no job | **0.121 GB** (flat for 10 min) | ~$1.20/mo |
+| **awake after a sweep, no job** | **0.78–0.92 GB** (flat 5 min, then slept) | **~$8–9/mo** |
+| sweep running | 1.2–1.6 GB peak | pennies per sweep |
+
+Idle CPU is negligible (~0.0015 vCPU ≈ $0.03/mo); memory is the whole bill.
+
+**The third row is the finding, and neither the naive estimate nor the "it's only uvicorn"
+estimate would have produced it: memory is not reclaimed when a sweep's browsers exit.** Idle
+after boot is 0.121 GB, but idle *after a sweep* sits at ~0.9 GB until the process dies — and
+**sleeping is what kills it.** So sleep is doing double duty: it is the billing story *and* the
+memory-reclamation story. A never-sleeping instance doesn't cost $1.20/mo, it costs ~$8–9/mo —
+**more than the $5 the Hobby plan includes** — and anyone actually using the product will have
+run a sweep.
+
+Don't cry wolf and don't undersell: **~$1.20/mo if it never scrapes, ~$8–9/mo once it has.**
+(The 5 GB volume bills either way and is not part of this delta.)
+
 **Not proof.** A marketplace listing is not a random sample of what the editor permits, and this
 measures what authoring paths *emit*, not what they *allow*. A dashboard check settles it — but
 it now starts from a measured expectation rather than an absent doc line.

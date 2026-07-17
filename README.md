@@ -46,6 +46,38 @@ for sale this week. This packages the hard part.
 Not built yet: OAuth (so nothing is authenticated yet), live VNC, the Railway
 template.
 
+## What it costs — and the one switch that decides it
+
+Railway bills what you actually use: roughly **$10 per GB of memory per month** and
+**$20 per vCPU per month**. The Hobby plan is $5/month and **includes $5 of usage**.
+
+**Turn on "Serverless" for the service after you deploy.** It is one toggle in the
+same Railway tab where you copy `APP_SECRET`, and it is what makes the numbers
+below small. Do not skip it, and do not assume the template did it for you — **it
+cannot**. This has been measured against every public template on Railway (1500 of
+them, 2964 services): **not one carries a sleep setting**, because no template
+authoring path can store it. See `docs/railway-template.md`.
+
+Measured on a real deployment, on Railway's hardware:
+
+| the server is… | memory | costs, if it never slept |
+|---|---|---|
+| asleep | 0 | **$0** |
+| awake, freshly started, doing nothing | 0.12 GB | ~$1.20/month |
+| **awake after a sweep, doing nothing** | **0.78–0.92 GB** | **~$8–9/month** |
+| running a sweep | up to 1.6 GB | pennies per sweep |
+
+The row that matters is the third one, and it is the one you would not guess:
+**memory is not handed back when a sweep's browsers exit — sleeping is what
+reclaims it.** So a server that never sleeps does not idle at 0.12 GB, it idles at
+close to a gigabyte, for as long as it stays up. That is **~$8–9/month of paying
+for nothing**, which is more than the $5 your plan includes.
+
+With Serverless on, the server sleeps a few minutes after it goes quiet and wakes
+on the next request in about a second, so you are billed for the minutes a sweep
+runs and essentially nothing else. A sweep is short: a full 20-page sweep of the
+Bay Area — 955 listings — took **about six minutes**.
+
 ## The tools
 
 ```
