@@ -223,6 +223,49 @@ class TestTaskBrowsersAreWatchableButNotTouchable:
         assert out == update_request, "the message after a dropped one must survive intact"
 
 
+class TestViewOnlyIsTheFloor:
+    """Who is allowed to *drive* a browser over VNC, not just watch it.
+
+    View-only is the default for every pane; input is lifted only by a control
+    token on a browser that is not a sweep's. These test the decision the proxy
+    makes (routes/vnc.viewer_is_readonly) directly, so "a control token on a task
+    browser is still view-only" is observable without a live framebuffer.
+    """
+
+    def readonly(self, inst, token):
+        from app.routes.vnc import viewer_is_readonly
+
+        return viewer_is_readonly(inst, token, SECRET)
+
+    def test_a_manual_browser_is_view_only_by_default(self):
+        """The floor: a plain viewer token does not drive, even an owner's own."""
+        watch = tokens.issue("inst1", SECRET, kind=tokens.VNC)
+        assert self.readonly(FakeInstance(origin="interactive"), watch) is True
+
+    def test_a_control_token_lifts_it_for_a_manual_browser(self):
+        """The "Take control" path: the escalation the endpoint mints on request."""
+        drive = tokens.issue("inst1", SECRET, kind=tokens.VNC, control=True)
+        assert self.readonly(FakeInstance(origin="interactive"), drive) is False
+
+    def test_a_sweeps_browser_stays_view_only_even_with_a_control_token(self):
+        """The origin guard, and it is not redundant with the endpoint refusing to
+        mint control for a task browser: even if a control token reached here, the
+        sweep must not be drivable. Break the `origin == "task"` line and this is
+        the test that falls."""
+        drive = tokens.issue("inst1", SECRET, kind=tokens.VNC, control=True)
+        assert self.readonly(FakeInstance(origin="task", subject=None), drive) is True
+
+    def test_a_control_token_for_another_instance_does_not_lift_it(self):
+        drive = tokens.issue("other", SECRET, kind=tokens.VNC, control=True)
+        assert self.readonly(FakeInstance(iid="inst1", origin="interactive"), drive) is True
+
+    def test_a_control_token_for_another_subject_does_not_lift_it(self):
+        drive = tokens.issue("inst1", SECRET, kind=tokens.VNC, subject="mallory", control=True)
+        assert self.readonly(
+            FakeInstance(origin="interactive", subject="alice"), drive
+        ) is True
+
+
 class TestTheViewerUrl:
     def test_it_is_offered_when_the_browser_has_a_live_view(self):
         view = instance_view(FakeInstance(), secret=SECRET, base_url="https://app.example/")

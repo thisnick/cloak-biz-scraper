@@ -58,15 +58,24 @@ def _audience(kind: str, instance_id: str) -> str:
 
 
 def issue(instance_id: str, secret: str, *, kind: str = CDP, subject: str = OWNER,
-          ttl_sec: int = TTL_SEC, now: float | None = None) -> str:
+          control: bool = False, ttl_sec: int = TTL_SEC, now: float | None = None) -> str:
     """A fresh token for one instance and one grant. Minted per call — never
-    cached, never reused."""
-    return signing.issue(
-        {"aud": _audience(kind, instance_id), "sub": subject},
-        secret,
-        ttl_sec=ttl_sec,
-        now=now,
-    )
+    cached, never reused.
+
+    `control` distinguishes the two VNC grants **within** the one `vnc:<id>`
+    audience: a plain viewer token (the default) versus one that additionally
+    lets its holder drive the browser over RFB — "Take control". Keeping them the
+    same audience, separated by a signed claim, is deliberate: a control token is
+    still not a CDP token and still cannot open a browser it was not minted for,
+    and a *leaked viewer* token — the one that could end up in a DOM or history —
+    has no `ctl` claim and stays a viewer, because the claim is inside the MAC and
+    cannot be added without the secret. The dashboard mints a viewer token for
+    every pane at rest and a control token only when the user explicitly asks.
+    """
+    claims = {"aud": _audience(kind, instance_id), "sub": subject}
+    if control:
+        claims["ctl"] = 1
+    return signing.issue(claims, secret, ttl_sec=ttl_sec, now=now)
 
 
 def verify(token: str | None, instance_id: str, secret: str | None, *, kind: str = CDP,
@@ -90,3 +99,24 @@ def verify(token: str | None, instance_id: str, secret: str | None, *, kind: str
     if subject is not None and claims.get("sub") != subject:
         return False
     return True
+
+
+def grants_control(token: str | None, instance_id: str, secret: str | None, *,
+                   subject: str | None = OWNER, now: float | None = None) -> bool:
+    """True only for a live VNC token that also carries the `control` grant.
+
+    Read *after* `verify` has already accepted the token: this answers the
+    second, narrower question — "may this viewer also drive?" — and it re-derives
+    the answer from the signed bytes rather than trusting anything the client
+    said. A viewer token, a CDP token, a token for another instance or subject,
+    or any forgery all answer False, so the VNC proxy falls back to view-only,
+    which is the safe default for a framebuffer of the user's logged-in browser.
+    """
+    if not instance_id:
+        return False
+    claims = signing.verify(token, secret, audience=_audience(VNC, instance_id), now=now)
+    if claims is None:
+        return False
+    if subject is not None and claims.get("sub") != subject:
+        return False
+    return bool(claims.get("ctl"))

@@ -861,3 +861,111 @@ class TestSessionsControls:
     def test_logout_rejects_a_foreign_origin(self, auth):
         assert auth.post("/logout", headers={"Origin": "https://evil.example"},
                          follow_redirects=False).status_code == 403
+
+
+class TestLivePaneTokens:
+    """The dashboard's live noVNC panes fetch their token here, at connect time,
+    so no token that grants sight of the user's browser is baked into the page.
+    A view token is the default; "Take control" is a separate POST-only
+    escalation, refused outright for a sweep's browser.
+    """
+
+    def _stub(self, monkeypatch, *, origin="interactive", vnc_port=6100, subject=None):
+        from types import SimpleNamespace
+
+        inst = SimpleNamespace(id="inst1", origin=origin, vnc_port=vnc_port, subject=subject)
+        monkeypatch.setattr(app.state.instances, "get",
+                            lambda iid: inst if iid == "inst1" else None)
+        return inst
+
+    # ── the default: a fresh, view-only token ──
+    def test_a_pane_gets_a_fresh_view_only_token(self, auth, monkeypatch):
+        from app.services import tokens
+
+        self._stub(monkeypatch)
+        r = auth.get("/sessions/instances/inst1/vnc-token")
+        assert r.status_code == 200
+        token = r.json()["token"]
+        assert tokens.verify(token, "inst1", SECRET, kind=tokens.VNC), "a real VNC token"
+        assert not tokens.verify(token, "inst1", SECRET, kind=tokens.CDP), "never a driver"
+        assert not tokens.grants_control(token, "inst1", SECRET), "view-only by default"
+
+    def test_no_token_for_a_browser_without_a_live_view(self, auth, monkeypatch):
+        self._stub(monkeypatch, vnc_port=None)
+        assert auth.get("/sessions/instances/inst1/vnc-token").status_code == 404
+
+    def test_no_token_for_an_unknown_instance(self, auth, monkeypatch):
+        self._stub(monkeypatch)
+        assert auth.get("/sessions/instances/nope/vnc-token").status_code == 404
+
+    # ── the page must not carry a token itself ──
+    def test_the_dashboard_html_carries_no_vnc_token(self, auth, monkeypatch):
+        """The whole reason the pane fetches a token: none may sit in the markup,
+        the DOM, or view-source. A running instance with a live view is exactly
+        the case that would leak one."""
+        from test_vnc import FakeInstance
+
+        from app.services.views import instance_view
+
+        async def _noop_stop(iid):
+            return True
+
+        inst = FakeInstance(iid="inst1", origin="interactive", vnc_port=6100)
+        monkeypatch.setattr(app.state.instances, "running", {"inst1": inst})
+        # The fake never really launched, so shutdown must not try to close it.
+        monkeypatch.setattr(app.state.instances, "stop", _noop_stop)
+        page = auth.get("/").text
+        # The pane is rendered (so this is a real negative, not an empty page)…
+        assert 'data-instance="inst1"' in page
+        # …but the freshly-minted VNC token for it appears nowhere in the source.
+        vnc_url = instance_view(inst, secret=SECRET, base_url="https://testserver").vnc_url
+        token = vnc_url.split("t%3D")[1].split("&")[0]
+        assert token not in page
+
+    # ── guard: unauth mints nothing ──
+    def test_signed_out_gets_no_token(self, client, monkeypatch):
+        self._stub(monkeypatch)
+        r = client.get("/sessions/instances/inst1/vnc-token", follow_redirects=False)
+        assert r.status_code == 303 and "token" not in r.text
+        p = client.post("/sessions/instances/inst1/control", follow_redirects=False)
+        assert p.status_code == 303 and "token" not in p.text
+
+    # ── guard: a foreign Origin mints nothing ──
+    def test_a_foreign_origin_gets_no_token(self, auth, monkeypatch):
+        self._stub(monkeypatch)
+        r = auth.get("/sessions/instances/inst1/vnc-token",
+                     headers={"Origin": "https://evil.example"})
+        assert r.status_code == 403
+        p = auth.post("/sessions/instances/inst1/control",
+                      headers={"Origin": "https://evil.example"})
+        assert p.status_code == 403
+
+    # ── Take control: the escalation ──
+    def test_take_control_mints_a_control_token(self, auth, monkeypatch):
+        from app.services import tokens
+
+        self._stub(monkeypatch, origin="interactive")
+        r = auth.post("/sessions/instances/inst1/control")
+        assert r.status_code == 200
+        token = r.json()["token"]
+        assert tokens.grants_control(token, "inst1", SECRET), "control was asked for"
+        assert not tokens.verify(token, "inst1", SECRET, kind=tokens.CDP), "still not a driver token"
+
+    def test_take_control_is_refused_for_a_sweeps_browser(self, auth, monkeypatch):
+        """A sweep is mid-navigation; a click would corrupt it. Break the origin
+        check in the endpoint and this is the test that falls."""
+        self._stub(monkeypatch, origin="task")
+        r = auth.post("/sessions/instances/inst1/control")
+        assert r.status_code == 409
+        assert "token" not in r.text
+
+    def test_take_control_is_post_only(self, auth, monkeypatch):
+        """A control grant behind GET would be reachable cross-site — SameSite=lax
+        leaks the cookie on a top-level cross-site GET."""
+        self._stub(monkeypatch)
+        assert auth.get("/sessions/instances/inst1/control",
+                        follow_redirects=False).status_code == 405
+
+    def test_take_control_404s_for_an_unknown_instance(self, auth, monkeypatch):
+        self._stub(monkeypatch)
+        assert auth.post("/sessions/instances/nope/control").status_code == 404

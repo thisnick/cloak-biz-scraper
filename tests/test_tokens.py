@@ -82,6 +82,60 @@ class TestWatchingIsNotDriving:
         assert not tokens.verify(watch, "inst-2", SECRET, kind=tokens.VNC)
 
 
+class TestTakingControl:
+    """Watching and driving-over-VNC are the same audience split by a signed
+    claim. A control token lifts the view-only floor; a viewer token never does,
+    which is what keeps a leaked viewer URL from becoming a way to type into the
+    user's browser."""
+
+    def test_a_plain_vnc_token_grants_no_control(self):
+        watch = tokens.issue("inst-1", SECRET, kind=tokens.VNC)
+        assert not tokens.grants_control(watch, "inst-1", SECRET)
+
+    def test_a_control_token_grants_control(self):
+        drive = tokens.issue("inst-1", SECRET, kind=tokens.VNC, control=True)
+        assert tokens.grants_control(drive, "inst-1", SECRET)
+
+    def test_a_control_token_is_still_only_a_viewer_for_other_purposes(self):
+        """It carries input over VNC; it is not a CDP token and does not become
+        one by carrying `ctl`."""
+        drive = tokens.issue("inst-1", SECRET, kind=tokens.VNC, control=True)
+        assert tokens.verify(drive, "inst-1", SECRET, kind=tokens.VNC)
+        assert not tokens.verify(drive, "inst-1", SECRET, kind=tokens.CDP)
+
+    def test_a_cdp_token_does_not_grant_vnc_control(self):
+        drive = tokens.issue("inst-1", SECRET, kind=tokens.CDP, control=True)
+        assert not tokens.grants_control(drive, "inst-1", SECRET)
+
+    def test_control_is_still_scoped_to_one_instance(self):
+        drive = tokens.issue("inst-1", SECRET, kind=tokens.VNC, control=True)
+        assert not tokens.grants_control(drive, "inst-2", SECRET)
+
+    def test_control_is_still_bound_to_its_subject(self):
+        drive = tokens.issue("inst-1", SECRET, kind=tokens.VNC, subject="alice", control=True)
+        assert tokens.grants_control(drive, "inst-1", SECRET, subject="alice")
+        assert not tokens.grants_control(drive, "inst-1", SECRET, subject="bob")
+
+    def test_the_control_claim_cannot_be_added_without_the_secret(self):
+        """The escalation a leaked viewer token would attempt: forge `ctl` onto
+        it. The claim is inside the MAC, so re-signing needs the secret."""
+        import base64
+        import json
+
+        watch = tokens.issue("inst-1", SECRET, kind=tokens.VNC)
+        payload, signature = watch.split(".", 1)
+        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        claims["ctl"] = 1
+        forged = base64.urlsafe_b64encode(
+            json.dumps(claims).encode()
+        ).decode().rstrip("=")
+        assert not tokens.grants_control(f"{forged}.{signature}", "inst-1", SECRET)
+
+    def test_junk_grants_no_control(self):
+        for junk in (None, "", "x", "a.b.c"):
+            assert not tokens.grants_control(junk, "inst-1", SECRET)
+
+
 class TestSubjectBinding:
     """The binding Step 3 could not have, because no subjects existed.
 

@@ -473,6 +473,73 @@ async def ui_close_instance(request: Request, instance_id: str) -> Response:
     return _sessions_redirect()
 
 
+# ── live-pane tokens ──────────────────────────────────────────────────────────
+#
+# The dashboard renders live noVNC panes, but the page HTML carries no VNC token:
+# a token baked into the markup lands in the DOM, the page's view-source, and
+# whatever the browser caches of it. Instead the pane's JavaScript asks for one
+# here, at connect time, over the cookie session — so the token is minted fresh
+# per pane, lives ten minutes, and never sits in the page. Both endpoints mint a
+# `vnc:<id>` token scoped to the one instance and bound to the subject the WS
+# guard will check it against; the difference is only whether it also grants
+# input.
+
+
+def _vnc_subject_for(inst) -> str:
+    """The subject a pane token must bear to pass the WS guard for this instance.
+
+    Mirrors `routes/ws_guard.authorize`: a browser with no recorded subject (a
+    sweep's own) falls back to the deployment's single owner, not to "anyone".
+    Minting against a different subject than the guard checks would hand out
+    tokens the guard then refuses — a silently broken live view.
+    """
+    from ..services.tokens import OWNER
+
+    return getattr(inst, "subject", None) or OWNER
+
+
+@router.get("/sessions/instances/{instance_id}/vnc-token")
+async def ui_vnc_token(request: Request, instance_id: str) -> dict[str, str]:
+    """A fresh, view-only VNC token for one pane. The default grant: watching."""
+    _require(request)
+    _require_same_origin(request)
+    from ..services.tokens import VNC, issue
+
+    inst = request.app.state.instances.get(instance_id)
+    if inst is None or not getattr(inst, "vnc_port", None):
+        raise HTTPException(status_code=404, detail="this browser has no live view")
+    secret = request.app.state.secret.current()
+    token = issue(instance_id, secret, kind=VNC, subject=_vnc_subject_for(inst))
+    return {"token": token, "path": f"/instances/{instance_id}/vnc"}
+
+
+@router.post("/sessions/instances/{instance_id}/control")
+async def ui_take_control(request: Request, instance_id: str) -> dict[str, str]:
+    """A control-grant VNC token — the explicit "Take control" switch.
+
+    A control token lets its holder drive the browser (full keyboard and mouse)
+    over the same socket a viewer uses. That is a deliberate escalation, so it is
+    a POST behind both CSRF layers, never a default, and refused outright for a
+    sweep's browser — that one is view-only however it is asked for, because it is
+    mid-navigation and a click would corrupt the run.
+    """
+    _require(request)
+    _require_same_origin(request)
+    from ..services.tokens import VNC, issue
+
+    inst = request.app.state.instances.get(instance_id)
+    if inst is None or not getattr(inst, "vnc_port", None):
+        raise HTTPException(status_code=404, detail="this browser has no live view")
+    if inst.origin == "task":
+        raise HTTPException(
+            status_code=409,
+            detail="a sweep's browser is view-only; it is mid-navigation on its own schedule",
+        )
+    secret = request.app.state.secret.current()
+    token = issue(instance_id, secret, kind=VNC, subject=_vnc_subject_for(inst), control=True)
+    return {"token": token, "path": f"/instances/{instance_id}/vnc"}
+
+
 @router.post("/settings/cloakbrowser", response_class=HTMLResponse)
 async def save_cloakbrowser(
     request: Request,

@@ -36,11 +36,28 @@ import websockets
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from ..services import rfb, tokens
-from .ws_guard import Denied, authorize
+from .ws_guard import Denied, authorize, bearer
 
 logger = logging.getLogger("cloakbiz.vnc")
 
 router = APIRouter()
+
+
+def viewer_is_readonly(inst, token: str | None, secret: str | None) -> bool:
+    """Whether this VNC connection must strip the caller's input.
+
+    View-only is the floor. A sweep's browser is view-only however it is asked
+    for — it is mid-navigation on its own schedule and a click would corrupt the
+    run — so its origin decides before the token is even consulted. For any other
+    browser, input is allowed only when the token itself carries the `control`
+    grant that the "Take control" endpoint mints; the default viewer token, a CDP
+    token, a token for another instance or subject, or any forgery all leave the
+    connection read-only. Split out from the endpoint so the decision can be
+    tested without a live framebuffer behind it."""
+    if inst.origin == "task":
+        return True
+    subject = getattr(inst, "subject", None) or tokens.OWNER
+    return not tokens.grants_control(token, inst.id, secret, subject=subject)
 
 
 @router.websocket("/instances/{instance_id}/vnc")
@@ -57,7 +74,11 @@ async def vnc_proxy(ws: WebSocket, instance_id: str, t: str | None = None):
         await ws.close(code=4004, reason="this browser has no live view")
         return
 
-    view_only = inst.origin == "task"
+    # View-only is the floor: every pane opens as a viewer, and input is lifted
+    # only by a control token on a non-task browser (see viewer_is_readonly). The
+    # token already passed `authorize`; this re-reads it for the extra grant.
+    secret = ws.app.state.secret.current()
+    view_only = viewer_is_readonly(inst, t or bearer(ws.headers), secret)
     inst.touch()
     requested = ws.scope.get("subprotocols", [])
     await ws.accept(subprotocol="binary" if "binary" in requested else None)
