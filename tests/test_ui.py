@@ -401,6 +401,41 @@ class TestProxyTest:
         assert app.state.settings.load().proxy_host == "192.0.2.1"
 
     @respx.mock
+    def test_a_failed_retest_does_not_destroy_a_working_proxy(self, auth, monkeypatch):
+        """The order bug: write-then-test replaced a routing proxy with a broken
+        one on a single typo.
+
+        A proxy is saved and proven to work. The user edits the form, mistypes
+        the host, and clicks Save & test — which fails. The stored proxy must be
+        the one that still works, not the typo: the test now runs *before* the
+        write, so nothing is persisted when it fails against a working config.
+        """
+        from app.services import geo
+
+        # 1. establish a working proxy
+        respx.get("https://api.ipify.org").mock(return_value=httpx.Response(200, text="45.12.3.4"))
+        monkeypatch.setattr(geo, "_geolocate", lambda ip: ("America/Los_Angeles", "en-US", "US", "San Jose"))
+        auth.post("/settings/proxy", data={
+            "action": "test", "proxy_user": "gooduser", "proxy_password": "goodpw",
+            "proxy_host": "works.example.com", "proxy_port": "1000"})
+        assert app.state.settings.load().proxy_host == "works.example.com"
+        assert app.state.settings.load().proxy_last_check_ok is True
+
+        # 2. mistype the host and re-test; it fails
+        respx.get("https://api.ipify.org").mock(side_effect=httpx.ConnectError("refused"))
+        respx.get("https://checkip.amazonaws.com").mock(side_effect=httpx.ConnectError("refused"))
+        r = auth.post("/settings/proxy", data={
+            "action": "test", "proxy_user": "gooduser", "proxy_password": "",
+            "proxy_host": "typo.invalid", "proxy_port": "1000"})
+        assert r.status_code == 400
+        assert "was kept unchanged" in r.text
+
+        # 3. the working host is still there; the typo never landed
+        after = app.state.settings.load()
+        assert after.proxy_host == "works.example.com", "a typo overwrote a working proxy"
+        assert after.proxy_last_check_ok is True, "the working verdict was downgraded"
+
+    @respx.mock
     def test_a_passing_test_is_remembered_too(self, auth, monkeypatch):
         from app.services import geo
 

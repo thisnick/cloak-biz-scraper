@@ -360,22 +360,24 @@ async def save_proxy(
     _require(request)
     store = request.app.state.settings
     current = store.load()
-    settings = store.update(
+    changes = dict(
         proxy_user=proxy_user.strip(),
         proxy_password=_keep(proxy_password, current.proxy_password),
         proxy_host=proxy_host.strip(),
         proxy_port=proxy_port.strip(),
         proxy_country=proxy_country.strip() or current.proxy_country,
         proxy_region=proxy_region.strip() or current.proxy_region,
-        # Saving invalidates the previous verdict, which described the values
-        # that were there before. Carrying a "working" over an edited host would
-        # be a measurement attributed to something we never measured.
-        proxy_last_check_at=0.0,
-        proxy_last_check_ok=None,
-        proxy_last_check_summary="",
     )
 
     if action != "test":
+        # Plain Save: persist as typed, and drop the previous verdict — it
+        # described the values that were there before, and carrying a "working"
+        # over an edited host would attribute a measurement to something we never
+        # measured. Testing is the user's next step, by their own choice.
+        settings = store.update(
+            **changes,
+            proxy_last_check_at=0.0, proxy_last_check_ok=None, proxy_last_check_summary="",
+        )
         return _render(
             request,
             Result(
@@ -385,7 +387,16 @@ async def save_proxy(
             ),
         )
 
-    if not settings.proxy_configured():
+    # action == "test": test the SUBMITTED values before writing anything.
+    #
+    # The old order wrote first and tested second, so a proxy that failed the
+    # test was already saved — and if the user had a *working* proxy and mistyped
+    # one field, clicking "Save & test" replaced it with the broken one on the
+    # strength of that typo. So build a candidate that is NOT persisted, probe it,
+    # and only write once it has proven it can route. A failed test leaves the
+    # stored proxy, and its verdict, exactly as they were.
+    candidate = Settings.model_validate({**current.model_dump(), **changes})
+    if not candidate.proxy_configured():
         return _render(
             request,
             Result("proxy", False, "Fill in the username, password, host, and port first."),
@@ -395,18 +406,34 @@ async def save_proxy(
     from ..services.geo import ProxyUnreachable, probe
     from ..services.proxy import ProxyParts, build_proxy_url, new_session_token
 
-    url = build_proxy_url(new_session_token(), ProxyParts.from_settings(settings))
+    url = build_proxy_url(new_session_token(), ProxyParts.from_settings(candidate))
     try:
         measured = await probe(url)
     except ProxyUnreachable as exc:
+        # A failed test must never downgrade a proxy that currently works: the
+        # user may have a routing proxy and mistyped one field, and the old order
+        # (write, then test) replaced the good config with the broken one on that
+        # typo. So if a proven-working proxy is stored, keep it and say so.
+        if current.proxy_last_check_ok:
+            return _render(
+                request,
+                Result("proxy", False,
+                       str(exc) + " Your previously working proxy was kept unchanged."),
+                status=400,
+            )
+        # Nothing working is at stake, so record the attempt: persist what they
+        # typed with a failed verdict, so a later visit shows "not working"
+        # rather than a green light, and the values are there to fix.
         store.update(
+            **changes,
             proxy_last_check_at=time.time(),
             proxy_last_check_ok=False,
             proxy_last_check_summary=_first_sentence(str(exc)),
         )
         return _render(request, Result("proxy", False, str(exc)), status=400)
 
-    store.update(
+    settings = store.update(
+        **changes,
         proxy_last_check_at=time.time(),
         proxy_last_check_ok=True,
         proxy_last_check_summary=measured.describe(),
