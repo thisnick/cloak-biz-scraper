@@ -64,16 +64,26 @@ class RateLimiter:
     def _limit_for(self, key: str) -> int:
         return self._global_max if key == _GLOBAL else self._max
 
-    def _prune(self, key: str, now: float) -> deque[float]:
+    def _live(self, key: str, now: float) -> deque[float]:
+        """This key's failures inside the window, still attached to the store.
+
+        Returning a detached deque here was a real bug and an instructive one:
+        an earlier version pruned an empty key out of the dict and handed the
+        orphan back, so `fail()` appended to a deque nobody could see and the
+        limiter counted to zero forever. It looked like careful cleanup and was
+        a silent no-op — the exact shape of a security control that reports
+        success while doing nothing.
+        """
         hits = self._hits.setdefault(key, deque())
         cutoff = now - self._window
         while hits and hits[0] < cutoff:
             hits.popleft()
-        if not hits and key != _GLOBAL:
-            # Keeping an empty deque per address seen would be a memory leak an
-            # attacker controls the size of, one key per spoofed header.
-            self._hits.pop(key, None)
         return hits
+
+    def _forget_if_empty(self, key: str) -> None:
+        """Drop spent keys so a spoofed header cannot grow the dict forever."""
+        if key != _GLOBAL and not self._hits.get(key):
+            self._hits.pop(key, None)
 
     def retry_after(self, key: str, *, now: float | None = None) -> float:
         """Seconds until this key may try again; 0.0 when it may try now.
@@ -85,9 +95,10 @@ class RateLimiter:
         with self._lock:
             wait = 0.0
             for candidate in (key, _GLOBAL):
-                hits = self._prune(candidate, now)
+                hits = self._live(candidate, now)
                 if len(hits) >= self._limit_for(candidate):
                     wait = max(wait, hits[0] + self._window - now)
+                self._forget_if_empty(candidate)
             return round(max(wait, 0.0), 1)
 
     def fail(self, key: str, *, now: float | None = None) -> None:
@@ -95,7 +106,7 @@ class RateLimiter:
         now = time.time() if now is None else now
         with self._lock:
             for candidate in (key, _GLOBAL):
-                self._prune(candidate, now).append(now)
+                self._live(candidate, now).append(now)
 
     def reset(self, key: str) -> None:
         """Forget this key's failures — called when the secret was right.

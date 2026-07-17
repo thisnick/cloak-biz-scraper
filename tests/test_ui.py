@@ -110,12 +110,18 @@ class TestLogin:
         """The silent brick: flag left set, rotate, forget, redeploy with the
         same value -> reset skipped as already-consumed -> still locked out, and
         the only clue is a log line they cannot reach."""
-        monkeypatch.setenv("APP_SECRET", SECRET)
-        monkeypatch.setenv("APP_SECRET_RESET", "true")
-        service = SecretService(tmp_path / "auth.json", tmp_path / ".dek")
-        service.bootstrap()                       # reset consumed
-        service.rotate("a-rotated-secret-000009")  # ...then they forget this
+        # The TestClient is entered FIRST, before APP_SECRET_RESET is set. The
+        # app's lifespan bootstraps the *shared* volume's secret, so a reset flag
+        # visible to it re-seeds that volume with this module's SECRET — which is
+        # not this test's subject, and used to leave every later test module
+        # signing with a secret the server no longer held. Their negative tests
+        # still passed, because a wrong secret also produces "refused".
         with TestClient(app, base_url="https://testserver") as c:
+            monkeypatch.setenv("APP_SECRET", SECRET)
+            monkeypatch.setenv("APP_SECRET_RESET", "true")
+            service = SecretService(tmp_path / "auth.json", tmp_path / ".dek")
+            service.bootstrap()                       # reset consumed
+            service.rotate("a-rotated-secret-000009")  # ...then they forget this
             app.state.secret = SecretService(tmp_path / "auth.json", tmp_path / ".dek")
             app.state.secret.bootstrap()          # redeploy, same env value
             assert app.state.secret.reset_ignored

@@ -31,6 +31,32 @@ for _leak in (
     os.environ.pop(_leak, None)
 
 
+def isolate_auth(app, tmp_path):
+    """Give this test its own volume for the secret and the OAuth store.
+
+    The module-level `app` is shared by every test, and its lifespan points the
+    secret at the one real DATA_DIR — so a test that legitimately exercises
+    APP_SECRET_RESET rewrites the stored secret that every *other* module's
+    fixture assumes. That already happened: test_ui's reset test re-seeded the
+    shared volume with its own constant, and the modules that ran after it were
+    signing tokens with a secret the server no longer held. Their negative tests
+    passed anyway — "refused" is what a wrong secret produces too — so the
+    breakage stayed invisible until a *positive* control asked for a success.
+
+    Isolating per test is the fix, and it is what test_ui's own client fixture
+    already does for settings.
+    """
+    from app.services.oauth import OAuthProvider, OAuthStore
+    from app.services.secret import SecretService
+
+    app.state.secret = SecretService(tmp_path / "auth.json", tmp_path / ".dek")
+    app.state.secret.bootstrap()
+    app.state.oauth = OAuthProvider(
+        OAuthStore(tmp_path / "oauth.json", tmp_path / ".dek"), app.state.secret
+    )
+    app.state.login_limiter.__init__()
+
+
 def mint_access(app, *, subject: str = "owner", client_id: str = "test-client",
                 ttl_sec: int | None = None) -> str:
     """A real OAuth access token, minted by the app's own provider.

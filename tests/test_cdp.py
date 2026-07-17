@@ -10,6 +10,8 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+from conftest import isolate_auth
+
 from app.main import app
 from app.services import tokens
 
@@ -17,10 +19,11 @@ SECRET = "test-secret-value-long-enough"
 
 
 @pytest.fixture
-def client(monkeypatch):
+def client(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_SECRET", SECRET)
     monkeypatch.delenv("APP_SECRET_RESET", raising=False)
     with TestClient(app, base_url="https://testserver", follow_redirects=False) as c:
+        isolate_auth(app, tmp_path)
         yield c
 
 

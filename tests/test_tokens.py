@@ -51,10 +51,70 @@ class TestIssueAndVerify:
         import base64, json
 
         forged = base64.urlsafe_b64encode(
-            json.dumps({"aud": "instance:inst-2", "exp": int(time.time() + 600)}).encode()
+            json.dumps({"aud": "cdp:inst-2", "sub": tokens.OWNER,
+                        "exp": int(time.time() + 600)}).encode()
         ).decode().rstrip("=")
         signature = tokens.issue("inst-1", SECRET).split(".", 1)[1]
         assert not tokens.verify(f"{forged}.{signature}", "inst-2", SECRET)
+
+
+class TestWatchingIsNotDriving:
+    """CDP and VNC are separate grants, signed with the same secret.
+
+    The VNC URL is built to sit in an `iframe src`, where it reaches the DOM,
+    the referrer, and the browser history of anyone who opens the dashboard —
+    far leakier than an agent's tool call. If one token opened both doors, the
+    leakiest URL in the system would also be the most powerful.
+    """
+
+    def test_a_vnc_token_does_not_drive(self):
+        watch = tokens.issue("inst-1", SECRET, kind=tokens.VNC)
+        assert tokens.verify(watch, "inst-1", SECRET, kind=tokens.VNC)
+        assert not tokens.verify(watch, "inst-1", SECRET, kind=tokens.CDP)
+
+    def test_a_cdp_token_is_not_a_viewer_token_either(self):
+        """Symmetry is not the point — being unable to swap them is."""
+        drive = tokens.issue("inst-1", SECRET, kind=tokens.CDP)
+        assert not tokens.verify(drive, "inst-1", SECRET, kind=tokens.VNC)
+
+    def test_each_grant_is_still_scoped_to_one_instance(self):
+        watch = tokens.issue("inst-1", SECRET, kind=tokens.VNC)
+        assert not tokens.verify(watch, "inst-2", SECRET, kind=tokens.VNC)
+
+
+class TestSubjectBinding:
+    """The binding Step 3 could not have, because no subjects existed.
+
+    With one APP_SECRET there is exactly one subject today, so this cannot fire
+    in production — it is enforced and real, but it is defence in depth for a
+    future with more than one subject rather than a wall between two users who
+    exist now.
+    """
+
+    def test_a_token_verifies_for_the_subject_it_was_minted_for(self):
+        token = tokens.issue("inst-1", SECRET, subject="alice")
+        assert tokens.verify(token, "inst-1", SECRET, subject="alice")
+
+    def test_another_subjects_token_is_refused(self):
+        token = tokens.issue("inst-1", SECRET, subject="alice")
+        assert not tokens.verify(token, "inst-1", SECRET, subject="bob")
+
+    def test_the_default_subject_is_the_one_owner(self):
+        assert tokens.verify(tokens.issue("inst-1", SECRET), "inst-1", SECRET,
+                             subject=tokens.OWNER)
+
+    def test_a_subject_cannot_be_swapped_without_breaking_the_signature(self):
+        """The sub claim is inside the MAC, not beside it."""
+        token = tokens.issue("inst-1", SECRET, subject="alice")
+        payload, signature = token.split(".", 1)
+        import base64, json
+
+        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        claims["sub"] = "bob"
+        forged = base64.urlsafe_b64encode(
+            json.dumps(claims).encode()
+        ).decode().rstrip("=")
+        assert not tokens.verify(f"{forged}.{signature}", "inst-1", SECRET, subject="bob")
 
     def test_junk_is_refused_rather_than_raising(self):
         for junk in (None, "", "x", "a.b.c", "....", "notbase64!.sig"):
