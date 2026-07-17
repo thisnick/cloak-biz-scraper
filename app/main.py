@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.responses import RedirectResponse
+from starlette.routing import Route
 
 from . import __version__, mcp_server
 from .config import CONFIG, bootstrap_binary_cache, purge_binary_env
@@ -127,7 +128,16 @@ app.include_router(health.router)
 app.include_router(api.router)
 app.include_router(ui.router)
 
-# Mounted rather than routed: the endpoint enforces the transport rules (GET →
-# 405, Origin) itself, and a Mount hands it every request to /mcp whatever the
-# method or trailing slash.
-app.mount("/mcp", MCPEndpoint(lambda: getattr(app.state, "mcp_manager", None)))
+# A Route, deliberately, not a Mount. `Mount("/mcp")` compiles to the regex
+# ^/mcp/(?P<path>.*)$ — it never matches a bare "/mcp", so Starlette's
+# redirect_slashes answers the actual endpoint with a 307 to "/mcp/". The spec
+# says one endpoint and clients POST to exactly "/mcp"; worse, the redirect is
+# invisible to any client that follows redirects (including httpx and every test
+# client), so it would have looked fine here and cost a real client its POST body.
+#
+# `methods=None` means every method reaches the endpoint, which is what lets it
+# answer GET with its own 405 and an explanation rather than Starlette's bare one.
+# Starlette treats a non-function endpoint as a raw ASGI app, which MCPEndpoint is.
+app.router.routes.append(
+    Route("/mcp", MCPEndpoint(lambda: getattr(app.state, "mcp_manager", None)), methods=None)
+)

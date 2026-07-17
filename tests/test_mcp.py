@@ -35,7 +35,11 @@ INIT = {
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_SECRET", "test-secret-value-long-enough")
     monkeypatch.delenv("APP_SECRET_RESET", raising=False)
-    with TestClient(app, base_url="https://testserver") as c:
+    # follow_redirects=False on purpose. Mounting the endpoint (rather than
+    # routing it) made a bare POST /mcp answer 307 to /mcp/, and every one of
+    # these tests passed anyway because the client quietly followed it. A real
+    # client is entitled not to. The endpoint is /mcp, so /mcp must answer.
+    with TestClient(app, base_url="https://testserver", follow_redirects=False) as c:
         yield c
 
 
@@ -88,6 +92,22 @@ class TestStateless:
         listing = schema["$defs"]["Listing"]["properties"]
         for field in ("asking_price", "revenue", "cashflow", "ebitda"):
             assert listing[field]["type"] == "string", field
+
+
+class TestTheEndpointIsExactlySlashMcp:
+    def test_post_to_mcp_is_answered_not_redirected(self, client):
+        """A redirect here is the bug that hides from its own tests.
+
+        Mounting the endpoint made /mcp answer 307 -> /mcp/, which every
+        redirect-following client (httpx, this test client by default) papers
+        over. Clients POST to /mcp; that is the endpoint, so that is what must
+        answer.
+        """
+        r = client.post("/mcp", json=INIT, headers=HEADERS)
+        assert r.status_code == 200, f"expected a real answer, got {r.status_code}"
+
+    def test_get_is_refused_at_mcp_not_redirected(self, client):
+        assert client.get("/mcp", headers=HEADERS).status_code == 405
 
 
 class TestHostIsNotAllowlisted:

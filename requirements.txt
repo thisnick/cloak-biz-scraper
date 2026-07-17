@@ -1,9 +1,26 @@
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
-pydantic==2.10.5
+# 2.11 is mcp's floor. It was 2.10.5 before the MCP server existed; leaving it
+# there makes the image unbuildable (pip resolves nothing), while a local venv
+# that already had mcp installed quietly upgrades and passes every test against
+# a version the container could never have had.
+pydantic==2.13.4
 # The settings UI: server-rendered templates and form parsing. No JS toolchain.
 jinja2==3.1.6
-python-multipart==0.0.20
+python-multipart==0.0.32
+# The MCP server. Three pins, not one, and the two extra ones are load-bearing:
+#
+#   * mcp declares `starlette>=0.27` with no upper bound, so a fresh install
+#     resolves the newest (1.3.x) — which fastapi 0.115.6 forbids (<0.42). The
+#     result is not a resolver warning you can ignore: `import fastapi` itself
+#     fails. Pinning starlette is what keeps the two compatible.
+#   * sse-starlette 3.x requires starlette>=0.49.1 and would drag the same
+#     conflict back in through mcp's dependency on it. 2.x sits with 0.41.
+#
+# `pip check` passes on this set. Loosen any one of them and it stops.
+mcp==1.28.1
+starlette==0.41.3
+sse-starlette==2.1.3
 # Notion API + measuring the proxy's exit IP.
 httpx==0.28.1
 # [geoip] pulls geoip2 — without it, geoip=True raises at launch and the browser's

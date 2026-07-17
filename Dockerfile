@@ -28,10 +28,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     xvfb fontconfig procps ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+# Node, for exactly one job: markdown -> Notion blocks via martian. Notion's
+# block schema is fiddly enough (nested rich_text, per-object limits, which
+# markdown it silently drops) that reimplementing it in Python would be a
+# permanent liability for no gain.
+RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r /app/requirements.txt
+
+# After the pip layer so editing the script does not reinstall Python deps.
+RUN mkdir -p /opt/md2blocks && cd /opt/md2blocks && npm init -y >/dev/null \
+    && npm install @tryfabric/martian@1.2.4 && npm cache clean --force
+COPY md2blocks/md2blocks.mjs /opt/md2blocks/md2blocks.mjs
 
 COPY app/ /app/app/
 COPY scripts/ /app/scripts/
