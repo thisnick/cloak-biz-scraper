@@ -5,23 +5,27 @@ from pydantic import BaseModel, Field
 
 
 class Listing(BaseModel):
-    """One business listing, normalized.
+    """One business listing.
 
-    Every source adapter emits this same shape, so the stores never learn which
-    site a row came from and the scrape adapters never learn where it lands.
-
-    **The money fields are verbatim strings — exactly what the card said**:
-    "$1,258,000", "Not Disclosed", "$81,000 + Inventory". A scraper reports what
-    it saw and never discards information, because the moment it parses it has
-    thrown away the difference between "$81,000" and "$81,000 + Inventory" for
-    everyone downstream, including the agent reading this over MCP.
-
-    **Parsing to a number is the STORE's job**, not this model's, because
-    "number" is a property of the Notion column rather than of the listing:
-    NotionStore parses when writing to a Number column and leaves the cell empty
-    when it cannot be sure. See stores/money.py for why an empty cell beats a
-    confident wrong one, and stores/notion.py for where it happens.
+    Money fields are quoted verbatim from the listing, exactly as it stated them
+    — "$1,258,000", "Not Disclosed", "$81,000 + Inventory". They are strings, so
+    read them as text rather than assuming a number.
     """
+
+    # The docstring above is shipped to the model as part of the tool's output
+    # schema, so it describes the data and nothing else. The reasoning, for
+    # whoever edits this next:
+    #
+    # Every source adapter emits this shape, so stores never learn which site a
+    # row came from and adapters never learn where it lands.
+    #
+    # The money fields are verbatim because a scraper that parses has already
+    # destroyed the difference between "$81,000" and "$81,000 + Inventory" for
+    # everyone downstream, including the agent. Parsing is the STORE's job:
+    # "number" is a property of the Notion column, not of the listing, so
+    # NotionStore parses on the way in and leaves the cell empty when it cannot
+    # be sure. See stores/money.py for why an empty cell beats a confident wrong
+    # one, and stores/notion.py for where it happens.
 
     listing_id: str = ""
     url: str = ""
@@ -72,14 +76,17 @@ class Job(BaseModel):
 
 
 class ScrapeResult(BaseModel):
-    """The one shape both `scrape_listings` and `get_scrape_listing_results`
-    return.
+    """The result of a sweep.
 
-    Same schema from both, so an agent never has to learn two. Starting a sweep
-    and collecting it are the same question asked at different times, and the
-    only honest difference between the answers is `status` and how full
-    `listings` is.
+    While status is "working" the sweep is still running and `listings` is
+    empty — collect it with get_scrape_listing_results. `synced` is null when
+    sync was false, which means nothing was saved rather than nothing was found.
     """
+
+    # Both tools return this one shape so an agent never has to learn two:
+    # starting a sweep and collecting it are the same question asked at
+    # different times, and the only honest difference between the answers is
+    # `status` and how full `listings` is.
 
     job_id: str
     status: str = "working"
@@ -135,19 +142,26 @@ class InstanceCreate(BaseModel):
 
 
 class InstanceView(BaseModel):
-    """A running browser, as an agent sees it.
+    """A running browser.
 
-    `timezone` and `locale` are `None` when they were not measured, and that is
-    load-bearing. Step 1 defaulted an unmeasured timezone to America/Los_Angeles,
-    which reported a value nobody had observed as though it were resolved — for
-    an instance whose proxy could not even route. Step 2 deleted that fallback.
-    Nothing here may reintroduce one: a browser whose reported timezone
-    contradicts its exit IP is the exact tell listing sites look for, so an
-    honest `null` is worth more than a plausible string.
-
-    `cdp_url` carries a freshly minted, short-lived token and is therefore
-    different on every call. It is never stored and never reused.
+    `timezone` and `locale` are null when they could not be measured — never
+    guessed at. `cdp_url` carries a short-lived token and is only valid for a
+    few minutes.
     """
+
+    # Everything above this line is shipped to the model as the tool's output
+    # schema, so it says what the data means and stops. The reasoning belongs
+    # here, where it is for whoever edits this next:
+    #
+    # The nulls are load-bearing. Step 1 defaulted an unmeasured timezone to
+    # America/Los_Angeles, reporting a value nobody had observed as though it
+    # were resolved — on instances whose proxy could not even route. Step 2
+    # deleted that fallback. This is the first step where an agent can see the
+    # field, so it is the first step where a default would be believed, and a
+    # browser whose timezone contradicts its exit IP is the exact tell listing
+    # sites look for. An honest null beats a plausible string.
+    #
+    # cdp_url is minted per call and never stored (services/views.py).
 
     instance_id: str
     profile: str
