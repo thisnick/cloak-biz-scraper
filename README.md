@@ -68,7 +68,8 @@ You are already in the dashboard from step 2, so this is one more click while yo
 are standing there. It makes the server switch itself off when nothing is
 happening, and switch back on — in about a second — the next time you use it.
 
-**Skipping it costs about $8–9 a month, forever, for a server doing nothing.**
+**Skipping it costs about $8–9 a month and slowly rising, for a server doing
+nothing.**
 That is more than the $5 of usage your plan includes. Nothing will warn you: the
 app works exactly the same either way, and the bill is the only feedback you get.
 
