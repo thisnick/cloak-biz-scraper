@@ -38,6 +38,7 @@ from ..config import CONFIG
 from . import geo
 from .display import DisplayManager
 from .geo import GeoUnresolved
+from .license import resolve_pro_binary
 from .profiles import ProfileStore
 from .proxy import ProxyParts, build_proxy_url, masked
 from .settings import SettingsService
@@ -54,10 +55,6 @@ Origin = Literal["task", "interactive"]
 
 class CapExceeded(RuntimeError):
     pass
-
-
-class LicenseNotConfigured(RuntimeError):
-    """No Pro license in settings."""
 
 
 class PinUnavailable(RuntimeError):
@@ -215,11 +212,18 @@ class InstanceManager:
         from cloakbrowser import launch_persistent_context_async
 
         settings = self._settings.load()
-        if not settings.cloakbrowser_license_key:
-            raise LicenseNotConfigured(
-                "CloakBrowser license key is not configured. Add it under Settings — "
-                "without it only the free binary is available, which this app does not use."
-            )
+
+        # Resolve the binary before anything else, and refuse anything but Pro.
+        # Guarding only the *empty* key is not enough: an invalid one does not
+        # raise, it silently resolves the free browser — which is a different,
+        # older binary that the Step 0 fonts gate never covered. Cheap to do
+        # here: every launch path calls ensure_binary anyway, so this hits the
+        # same cache a moment earlier and simply looks at what came back.
+        await asyncio.to_thread(
+            resolve_pro_binary,
+            settings.cloakbrowser_license_key,
+            settings.cloakbrowser_version,
+        )
         parts = ProxyParts.from_settings(settings)
 
         profile = self.profiles.get_or_create(
