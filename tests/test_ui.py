@@ -88,7 +88,7 @@ class TestLogin:
     def test_signed_in_sees_the_settings(self, auth):
         response = auth.get("/")
         assert response.status_code == 200
-        assert "Residential proxy" in response.text
+        assert "Everything this server needs" in response.text
 
     def test_logout_clears_the_session(self, auth):
         auth.post("/logout")
@@ -158,7 +158,7 @@ class TestSaving:
         auth.post("/settings/cloakbrowser", data={"cloakbrowser_license_key": "cb_verysecret"})
         page = auth.get("/")
         assert "cb_verysecret" not in page.text
-        assert "licence saved" in page.text
+        assert "Licence saved" in page.text
 
     def test_blank_secret_field_keeps_the_saved_value(self, auth):
         auth.post("/settings/cloakbrowser", data={"cloakbrowser_license_key": "cb_keepme"})
@@ -364,10 +364,9 @@ class TestProxyTest:
         )
         # Come back later. Fresh GET, no banner from the POST.
         page = shown(auth.get("/"))
-        assert "not working" in page
         assert "did not work when it was last tested" in page
         assert "Scrapes will fail until it does" in page
-        assert '<span class="pill unset">not working</span>' in auth.get("/").text
+        assert '<span class="chip bad">Not working</span>' in auth.get("/").text
         # And the values they typed are still there to fix, not thrown away.
         assert app.state.settings.load().proxy_host == "192.0.2.1"
 
@@ -418,7 +417,7 @@ class TestProxyTest:
                   "proxy_host": "h.example.com", "proxy_port": "1000"},
         )
         page = shown(auth.get("/"))
-        assert '<span class="pill set">working</span>' in auth.get("/").text
+        assert '<span class="chip ok">Working</span>' in auth.get("/").text
         assert "45.12.3.4" in page and "Last tested" in page
 
     def test_filling_the_form_in_is_not_evidence_of_anything(self, auth):
@@ -429,9 +428,9 @@ class TestProxyTest:
         )
         response = auth.get("/")
         page = shown(response)
-        assert '<span class="pill warn">not tested yet</span>' in response.text
+        assert '<span class="chip warn">Not tested</span>' in response.text
         assert "Filling the form in does not prove the proxy routes" in page
-        assert '<span class="pill set">working</span>' not in response.text
+        assert '<span class="chip ok">Working</span>' not in response.text
 
     @respx.mock
     def test_editing_the_proxy_retires_the_old_verdict(self, auth, monkeypatch):
@@ -450,7 +449,7 @@ class TestProxyTest:
                                            "proxy_host": "somewhere-else.example.com",
                                            "proxy_port": "1000"})
         assert app.state.settings.load().proxy_status() == "untested"
-        assert "not tested yet" in shown(auth.get("/"))
+        assert '<span class="chip warn">Not tested</span>' in auth.get("/").text
 
     def test_incomplete_proxy_is_not_tested(self, auth):
         response = auth.post("/settings/proxy", data={"action": "test", "proxy_user": "u"})

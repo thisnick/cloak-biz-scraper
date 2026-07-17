@@ -1,43 +1,43 @@
 {% extends "base.html" %}
 {% block title %}Sign in — Cloak Biz Scraper{% endblock %}
-{% block body %}
-<h1>Cloak Biz Scraper</h1>
-<p class="sub">Sign in with the deployment secret to configure this server.</p>
+{% block shell %}
+<div class="login-page">
+  <div class="login">
+    <h1>Cloak Biz Scraper</h1>
+    <p class="sub">Sign in with the deployment secret to configure this server.</p>
 
-<section>
-  {% if unconfigured %}
-    {# Not a crash: healthz stays green and the page explains itself, because a
-       crash-looping container on Railway tells the user nothing at all. #}
-    <div class="banner bad">
-      <strong>This deployment has no secret set.</strong>
-      Nobody can sign in until it does. In Railway, open this service's
-      <em>Variables</em> tab, add <code>APP_SECRET</code> with a long random value,
-      and let it redeploy. Then come back and sign in with that value.
-    </div>
-  {% else %}
-    {% if error %}<div class="banner bad">{{ error }}</div>{% endif %}
-
-    <form method="post" action="/login">
-      <label for="secret">APP_SECRET</label>
-      <input type="password" id="secret" name="secret" autocomplete="current-password"
-             autofocus required>
-      <p class="hint">
-        Copy it from your Railway service's <em>Variables</em> tab.
-      </p>
-      <div class="actions">
-        <button class="primary" type="submit">Sign in</button>
+    {% if unconfigured %}
+      {# Not a crash: healthz stays green and the page explains itself, because a
+         crash-looping container on Railway tells the user nothing at all. #}
+      <div class="banner bad">
+        <strong>This deployment has no secret set.</strong>
+        Nobody can sign in until it does. In Railway, open this service's
+        <em>Variables</em> tab, add <code>APP_SECRET</code> with a long random value,
+        and let it redeploy. Then come back and sign in with that value.
       </div>
-    </form>
+    {% else %}
+      {% if error %}<div class="banner bad">{{ error }}</div>{% endif %}
 
-    {# The recovery line belongs HERE, not on the settings page: someone locked
-       out cannot read the settings page, and someone who can read it does not
-       need this. It is one line because recovery is now one step — the secret is
-       just the Railway variable. #}
-    <hr>
-    <p class="hint" style="margin-bottom:0">
-      <strong>Forgotten it?</strong> It is your <code>APP_SECRET</code> in Railway →
-      this service → <em>Variables</em>. To change it, edit it there and redeploy.
-    </p>
-  {% endif %}
-</section>
+      <form method="post" action="/login">
+        <label for="secret">APP_SECRET</label>
+        <input type="password" id="secret" name="secret" autocomplete="current-password"
+               autofocus required>
+        <div class="actions">
+          <button class="primary" type="submit">Sign in</button>
+        </div>
+        <p class="hint">Copy it from your Railway service's <em>Variables</em> tab.</p>
+      </form>
+
+      {# The recovery line belongs HERE, not on the settings page: someone locked
+         out cannot read the settings page, and someone who can read it does not
+         need this. It is one line because recovery is now one step — the secret is
+         just the Railway variable. #}
+      <hr>
+      <p class="hint" style="margin-bottom:0">
+        <strong>Forgotten it?</strong> It is your <code>APP_SECRET</code> in Railway →
+        this service → <em>Variables</em>. To change it, edit it there and redeploy.
+      </p>
+    {% endif %}
+  </div>
+</div>
 {% endblock %}

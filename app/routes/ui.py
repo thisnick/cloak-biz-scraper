@@ -94,8 +94,58 @@ def _require_same_origin(request: Request) -> None:
         raise HTTPException(status_code=403, detail="cross-origin request refused")
 
 
+def _ago(epoch: float) -> str:
+    """A human "when", relative to now. The dashboard shows times to a person who
+    thinks in "6 min ago", not epoch seconds."""
+    if not epoch:
+        return ""
+    secs = max(0, int(time.time() - epoch))
+    if secs < 60:
+        return "just now"
+    mins = secs // 60
+    if mins < 60:
+        return f"{mins} min ago"
+    hours = mins // 60
+    if hours < 24:
+        return f"{hours} hr ago"
+    days = hours // 24
+    return "Yesterday" if days == 1 else f"{days} days ago"
+
+
+def _dur(seconds: float) -> str:
+    """A short duration like 4m 12s / 21s. Never negative, never a bare float."""
+    s = max(0, int(seconds))
+    return f"{s // 60}m {s % 60:02d}s" if s >= 60 else f"{s}s"
+
+
+def _job_result(job) -> tuple[str, str]:
+    """(css-state, label) for a finished job's Result cell. 'blocked' is called
+    out because it is the failure a user can act on (rotate/retry), distinct from
+    an ordinary stop."""
+    if job.status == "completed":
+        return "ok", f"{len(job.listings)} listings"
+    if job.status == "failed":
+        if job.error and "block" in job.error.lower():
+            return "bad", "Blocked"
+        return "asleep", "Stopped"
+    return "live", "Running"
+
+
 def _render(request: Request, result: Result | None = None, status: int = 200) -> Response:
     settings: Settings = request.app.state.settings.load()
+    from ..services.urls import public_base
+    from ..services.views import instance_view
+
+    secret = request.app.state.secret.current()
+    base = public_base(request)
+    instances = [
+        instance_view(i, secret=secret, base_url=base)
+        for i in request.app.state.instances.running.values()
+    ]
+    jobs = request.app.state.jobs.all()
+    running = [j for j in jobs if j.status == "working"]
+    history = [j for j in jobs if j.status != "working"][:25]
+
     return templates.TemplateResponse(
         request,
         "index.html",
@@ -107,6 +157,15 @@ def _render(request: Request, result: Result | None = None, status: int = 200) -
             "has_proxy_password": bool(settings.proxy_password),
             "has_notion_token": bool(settings.notion_api_token),
             "proxy_checked_at": _when(settings.proxy_last_check_at),
+            # dashboard sections
+            "instances": instances,
+            "running_jobs": running,
+            "history_jobs": history,
+            "server_url": base.rstrip("/") + "/mcp",
+            "ago": _ago,
+            "dur": _dur,
+            "job_result": _job_result,
+            "now": time.time(),
         },
         status_code=status,
     )

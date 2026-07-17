@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}Settings — Cloak Biz Scraper{% endblock %}
+{% block title %}Cloak Biz Scraper{% endblock %}
 
 {% macro banner(name) %}
   {% if result and result.section == name %}
@@ -8,9 +8,7 @@
       {% if name == 'notion' and result.detail and result.detail.problems is defined %}
         {% set r = result.detail %}
         {# Two grades, never merged. Required = nothing syncs until you fix it.
-           Recommended = everything syncs except this column. Presenting them as
-           one list of "schema problems" is how someone ends up hunting for a
-           blocker they don't have. #}
+           Recommended = everything syncs except this column. #}
         {% if r.missing_required or r.mismatched_required %}
           <p style="margin:10px 0 2px"><strong>Add these before syncing can work:</strong></p>
           <ul>
@@ -36,263 +34,388 @@
   {% endif %}
 {% endmacro %}
 
-{% block body %}
-<header>
-  <div>
-    <h1>Cloak Biz Scraper</h1>
-    <p class="sub">Everything this server needs, configured here. Nothing to install.</p>
-  </div>
-  <form method="post" action="/logout"><button type="submit">Sign out</button></form>
-</header>
+{% set active = 'settings' if result else 'overview' %}
+{% set titles = {'overview':'Overview','browsers':'Browsers','tasks':'Tasks','connect':'Connect','settings':'Settings'} %}
 
-{# ── CloakBrowser ─────────────────────────────────────────────────────────── #}
-<section>
-  <h2>CloakBrowser
-    <span class="pill {{ 'set' if has_license else 'unset' }}">{{ 'licence saved' if has_license else 'no licence' }}</span>
-  </h2>
-  <p class="hint">
-    Your own CloakBrowser Pro licence. The browser itself (~150 MB) is downloaded
-    on demand and kept on this server's disk — verifying below fetches it now, so
-    your first scrape doesn't wait for it.
-  </p>
-  {{ banner('cloakbrowser') }}
-  {% if result and result.section == 'cloakbrowser' and result.ok and result.detail and result.detail.version %}
-    <p class="hint mono">Resolved version: {{ result.detail.version }} · cached in {{ result.detail.cache_dir }}</p>
-  {% endif %}
-
-  <form method="post" action="/settings/cloakbrowser">
-    <label for="lic">Licence key</label>
-    <input type="password" id="lic" name="cloakbrowser_license_key" autocomplete="off"
-           placeholder="{{ '•••••••••• (saved — leave blank to keep it)' if has_license else 'cb_...' }}">
-
-    <label for="pin">Version pin <span style="font-weight:400;color:var(--muted)">— optional</span></label>
-    <input type="text" id="pin" name="cloakbrowser_version" class="mono"
-           value="{{ s.cloakbrowser_version }}" placeholder="e.g. 148.0.7778.215.5">
-    <p class="hint">
-      Leave empty to always get the latest build. Pin it only if you need to freeze
-      a specific version — pinned versions are withdrawn once superseded, and a
-      withdrawn pin stops working until you clear it.
-    </p>
-    <div class="actions">
-      <button type="submit" name="action" value="save">Save</button>
-      <button class="primary" type="submit" name="action" value="verify">Save &amp; verify licence</button>
+{% block shell %}
+<div class="app" id="app">
+  <aside class="side">
+    <div class="brand"><div class="mark"></div><div class="txt"><b>Cloak Biz Scraper</b></div></div>
+    <nav>
+      <button class="nav-item {{ 'active' if active=='overview' }}" data-nav="overview">
+        <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12l9-9 9 9M5 10v10h14V10"/></svg><span class="txt">Overview</span></button>
+      <button class="nav-item {{ 'active' if active=='browsers' }}" data-nav="browsers">
+        <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 8h18"/></svg><span class="txt">Browsers</span>{% if instances %}<span class="badge">{{ instances|length }}</span>{% endif %}</button>
+      <button class="nav-item {{ 'active' if active=='tasks' }}" data-nav="tasks">
+        <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 6h11M9 12h11M9 18h11"/><path d="M4 6l1 1 2-2M4 12l1 1 2-2M4 18l1 1 2-2"/></svg><span class="txt">Tasks</span>{% if running_jobs %}<span class="badge">{{ running_jobs|length }}</span>{% endif %}</button>
+      <button class="nav-item {{ 'active' if active=='connect' }}" data-nav="connect">
+        <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 11V7a4 4 0 0 1 8 0M6 11h12a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-6a2 2 0 0 1 2-2z"/></svg><span class="txt">Connect</span></button>
+      <button class="nav-item {{ 'active' if active=='settings' }}" data-nav="settings">
+        <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/></svg><span class="txt">Settings</span></button>
+    </nav>
+    <div class="side-foot">
+      <form method="post" action="/logout">
+        <button class="signout" type="submit">
+          <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></svg><span class="txt">Sign out</span></button>
+      </form>
     </div>
-  </form>
-</section>
+  </aside>
 
-{# ── Proxy ────────────────────────────────────────────────────────────────── #}
-{# The pill reports the last measurement, never the fact that the boxes are
-   filled in. A config with every field set and no working route is the exact
-   thing a green "configured" would hide, and the error banner is gone the
-   moment they navigate away. #}
-{% set st = s.proxy_status() %}
-{% set pill = {'working': ('set', 'working'), 'broken': ('unset', 'not working'),
-               'untested': ('warn', 'not tested yet'),
-               'unconfigured': ('unset', 'not configured')}[st] %}
-<section>
-  <h2>Residential proxy
-    <span class="pill {{ pill[0] }}">{{ pill[1] }}</span>
-  </h2>
-  <p class="hint">
-    Every browser goes out through your proxy. Without one, nothing launches — this
-    server never browses from its own address.
-  </p>
-
-  {% if st == 'broken' %}
-    <div class="banner bad">
-      <strong>This proxy did not work when it was last tested.</strong>
-      Scrapes will fail until it does — a browser cannot launch without a route out.
-      <br><span class="hint">{{ s.proxy_last_check_summary }} (tested {{ proxy_checked_at }})</span>
+  <main>
+    <div class="topbar">
+      <button class="iconbtn" id="collapse" aria-label="Collapse menu"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16M4 12h16M4 18h16"/></svg></button>
+      <h1 id="tb-title">{{ titles[active] }}</h1>
+      <div class="spacer"></div>
     </div>
-  {% elif st == 'working' %}
-    <p class="hint">
-      Last tested {{ proxy_checked_at }}: <span class="mono">{{ s.proxy_last_check_summary }}</span>
-    </p>
-  {% elif st == 'untested' %}
-    <div class="banner warn">
-      Saved, but never tested. Filling the form in does not prove the proxy routes —
-      click <em>Save &amp; test proxy</em> to find out.
+
+    <div class="content">
+
+      {# ── OVERVIEW ────────────────────────────────────────────────────── #}
+      <section data-section="overview" class="{{ 'on' if active=='overview' }}">
+        <h2 class="page-h">Overview</h2>
+        <p class="page-lead">Everything running right now, at a glance.</p>
+
+        <div class="subh">Browsers — {{ instances|length }} running<a data-nav="browsers" href="#">Open Browsers →</a></div>
+        {% if instances %}
+          {% for i in instances %}
+          <div class="card trun">
+            <span class="statepill {{ 'live' if i.origin=='task' else 'idle' }}"><span class="dot {{ 'live' if i.origin=='task' else 'idle' }}"></span>{{ 'Working' if i.origin=='task' else 'Idle' }}</span>
+            <div class="g"><b>{{ 'Sweep browser' if i.origin=='task' else 'Manual browser' }}</b>
+              <div class="where">{{ i.timezone or 'location unknown' }}{% if i.proxy_ip %} · via proxy{% endif %}</div></div>
+            <span class="tagb {{ '' if i.origin=='task' else 'int' }}">{{ 'Task' if i.origin=='task' else 'Interactive' }}</span>
+          </div>
+          {% endfor %}
+        {% else %}
+          <div class="card"><div class="pane-slot" style="border:none;background:none">No browsers running. Start one from Browsers, or ask your assistant to run a sweep.</div></div>
+        {% endif %}
+
+        <div class="subh">Tasks<a data-nav="tasks" href="#">Open Tasks →</a></div>
+        {% if running_jobs %}
+          {% for j in running_jobs %}
+          <div class="card trun">
+            <span class="statepill live"><span class="dot live"></span>Running</span>
+            <div class="g"><b>Sweep</b><div class="where">page {{ j.pages_crawled }} / {{ j.max_pages }} · started {{ ago(j.created_at) }}</div></div>
+            <div class="el">{{ dur(now - j.created_at) }}</div>
+          </div>
+          {% endfor %}
+        {% else %}
+          <div class="card"><div class="pane-slot" style="border:none;background:none">Nothing running right now.</div></div>
+        {% endif %}
+      </section>
+
+      {# ── BROWSERS ────────────────────────────────────────────────────── #}
+      <section data-section="browsers" class="{{ 'on' if active=='browsers' }}">
+        <h2 class="page-h">Browsers</h2>
+        <div class="bar-actions">
+          <div class="count"><b>{{ instances|length }}</b> running · they close on their own when idle</div>
+          <form method="post" action="/sessions/instances"><button class="btn primary" type="submit">+ New browser</button></form>
+        </div>
+        <div class="acc browsers">
+          {% for i in instances %}
+          <div class="acc-item {{ 'open' if loop.first }}">
+            <button class="acc-head">
+              <svg class="chev" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M9 6l6 6-6 6"/></svg>
+              <span class="h-title">{{ 'Sweep browser' if i.origin=='task' else 'Manual browser' }}</span>
+              <div class="h-right">
+                <span class="tagb {{ '' if i.origin=='task' else 'int' }}">{{ 'Task' if i.origin=='task' else 'Interactive' }}</span>
+                <span class="statepill {{ 'live' if i.origin=='task' else 'idle' }}"><span class="dot {{ 'live' if i.origin=='task' else 'idle' }}"></span>{{ 'Live' if i.origin=='task' else 'Idle' }}</span>
+                {% if i.expires_at %}<span class="closes">closes in <b>{{ dur(i.expires_at - now) }}</b></span>{% endif %}
+              </div>
+            </button>
+            <div class="acc-body" style="display:grid;grid-template-columns:1.5fr 1fr;gap:17px">
+              {# Stage B replaces this slot with a live view-only noVNC pane. #}
+              <div class="pane-slot">Live view arrives in the next update.<br>The browser is running now.</div>
+              <div class="bctrl">
+                <div class="kv"><span class="k">Doing</span><span class="v">{% if i.origin=='task' %}Running a sweep{% else %}<small>you opened this</small>{% endif %}</span></div>
+                <div class="kv"><span class="k">Open for</span><span class="v">{{ dur(i.age_sec) }}</span></div>
+                <div class="kv"><span class="k">Proxy &amp; location</span><span class="v">{{ i.timezone or 'unknown' }}{% if i.locale %} · {{ i.locale }}{% endif %}</span></div>
+                <div class="btnrow">
+                  <form method="post" action="/sessions/instances/{{ i.instance_id }}/close">
+                    <button class="btn danger" type="submit">Close</button>
+                  </form>
+                </div>
+              </div>
+            </div>
+          </div>
+          {% else %}
+          <div class="card"><div class="pane-slot" style="border:none;background:none">No browsers running. Click <b>+ New browser</b> to open one you can watch and drive.</div></div>
+          {% endfor %}
+        </div>
+      </section>
+
+      {# ── TASKS ───────────────────────────────────────────────────────── #}
+      <section data-section="tasks" class="{{ 'on' if active=='tasks' }}">
+        <h2 class="page-h">Tasks</h2>
+        <div class="subh">Running now</div>
+        {% if running_jobs %}
+          {% for j in running_jobs %}
+          <div class="card trun">
+            <span class="statepill live"><span class="dot live"></span>Running</span>
+            <div class="g"><b>Sweep</b><div class="where">page {{ j.pages_crawled }} / {{ j.max_pages }}</div></div>
+            <div class="el">{{ dur(now - j.created_at) }}</div>
+          </div>
+          {% endfor %}
+        {% else %}
+          <div class="card"><div class="pane-slot" style="border:none;background:none">No task is running. Ask your assistant to find listings, or start one yourself.</div></div>
+        {% endif %}
+
+        <div class="subh">History</div>
+        <div class="card" style="padding:14px 0 6px">
+          <div class="tablewrap">
+            <table class="hist">
+              <thead><tr><th>Task</th><th>Started</th><th>Ran for</th><th>Result</th></tr></thead>
+              <tbody>
+                {% for j in history_jobs %}
+                  {% set r = job_result(j) %}
+                  <tr>
+                    <td><b>Sweep</b></td>
+                    <td class="mono">{{ ago(j.created_at) }}</td>
+                    <td class="mono">{{ dur(j.updated_at - j.created_at) }}</td>
+                    <td>{% if r[0]=='ok' %}<span class="res">{{ r[1] }}</span>{% else %}<span class="statepill {{ r[0] }}"><span class="dot {{ r[0] }}"></span>{{ r[1] }}</span>{% endif %}</td>
+                  </tr>
+                {% else %}
+                  <tr><td colspan="4" class="mono" style="color:var(--muted)">No finished tasks yet.</td></tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      {# ── CONNECT ─────────────────────────────────────────────────────── #}
+      <section data-section="connect" class="{{ 'on' if active=='connect' }}">
+        <h2 class="page-h">Connect your assistant</h2>
+        <p class="page-lead">Add this server to ChatGPT or Claude once. Then just ask them to find listings — they do the rest through this server.</p>
+        <div class="urlbox">
+          <span class="lab">Server link</span>
+          <code id="mcpurl">{{ server_url }}</code>
+          <button class="btn" id="copybtn" type="button">Copy</button>
+        </div>
+
+        <div class="acc">
+          <div class="acc-item">
+            <button class="acc-head">
+              <span class="clogo gpt">G</span><span class="h-title">Connect in ChatGPT</span>
+              <div class="h-right"><svg class="chev" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M9 6l6 6-6 6"/></svg></div>
+            </button>
+            <div class="acc-body">
+              <ol class="steps">
+                <li>Open <b>Settings → Connectors</b>.</li>
+                <li>Choose <b>Add custom connector</b> and paste the server link above.</li>
+                <li>When it asks you to sign in, enter your secret — the same one you use here.</li>
+                <li>Done. In a chat, say <i>“find new Bay Area listings.”</i></li>
+              </ol>
+              <p class="provisional">⚠ The exact menu names are still being confirmed against the real ChatGPT connector flow; they may differ slightly.</p>
+            </div>
+          </div>
+          <div class="acc-item">
+            <button class="acc-head">
+              <span class="clogo claude">C</span><span class="h-title">Connect in Claude</span>
+              <div class="h-right"><svg class="chev" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M9 6l6 6-6 6"/></svg></div>
+            </button>
+            <div class="acc-body">
+              <ol class="steps">
+                <li>Open <b>Settings → Connectors</b>.</li>
+                <li>Choose <b>Add custom connector</b> and paste the server link above.</li>
+                <li>When it asks you to sign in, enter your secret — the same one you use here.</li>
+                <li>Done. In a chat, say <i>“find new Bay Area listings.”</i></li>
+              </ol>
+              <p class="provisional">⚠ The exact menu names are still being confirmed against the real Claude connector flow; they may differ slightly.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="cnote">
+          <svg class="ico" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
+          <div><b>Signing in is the same secret</b><p>Both apps send you here to sign in. Use your <code>APP_SECRET</code> — you never hand either app your licence, proxy, or Notion details.</p></div>
+        </div>
+      </section>
+
+      {# ── SETTINGS ────────────────────────────────────────────────────── #}
+      <section data-section="settings" class="{{ 'on' if active=='settings' }}">
+        <h2 class="page-h">Settings</h2>
+        <p class="page-lead">Everything this server needs, set once and kept on this server. Tap a section to open it.</p>
+
+        <div class="acc">
+
+          {# Browser licence #}
+          <div class="acc-item {{ 'open' if result and result.section=='cloakbrowser' }}">
+            <button class="acc-head">
+              <svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 8h18"/></svg>
+              <span class="h-title">Browser licence</span>
+              <div class="h-right">
+                <span class="chip {{ 'ok' if has_license else 'bad' }}">{{ 'Licence saved' if has_license else 'No licence' }}</span>
+                <svg class="chev" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M9 6l6 6-6 6"/></svg>
+              </div>
+            </button>
+            <div class="acc-body">
+              <p class="lead-help">Your CloakBrowser Pro key. The browser (~150 MB) downloads on demand and stays on this server's disk — verifying fetches it now, so your first scrape doesn't wait.</p>
+              {{ banner('cloakbrowser') }}
+              {% if result and result.section == 'cloakbrowser' and result.ok and result.detail and result.detail.version %}
+                <p class="lead-help mono">Resolved version: {{ result.detail.version }} · cached in {{ result.detail.cache_dir }}</p>
+              {% endif %}
+              <form method="post" action="/settings/cloakbrowser">
+                <div class="field"><label>Licence key</label>
+                  <input type="password" name="cloakbrowser_license_key" autocomplete="off"
+                         placeholder="{{ '•••••••••• (saved — leave blank to keep it)' if has_license else 'cb_...' }}"></div>
+                <div class="field"><label>Version pin — optional</label>
+                  <input type="text" name="cloakbrowser_version" value="{{ s.cloakbrowser_version }}" placeholder="e.g. 148.0.7778.215.5">
+                  <div class="help">Leave empty to always get the latest. Pin only to freeze a version; a withdrawn pin stops working until you clear it.</div></div>
+                <div class="btnrow">
+                  <button class="btn" type="submit" name="action" value="save">Save</button>
+                  <button class="btn primary" type="submit" name="action" value="verify">Save &amp; verify</button>
+                </div>
+              </form>
+            </div>
+          </div>
+
+          {# Proxy #}
+          {% set st = s.proxy_status() %}
+          {% set chip = {'working': ('ok', 'Working'), 'broken': ('bad', 'Not working'),
+                         'untested': ('warn', 'Not tested'), 'unconfigured': ('bad', 'Not set up')}[st] %}
+          <div class="acc-item {{ 'open' if result and result.section=='proxy' }}">
+            <button class="acc-head">
+              <svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2c3 3 3 17 0 20M12 2c-3 3-3 17 0 20"/></svg>
+              <span class="h-title">Proxy</span>
+              <div class="h-right">
+                <span class="chip {{ chip[0] }}">{{ chip[1] }}</span>
+                <svg class="chev" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M9 6l6 6-6 6"/></svg>
+              </div>
+            </button>
+            <div class="acc-body">
+              <p class="lead-help">Every browser goes out through this. Without it, nothing launches — the server never uses its own address.</p>
+              {% if st == 'broken' %}
+                <div class="banner bad"><strong>This proxy did not work when it was last tested.</strong>
+                  Scrapes will fail until it does.<br><span class="hint">{{ s.proxy_last_check_summary }} (tested {{ proxy_checked_at }})</span></div>
+              {% elif st == 'untested' %}
+                <div class="banner warn">Saved, but never tested. Filling the form in does not prove the proxy routes — click <em>Save &amp; test</em> to check.</div>
+              {% elif st == 'working' %}
+                <p class="lead-help">Last tested {{ proxy_checked_at }}: <span class="mono">{{ s.proxy_last_check_summary }}</span></p>
+              {% endif %}
+              {{ banner('proxy') }}
+              {% if result and result.section == 'proxy' and result.ok and result.detail %}
+                <p class="lead-help">Measured just now: exit IP <span class="mono">{{ result.detail.exit_ip }}</span>,
+                  {% if result.detail.geo_resolved %}{{ result.detail.city or 'an unnamed city' }}{% if result.detail.country %}, {{ result.detail.country }}{% endif %}, timezone <span class="mono">{{ result.detail.timezone }}</span>.{% else %}location <strong>unknown</strong>.{% endif %}
+                  This proves traffic routes; it may <strong>not</strong> prove your password is right — some providers skip the password check for addresses they trust, so a typo would still look like this.</p>
+              {% endif %}
+              <form method="post" action="/settings/proxy">
+                <div class="grid2">
+                  <div class="field"><label>Username</label><input type="text" name="proxy_user" value="{{ s.proxy_user }}" autocomplete="off"></div>
+                  <div class="field"><label>Password</label><input type="password" name="proxy_password" autocomplete="off" placeholder="{{ '•••••••••• (saved)' if has_proxy_password else '' }}"></div>
+                  <div class="field"><label>Host</label><input type="text" name="proxy_host" value="{{ s.proxy_host }}"></div>
+                  <div class="field"><label>Port</label><input type="text" name="proxy_port" value="{{ s.proxy_port }}"></div>
+                  <div class="field"><label>Country</label><input type="text" name="proxy_country" value="{{ s.proxy_country }}"></div>
+                  <div class="field"><label>Region</label><input type="text" name="proxy_region" value="{{ s.proxy_region }}"></div>
+                </div>
+                <div class="btnrow">
+                  <button class="btn" type="submit" name="action" value="save">Save</button>
+                  <button class="btn primary" type="submit" name="action" value="test">Save &amp; test</button>
+                </div>
+              </form>
+            </div>
+          </div>
+
+          {# Notion #}
+          <div class="acc-item {{ 'open' if result and result.section=='notion' }}">
+            <button class="acc-head">
+              <svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h16v16H4zM4 9h16M9 4v16"/></svg>
+              <span class="h-title">Notion</span>
+              <div class="h-right">
+                <span class="chip {{ 'ok' if s.notion_configured() else 'warn' }}">{{ 'Connected' if s.notion_configured() else 'Incomplete' }}</span>
+                <svg class="chev" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M9 6l6 6-6 6"/></svg>
+              </div>
+            </button>
+            <div class="acc-body">
+              <p class="lead-help">Where found listings are saved. Create an integration at <a href="https://www.notion.so/my-integrations" target="_blank" rel="noreferrer">notion.so/my-integrations</a>, paste its token, then <em>share</em> your database with it from Notion's ••• menu.</p>
+              {{ banner('notion') }}
+              <form method="post" action="/settings/notion">
+                <div class="field"><label>API token</label>
+                  <input type="password" name="notion_api_token" autocomplete="off"
+                         placeholder="{{ '•••••••••• (saved — leave blank to keep it)' if has_notion_token else 'ntn_...' }}"></div>
+                <div class="btnrow">
+                  <button class="btn" type="submit" name="action" value="save">Save</button>
+                  <button class="btn primary" type="submit" name="action" value="list">Save &amp; find my databases</button>
+                </div>
+              </form>
+              {% if s.notion_db_id %}
+                <div class="selrow"><span class="k">Saving to</span><span class="v">{{ s.notion_db_id }}</span>
+                  <form method="post" action="/settings/notion/verify" style="margin-left:auto"><button class="btn" type="submit">Verify schema</button></form></div>
+              {% endif %}
+              {% if result and result.section == 'notion' and result.detail and result.detail.databases is defined %}
+                <hr>
+                <p class="lead-help">Use an existing database — its schema is checked before anything is written. Nothing is changed for you.</p>
+                <form method="post" action="/settings/notion/select">
+                  <div class="field"><label>Database</label>
+                    <select name="db_id">
+                      {% for db in result.detail.databases %}<option value="{{ db.id }}" {{ 'selected' if db.id == s.notion_db_id }}>{{ db.title }}</option>{% endfor %}
+                    </select></div>
+                  <div class="btnrow"><button class="btn primary" type="submit">Use this database</button></div>
+                </form>
+                <hr>
+                <p class="lead-help">Or create a new one — only when you click; this app never adds a database on its own.</p>
+                <form method="post" action="/settings/notion/create">
+                  <div class="field"><label>Under which page</label>
+                    <select name="parent_page_id">
+                      {% for pg in result.detail.pages %}<option value="{{ pg.id }}">{{ pg.title }}</option>{% endfor %}
+                    </select></div>
+                  <div class="field"><label>Name it</label><input type="text" name="title" value="Business Listings"></div>
+                  <div class="btnrow"><button class="btn" type="submit">Create database</button></div>
+                </form>
+              {% endif %}
+            </div>
+          </div>
+
+          {# Capacity #}
+          <div class="acc-item {{ 'open' if result and result.section=='pool' }}">
+            <button class="acc-head">
+              <svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+              <span class="h-title">Capacity</span>
+              <div class="h-right">
+                <span class="chip ok">{{ s.max_instances }} browsers max</span>
+                <svg class="chev" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M9 6l6 6-6 6"/></svg>
+              </div>
+            </button>
+            <div class="acc-body">
+              <p class="lead-help">How many browsers can run at once. Each running browser uses roughly <strong>0.5–1 GB</strong>, billed on actual usage (about $10/GB per month). If you turned on <strong>Serverless</strong> in Railway, the server sleeps when idle and you pay only for the minutes a sweep runs — a 3-minute sweep with 4 browsers costs pennies. <strong>If you didn't, you're paying for every hour of the month</strong> (~$8–9) whether you scrape or not.</p>
+              {{ banner('pool') }}
+              {% if pool_warning %}<div class="banner warn">{{ pool_warning }}</div>{% endif %}
+              <form method="post" action="/settings/pool">
+                <div class="grid2">
+                  <div class="field"><label>Most browsers at once</label><input type="number" name="max_instances" min="1" value="{{ s.max_instances }}"></div>
+                  <div class="field"><label>Always keep free for you</label><input type="number" name="interactive_reserve" min="0" value="{{ s.interactive_reserve }}"></div>
+                </div>
+                <div class="help">Reserved slots stay free so you can always open a browser by hand, even mid-sweep. Scraping gets the rest ({{ s.task_budget }} right now).</div>
+                <div class="btnrow"><button class="btn primary" type="submit">Save</button></div>
+              </form>
+            </div>
+          </div>
+        </div>
+
+        <div class="cnote">
+          <svg class="ico" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>
+          <div><b>Sign-in secret</b><p>You sign in with <code>APP_SECRET</code> from Railway. To change it, edit it there and redeploy — there's only one, in one place.</p></div>
+        </div>
+      </section>
+
     </div>
-  {% endif %}
+  </main>
+</div>
 
-  {{ banner('proxy') }}
-  {% if result and result.section == 'proxy' and result.ok and result.detail %}
-    {# Report the measurement, and be explicit about its limit. A green result is
-       not evidence the credentials are right, and saying "credentials OK" would
-       be a lie we measured nothing to support.
-
-       This used to justify that by asserting the provider never checks passwords
-       at all — a property of the provider. It is a property of the address you
-       ask from: measured, the check is skipped from a trusted address and
-       enforced from a deployed one, which is how a stale password sat in a local
-       .env for the life of this project without a symptom. So the limit is real
-       but narrower than we claimed, and the copy below says "may not" for that
-       reason. (The retired sentence is not quoted here on purpose: a test scans
-       this file for it, and a quotation reads like an assertion to anyone
-       grepping.) #}
-    <p class="hint">
-      Measured through the proxy just now: exit IP <span class="mono">{{ result.detail.exit_ip }}</span>,
-      {% if result.detail.geo_resolved %}
-        located in {{ result.detail.city or 'an unnamed city' }}{% if result.detail.country %}, {{ result.detail.country }}{% endif %},
-        timezone <span class="mono">{{ result.detail.timezone }}</span>.
-      {% else %}
-        location <strong>unknown</strong> — the IP could not be geolocated.
-      {% endif %}
-      This proves traffic routes and where it comes out. It may <strong>not</strong>
-      prove your password is right — some providers skip the password check for
-      addresses they already trust, so on those a typo would still look like this.
-    </p>
-  {% endif %}
-
-  <form method="post" action="/settings/proxy">
-    <div class="row">
-      <div>
-        <label for="pu">Username</label>
-        <input type="text" id="pu" name="proxy_user" value="{{ s.proxy_user }}" autocomplete="off">
-      </div>
-      <div>
-        <label for="pp">Password</label>
-        <input type="password" id="pp" name="proxy_password" autocomplete="off"
-               placeholder="{{ '•••••••••• (saved)' if has_proxy_password else '' }}">
-      </div>
-    </div>
-    <div class="row">
-      <div>
-        <label for="ph">Host</label>
-        <input type="text" id="ph" name="proxy_host" value="{{ s.proxy_host }}" class="mono">
-      </div>
-      <div>
-        <label for="po">Port</label>
-        <input type="text" id="po" name="proxy_port" value="{{ s.proxy_port }}" class="mono">
-      </div>
-    </div>
-    <div class="row">
-      <div>
-        <label for="pc">Country</label>
-        <input type="text" id="pc" name="proxy_country" value="{{ s.proxy_country }}">
-      </div>
-      <div>
-        <label for="pr">Region</label>
-        <input type="text" id="pr" name="proxy_region" value="{{ s.proxy_region }}">
-      </div>
-    </div>
-    <div class="actions">
-      <button type="submit" name="action" value="save">Save</button>
-      <button class="primary" type="submit" name="action" value="test">Save &amp; test proxy</button>
-    </div>
-  </form>
-</section>
-
-{# ── Notion ───────────────────────────────────────────────────────────────── #}
-<section>
-  <h2>Notion
-    <span class="pill {{ 'set' if s.notion_configured() else 'unset' }}">{{ 'ready' if s.notion_configured() else 'incomplete' }}</span>
-  </h2>
-  <p class="hint">
-    Where found listings are saved. Create an integration at
-    <a href="https://www.notion.so/my-integrations" target="_blank" rel="noreferrer">notion.so/my-integrations</a>,
-    paste its token, then <em>share</em> your database or page with it from Notion's
-    ••• menu — an unshared database is invisible to the API.
-  </p>
-  {{ banner('notion') }}
-
-  <form method="post" action="/settings/notion">
-    <label for="nt">API token</label>
-    <input type="password" id="nt" name="notion_api_token" autocomplete="off"
-           placeholder="{{ '•••••••••• (saved — leave blank to keep it)' if has_notion_token else 'ntn_...' }}">
-    <div class="actions">
-      <button type="submit" name="action" value="save">Save</button>
-      <button class="primary" type="submit" name="action" value="list">Save &amp; find my databases</button>
-    </div>
-  </form>
-
-  {% if s.notion_db_id %}
-    <hr>
-    <p class="hint">
-      Selected database: <span class="mono">{{ s.notion_db_id }}</span>
-    </p>
-    <form method="post" action="/settings/notion/verify">
-      <div class="actions"><button type="submit">Verify schema</button></div>
-    </form>
-  {% endif %}
-
-  {% if result and result.section == 'notion' and result.detail and result.detail.databases is defined %}
-    <hr>
-    <h2 style="font-size:14px">Use an existing database</h2>
-    <p class="hint">Its schema is checked before anything is written. Nothing is changed for you.</p>
-    <form method="post" action="/settings/notion/select">
-      <select name="db_id" aria-label="Database">
-        {% for db in result.detail.databases %}
-          <option value="{{ db.id }}" {{ 'selected' if db.id == s.notion_db_id }}>{{ db.title }}</option>
-        {% endfor %}
-      </select>
-      <div class="actions"><button class="primary" type="submit">Use this database</button></div>
-    </form>
-
-    <hr>
-    <h2 style="font-size:14px">Or create a new one</h2>
-    <p class="hint">
-      Created only when you click — this app never adds a database to your workspace
-      on its own.
-    </p>
-    <form method="post" action="/settings/notion/create">
-      <label for="pp2">Under which page</label>
-      <select id="pp2" name="parent_page_id">
-        {% for pg in result.detail.pages %}
-          <option value="{{ pg.id }}">{{ pg.title }}</option>
-        {% endfor %}
-      </select>
-      <label for="dbt">Name it</label>
-      <input type="text" id="dbt" name="title" value="Business Listings">
-      <div class="actions"><button type="submit">Create database</button></div>
-    </form>
-  {% endif %}
-</section>
-
-{# ── Pool ─────────────────────────────────────────────────────────────────── #}
-<section>
-  <h2>Browser pool</h2>
-  {# The ceiling here is cost, not memory. This used to say it's cheap "because
-     the service sleeps when idle" — stated as a property of the product. It is
-     a property of a switch the user has to find: a Railway template cannot carry
-     sleepApplication (0 of 2964 services across every public template), so the
-     deploy leaves it off and nothing says so. Measured: idle after a sweep holds
-     ~0.86 GB until the process dies, because sleeping is what reclaims it. #}
-  <p class="hint">
-    Each running browser uses roughly <strong>0.5–1 GB</strong>. You're billed on
-    <strong>actual usage</strong> (about $10/GB per month). If you turned on
-    <strong>Serverless</strong> in Railway, the server sleeps when idle and you pay
-    for the minutes a sweep runs — a 3-minute sweep with 4 browsers costs pennies.
-    <strong>If you didn't, you're paying for every hour of the month</strong>
-    (~$8–9) whether you scrape or not. Raise this for faster multi-page sweeps;
-    lower it if you want a tighter cap.
-  </p>
-  {{ banner('pool') }}
-  {% if pool_warning %}<div class="banner warn">{{ pool_warning }}</div>{% endif %}
-
-  <form method="post" action="/settings/pool">
-    <div class="row">
-      <div>
-        <label for="mi">Maximum browsers</label>
-        <input type="number" id="mi" name="max_instances" min="1" value="{{ s.max_instances }}">
-      </div>
-      <div>
-        <label for="ir">Reserved for interactive use</label>
-        <input type="number" id="ir" name="interactive_reserve" min="0" value="{{ s.interactive_reserve }}">
-      </div>
-    </div>
-    <p class="hint">
-      Reserved slots are kept free so you can always open a browser and look at it
-      by hand, even while a sweep is running. Scraping gets the rest
-      ({{ s.task_budget }} right now).
-    </p>
-    <div class="actions"><button class="primary" type="submit">Save</button></div>
-  </form>
-</section>
-
-<p class="foot">
-  Settings are stored encrypted on this server's disk. Anyone with access to the
-  disk can read them regardless — the encryption guards against a stray backup or
-  snapshot, not against someone who already has the volume.
-</p>
+<script>
+  (function(){
+    var titles={overview:'Overview',browsers:'Browsers',tasks:'Tasks',connect:'Connect',settings:'Settings'};
+    function go(k){
+      document.querySelectorAll('.nav-item').forEach(function(x){x.classList.toggle('active',x.getAttribute('data-nav')===k);});
+      document.querySelectorAll('[data-section]').forEach(function(s){s.classList.toggle('on',s.getAttribute('data-section')===k);});
+      var t=document.getElementById('tb-title'); if(t)t.textContent=titles[k]||'';
+      window.scrollTo({top:0,behavior:'smooth'});
+    }
+    document.querySelectorAll('[data-nav]').forEach(function(n){n.addEventListener('click',function(e){e.preventDefault();go(n.getAttribute('data-nav'));});});
+    var col=document.getElementById('collapse');
+    if(col)col.addEventListener('click',function(){document.getElementById('app').classList.toggle('collapsed');});
+    document.querySelectorAll('.acc-head').forEach(function(h){h.addEventListener('click',function(){h.parentElement.classList.toggle('open');});});
+    var cb=document.getElementById('copybtn');
+    if(cb)cb.addEventListener('click',function(){var u=document.getElementById('mcpurl').textContent;try{navigator.clipboard.writeText(u);}catch(e){}var o=cb.textContent;cb.textContent='Copied';setTimeout(function(){cb.textContent=o;},1400);});
+  })();
+</script>
 {% endblock %}
