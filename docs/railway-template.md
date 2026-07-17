@@ -291,6 +291,45 @@ run a sweep.
 Don't cry wolf and don't undersell: **~$1.20/mo if it never scrapes, ~$8–9/mo once it has.**
 (The 5 GB volume bills either way and is not part of this delta.)
 
+### Does it plateau, or climb forever? Tested, because ~$8–9 assumed the answer.
+
+Every idle-after-sweep reading above came from a wake containing **exactly one sweep**, each
+ended by a sleep that reset the process. So "post-sweep idle = 0.9 GB" was really "post-*first*-
+sweep idle", and the price above assumed it plateaus — in the one scenario the docs describe,
+where a user skips Serverless and the process **never** resets.
+
+**Two things were measured.**
+
+**1. Awake, it does not let go.** One sweep, then the service held awake for **20 minutes** by
+polling `/healthz` every 20s (a response is outbound, so the sleep clock cannot fire — status
+stayed `SUCCESS` throughout, far past the 6–10 min threshold). Memory sat at **exactly 0.858 GB
+for 20 consecutive samples**, flat. So "sleeping is what reclaims it" is **confirmed**, now by a
+test where sleep was excluded by construction rather than by never having waited long enough.
+
+**2. Across sweeps it creeps, slowly, and does not run away.** Six sweeps in one process
+(continuous trace, no drop to ~0.07 = no sleep or restart in between):
+
+| sweep | 2 | 3 | 4 | 5 | 6 |
+|---|---|---|---|---|---|
+| idle GB | 0.800 | 0.821 | 0.833 | 0.843 | 0.858 |
+
+Monotonic: **+21, +12, +10, +15 MB — about +14 MB per sweep, ~58 MB over four sweeps.**
+
+So: **not a plateau, but not a runaway either.** Linear extrapolation (from five points, so
+treat as an order of magnitude, not a forecast) puts a daily sweeper who never sleeps at ~1.2 GB
+(~$12/mo) after a month. The 48 GB ceiling is never approached, so **cost is the failure mode,
+not an OOM** — and any redeploy or platform restart resets it. **~$8–9/mo is the right number
+for the README**, drifting upward for a long-lived never-sleeping process.
+
+⚠️ **Two of the checks in that run were themselves wrong — noted so nobody trusts them again:**
+- **Counting `ready:` lines is not a restart invariant.** `deploymentLogs` is a rolling window,
+  so the count went **6 → 5** and the script declared "same process: False". A restart would
+  make it go *up*. The real invariant is the memory trace: a restart shows as a drop to ~0.07
+  and a climb back, and 20 flat samples show neither.
+- **An outlier fooled the verdict.** The first reading (1.555 GB) caught a browser still tearing
+  down; comparing it to the last produced a *negative* delta and a confident "PLATEAUS" that hid
+  a monotonic climb. The series is the evidence, not the endpoints.
+
 ### 🔴 PENDING: the same false claim is live in the product
 
 `app/templates/index.html` (the Pool section, next to `max_instances`) still says:
