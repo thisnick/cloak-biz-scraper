@@ -52,7 +52,7 @@ Shape verified against shipped repo+volume templates (`n8n`, `ghost`, `vaultward
       },
       "variables": {
         "APP_SECRET": {
-          "description": "Log in to this server with this. Copy it from the Variables tab after deploying. You can rotate it later in the app's settings.",
+          "description": "Log in to this server with this. Copy it from the Variables tab after deploying. To change it, edit the variable and redeploy.",
           "defaultValue": "${{secret(32)}}",
           "isOptional": false
         }

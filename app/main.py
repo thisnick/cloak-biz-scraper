@@ -59,10 +59,10 @@ async def lifespan(app: FastAPI):
     settings = settings_service.load()  # first boot seeds from env; volume wins after
     purge_binary_env()  # only after seeding, or the seed would find nothing
 
-    # The volume's secret is authoritative; APP_SECRET seeds it once and
-    # APP_SECRET_RESET recovers a forgotten one. Never fatal when absent: the
-    # login page explains itself, whereas a crash loop explains nothing.
-    secret_service = SecretService(CONFIG.secret_path, CONFIG.dek_path)
+    # APP_SECRET is read straight from the environment every boot — the Railway
+    # variable is the one source of truth. Never fatal when absent: the login
+    # page explains itself, whereas a crash loop explains nothing.
+    secret_service = SecretService()
     secret = secret_service.bootstrap()
 
     # Jobs live on the volume so a finished sweep survives the container

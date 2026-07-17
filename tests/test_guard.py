@@ -165,23 +165,18 @@ class TestWhatMustStayOpen:
 
 
 class TestRotationRevokesEverything:
-    def test_rotating_the_secret_kills_live_access_tokens(self, client):
+    def test_changing_the_secret_kills_live_access_tokens(self, client, monkeypatch):
         """The revocation story, and the reason there is no /revoke endpoint.
 
         Tokens are stateless, so nothing is stored that could be struck out —
         the only lever is the signing key, and this proves the lever works.
+        Changing APP_SECRET is what an operator does in Railway; here it is one
+        setenv, and monkeypatch restores it, so nothing leaks into a later test.
         """
         token = mint_access(app)
         assert client.get("/api/instances",
                           headers={"Authorization": f"Bearer {token}"}).status_code == 200
 
-        try:
-            app.state.secret.rotate("a-brand-new-secret-value-here")
-            assert client.get("/api/instances",
-                              headers={"Authorization": f"Bearer {token}"}).status_code == 401
-        finally:
-            # The stored secret is authoritative and lives on the shared test
-            # volume, so a rotation here outlives this test and every later one
-            # that signs anything would quietly be using the wrong key. Put it
-            # back rather than leave the suite order-dependent.
-            app.state.secret.rotate(SECRET)
+        monkeypatch.setenv("APP_SECRET", "a-brand-new-secret-value-here")
+        assert client.get("/api/instances",
+                          headers={"Authorization": f"Bearer {token}"}).status_code == 401

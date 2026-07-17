@@ -140,9 +140,6 @@ def _login_context(request: Request, error: str | None = None) -> dict[str, Any]
     return {
         "error": error,
         "unconfigured": secret_service.current() is None,
-        # A reset the user asked for and we deliberately ignored. Silent, this is
-        # a brick: they set the flag, redeployed, and nothing changed.
-        "reset_ignored": secret_service.reset_ignored,
     }
 
 
@@ -621,10 +618,8 @@ async def create_database(
     return _render(request, Result("notion", report.complete, message, report))
 
 
-# In-app APP_SECRET rotation used to live here. It was removed from the UI (the
-# "which secret wins, the volume's or Railway's" explanation was more than a
-# non-technical user should have to parse) but the mechanism it drove is intact:
-# the volume-stored secret stays authoritative, and a forgotten secret is
-# recovered with APP_SECRET_RESET on the backend — see services/secret.py and
-# the README's troubleshooting section. secret_service.rotate() remains for that
-# path; it simply has no web form anymore.
+# In-app APP_SECRET rotation used to live here, backed by a volume-authoritative
+# secret and an APP_SECRET_RESET escape hatch. All of that is gone: APP_SECRET is
+# now just the Railway variable, read every boot (services/secret.py). To change
+# it, edit the variable and redeploy; to recover it, read it off the Variables
+# tab. There is nothing left for a settings form to do.

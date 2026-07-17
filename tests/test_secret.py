@@ -1,160 +1,110 @@
-"""The volume-authoritative APP_SECRET (#17): seeding, rotation, and the
-recovery path — plus the trap on the other side of the recovery path."""
+"""APP_SECRET is the environment variable, read every boot — nothing else.
+
+This replaces the volume-authoritative model (seed-once, in-app rotate,
+APP_SECRET_RESET recovery). Step 5 measured away the two hazards that model
+guarded against — Railway's secret() is stable across redeploys and readable —
+so the secret is now simply the Railway variable. These tests pin that, and pin
+that the old machinery is gone rather than merely unused.
+"""
 from __future__ import annotations
 
 import pytest
 
-from app.services.secret import SecretService, WeakSecret
+from app.services.secret import SecretService
 from app.services.settings import SettingsService
 
 GOOD = "a-long-enough-secret-0001"
 OTHER = "a-different-long-secret-2"
 
 
-@pytest.fixture
-def make(tmp_path):
-    def _make():
-        return SecretService(tmp_path / "auth.json", tmp_path / ".dek")
-
-    return _make
-
-
-class TestSeeding:
-    def test_env_seeds_on_first_boot(self, make, monkeypatch):
+class TestEnvIsTheSourceOfTruth:
+    def test_the_env_value_is_the_secret(self, monkeypatch):
         monkeypatch.setenv("APP_SECRET", GOOD)
-        assert make().bootstrap() == GOOD
+        assert SecretService().bootstrap() == GOOD
+        assert SecretService().current() == GOOD
 
-    def test_volume_wins_on_every_later_boot(self, make, monkeypatch):
+    def test_a_changed_env_value_takes_effect(self, monkeypatch):
+        """Editing the Railway variable and redeploying IS how the secret changes.
+
+        The old model deliberately ignored a changed env on later boots, because
+        the volume copy was authoritative and a re-read would have reverted an
+        in-app rotation. There is no volume copy now, so the env value simply
+        wins — which is the whole point of the simplification.
+        """
         monkeypatch.setenv("APP_SECRET", GOOD)
-        make().bootstrap()
-        # The whole point of #17: an env var that won re-reads would silently
-        # revert the UI's rotation on every restart.
-        monkeypatch.setenv("APP_SECRET", "changed-in-railway-9999")
-        assert make().bootstrap() == GOOD
+        assert SecretService().current() == GOOD
+        monkeypatch.setenv("APP_SECRET", OTHER)  # the redeploy Railway would do
+        assert SecretService().current() == OTHER
 
-    def test_no_secret_anywhere_is_not_fatal(self, make, monkeypatch):
+    def test_whitespace_is_trimmed(self, monkeypatch):
+        monkeypatch.setenv("APP_SECRET", f"  {GOOD}  ")
+        assert SecretService().current() == GOOD
+
+    def test_missing_secret_is_not_fatal_and_says_so(self, monkeypatch):
+        """A crash loop tells a Railway user nothing; None lets the login page
+        tell them exactly what to set."""
         monkeypatch.delenv("APP_SECRET", raising=False)
-        # A crash loop tells a Railway user nothing; the login page tells them
-        # exactly what to set.
-        assert make().bootstrap() is None
-        assert make().current() is None
+        assert SecretService().bootstrap() is None
+        assert SecretService().current() is None
 
-    def test_stored_secret_is_not_plaintext_on_disk(self, make, tmp_path, monkeypatch):
-        monkeypatch.setenv("APP_SECRET", GOOD)
-        make().bootstrap()
-        assert GOOD.encode() not in (tmp_path / "auth.json").read_bytes()
+    def test_an_empty_env_value_counts_as_unset(self, monkeypatch):
+        monkeypatch.setenv("APP_SECRET", "   ")
+        assert SecretService().current() is None
 
 
 class TestVerify:
-    def test_right_and_wrong(self, make, monkeypatch):
+    def test_right_and_wrong(self, monkeypatch):
         monkeypatch.setenv("APP_SECRET", GOOD)
-        service = make()
-        service.bootstrap()
-        assert service.verify(GOOD)
-        assert not service.verify(OTHER)
-        assert not service.verify("")
+        s = SecretService()
+        assert s.verify(GOOD)
+        assert not s.verify(OTHER)
+        assert not s.verify("")
 
-    def test_unconfigured_verifies_nothing(self, make, monkeypatch):
+    def test_unconfigured_verifies_nothing(self, monkeypatch):
         monkeypatch.delenv("APP_SECRET", raising=False)
-        service = make()
-        service.bootstrap()
-        assert not service.verify("")
-        assert not service.verify("anything")
+        s = SecretService()
+        assert not s.verify("")
+        assert not s.verify("anything")
 
 
-class TestRotation:
-    def test_rotate_then_reopen(self, make, monkeypatch):
+class TestTheOldMachineryIsGone:
+    """Not just unused — removed. If any of these come back, so does the
+    two-places confusion the change existed to delete."""
+
+    def test_there_is_no_in_app_rotation(self):
+        assert not hasattr(SecretService(), "rotate"), (
+            "rotate() is back — the secret is the Railway variable, changed there"
+        )
+
+    def test_nothing_is_written_to_the_volume(self, tmp_path, monkeypatch):
+        """The secret used to be encrypted onto the volume as auth.json. It must
+        not be persisted at all now — env is the only home."""
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
         monkeypatch.setenv("APP_SECRET", GOOD)
-        make().bootstrap()
-        make().rotate(OTHER)
-        assert make().bootstrap() == OTHER, "a restart must not undo a rotation"
+        SecretService().bootstrap()
+        assert not (tmp_path / "auth.json").exists(), "a secret file reappeared on the volume"
 
-    def test_short_secret_refused(self, make, monkeypatch):
+    def test_APP_SECRET_RESET_does_nothing(self, monkeypatch):
+        """The recovery flag is meaningless now: there is no stored value to
+        override, so a boot with the flag set behaves like any other boot."""
         monkeypatch.setenv("APP_SECRET", GOOD)
-        service = make()
-        service.bootstrap()
-        with pytest.raises(WeakSecret):
-            service.rotate("short")
-        assert service.current() == GOOD, "a refused rotation must change nothing"
-
-
-class TestResetRecovery:
-    """APP_SECRET_RESET exists so a forgotten rotated secret cannot brick a
-    deployment nobody can shell into."""
-
-    def test_reset_adopts_the_new_env_value(self, make, monkeypatch):
-        monkeypatch.setenv("APP_SECRET", GOOD)
-        make().bootstrap()
-        make().rotate("forgotten-secret-forever")
-
+        monkeypatch.setenv("APP_SECRET_RESET", "true")
+        assert SecretService().current() == GOOD
+        # And changing APP_SECRET still just works, flag or no flag.
         monkeypatch.setenv("APP_SECRET", OTHER)
-        monkeypatch.setenv("APP_SECRET_RESET", "true")
-        assert make().bootstrap() == OTHER
-
-    def test_reset_recovers_even_to_the_original_seed_value(self, make, monkeypatch):
-        # The obvious implementation — "skip if this value was already used" —
-        # gets this wrong and leaves the user bricked: resetting back to the
-        # value first-boot seeded from is the most likely thing they would try.
-        monkeypatch.setenv("APP_SECRET", GOOD)
-        make().bootstrap()
-        make().rotate("forgotten-secret-forever")
-
-        monkeypatch.setenv("APP_SECRET_RESET", "true")  # APP_SECRET still GOOD
-        assert make().bootstrap() == GOOD
-
-    def test_a_left_behind_flag_does_not_revert_a_later_rotation(self, make, monkeypatch):
-        """The trap. Railway variables are sticky and nobody removes the flag."""
-        monkeypatch.setenv("APP_SECRET", GOOD)
-        monkeypatch.setenv("APP_SECRET_RESET", "true")
-        make().bootstrap()          # reset consumed
-        make().rotate(OTHER)        # user rotates afterwards, flag still set
-
-        # If a set flag simply meant "re-seed", this restart would silently throw
-        # the rotation away and hand back GOOD — the exact un-rotatable-env-var
-        # behaviour #17 exists to eliminate.
-        assert make().bootstrap() == OTHER
-        assert make().bootstrap() == OTHER, "and it must stay rotated across restarts"
-
-    def test_reset_reapplies_when_the_env_value_changes_again(self, make, monkeypatch):
-        monkeypatch.setenv("APP_SECRET", GOOD)
-        monkeypatch.setenv("APP_SECRET_RESET", "true")
-        make().bootstrap()
-        make().rotate("forgotten-again-secret")
-
-        monkeypatch.setenv("APP_SECRET", OTHER)  # a genuinely new reset request
-        assert make().bootstrap() == OTHER
-
-    def test_flag_without_a_value_changes_nothing(self, make, monkeypatch):
-        monkeypatch.setenv("APP_SECRET", GOOD)
-        make().bootstrap()
-        make().rotate(OTHER)
-        monkeypatch.delenv("APP_SECRET")
-        monkeypatch.setenv("APP_SECRET_RESET", "true")
-        assert make().bootstrap() == OTHER
-
-    def test_flag_is_off_unless_truthy(self, make, monkeypatch):
-        monkeypatch.setenv("APP_SECRET", GOOD)
-        make().bootstrap()
-        make().rotate(OTHER)
-        for value in ("false", "0", "no", "", "maybe"):
-            monkeypatch.setenv("APP_SECRET_RESET", value)
-            assert make().bootstrap() == OTHER, f"{value!r} must not trigger a reset"
+        assert SecretService().current() == OTHER
 
 
-def test_rotation_never_strands_the_settings(tmp_path, monkeypatch):
-    """The property Step 1 established, restated against the real rotation path.
-
-    Settings are encrypted with the volume's DEK, never with APP_SECRET, so
-    rotating the secret cannot put them behind a key nobody has.
+def test_changing_the_secret_never_strands_the_settings(tmp_path, monkeypatch):
+    """The property that made rotation safe before, now doing nothing but staying
+    true: settings are encrypted with the volume DEK, never with APP_SECRET, so
+    changing the secret cannot put them behind a key nobody has.
     """
     monkeypatch.setenv("APP_SECRET", GOOD)
     settings = SettingsService(tmp_path / "settings.json", tmp_path / ".dek")
     settings.update(proxy_host="proxy.example.com", notion_db_id="db-123")
 
-    secret = SecretService(tmp_path / "auth.json", tmp_path / ".dek")
-    secret.bootstrap()
-    secret.rotate(OTHER)
-
+    monkeypatch.setenv("APP_SECRET", OTHER)  # edit the Railway variable, redeploy
     reopened = SettingsService(tmp_path / "settings.json", tmp_path / ".dek").load()
     assert reopened.proxy_host == "proxy.example.com"
     assert reopened.notion_db_id == "db-123"

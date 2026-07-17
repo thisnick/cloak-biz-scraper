@@ -1,4 +1,4 @@
-"""The settings UI: login, session handling, saving, and rotation.
+"""The settings UI: login, session handling, and saving.
 
 base_url is https so the client stores and re-sends the Secure session cookie —
 over http it would be silently dropped, and every authenticated test would pass
@@ -45,7 +45,7 @@ def client(tmp_path, monkeypatch):
         # Repoint the services at a per-test volume; the module-level app is
         # shared, and one test's saved licence key must not be another's fixture.
         app.state.settings = SettingsService(tmp_path / "settings.json", tmp_path / ".dek")
-        app.state.secret = SecretService(tmp_path / "auth.json", tmp_path / ".dek")
+        app.state.secret = SecretService()
         app.state.secret.bootstrap()
         yield c
 
@@ -102,48 +102,20 @@ class TestLogin:
         """Where a locked-out person actually is.
 
         It used to live only on the settings page — behind this login — so the
-        only person who could read it was the one who did not need it.
+        only person who could read it was the one who did not need it. And it is
+        one line now, because recovery is one step: the secret is the Railway
+        variable, so you read it off the Variables tab.
         """
         page = shown(client.get("/login"))
-        assert "APP_SECRET_RESET=true" in page
         assert "Forgotten it?" in page
-        assert "settings and licence survive" in page
-
-    def test_an_ignored_reset_says_so_on_the_login_page(self, tmp_path, monkeypatch):
-        """The silent brick: flag left set, rotate, forget, redeploy with the
-        same value -> reset skipped as already-consumed -> still locked out, and
-        the only clue is a log line they cannot reach."""
-        # The TestClient is entered FIRST, before APP_SECRET_RESET is set. The
-        # app's lifespan bootstraps the *shared* volume's secret, so a reset flag
-        # visible to it re-seeds that volume with this module's SECRET — which is
-        # not this test's subject, and used to leave every later test module
-        # signing with a secret the server no longer held. Their negative tests
-        # still passed, because a wrong secret also produces "refused".
-        with TestClient(app, base_url="https://testserver") as c:
-            monkeypatch.setenv("APP_SECRET", SECRET)
-            monkeypatch.setenv("APP_SECRET_RESET", "true")
-            service = SecretService(tmp_path / "auth.json", tmp_path / ".dek")
-            service.bootstrap()                       # reset consumed
-            service.rotate("a-rotated-secret-000009")  # ...then they forget this
-            app.state.secret = SecretService(tmp_path / "auth.json", tmp_path / ".dek")
-            app.state.secret.bootstrap()          # redeploy, same env value
-            assert app.state.secret.reset_ignored
-
-            page = shown(c.get("/login"))
-            assert "already used for this" in page
-            assert "brand-new value" in page
-            # And a failed login must show it too — that is when they are looking.
-            assert "already used for this" in shown(
-                c.post("/login", data={"secret": SECRET}, follow_redirects=False)
-            )
-
-    def test_no_ignored_reset_no_noise(self, client):
-        assert "already used for this" not in shown(client.get("/login"))
+        assert "Variables" in page
+        # The old multi-step reset ritual is gone from the page entirely.
+        assert "APP_SECRET_RESET" not in page
 
     def test_login_page_explains_an_unconfigured_deployment(self, tmp_path, monkeypatch):
         monkeypatch.delenv("APP_SECRET", raising=False)
         with TestClient(app, base_url="https://testserver") as c:
-            app.state.secret = SecretService(tmp_path / "auth.json", tmp_path / ".dek")
+            app.state.secret = SecretService()
             app.state.secret.bootstrap()
             page = c.get("/login")
             assert "no secret set" in page.text
@@ -624,13 +596,11 @@ class TestNotionUi:
         assert "rejected the API token" in response.text
 
 
-# In-app secret rotation was removed from the settings UI (its "volume vs Railway,
-# which wins" explanation was more than this audience should have to read). The
-# backend mechanism it drove is unchanged and still covered by test_secret.py:
-# secret_service.rotate(), the volume-authoritative secret, and APP_SECRET_RESET
-# recovery. The forgotten-secret path is documented in the README, where a
-# locked-out user can actually reach it — the old on-page note sat behind the very
-# login it was meant to rescue.
+# In-app secret rotation, the volume-authoritative secret, and APP_SECRET_RESET
+# were all removed: APP_SECRET is now just the Railway variable (test_secret.py).
+# The forgotten-secret note lives on the login page, where a locked-out user can
+# reach it — the old settings-page note sat behind the very login it was meant to
+# rescue.
 
 
 class TestRunEvidenceIsReachableButNotPublic:

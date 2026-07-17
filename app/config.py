@@ -41,13 +41,6 @@ class Config:
         return self.data_dir / ".dek"
 
     @property
-    def secret_path(self) -> Path:
-        """The authoritative APP_SECRET. Kept apart from settings.json because it
-        is auth material, not user configuration: different lifecycle, different
-        blast radius, and it must never ride along in a settings dump."""
-        return self.data_dir / "auth.json"
-
-    @property
     def oauth_path(self) -> Path:
         """Registered OAuth clients and live authorization codes.
 

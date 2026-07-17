@@ -289,20 +289,13 @@ with the filters already applied.
 
 ### You forgot `APP_SECRET`
 
-You are not locked out. In Railway → Variables, set `APP_SECRET` to whatever you
-want it to be now, **and** add:
+You are not locked out, and there is nothing to reset. `APP_SECRET` is just a
+Railway variable — open your service → **Variables** → `APP_SECRET` and read it.
 
-```
-APP_SECRET_RESET = true
-```
-
-Deploy, and the next boot adopts the new secret. Your settings, licence, proxy and
-Notion configuration are all untouched — they are not encrypted with this secret,
-precisely so that changing it can never strand them.
-
-You can leave `APP_SECRET_RESET` set afterwards; it is consumed once. Leaving it
-does **not** mean every future restart overwrites your secret, so if you later
-change the secret from inside the app, that change sticks.
+To change it, edit it there and redeploy. The next boot uses the new value, and
+every open session is signed out (a good thing if you're changing it because it
+leaked). Your settings, licence, proxy and Notion configuration are untouched —
+they are not encrypted with this secret, so changing it can never strand them.
 
 ## The tools
 
@@ -372,17 +365,19 @@ revert on the next restart.
 Env vars still *seed* the settings on first boot, which is a convenience for local
 dev and CI. After that the volume wins and the environment is ignored.
 
-That applies to `APP_SECRET` too: you can rotate it in the UI, and the rotation
-survives restarts because the volume's copy is the real one. If you forget the
-secret you rotated to, set a new `APP_SECRET` **and** `APP_SECRET_RESET=true` and
-restart — the next boot adopts it. The reset is consumed once, so a flag left set
-afterwards will not keep reverting later rotations.
+`APP_SECRET` is the one exception: it is **not** stored on the volume and not
+seeded — it is read straight from the environment every boot, so the Railway
+variable is always the live value. That is why it is the single variable the
+deployment needs, and why changing it is one edit in Railway rather than a rotate
+button plus a reset flag. (Encryption is keyed on a volume-local data key, never
+on `APP_SECRET`, so changing the secret never strands the settings.)
 
 **What "test proxy" does and does not tell you.** It reports the exit IP and geo
-it actually measured through the proxy. It does *not* verify your credentials:
-Evomi accepts any password and only rejects a wrong username, so a typo'd
-password still yields a working residential exit. Nothing in the UI claims
-otherwise, because nothing measured it.
+it actually measured through the proxy. It does *not* reliably prove your
+credentials: some providers skip the password check for addresses they already
+trust, so a wrong password can still yield a working exit when you test from your
+own machine and be refused from your server. Nothing in the UI claims the
+credentials are verified, because nothing measured that.
 
 **Nothing reports a value it did not measure.** If the exit IP cannot be read back
 through the proxy, launching fails immediately rather than holding a pool slot on

@@ -49,7 +49,7 @@ def isolate_auth(app, tmp_path):
     from app.services.oauth import OAuthProvider, OAuthStore
     from app.services.secret import SecretService
 
-    app.state.secret = SecretService(tmp_path / "auth.json", tmp_path / ".dek")
+    app.state.secret = SecretService()
     app.state.secret.bootstrap()
     app.state.oauth = OAuthProvider(
         OAuthStore(tmp_path / "oauth.json", tmp_path / ".dek"), app.state.secret
