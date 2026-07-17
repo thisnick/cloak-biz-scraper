@@ -63,6 +63,7 @@ from mcp.server.auth.provider import (
     AccessToken,
     AuthorizationCode,
     AuthorizationParams,
+    AuthorizeError,
     RefreshToken,
     TokenError,
 )
@@ -97,6 +98,20 @@ PENDING_TTL_SEC = 15 * 60
 _AUD_ACCESS = "oauth:access"
 _AUD_REFRESH = "oauth:refresh"
 _AUD_PENDING = "oauth:pending"
+
+# RFC 7636 §4.2: a base64url S256 challenge is 43 characters, and the spec bounds
+# the field at 43–128. The SDK types `code_challenge` as `str`, so an EMPTY one
+# validates and sails through to the login form — measured, not theorised.
+#
+# It is not exploitable: nothing hashes to "", so the code can never be redeemed.
+# It is worse than useless, which is why it is rejected here rather than left to
+# fail later. The user would be asked to type APP_SECRET — the one credential
+# protecting everything — into a login form to authorize a client whose code was
+# dead on arrival, and the only symptom would be an `invalid_grant` at the token
+# endpoint that names nothing they did. Refusing at /authorize turns that into an
+# error the client sees before anyone is asked for a secret.
+_CHALLENGE_MIN = 43
+_CHALLENGE_MAX = 128
 
 
 def _hash(value: str) -> str:
@@ -248,6 +263,14 @@ class OAuthProvider:
         makes the round trip safe. Being stateless also means a redeploy between
         the two halves of a login does not strand the user on a dead form.
         """
+        challenge = params.code_challenge or ""
+        if not (_CHALLENGE_MIN <= len(challenge) <= _CHALLENGE_MAX):
+            raise AuthorizeError(
+                "invalid_request",
+                "code_challenge must be a base64url-encoded SHA-256 challenge of "
+                f"{_CHALLENGE_MIN}-{_CHALLENGE_MAX} characters (RFC 7636). PKCE is "
+                "required by this server.",
+            )
         blob = signing.issue(
             {
                 "aud": _AUD_PENDING,

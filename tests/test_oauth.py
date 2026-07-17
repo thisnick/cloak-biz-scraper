@@ -285,6 +285,53 @@ class TestPKCEIsEnforced:
         # Refused, one way or another — never a 302 to the login form.
         assert r.status_code != 302 or "error=" in r.headers.get("location", "")
 
+    def test_an_empty_challenge_never_reaches_the_login_form(self, client):
+        """Measured against the live server: the SDK types `code_challenge` as a
+        plain `str`, so an EMPTY one validates and redirects to the login form.
+
+        It was never exploitable — nothing hashes to "", so the code could not be
+        redeemed — but it was worse than useless: the user would be asked to type
+        APP_SECRET, the one credential protecting everything, to authorize a
+        client whose code was dead on arrival, and the only symptom would be an
+        `invalid_grant` naming nothing they did.
+        """
+        info = register(client)
+        r = client.get("/authorize", params={
+            "response_type": "code", "client_id": info["client_id"],
+            "redirect_uri": REDIRECT, "code_challenge": "", "code_challenge_method": "S256",
+        })
+        assert "/authorize/login" not in r.headers.get("location", ""), (
+            "an empty PKCE challenge must not get as far as asking for the secret"
+        )
+        assert "error=invalid_request" in r.headers.get("location", "")
+
+    def test_a_short_challenge_is_refused(self, client):
+        """RFC 7636 §4.2 bounds the challenge at 43-128 characters; a short one
+        is not an S256 digest of anything."""
+        info = register(client)
+        r = client.get("/authorize", params={
+            "response_type": "code", "client_id": info["client_id"],
+            "redirect_uri": REDIRECT, "code_challenge": "abc", "code_challenge_method": "S256",
+        })
+        assert "/authorize/login" not in r.headers.get("location", "")
+
+    def test_a_real_challenge_still_gets_through(self, client):
+        """The control: the length check must not refuse a legitimate challenge."""
+        info = register(client)
+        r = authorize(client, info, pkce()[1])
+        assert "/authorize/login" in r.headers["location"]
+
+    def test_the_plain_method_is_refused(self, client):
+        """`plain` is a PKCE challenge that is not a challenge. OAuth 2.1 drops
+        it, and the metadata only ever advertised S256."""
+        info = register(client)
+        r = client.get("/authorize", params={
+            "response_type": "code", "client_id": info["client_id"],
+            "redirect_uri": REDIRECT, "code_challenge": pkce()[1],
+            "code_challenge_method": "plain",
+        })
+        assert "/authorize/login" not in r.headers.get("location", "")
+
     def test_the_wrong_verifier_is_refused_at_token(self, client):
         """The check that makes an intercepted code useless."""
         _, challenge = pkce()

@@ -54,14 +54,19 @@ def authorize(app, headers, query_token: str | None, instance_id: str, *, kind: 
     token = query_token or bearer(headers)
 
     inst = app.state.instances.get(instance_id)
-    # The subject that owns this browser. `or OWNER` rather than `or None`: None
-    # means "any subject" to tokens.verify, and an instance launched without a
-    # recorded owner should fall back to the strictest reading, not the loosest.
-    # An unknown instance is checked against OWNER too, so that a bad token and a
-    # missing instance take the same path and cannot be told apart by timing.
-    owner = getattr(inst, "owner", None) or tokens.OWNER
+    # `subject`, NOT `owner`. They are different things and conflating them was a
+    # real bug: `owner` is job attribution ("job:abc123"), which no OAuth subject
+    # ever equals, so checking the token against it refused every task browser as
+    # "invalid token" — the right outcome for CDP, reached for the wrong reason,
+    # and the wrong outcome for VNC, which is supposed to let you watch a sweep.
+    #
+    # `or OWNER` rather than `or None`: None means "any subject" to tokens.verify,
+    # and a browser with no recorded subject (a sweep's own) should fall back to
+    # the strictest reading, not the loosest. An unknown instance is checked the
+    # same way, so a bad token and a missing instance take the same path.
+    subject = getattr(inst, "subject", None) or tokens.OWNER
 
-    if not tokens.verify(token, instance_id, secret, kind=kind, subject=owner):
+    if not tokens.verify(token, instance_id, secret, kind=kind, subject=subject):
         # Deliberately one message for missing, expired, forged, wrong-instance,
         # wrong-grant, and wrong-subject. Which one it was is only useful to
         # someone who should not have been here.

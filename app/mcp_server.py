@@ -187,7 +187,7 @@ def build(app) -> FastMCP:
         subject = _subject(ctx)
         inst = await app.state.instances.launch(
             InstanceCreate(profile=profile, country=country, region=region, geoip=geoip),
-            origin="interactive", owner=subject,
+            origin="interactive", subject=subject,
         )
         return instance_view(inst, secret=app.state.secret.current(),
                              base_url=_base_url(ctx), subject=subject)

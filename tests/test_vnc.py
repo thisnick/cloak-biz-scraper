@@ -32,11 +32,15 @@ def client(tmp_path, monkeypatch):
 
 
 class FakeInstance:
-    def __init__(self, iid="inst1", origin="interactive", vnc_port=6100, owner=tokens.OWNER):
+    def __init__(self, iid="inst1", origin="interactive", vnc_port=6100,
+                 subject=tokens.OWNER, owner=None):
         self.id = iid
         self.origin = origin
         self.vnc_port = vnc_port
         self.cdp_port = 9222
+        # Two different things, and conflating them was a real bug. `owner` is
+        # job attribution ("job:abc123"); `subject` is the OAuth principal.
+        self.subject = subject
         self.owner = owner
         self.profile = "agent"
         self.proxy_ip = "203.0.113.7"
@@ -102,7 +106,7 @@ class TestUpgradeIsRefusedBeforeAccept:
         """Cross-subject. Enforced and real; with one APP_SECRET there is one
         subject, so it cannot fire in production today."""
         monkeypatch.setattr(
-            app.state.instances, "get", lambda iid: FakeInstance(iid, owner="alice")
+            app.state.instances, "get", lambda iid: FakeInstance(iid, subject="alice")
         )
         someone_else = tokens.issue("inst1", SECRET, kind=tokens.VNC, subject="mallory")
         assert refuses(client, f"/instances/inst1/vnc?t={someone_else}") == 4401
@@ -117,7 +121,7 @@ class TestUpgradeIsRefusedBeforeAccept:
         dial rather than from a 4401.
         """
         monkeypatch.setattr(
-            app.state.instances, "get", lambda iid: FakeInstance(iid, owner="alice", vnc_port=1)
+            app.state.instances, "get", lambda iid: FakeInstance(iid, subject="alice", vnc_port=1)
         )
         mine = tokens.issue("inst1", SECRET, kind=tokens.VNC, subject="alice")
         # Reaching the body of this `with` at all is the assertion: a refused
@@ -146,14 +150,50 @@ class TestUpgradeIsRefusedBeforeAccept:
 
 
 class TestTaskBrowsersAreWatchableButNotTouchable:
+    """A sweep's browser as it really is: origin="task", and `owner` carrying the
+    job that launched it ("job:abc123"), which is what the scrape service has
+    always put there.
+
+    That detail is the whole point of these tests. `owner` was mistaken for the
+    OAuth subject, and because no subject ever equals "job:abc123", every task
+    browser failed the subject check. CDP was still refused — the right outcome
+    reached for the wrong reason, which no CDP test could see — while VNC was
+    refused too, silently deleting the "watch your sweep" feature. Only a live
+    sweep showed it, so the fake now carries the real shape.
+    """
+
+    def task_browser(self, iid="inst1"):
+        return FakeInstance(iid, origin="task", owner="job:abc123", subject=None)
+
     def test_a_sweeps_browser_is_still_never_drivable(self, client, monkeypatch):
         """The Step 3 property. VNC being more permissive must not have loosened
         this by accident."""
-        monkeypatch.setattr(
-            app.state.instances, "get", lambda iid: FakeInstance(iid, origin="task")
-        )
+        monkeypatch.setattr(app.state.instances, "get", lambda iid: self.task_browser(iid))
         good = tokens.issue("inst1", SECRET, kind=tokens.CDP)
-        assert refuses(client, f"/instances/inst1/cdp?t={good}") == 4003
+        assert refuses(client, f"/instances/inst1/cdp?t={good}") == 4003, (
+            "must be refused for BELONGING TO A SWEEP (4003), not for a bad token (4401)"
+        )
+
+    def test_a_sweeps_browser_can_still_be_watched(self, client, monkeypatch):
+        """The half the collision broke. Inspection is the differentiator, and a
+        sweep is the most interesting thing to inspect."""
+        monkeypatch.setattr(
+            app.state.instances, "get", lambda iid: FakeInstance(
+                iid, origin="task", owner="job:abc123", subject=None, vnc_port=1
+            )
+        )
+        watch = tokens.issue("inst1", SECRET, kind=tokens.VNC)
+        # Accepted: refusal would raise out of __enter__.
+        with client.websocket_connect(f"/instances/inst1/vnc?t={watch}"):
+            pass
+
+    def test_job_attribution_is_not_an_identity(self, client, monkeypatch):
+        """The bug, stated directly: a browser's `owner` must never be read as the
+        principal a token has to match."""
+        monkeypatch.setattr(app.state.instances, "get", lambda iid: self.task_browser(iid))
+        # A token minted for the job string — what "owner is the subject" implies.
+        pretending = tokens.issue("inst1", SECRET, kind=tokens.VNC, subject="job:abc123")
+        assert refuses(client, f"/instances/inst1/vnc?t={pretending}") == 4401
 
     def test_input_is_stripped_for_a_task_browser(self):
         """What makes watching a sweep safe. A KeyEvent and a PointerEvent are

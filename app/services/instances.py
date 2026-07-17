@@ -110,6 +110,17 @@ class Instance:
     ttl_min: int
     created_wall: float
     created_mono: float
+    # The OAuth subject that asked for this browser. Deliberately NOT `owner`,
+    # which already means something else here: `owner` is job attribution
+    # ("job:abc123", "archive:foo") and says which piece of work a browser
+    # belongs to, not which principal. Overloading the two silently broke both —
+    # a sweep's browser has owner="job:…", which no OAuth subject ever equals, so
+    # every task browser was refused as "invalid token" rather than "belongs to a
+    # sweep", and its live view could not be opened at all.
+    #
+    # None for browsers launched by a sweep: the job owns them, and the endpoints
+    # fall back to the deployment's single subject rather than to "anyone".
+    subject: str | None = None
     # None when this browser has no live view: the display fell back to Xvfb
     # because Xvnc was absent. Callers omit vnc_url rather than mint one that
     # would connect to nothing. Defaulted so that "no live view" is what an
@@ -196,12 +207,13 @@ class InstanceManager:
         raise RuntimeError("no free CDP port")
 
     async def launch(self, req, *, origin: Origin = "interactive",
-                     owner: str | None = None, wait: bool | None = None) -> Instance:
+                     owner: str | None = None, subject: str | None = None,
+                     wait: bool | None = None) -> Instance:
         if wait is None:
             wait = origin == "task"
         await self._acquire(origin, wait)
         try:
-            inst = await self._do_launch(req, origin, owner)
+            inst = await self._do_launch(req, origin, owner, subject)
         except BaseException:
             await self._release_pending(origin)
             raise
@@ -214,7 +226,8 @@ class InstanceManager:
                     len(self.running), self._settings.load().max_instances)
         return inst
 
-    async def _do_launch(self, req, origin: Origin, owner: str | None) -> Instance:
+    async def _do_launch(self, req, origin: Origin, owner: str | None,
+                         subject: str | None = None) -> Instance:
         from cloakbrowser import launch_persistent_context_async
 
         settings = self._settings.load()
@@ -306,6 +319,7 @@ class InstanceManager:
         now_wall, now_mono = time.time(), time.monotonic()
         inst = Instance(
             id=uuid.uuid4().hex[:12], profile=profile.name, origin=origin, owner=owner,
+            subject=subject,
             context=context, display=display, cdp_port=cdp_port, vnc_port=vnc_port,
             proxy_ip=proxy_ip, timezone=tz, locale=locale,
             headed=req.headed, geoip=req.geoip, humanize=req.humanize,

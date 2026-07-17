@@ -43,11 +43,12 @@ def manager(tmp_path, monkeypatch):
     mgr = InstanceManager(service)
     monkeypatch.setattr(mgr, "profiles", _NullProfiles(tmp_path))
 
-    async def fake_launch(req, origin, owner):
+    async def fake_launch(req, origin, owner, subject=None):
         await asyncio.sleep(0.01)
         now = time.monotonic()
         return Instance(
             id=uuid.uuid4().hex[:12], profile=req.profile, origin=origin, owner=owner,
+            subject=subject,
             context=FakeContext(), display=0, cdp_port=0, proxy_ip="203.0.113.1",
             timezone="America/Los_Angeles", locale="en-US", headed=True, geoip=True,
             humanize=True, seed=1, ttl_min=60, created_wall=time.time(),
@@ -136,7 +137,7 @@ async def test_budget_change_in_settings_applies_without_a_restart(manager):
 
 
 async def test_a_failed_launch_does_not_leak_its_slot(manager, monkeypatch):
-    async def boom(req, origin, owner):
+    async def boom(req, origin, owner, subject=None):
         raise RuntimeError("launch exploded")
 
     monkeypatch.setattr(manager, "_do_launch", boom)
@@ -151,7 +152,7 @@ async def test_a_failed_launch_does_not_leak_its_slot(manager, monkeypatch):
 async def test_a_waiting_task_is_released_when_a_launch_fails(manager, monkeypatch):
     held = [await _launch(manager, "task", wait=False) for _ in range(3)]
 
-    async def boom(req, origin, owner):
+    async def boom(req, origin, owner, subject=None):
         raise RuntimeError("nope")
 
     monkeypatch.setattr(manager, "_do_launch", boom)

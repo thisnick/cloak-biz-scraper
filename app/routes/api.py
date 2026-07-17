@@ -102,7 +102,7 @@ async def create_instance(request: Request, body: InstanceCreate) -> InstanceVie
     subject = _subject(request)
     try:
         inst = await request.app.state.instances.launch(
-            body, origin="interactive", owner=subject
+            body, origin="interactive", subject=subject
         )
     except CapExceeded as exc:
         raise HTTPException(status_code=429, detail=str(exc)) from exc
