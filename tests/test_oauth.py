@@ -183,6 +183,96 @@ class TestDynamicClientRegistration:
         assert info["client_id"]
         assert REDIRECT in info["redirect_uris"]
 
+    def test_a_client_asking_only_for_the_auth_code_grant_can_register(self, client):
+        """The hazard: this is RFC 7591's default, spelled out, and the SDK 400s it.
+
+        §2: "If omitted, the default behavior is that the client will use only
+        the 'authorization_code' Grant Type." The SDK hardcodes
+        `{"authorization_code","refresh_token"}.issubset(...)` with no setting to
+        turn it off — so it accepts the client that omits the field and refuses
+        the client that says the same thing explicitly. A connector that
+        registers this way could not be added at all.
+
+        Measured against the deployed server before the fix: omitted -> 201,
+        ["authorization_code"] -> 400, both -> 201.
+        """
+        r = client.post("/register", json={
+            "redirect_uris": [REDIRECT],
+            "client_name": "Auth-code-only Client",
+            "grant_types": ["authorization_code"],
+        })
+        assert r.status_code == 201, r.text
+
+    def test_the_substitution_is_told_to_the_client(self, client):
+        """We hand it a grant it did not ask for, so it must be able to see that.
+
+        RFC 7591 §3.2.1 lets a server "reject or replace any of the client's
+        requested metadata values ... and substitute them with suitable values",
+        and requires it to "return all registered metadata about this client".
+        The registered set is what the client permanently carries, so returning
+        the request's values rather than the registered ones would be a lie the
+        client acts on.
+        """
+        r = client.post("/register", json={
+            "redirect_uris": [REDIRECT],
+            "client_name": "Auth-code-only Client",
+            "grant_types": ["authorization_code"],
+        })
+        assert set(r.json()["grant_types"]) == {"authorization_code", "refresh_token"}
+
+    def test_an_auth_code_only_client_can_actually_USE_the_flow(self, client):
+        """201 is not the claim. A working connector is.
+
+        Registering is worthless if the client it produced cannot then authorize
+        and exchange a code — that is the thing Step 6 needs, and a status code
+        does not prove it.
+        """
+        info = register(client, grant_types=["authorization_code"])
+        verifier, challenge = pkce()
+        code = login_and_get_code(client, info, challenge)
+        r = exchange(client, info, code, verifier)
+        assert r.status_code == 200, r.text
+        assert r.json()["access_token"]
+
+    def test_a_grant_we_cannot_honour_is_still_refused(self, client):
+        """The guard must still bite.
+
+        If the fix were "stop checking grant_types", this would register happily
+        and we would have advertised a grant /token cannot perform. We only
+        substitute the exact shape RFC 7591 blesses; everything else is left to
+        the SDK to judge.
+        """
+        r = client.post("/register", json={
+            "redirect_uris": [REDIRECT],
+            "client_name": "Client-credentials Client",
+            "grant_types": ["client_credentials"],
+        })
+        assert r.status_code == 400, r.text
+
+    def test_the_neighbouring_checks_survive_the_fix(self, client):
+        """The fix re-feeds `RegistrationHandler.handle()`; it must not bypass it.
+
+        The grant_types check sits *between* two load-bearing ones: scope-subset
+        validation above, and `response_types must include "code"` below — the
+        MCP spec's PKCE requirement. Reimplementing registration to dodge the bad
+        check would silently drop both good ones, and no test would notice. So
+        pin them: they run because we corrected the handler's input rather than
+        replacing the handler.
+        """
+        no_code = client.post("/register", json={
+            "redirect_uris": [REDIRECT], "client_name": "Implicit Client",
+            "grant_types": ["authorization_code"],  # the path the fix touches
+            "response_types": ["token"],
+        })
+        assert no_code.status_code == 400, "response_types check died with the fix"
+
+        bad_scope = client.post("/register", json={
+            "redirect_uris": [REDIRECT], "client_name": "Greedy Client",
+            "grant_types": ["authorization_code"],  # the path the fix touches
+            "scope": "root-of-the-machine",
+        })
+        assert bad_scope.status_code == 400, "scope check died with the fix"
+
     def test_registration_survives_a_restart(self, client, tmp_path):
         """The one that Railway's scale-to-zero makes non-negotiable.
 

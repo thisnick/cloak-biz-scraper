@@ -31,6 +31,7 @@ Serving both costs one route.
 """
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from urllib.parse import urlparse
@@ -63,6 +64,44 @@ REGISTRATION_OPTIONS = ClientRegistrationOptions(
     valid_scopes=oauth_service.SCOPES,
     default_scopes=oauth_service.SCOPES,
 )
+
+
+def _grant_types_the_sdk_would_refuse(body: object) -> bool:
+    """Is this the registration the SDK rejects for no good reason?
+
+    The SDK hardcodes `{"authorization_code","refresh_token"}.issubset(grant_types)`
+    (`mcp/server/auth/handlers/register.py`) with no way to configure it —
+    `ClientRegistrationOptions` carries only enabled/secret-expiry/scopes.
+
+    That rejects **RFC 7591's own default**. §2: *"If omitted, the default
+    behavior is that the client will use only the 'authorization_code' Grant
+    Type."* So the SDK accepts a client that omits the field and refuses the
+    client that says the identical thing out loud — same meaning, opposite
+    outcome, 400 vs 201. Known upstream (fastmcp#2460) and unfixed in 1.28.1.
+
+    We only touch that exact shape. Anything else — `client_credentials`, a grant
+    we cannot honour, a missing field — is left for the SDK to judge.
+    """
+    if not isinstance(body, dict):
+        return False
+    grants = body.get("grant_types")
+    return isinstance(grants, list) and set(grants) == {"authorization_code"}
+
+
+def _with_body(request: Request, body: bytes) -> Request:
+    """The same request, re-reading a body we supply.
+
+    Deliberately re-*feeding* the handler rather than reimplementing it. The
+    grant_types check sits in the middle of `RegistrationHandler.handle()`, and
+    its neighbours are load-bearing: scope-subset checking above it, and
+    `response_types` must include `code` below it — the MCP spec's PKCE
+    requirement. Routing around `handle()` to dodge one bad check would silently
+    take both good ones with it, and nothing would notice.
+    """
+    async def receive() -> dict[str, object]:
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    return Request(request.scope, receive)
 
 RESOURCE_METADATA_PATH = "/.well-known/oauth-protected-resource"
 
@@ -190,6 +229,32 @@ async def register(request: Request) -> Response:
             headers={"Retry-After": str(int(wait) + 1)},
         )
     limiter.record(key)
+
+    # Substitute a grant the client didn't ask for — a decision, not a side
+    # effect. RFC 7591 §3.2.1: "The authorization server MAY reject or replace
+    # any of the client's requested metadata values ... and substitute them with
+    # suitable values", and MUST return everything it registered. The SDK passes
+    # grant_types straight into the response, so the client is told: it asked for
+    # authorization_code and is handed back authorization_code + refresh_token.
+    #
+    # The alternative is refusing a conformant client and a connector that cannot
+    # be added at all. Granting a refresh it never uses costs nothing here — this
+    # is a single-user server and the client is one its owner just approved on
+    # the consent screen — whereas refusing costs the whole feature.
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 — not ours to diagnose; the SDK reports it
+        body = None
+    if _grant_types_the_sdk_would_refuse(body):
+        logger.info(
+            "client %r registered for authorization_code only; adding refresh_token, "
+            "which the SDK requires and RFC 7591 permits us to substitute",
+            (body or {}).get("client_name", "<unnamed>"),
+        )
+        request = _with_body(
+            request, json.dumps({**body, "grant_types": ["authorization_code", "refresh_token"]}).encode()
+        )
+
     return _allow_cross_origin(
         await RegistrationHandler(_provider(request), options=REGISTRATION_OPTIONS).handle(request)
     )
