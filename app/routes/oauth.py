@@ -111,6 +111,41 @@ def _cors(payload: dict) -> JSONResponse:
     return JSONResponse(payload, headers={"Access-Control-Allow-Origin": "*"})
 
 
+# The same reasoning the SDK's own create_auth_routes applies, and the reason we
+# have to apply it ourselves: these handlers are mounted directly rather than
+# through that helper, so its CORS wrapper is not in the path.
+#
+# `/authorize` is deliberately NOT in this list. It is a page a browser is
+# redirected to, not something a script fetches, and it is where APP_SECRET gets
+# typed — there is nothing a cross-origin reader of it could want that is not
+# the thing we are protecting.
+_CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, mcp-protocol-version",
+    "Access-Control-Max-Age": "86400",
+}
+
+
+def _allow_cross_origin(response: Response) -> Response:
+    for name, value in _CORS_HEADERS.items():
+        response.headers[name] = value
+    return response
+
+
+@router.options("/register")
+@router.options("/token")
+async def oauth_preflight() -> Response:
+    """A browser will not POST cross-origin without asking first.
+
+    Registration and the token exchange are both reachable from a page (the MCP
+    Inspector runs in one), and both are safe to be: neither hands anything to a
+    caller who was not already holding the code, the verifier, and the client's
+    own credentials.
+    """
+    return _allow_cross_origin(Response(status_code=204))
+
+
 @router.get("/.well-known/oauth-authorization-server")
 async def authorization_server_metadata(request: Request) -> Response:
     return _cors(_as_metadata(public_base(request)))
@@ -154,7 +189,9 @@ async def register(request: Request) -> Response:
             headers={"Retry-After": str(int(wait) + 1)},
         )
     limiter.record(key)
-    return await RegistrationHandler(_provider(request), options=REGISTRATION_OPTIONS).handle(request)
+    return _allow_cross_origin(
+        await RegistrationHandler(_provider(request), options=REGISTRATION_OPTIONS).handle(request)
+    )
 
 
 @router.api_route("/authorize", methods=["GET", "POST"])
@@ -165,7 +202,9 @@ async def authorize(request: Request) -> Response:
 @router.post("/token")
 async def token(request: Request) -> Response:
     provider = _provider(request)
-    return await TokenHandler(provider, ClientAuthenticator(provider)).handle(request)
+    return _allow_cross_origin(
+        await TokenHandler(provider, ClientAuthenticator(provider)).handle(request)
+    )
 
 
 # ── the login step (proving APP_SECRET) ─────────────────────────────────────

@@ -133,6 +133,49 @@ class TestDiscovery:
         assert bare == suffixed
 
 
+class TestBrowserBasedClientsCanReachTheFlow:
+    """The MCP Inspector runs in a web page, and the SDK's own create_auth_routes
+    puts CORS on exactly these endpoints for that reason. We mount the handlers
+    directly, so its wrapper is not in our path and we have to do it ourselves —
+    an omission that would only show up as "the Inspector cannot register".
+    """
+
+    def test_discovery_is_readable_cross_origin(self, client):
+        r = client.get("/.well-known/oauth-authorization-server")
+        assert r.headers["access-control-allow-origin"] == "*"
+
+    @pytest.mark.parametrize("path", ["/register", "/token"])
+    def test_preflight_is_answered(self, client, path):
+        r = client.options(path, headers={
+            "Origin": "https://inspector.example",
+            "Access-Control-Request-Method": "POST",
+        })
+        assert r.status_code == 204
+        assert r.headers["access-control-allow-origin"] == "*"
+        assert "POST" in r.headers["access-control-allow-methods"]
+
+    def test_the_registration_response_is_readable_cross_origin(self, client):
+        r = client.post("/register", json={"redirect_uris": [REDIRECT]})
+        assert r.headers["access-control-allow-origin"] == "*"
+
+    def test_the_token_response_is_readable_cross_origin(self, client):
+        verifier, challenge = pkce()
+        info = register(client)
+        code = login_and_get_code(client, info, challenge)
+        r = exchange(client, info, code, verifier)
+        assert r.status_code == 200
+        assert r.headers["access-control-allow-origin"] == "*"
+
+    def test_authorize_is_not_cross_origin_readable(self, client):
+        """The one page where APP_SECRET gets typed. A script on another origin
+        has no business reading it."""
+        info = register(client)
+        r = authorize(client, info, pkce()[1])
+        blob = parse_qs(urlparse(r.headers["location"]).query)["p"][0]
+        page = client.get(f"/authorize/login?p={blob}")
+        assert "access-control-allow-origin" not in page.headers
+
+
 class TestDynamicClientRegistration:
     def test_a_client_can_register_itself(self, client):
         """Without DCR, ChatGPT and Claude cannot connect at all."""
