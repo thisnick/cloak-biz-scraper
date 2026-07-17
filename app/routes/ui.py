@@ -127,15 +127,29 @@ def _keep(new: str, existing: str) -> str:
 # ── login ───────────────────────────────────────────────────────────────────
 
 
+def _login_context(request: Request, error: str | None = None) -> dict[str, Any]:
+    """What the login page needs — including how to get back in.
+
+    The recovery instructions used to live only on the settings page, which is
+    behind this login: the only person who could read them was the one who did
+    not need them. Anyone actually locked out saw "that is not the right secret"
+    and had nowhere to go.
+    """
+    secret_service = request.app.state.secret
+    return {
+        "error": error,
+        "unconfigured": secret_service.current() is None,
+        # A reset the user asked for and we deliberately ignored. Silent, this is
+        # a brick: they set the flag, redeployed, and nothing changed.
+        "reset_ignored": secret_service.reset_ignored,
+    }
+
+
 @router.get("/login", response_class=HTMLResponse)
 async def login_form(request: Request) -> Response:
     if _authed(request):
         return RedirectResponse("/", status_code=303)
-    return templates.TemplateResponse(
-        request,
-        "login.html",
-        {"error": None, "unconfigured": request.app.state.secret.current() is None},
-    )
+    return templates.TemplateResponse(request, "login.html", _login_context(request))
 
 
 @router.post("/login", response_class=HTMLResponse)
@@ -143,14 +157,14 @@ async def login(request: Request, secret: str = Form("")) -> Response:
     secret_service = request.app.state.secret
     if secret_service.current() is None:
         return templates.TemplateResponse(
-            request, "login.html", {"error": None, "unconfigured": True}, status_code=503
+            request, "login.html", _login_context(request), status_code=503
         )
     if not secret_service.verify(secret):
         logger.warning("failed login attempt from %s", request.client.host if request.client else "?")
         return templates.TemplateResponse(
             request,
             "login.html",
-            {"error": "That is not the right secret.", "unconfigured": False},
+            _login_context(request, "That is not the right secret."),
             status_code=401,
         )
 

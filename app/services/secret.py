@@ -26,8 +26,15 @@ The reset re-applies only when it is genuinely a *new* request:
     consumed (the user asked to reset to something new).
 
 A flag left set forever with an unchanged value is therefore inert, and a UI
-rotation performed afterwards sticks — which is the property that makes leaving
-the flag in place merely untidy rather than dangerous.
+rotation performed afterwards sticks.
+
+**But inert is not harmless, and the flag must still be removed.** A left-set
+flag is exactly what makes the *next* recovery a silent no-op: rotate, forget
+the new secret, redeploy with the same `APP_SECRET` still in place, and the
+reset is skipped as already-consumed — leaving the user locked out by the very
+mechanism meant to rescue them. The escape is real (set a *new* `APP_SECRET`
+value) but nobody would guess it from a page that just says the password is
+wrong, so the login page has to say so out loud. See routes/ui.py.
 
 Encryption of the settings store is deliberately **not** keyed on this secret
 (see crypto.py) precisely so that rotating it never strands the settings.
@@ -84,6 +91,11 @@ class SecretService:
         self._cipher = Cipher.from_volume(dek_path)
         self._lock = threading.Lock()
         self._state: _State | None = None
+        # Whether this boot ignored a reset request it had already consumed.
+        # Surfaced on the login page: a user locked out by their own left-set
+        # flag is looking at the one screen that can tell them, and "wrong
+        # secret" is not the reason they need.
+        self.reset_ignored = False
 
     # ── persistence ──────────────────────────────────────────────────────────
     def _read(self) -> _State | None:
@@ -146,9 +158,11 @@ class SecretService:
                         "APP_SECRET_RESET when you are back in."
                     )
                 else:
+                    self.reset_ignored = True
                     logger.info(
                         "APP_SECRET_RESET is still set but was already consumed for this "
-                        "value; ignoring it so the stored secret stays authoritative"
+                        "value; ignoring it so the stored secret stays authoritative. If "
+                        "you are locked out, set a NEW APP_SECRET value to force a reset."
                     )
             elif reset_requested and not env_secret:
                 logger.warning(

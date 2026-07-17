@@ -95,6 +95,42 @@ class TestLogin:
         client.cookies.set(sessions.COOKIE_NAME, sessions.issue("some-other-secret-entirely"))
         assert client.get("/", follow_redirects=False).status_code == 303
 
+    def test_the_recovery_path_is_on_the_login_page(self, client):
+        """Where a locked-out person actually is.
+
+        It used to live only on the settings page — behind this login — so the
+        only person who could read it was the one who did not need it.
+        """
+        page = shown(client.get("/login"))
+        assert "APP_SECRET_RESET=true" in page
+        assert "Forgotten it?" in page
+        assert "settings and licence survive" in page
+
+    def test_an_ignored_reset_says_so_on_the_login_page(self, tmp_path, monkeypatch):
+        """The silent brick: flag left set, rotate, forget, redeploy with the
+        same value -> reset skipped as already-consumed -> still locked out, and
+        the only clue is a log line they cannot reach."""
+        monkeypatch.setenv("APP_SECRET", SECRET)
+        monkeypatch.setenv("APP_SECRET_RESET", "true")
+        service = SecretService(tmp_path / "auth.json", tmp_path / ".dek")
+        service.bootstrap()                       # reset consumed
+        service.rotate("a-rotated-secret-000009")  # ...then they forget this
+        with TestClient(app, base_url="https://testserver") as c:
+            app.state.secret = SecretService(tmp_path / "auth.json", tmp_path / ".dek")
+            app.state.secret.bootstrap()          # redeploy, same env value
+            assert app.state.secret.reset_ignored
+
+            page = shown(c.get("/login"))
+            assert "already used for this" in page
+            assert "brand-new value" in page
+            # And a failed login must show it too — that is when they are looking.
+            assert "already used for this" in shown(
+                c.post("/login", data={"secret": SECRET}, follow_redirects=False)
+            )
+
+    def test_no_ignored_reset_no_noise(self, client):
+        assert "already used for this" not in shown(client.get("/login"))
+
     def test_login_page_explains_an_unconfigured_deployment(self, tmp_path, monkeypatch):
         monkeypatch.delenv("APP_SECRET", raising=False)
         with TestClient(app, base_url="https://testserver") as c:

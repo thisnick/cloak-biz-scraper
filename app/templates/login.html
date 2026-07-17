@@ -16,6 +16,24 @@
     </div>
   {% else %}
     {% if error %}<div class="banner bad">{{ error }}</div>{% endif %}
+
+    {% if reset_ignored %}
+      {# They asked for a reset and we refused it. Saying nothing here is what
+         turns a left-set flag into a brick: the flag is set, the redeploy
+         changed nothing, and the only other clue is a log line they cannot
+         reach. The escape — a NEW value — is unguessable from "wrong secret". #}
+      <div class="banner warn">
+        <strong><code>APP_SECRET_RESET</code> is set, but it was already used for this
+        <code>APP_SECRET</code> value</strong>, so it was ignored and the secret stored on
+        this server is still in force.
+        <br><br>
+        If you are locked out: set <code>APP_SECRET</code> in Railway to a
+        <strong>brand-new value</strong> (keeping <code>APP_SECRET_RESET=true</code>) and
+        redeploy. A reset only takes effect for a value it has not already been used for
+        — otherwise every restart would undo a secret you changed here.
+      </div>
+    {% endif %}
+
     <form method="post" action="/login">
       <label for="secret">APP_SECRET</label>
       <input type="password" id="secret" name="secret" autocomplete="current-password"
@@ -29,6 +47,18 @@
         <button class="primary" type="submit">Sign in</button>
       </div>
     </form>
+
+    {# The recovery path belongs HERE, not on the settings page: someone who is
+       locked out cannot read the settings page, and someone who can read it does
+       not need this. #}
+    <hr>
+    <p class="hint" style="margin-bottom:0">
+      <strong>Forgotten it?</strong> You can reset without a terminal. In Railway, open
+      this service's <em>Variables</em> tab, set <code>APP_SECRET</code> to a new value,
+      add <code>APP_SECRET_RESET=true</code>, and redeploy — the next start adopts the new
+      value. Your settings and licence survive; they are not encrypted with this secret.
+      Remove <code>APP_SECRET_RESET</code> once you are back in.
+    </p>
   {% endif %}
 </section>
 {% endblock %}
