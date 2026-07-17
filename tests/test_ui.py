@@ -7,6 +7,8 @@ since Railway is HTTPS).
 """
 from __future__ import annotations
 
+import pathlib
+
 import httpx
 import pytest
 import respx
@@ -215,6 +217,40 @@ class TestSaving:
     def test_pool_saves(self, auth):
         auth.post("/settings/pool", data={"max_instances": "6", "interactive_reserve": "2"})
         assert app.state.settings.load().max_instances == 6
+
+    def test_retired_claims_do_not_survive_in_template_SOURCE(self):
+        """Every other test here reads rendered output, and a Jinja comment is
+        not rendered. So a claim we retired can sit in the source forever, being
+        read by the next person as the reason the code is the way it is, while
+        the suite stays green — which is exactly what happened: the copy saying
+        "Evomi accepts any password" was fixed and the comment asserting it was
+        not, and it outlived the fix.
+
+        Note the whitespace collapse. A grep for the phrase missed it because the
+        comment wrapped it across a line break, so the words were never adjacent
+        in the file. A guard that cannot see through wrapping is not a guard.
+        """
+        import re
+
+        templates = pathlib.Path(__file__).resolve().parent.parent / "app" / "templates"
+        files = list(templates.glob("*.html"))
+        assert files, "found no templates to scan — the guard would pass vacuously"
+        retired = (
+            # measured false: the check is skipped from a trusted address, not absent
+            "accepts any password",
+            "only rejects a wrong username",
+            # measured false: a template cannot carry sleepApplication, so this is
+            # conditional on a switch the user must find themselves
+            "you only pay while a sweep is actually running",
+            "it's cheap because it sleeps",
+        )
+        for path in files:
+            src = re.sub(r"\s+", " ", path.read_text())
+            for claim in retired:
+                assert claim not in src, (
+                    f"{path.name} still asserts a retired claim: {claim!r} — "
+                    "check comments as well as copy"
+                )
 
     def test_pool_cost_copy_does_not_promise_sleep_we_cannot_ship(self, auth):
         """The page used to tell the reader, while they chose how many browsers

@@ -117,10 +117,19 @@
 
   {{ banner('proxy') }}
   {% if result and result.section == 'proxy' and result.ok and result.detail %}
-    {# Report the measurement, and be explicit about its limit. Evomi accepts any
-       password: a typo'd one still returns a working exit IP, so a green result
-       here is not evidence the credentials are right. Saying "credentials OK"
-       would be a lie we measured nothing to support. #}
+    {# Report the measurement, and be explicit about its limit. A green result is
+       not evidence the credentials are right, and saying "credentials OK" would
+       be a lie we measured nothing to support.
+
+       This used to justify that by asserting the provider never checks passwords
+       at all — a property of the provider. It is a property of the address you
+       ask from: measured, the check is skipped from a trusted address and
+       enforced from a deployed one, which is how a stale password sat in a local
+       .env for the life of this project without a symptom. So the limit is real
+       but narrower than we claimed, and the copy below says "may not" for that
+       reason. (The retired sentence is not quoted here on purpose: a test scans
+       this file for it, and a quotation reads like an assertion to anyone
+       grepping.) #}
     <p class="hint">
       Measured through the proxy just now: exit IP <span class="mono">{{ result.detail.exit_ip }}</span>,
       {% if result.detail.geo_resolved %}
