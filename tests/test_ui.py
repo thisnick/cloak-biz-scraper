@@ -697,15 +697,40 @@ class TestRunEvidenceIsReachableButNotPublic:
         assert r.status_code != 200
         assert b"PNG-pretend" not in r.content
 
+    # Payloads split by whether they REACH the code under test. This split is the
+    # test, not decoration: the HTTP client collapses a plain `../` to an absolute
+    # path *before the request is sent*, so `../../.dek` arrives as `/runs/.dek`,
+    # matches the get_run route, and dies on isalnum() — it never touches the
+    # containment check and proves nothing about it. Only a form the client cannot
+    # collapse (percent-encoded, or an absolute override) reaches get_evidence.
+    #
+    # Every payload below asserts *which handler answered it*, via the 404 detail
+    # string — "no such evidence" comes only from the containment branch, "no such
+    # run" only from get_run. So there are no silent passengers: a payload that
+    # stopped reaching the code (a client that changed its normalisation, a
+    # refactor that moved the check) flips its detail and fails here. Verified by
+    # removing the containment check and watching the REACHES set serve HTTP 200
+    # with the canary in the body.
+    _REACHES_CONTAINMENT = (
+        "..%2f..%2ftraversal-canary.txt",           # percent-encoded ../, at the canary
+        "%2e%2e%2f%2e%2e%2ftraversal-canary.txt",   # dots encoded too
+        "..%2f..%2f.dek",                           # the real prize: the data key
+        "/etc/passwd",                              # absolute path overrides the join
+    )
+    _NORMALISED_BY_THE_CLIENT = (
+        "../../.dek",                               # -> /runs/.dek before it is sent
+        "../../traversal-canary.txt",
+        "page-01-blocked/../../../traversal-canary.txt",
+    )
+
     def test_traversal_cannot_reach_anything_outside_the_run(self, auth):
         """`{name:path}` takes slashes, and /data holds the keys to everything.
 
-        Two directories above a run's evidence sit `settings.json` — the
-        licence, proxy and Notion credentials — and the `.dek` that decrypts it.
-        This is the one attack that turns a diagnostic route into a credential
-        leak, so it is worth a canary rather than an assertion about 404s alone:
-        the file is planted exactly where `.dek` lives, and reading it would mean
-        reading that.
+        Two directories above a run's evidence sit `settings.json` — the licence,
+        proxy and Notion credentials — and the `.dek` that decrypts it. This is
+        the one attack that turns a diagnostic route into a credential leak, so
+        the canary is planted exactly where `.dek` lives: reaching it means
+        reading the key.
 
         (A canary, not a real `.dek`: an earlier draft wrote the secret over the
         actual key file and broke every later test with a DecryptError. Tests
@@ -715,19 +740,33 @@ class TestRunEvidenceIsReachableButNotPublic:
         canary = CONFIG.evidence_dir.parent / "traversal-canary.txt"
         canary.write_text("CANARY-WHERE-THE-DEK-LIVES")
         try:
-            for attempt in (
-                "../../traversal-canary.txt",   # the canary, where .dek sits
-                "../../.dek",
-                "../../settings.json",
-                "..%2f..%2f.dek",
-                "page-01-blocked/../../../traversal-canary.txt",
-                "/etc/passwd",
-            ):
+            for attempt in self._REACHES_CONTAINMENT:
                 r = auth.get(f"/runs/{job.id}/evidence/{attempt}")
-                assert r.status_code == 404, f"traversal reached something: {attempt}"
+                assert r.status_code == 404, f"served something for {attempt}"
                 assert b"CANARY" not in r.content, f"LEAKED via {attempt}"
+                assert r.json()["detail"] == "no such evidence", (
+                    f"{attempt} did NOT reach the containment check "
+                    f"(got {r.json().get('detail')!r}) — this payload is now vacuous"
+                )
         finally:
             canary.unlink(missing_ok=True)
+
+    def test_the_readable_traversal_payloads_die_at_the_client(self, auth):
+        """The other half of the split, pinned so nobody mistakes it for coverage.
+
+        These never reach get_evidence — the client normalises them away first —
+        so they cannot exercise containment no matter what containment does. The
+        assertion is on the detail string precisely so that if a future client
+        stops normalising them, this flips to "no such evidence", fails, and tells
+        us the readable payloads are suddenly live and need real handling.
+        """
+        job = self._job(auth)
+        for attempt in self._NORMALISED_BY_THE_CLIENT:
+            r = auth.get(f"/runs/{job.id}/evidence/{attempt}")
+            assert r.status_code == 404
+            assert r.json()["detail"] == "no such run", (
+                f"{attempt} now reaches our code — it is no longer just documentation"
+            )
 
     def test_a_symlink_out_of_the_run_is_refused(self, auth):
         """resolve() follows links, so a link planted inside the evidence dir
