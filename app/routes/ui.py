@@ -446,19 +446,23 @@ async def ui_new_instance(
         country=country.strip() or None,
         region=region.strip() or None,
     )
+    # This is a form submit, so an error is shown by re-rendering the dashboard
+    # with a banner (like the settings pages), NOT by raising — a raw
+    # {"detail": ...} JSON body reads as "broken" to the first-boot user this
+    # button is for. The status codes are unchanged (the same 429/400 the REST
+    # twin returns); only the presentation differs. The REST endpoint
+    # POST /api/instances keeps its JSON error — its caller is an agent, not a
+    # browser. A missing or unusable licence is the first-boot footgun this
+    # button reaches; its message already names the fix ("Add it under Settings").
     try:
         await request.app.state.instances.launch(
             req, origin="interactive", subject=OWNER
         )
     except CapExceeded as exc:
-        raise HTTPException(status_code=429, detail=str(exc)) from exc
-    # Mirrors POST /api/instances exactly — same exceptions, same 400, no drift.
-    # A missing or unusable licence is the first-boot footgun the dashboard's
-    # "New browser" button reaches; without this it is a raw 500. Its message
-    # already names the fix ("Add it under Settings").
+        return _render(request, Result("browsers", False, str(exc)), status=429)
     except (LicenseNotConfigured, LicenseNotPro, ProxyNotConfigured, ProxyUnreachable,
             GeoUnresolved, PinUnavailable) as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return _render(request, Result("browsers", False, str(exc)), status=400)
     return _sessions_redirect()
 
 
@@ -475,14 +479,17 @@ async def ui_run_sweep(
     from ..services.scrape import NotionNotConfigured
     from ..sources import UnsupportedURL
 
+    # Same as ui_new_instance: a form submit, so errors re-render the dashboard
+    # with a banner (in the Tasks section) rather than a raw JSON body, status
+    # codes unchanged.
     try:
         request.app.state.scrape.start(
             url.strip(), max_pages=max_pages, sync=sync, db_id=db_id.strip() or None
         )
     except UnsupportedURL as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return _render(request, Result("tasks", False, str(exc)), status=422)
     except NotionNotConfigured as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return _render(request, Result("tasks", False, str(exc)), status=409)
     return _sessions_redirect("tasks")
 
 

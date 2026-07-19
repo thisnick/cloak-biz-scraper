@@ -894,7 +894,7 @@ class TestNewBrowserWithoutALicence:
 
         monkeypatch.setattr(app.state.instances, "launch", boom)
 
-    def test_the_dashboard_button_gets_a_helpful_400(self, auth, monkeypatch):
+    def test_the_dashboard_button_shows_a_helpful_banner_not_raw_json(self, auth, monkeypatch):
         from app.services.license import LicenseNotConfigured
 
         self._launch_raises(monkeypatch, LicenseNotConfigured(
@@ -902,10 +902,15 @@ class TestNewBrowserWithoutALicence:
             "without it only the free binary is available, which this app does not use."
         ))
         r = auth.post("/sessions/instances", data={"profile": "p"}, follow_redirects=False)
+        # Status is unchanged — the Reviewer's security tests assert on it — but a
+        # human sees the dashboard with a banner, not {"detail": ...} on a blank page.
         assert r.status_code == 400, "a missing licence must be a 400, not a 500"
-        assert "Settings" in r.json()["detail"], "the message must point at the fix"
+        assert 'class="banner' in r.text, "the error renders as a dashboard banner, not JSON"
+        assert '{"detail"' not in r.text, "no raw HTTPException body reaches the user"
+        assert "Add it under Settings" in shown(r), "the banner names the fix"
+        assert 'data-section="browsers" class="on"' in r.text, "and lands on the Browsers tab"
 
-    def test_the_rest_twin_answers_the_same(self, client, monkeypatch):
+    def test_the_rest_twin_keeps_its_json(self, client, monkeypatch):
         from conftest import mint_access
 
         from app.services.license import LicenseNotConfigured
@@ -915,12 +920,15 @@ class TestNewBrowserWithoutALicence:
         ))
         r = client.post("/api/instances", json={"profile": "p"},
                         headers={"Authorization": f"Bearer {mint_access(app)}"})
-        assert r.status_code == 400, "REST must mirror the UI — same failure, same 400"
+        # The API caller is an agent, not a browser, so it keeps the JSON body —
+        # the mirror is at the status code (both 400, neither a 500), not the
+        # presentation. Only the human-facing UI endpoint renders a banner.
+        assert r.status_code == 400, "REST must mirror the UI's status — same failure, same 400"
         assert "Settings" in r.json()["detail"]
 
-    def test_an_unusable_key_is_also_a_400(self, auth, monkeypatch):
+    def test_an_unusable_key_also_gets_a_banner_400(self, auth, monkeypatch):
         """A mistyped or expired key is the very next first-boot moment, and it
-        raises LicenseNotPro from the same launch path — also a 400, not a 500."""
+        raises LicenseNotPro from the same launch path — also a banner 400."""
         from app.services.license import LicenseNotPro
 
         self._launch_raises(monkeypatch, LicenseNotPro(
@@ -928,6 +936,29 @@ class TestNewBrowserWithoutALicence:
         ))
         r = auth.post("/sessions/instances", data={"profile": "p"}, follow_redirects=False)
         assert r.status_code == 400
+        assert 'class="banner' in r.text and '{"detail"' not in r.text
+
+    def test_a_full_pool_keeps_its_own_status_under_the_banner(self, auth, monkeypatch):
+        """The banner is presentation only: a non-licence failure still carries
+        its own distinct code (429 here), which the Reviewer's tests rely on."""
+        from app.services.instances import CapExceeded
+
+        self._launch_raises(monkeypatch, CapExceeded("pool full (4); reserve in use"))
+        r = auth.post("/sessions/instances", data={"profile": "p"}, follow_redirects=False)
+        assert r.status_code == 429, "status is unchanged; only the rendering became a banner"
+        assert 'class="banner' in r.text and "pool full" in shown(r)
+
+    def test_a_sweep_error_banners_on_the_tasks_tab(self, auth, monkeypatch):
+        from app.services.scrape import NotionNotConfigured
+
+        def boom(url, **kw):
+            raise NotionNotConfigured("Connect Notion in Settings before saving a sweep.")
+
+        monkeypatch.setattr(app.state.scrape, "start", boom)
+        r = auth.post("/sessions/sweep", data={"url": "https://x"}, follow_redirects=False)
+        assert r.status_code == 409
+        assert 'class="banner' in r.text and '{"detail"' not in r.text
+        assert 'data-section="tasks" class="on"' in r.text
 
 
 class TestLivePaneTokens:

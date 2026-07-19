@@ -38,7 +38,11 @@
 {# A settings POST forces its own section; otherwise the server may hint which
    one to land on (e.g. a redirect after "New browser" → Browsers), falling back
    to Overview. active_hint is already validated against titles server-side. #}
-{% set active = 'settings' if result else (active_hint if active_hint in titles else 'overview') %}
+{# A result may belong to a top-level section (a Browsers/Tasks error banner) or
+   to a settings accordion (section = cloakbrowser/proxy/notion/pool, which is not
+   a tab). The first lands on that tab; the second lands on Settings; otherwise a
+   server hint, else Overview. #}
+{% set active = result.section if result and result.section in titles else ('settings' if result else (active_hint if active_hint in titles else 'overview')) %}
 
 {% block shell %}
 <div class="app" id="app">
@@ -122,6 +126,7 @@
       {# ── BROWSERS ────────────────────────────────────────────────────── #}
       <section data-section="browsers" class="{{ 'on' if active=='browsers' }}">
         <h2 class="page-h">Browsers</h2>
+        {{ banner('browsers') }}
         <div class="bar-actions">
           <div class="count"><b>{{ instances|length }}</b> running · they close on their own when idle</div>
           <form method="post" action="/sessions/instances"><button class="btn primary" type="submit">+ New browser</button></form>
@@ -179,6 +184,7 @@
       {# ── TASKS ───────────────────────────────────────────────────────── #}
       <section data-section="tasks" class="{{ 'on' if active=='tasks' }}">
         <h2 class="page-h">Tasks</h2>
+        {{ banner('tasks') }}
         <div class="subh">Running now</div>
         {% if running_jobs %}
           {% for j in running_jobs %}
