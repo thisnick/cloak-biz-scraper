@@ -37,13 +37,20 @@ PAGE_URL = "https://dash.test/"
 # None of the layout checks touch a real socket.
 STUB_RFB = """
 export default class RFB {
-  constructor(){ this._l={}; }
+  constructor(target, url){
+    this._l={};
+    // Record every connection so a test can prove WHICH pane got control:
+    // the target element and the viewOnly it was set to.
+    this._rec = {target, viewOnly: null};
+    (window.__rfbLog = window.__rfbLog || []).push(this._rec);
+  }
   disconnect(){}
   focus(){}
   blur(){}
   sendKey(){}
   addEventListener(t,f){ (this._l[t]=this._l[t]||[]).push(f); }
-  set viewOnly(v){} set scaleViewport(v){} set background(v){}
+  set viewOnly(v){ this._rec.viewOnly = v; }
+  set scaleViewport(v){} set background(v){}
 }
 """
 
@@ -253,6 +260,55 @@ class TestMobileKeyboard:
         assert focused, "tapping Keyboard focuses the offscreen input (pops the soft keyboard)"
 
         page.set_viewport_size({"width": 1280, "height": 900})
+
+
+class TestControlLandsOnTheRightPane:
+    """The discriminating guard for the pane-targeting fix (6b54dc5).
+
+    One instance is shown by two panes at once: a view-only preview on Overview
+    and the full pane on Browsers, both `.pane[data-instance="i1"]`. Take control
+    must attach the DRIVABLE (viewOnly=false) connection to the Browsers pane, not
+    to the first-in-DOM Overview preview. The earlier keyboard test keyed off
+    whether the button appeared, so it passed even with the bug present; this
+    keys off which element the RFB connection actually attached to.
+    """
+
+    def test_take_control_drives_the_browsers_pane_not_the_overview_preview(self, measured):
+        page = measured["page"]
+        page.set_viewport_size({"width": 1280, "height": 900})
+        page.evaluate("() => document.getElementById('app').classList.remove('drawer-open','collapsed')")
+
+        # The bug is only discriminable when the duplicate actually exists.
+        dupes = page.evaluate("() => document.querySelectorAll('.pane[data-instance=\"i1\"]').length")
+        assert dupes == 2, f"need the Overview-preview + Browsers duplicate to test targeting; got {dupes}"
+
+        page.evaluate("document.querySelector('[data-nav=browsers]').click()")
+        page.wait_for_timeout(80)
+        # Start from a known state: if i1 is already controlling, release it.
+        page.evaluate("""() => {
+          const btn = document.querySelector('[data-control-for="i1"]');
+          const body = btn.closest('.acc-body');
+          const pane = body && body.querySelector('.pane');
+          if (pane && pane.classList.contains('controlling')) btn.click();
+        }""")
+        page.wait_for_timeout(80)
+
+        page.evaluate("window.__rfbLog = []")
+        page.evaluate("document.querySelector('[data-control-for=\"i1\"]').click()")  # take control
+        page.wait_for_timeout(150)
+
+        log = page.evaluate("""() => (window.__rfbLog || []).map(e => ({
+          viewOnly: e.viewOnly,
+          preview: !!(e.target && e.target.closest('.pane')
+                      && e.target.closest('.pane').classList.contains('preview')),
+          section: e.target && e.target.closest('[data-section]')
+                   && e.target.closest('[data-section]').getAttribute('data-section'),
+        }))""")
+        control = [e for e in log if e["viewOnly"] is False]
+        assert control, f"taking control should open a drivable (viewOnly=false) connection; log={log}"
+        assert all(e["section"] == "browsers" and not e["preview"] for e in control), (
+            f"control attached to the wrong pane — the Overview preview, not Browsers. log={log}"
+        )
 
 
 _PROBE = r"""
