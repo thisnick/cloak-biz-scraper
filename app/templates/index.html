@@ -523,10 +523,17 @@
   document.querySelectorAll('[data-nav]').forEach(function(n){
     n.addEventListener('click', function(){ activate(n.getAttribute('data-nav')); });
   });
+  // The same instance can have two panes (a view-only preview on Overview and the
+  // full pane on Browsers), so a control button must find *its own* pane — the one
+  // in its accordion — not the first globally-matching one, which is the hidden
+  // Overview preview. It has been driving that wrong pane since Stage B.
+  function paneNear(el){
+    var body = el.closest('.acc-body');
+    return body ? body.querySelector('.pane[data-instance]') : null;
+  }
   document.querySelectorAll('[data-control-for]').forEach(function(btn){
     btn.addEventListener('click', function(){
-      var id = btn.getAttribute('data-control-for');
-      var pane = document.querySelector('.pane[data-instance="' + id + '"]');
+      var pane = paneNear(btn);
       if(!pane) return;
       var taking = !pane.classList.contains('controlling');
       connect(pane, taking);
