@@ -74,7 +74,8 @@
 
   <main>
     <div class="topbar">
-      <button class="iconbtn" id="collapse" aria-label="Collapse menu"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16M4 12h16M4 18h16"/></svg></button>
+      <button class="iconbtn" id="hamburger" aria-label="Open menu" aria-expanded="false" aria-controls="app"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h16"/></svg></button>
+      <button class="iconbtn" id="collapse" aria-label="Collapse menu"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h16"/></svg></button>
       <h1 id="tb-title">{{ titles[active] }}</h1>
       <div class="spacer"></div>
     </div>
@@ -452,6 +453,7 @@
 
     </div>
   </main>
+  <div class="scrim" id="scrim" aria-hidden="true"></div>
 </div>
 
 <script>
@@ -463,9 +465,22 @@
       var t=document.getElementById('tb-title'); if(t)t.textContent=titles[k]||'';
       window.scrollTo({top:0,behavior:'smooth'});
     }
-    document.querySelectorAll('[data-nav]').forEach(function(n){n.addEventListener('click',function(e){e.preventDefault();go(n.getAttribute('data-nav'));});});
+    var app=document.getElementById('app');
+    // On mobile the sidebar is an off-canvas drawer; tapping a nav item both
+    // switches section and closes it.
+    function drawer(open){
+      app.classList.toggle('drawer-open', open);
+      var h=document.getElementById('hamburger');
+      if(h)h.setAttribute('aria-expanded', open?'true':'false');
+    }
+    document.querySelectorAll('[data-nav]').forEach(function(n){n.addEventListener('click',function(e){e.preventDefault();go(n.getAttribute('data-nav'));drawer(false);});});
     var col=document.getElementById('collapse');
-    if(col)col.addEventListener('click',function(){document.getElementById('app').classList.toggle('collapsed');});
+    if(col)col.addEventListener('click',function(){app.classList.toggle('collapsed');});
+    var ham=document.getElementById('hamburger');
+    if(ham)ham.addEventListener('click',function(){drawer(!app.classList.contains('drawer-open'));});
+    var scrim=document.getElementById('scrim');
+    if(scrim)scrim.addEventListener('click',function(){drawer(false);});
+    document.addEventListener('keydown',function(e){if(e.key==='Escape')drawer(false);});
     document.querySelectorAll('.acc-head').forEach(function(h){h.addEventListener('click',function(){h.parentElement.classList.toggle('open');});});
     var cb=document.getElementById('copybtn');
     if(cb)cb.addEventListener('click',function(){var u=document.getElementById('mcpurl').textContent;try{navigator.clipboard.writeText(u);}catch(e){}var o=cb.textContent;cb.textContent='Copied';setTimeout(function(){cb.textContent=o;},1400);});

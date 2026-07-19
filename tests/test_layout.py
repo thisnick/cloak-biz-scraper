@@ -255,6 +255,89 @@ class TestMobileKeyboard:
         page.set_viewport_size({"width": 1280, "height": 900})
 
 
+_PROBE = r"""
+() => {
+  const vis = e => { if(!e) return false; const s=getComputedStyle(e);
+    return s.display!=='none' && s.visibility!=='hidden'; };
+  const side = document.querySelector('.side').getBoundingClientRect();
+  const main = document.querySelector('main').getBoundingClientRect();
+  // Only elements actually on the page — a control in a hidden section (an
+  // accordion in a tab that isn't open) has height 0 and isn't a tap target now.
+  const H = sel => [...document.querySelectorAll(sel)]
+    .map(e => e.getBoundingClientRect().height).filter(h => h > 0);
+  const wrap = document.querySelector('.tablewrap');
+  return {
+    vw: innerWidth,
+    bodyScrollW: document.documentElement.scrollWidth,
+    sideLeft: side.left, sideRight: side.right,
+    mainW: main.width,
+    hamburger: vis(document.getElementById('hamburger')),
+    collapse: vis(document.getElementById('collapse')),
+    drawerOpen: document.getElementById('app').classList.contains('drawer-open'),
+    labelsVisible: vis(document.querySelector('.nav-item .txt')),
+    navH: H('.nav-item'), accH: H('.acc-head'), btnH: H('.btn'),
+    tableOverflowX: wrap ? getComputedStyle(wrap).overflowX : null,
+  };
+}
+"""
+
+
+class TestResponsive:
+    """Commit for the full mobile pass: the whole dashboard, measured at phone,
+    tablet, and desktop widths."""
+
+    def _at(self, page, width, height=820):
+        page.set_viewport_size({"width": width, "height": height})
+        page.evaluate("() => { const a=document.getElementById('app');"
+                      " a.classList.remove('drawer-open','collapsed'); }")
+        page.wait_for_timeout(320)  # let the drawer transition settle before measuring
+        return page.evaluate(_PROBE)
+
+    def test_phone_drawer_hidden_and_no_horizontal_scroll(self, measured):
+        m = self._at(measured["page"], 390)
+        assert m["sideRight"] <= 1, "the drawer is off-screen by default"
+        assert m["hamburger"] and not m["collapse"], "hamburger replaces the collapse toggle"
+        assert abs(m["mainW"] - 390) < 2, "main content is full width"
+        assert m["bodyScrollW"] <= 390, f"horizontal overflow: scrollWidth {m['bodyScrollW']} > 390"
+
+    def test_phone_hamburger_opens_drawer_with_labels(self, measured):
+        page = measured["page"]
+        self._at(page, 390)
+        page.evaluate("document.getElementById('hamburger').click()")
+        page.wait_for_timeout(260)
+        m = page.evaluate(_PROBE)
+        assert m["drawerOpen"] and m["sideLeft"] >= -1, "hamburger slides the drawer in"
+        assert m["labelsVisible"], "the drawer shows full labels, not an icon-only rail"
+        assert m["bodyScrollW"] <= 390, "the open drawer overlays; it does not widen the page"
+
+    def test_phone_touch_targets_are_at_least_44px(self, measured):
+        page = measured["page"]
+        self._at(page, 390)
+        # Browsers shows all three kinds of target at once and unhidden: nav items,
+        # accordion heads (one per browser), and buttons (New browser / Close).
+        page.evaluate("document.querySelector('[data-nav=browsers]').click()")
+        page.wait_for_timeout(80)
+        m = page.evaluate(_PROBE)
+        assert m["navH"] and all(h >= 44 for h in m["navH"]), f"nav taps: {m['navH']}"
+        assert m["accH"] and all(h >= 44 for h in m["accH"]), f"accordion heads: {m['accH']}"
+        assert m["btnH"] and all(h >= 42 for h in m["btnH"]), f"buttons: {m['btnH']}"
+
+    def test_phone_wide_tables_scroll_in_their_container(self, measured):
+        m = self._at(measured["page"], 390)
+        assert m["tableOverflowX"] in ("auto", "scroll"), \
+            "the history table scrolls inside its own box, so the page never does"
+
+    def test_tablet_has_no_horizontal_overflow(self, measured):
+        m = self._at(measured["page"], 768)
+        assert m["bodyScrollW"] <= 768, f"overflow at 768px: {m['bodyScrollW']}"
+
+    def test_desktop_keeps_the_rail_and_collapse_toggle(self, measured):
+        m = self._at(measured["page"], 1280)
+        assert m["sideLeft"] >= -1 and m["sideRight"] > 100, "the rail is in-flow, not a drawer"
+        assert m["collapse"] and not m["hamburger"], "desktop shows the collapse toggle"
+        assert m["bodyScrollW"] <= 1280
+
+
 def _screenshots(outdir: str) -> None:
     out = pathlib.Path(outdir)
     out.mkdir(parents=True, exist_ok=True)
@@ -270,14 +353,36 @@ def _screenshots(outdir: str) -> None:
             status=200, content_type="application/json",
             body='{"token":"t","path":"/instances/i1/vnc"}'))
         page.goto(PAGE_URL, wait_until="networkidle")
+
+        def reset(width, height=860):
+            page.set_viewport_size({"width": width, "height": height})
+            page.evaluate("() => document.getElementById('app').classList.remove('drawer-open','collapsed')")
+            page.evaluate("document.querySelector('[data-nav=overview]').click()")
+            page.wait_for_timeout(380)  # let the drawer transition fully settle before the shot
+
+        # desktop: the rail, expanded and collapsed
+        reset(1280)
         page.locator(".side").screenshot(path=str(out / "nav-expanded.png"))
         page.evaluate("document.getElementById('app').classList.add('collapsed')")
         page.wait_for_timeout(80)
         page.locator(".side").screenshot(path=str(out / "nav-collapsed.png"))
-        page.evaluate("document.getElementById('app').classList.remove('collapsed')")
-        page.set_viewport_size({"width": 390, "height": 780})
+        page.screenshot(path=str(out / "desktop.png"))
+
+        # tablet
+        reset(768)
+        page.screenshot(path=str(out / "tablet.png"))
+
+        # phone: drawer closed, then open
+        reset(390, 800)
+        page.screenshot(path=str(out / "phone-closed.png"))
+        page.evaluate("document.getElementById('hamburger').click()")
+        page.wait_for_timeout(300)
+        page.screenshot(path=str(out / "phone-drawer.png"))
+
+        # phone: driving a browser, keyboard revealed
+        reset(390, 800)
         page.evaluate("document.querySelector('[data-nav=browsers]').click()")
-        page.wait_for_timeout(60)
+        page.wait_for_timeout(80)
         page.evaluate("document.querySelector('[data-control-for=\"i1\"]').click()")
         page.evaluate("document.querySelector('[data-keyboard-for=\"i1\"]').click()")
         page.wait_for_timeout(80)
