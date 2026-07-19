@@ -157,6 +157,15 @@
                 <div class="pane-screen"></div>
                 <div class="pane-msg">Connecting to live view…</div>
                 <span class="pane-badge view">View only</span>
+                {% if i.origin != 'task' %}
+                {# Offscreen input the Keyboard button focuses, so a phone's soft
+                   keyboard pops for a browser you're driving (desktop has a real
+                   keyboard already). Keystrokes are forwarded to rfb.sendKey; on a
+                   view-only pane the server drops KeyEvents regardless. #}
+                <input class="pane-kbd" type="text" inputmode="text" autocomplete="off"
+                       autocapitalize="off" autocorrect="off" spellcheck="false"
+                       aria-hidden="true" tabindex="-1">
+                {% endif %}
               </div>
               {% else %}
               <div class="pane-slot">This browser has no live view.<br>It fell back to a plain display.</div>
@@ -168,6 +177,7 @@
                 <div class="btnrow">
                   {% if i.origin != 'task' and i.vnc_url %}
                   <button class="btn ctl-btn" type="button" data-control-for="{{ i.instance_id }}">Take control</button>
+                  <button class="btn kbd-btn" type="button" data-keyboard-for="{{ i.instance_id }}" hidden>⌨ Keyboard</button>
                   {% endif %}
                   <form method="post" action="/sessions/instances/{{ i.instance_id }}/close">
                     <button class="btn danger" type="submit">Close</button>
@@ -523,22 +533,75 @@
   document.querySelectorAll('[data-nav]').forEach(function(n){
     n.addEventListener('click', function(){ activate(n.getAttribute('data-nav')); });
   });
+  // ── soft keyboard (typing on a touch device you're driving) ──────────────
+  // noVNC's core already handles touch pointer gestures; the only mobile gap is
+  // text. A phone shows its soft keyboard when a real <input> is focused, so the
+  // Keyboard button focuses an offscreen one and its characters are forwarded to
+  // the browser via rfb.sendKey. Security is unchanged: the button only shows in
+  // control mode, and a view-only pane's server-side filter drops KeyEvents even
+  // if one were sent.
+  var SPECIAL = {Enter:0xFF0D, Tab:0xFF09, Escape:0xFF1B, Delete:0xFFFF,
+    ArrowLeft:0xFF51, ArrowUp:0xFF52, ArrowRight:0xFF53, ArrowDown:0xFF54,
+    Home:0xFF50, End:0xFF57};
+  function keysymForChar(ch){
+    var cp = ch.codePointAt(0);
+    return cp < 0x100 ? cp : 0x01000000 + cp;   // noVNC's Unicode keysym rule
+  }
+  function press(pane, keysym, code){
+    if(keysym != null && pane._rfb) pane._rfb.sendKey(keysym, code || null);
+  }
+  function keyboardButtonFor(id){
+    return document.querySelector('[data-keyboard-for="' + id + '"]');
+  }
+  function wireKeyboard(pane){
+    var input = pane.querySelector('.pane-kbd');
+    if(!input) return;
+    // beforeinput is what a soft keyboard reliably fires (keydown often does not).
+    input.addEventListener('beforeinput', function(e){
+      if(e.inputType === 'insertText' && e.data){
+        for(var i=0;i<e.data.length;i++) press(pane, keysymForChar(e.data[i]));
+      } else if(e.inputType === 'deleteContentBackward'){
+        press(pane, 0xFF08);                     // Backspace
+      } else if(e.inputType === 'insertLineBreak' || e.inputType === 'insertParagraph'){
+        press(pane, 0xFF0D);                     // Enter
+      }
+      // Never accumulate: the field is a keystroke conduit, not a text box.
+      setTimeout(function(){ input.value=''; }, 0);
+    });
+    // Navigation/edit keys that fire keydown (desktop, and many soft keyboards).
+    input.addEventListener('keydown', function(e){
+      if(SPECIAL[e.key] != null){ e.preventDefault(); press(pane, SPECIAL[e.key], e.code); }
+    });
+  }
+  document.querySelectorAll('.pane[data-instance]').forEach(wireKeyboard);
   // The same instance can have two panes (a view-only preview on Overview and the
-  // full pane on Browsers), so a control button must find *its own* pane — the one
-  // in its accordion — not the first globally-matching one, which is the hidden
-  // Overview preview. It has been driving that wrong pane since Stage B.
+  // full pane on Browsers), so a control/keyboard button must find *its own*
+  // pane — the one in its accordion — not the first globally-matching one.
   function paneNear(el){
     var body = el.closest('.acc-body');
     return body ? body.querySelector('.pane[data-instance]') : null;
   }
+  document.querySelectorAll('[data-keyboard-for]').forEach(function(kb){
+    kb.addEventListener('click', function(){
+      var pane = paneNear(kb);
+      var input = pane && pane.querySelector('.pane-kbd');
+      if(input){ input.value=''; input.focus(); }   // focusing pops the soft keyboard
+    });
+  });
+
   document.querySelectorAll('[data-control-for]').forEach(function(btn){
     btn.addEventListener('click', function(){
+      var id = btn.getAttribute('data-control-for');
       var pane = paneNear(btn);
       if(!pane) return;
       var taking = !pane.classList.contains('controlling');
       connect(pane, taking);
       btn.textContent = taking ? 'Release control' : 'Take control';
       btn.classList.toggle('active', taking);
+      // The Keyboard button is meaningful only while driving.
+      var kb = keyboardButtonFor(id);
+      if(kb){ kb.hidden = !taking; }
+      if(!taking){ var input = pane.querySelector('.pane-kbd'); if(input) input.blur(); }
     });
   });
   var start = document.querySelector('[data-section].on') || document.querySelector('[data-section]');
