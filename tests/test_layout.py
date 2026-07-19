@@ -1,0 +1,280 @@
+"""Numeric layout checks for the sidebar nav and the mobile keyboard affordance.
+
+Nick can't eyeball these (he's away), and "looks aligned" is not a regression
+guard. So this renders the real dashboard in a headless browser and asserts the
+geometry with `getBoundingClientRect`/`getBBox`: a misalignment is a failing
+test, not a matter of opinion.
+
+The browser is optional infrastructure — if neither system Chrome nor a
+Playwright-bundled Chromium is present, the module skips rather than fails, the
+same way the other browser-dependent tests do. noVNC is an apt package that is
+only in the Docker image, so its core import is stubbed here; none of these
+checks need a real framebuffer.
+
+Run directly (`python tests/test_layout.py <outdir>`) to also drop the
+collapsed / expanded / mobile screenshots for a human to glance at.
+"""
+from __future__ import annotations
+
+import pathlib
+import tempfile
+
+import pytest
+
+pytest.importorskip("playwright.sync_api")
+from playwright.sync_api import Error as PWError  # noqa: E402
+from playwright.sync_api import sync_playwright  # noqa: E402
+
+from app.main import app  # noqa: E402
+from app.services.secret import SecretService  # noqa: E402
+from app.services.settings import SettingsService  # noqa: E402
+
+SECRET = "layout-secret-long-enough"
+PAGE_URL = "https://dash.test/"
+
+# A no-op stand-in for noVNC's RFB: the pane module imports it at load time, so
+# without this the whole module errors and none of the keyboard wiring attaches.
+# None of the layout checks touch a real socket.
+STUB_RFB = """
+export default class RFB {
+  constructor(){ this._l={}; }
+  disconnect(){}
+  focus(){}
+  blur(){}
+  sendKey(){}
+  addEventListener(t,f){ (this._l[t]=this._l[t]||[]).push(f); }
+  set viewOnly(v){} set scaleViewport(v){} set background(v){}
+}
+"""
+
+
+class _Fake:
+    def __init__(self, iid, origin, vnc_port):
+        self.id, self.origin, self.vnc_port, self.subject = iid, origin, vnc_port, None
+        self.profile, self.proxy_ip = "p", "203.0.113.7"
+        self.timezone, self.locale = "America/Los_Angeles", "en-US"
+        self.geoip = self.humanize = True
+        self.ttl_min, self.created_wall = 60, 1_700_000_000.0
+
+    def age_sec(self):
+        return 5.0
+
+    def idle_sec(self):
+        return 5.0
+
+
+def _render_dashboard() -> str:
+    """The real `/` HTML, signed in, with one interactive and one task browser so
+    the badges, panes, and Take-control controls are all present."""
+    import os
+
+    from fastapi.testclient import TestClient
+
+    prev = os.environ.get("APP_SECRET")
+    os.environ["APP_SECRET"] = SECRET
+    try:
+        with TestClient(app, base_url="https://testserver") as c:
+            d = pathlib.Path(tempfile.mkdtemp())
+            app.state.settings = SettingsService(d / "s.json", d / ".dek")
+            app.state.secret = SecretService()
+            app.state.secret.bootstrap()
+
+            async def _noop(iid):
+                return True
+
+            app.state.instances.stop = _noop
+            app.state.instances.running = {
+                "i1": _Fake("i1", "interactive", 6100),
+                "j9": _Fake("j9", "task", 6101),
+            }
+            try:
+                c.post("/login", data={"secret": SECRET})
+                html = c.get("/").text
+            finally:
+                app.state.instances.running = {}
+        assert 'id="app"' in html, "render did not produce the dashboard (login failed?)"
+        return html
+    finally:
+        if prev is None:
+            os.environ.pop("APP_SECRET", None)
+        else:
+            os.environ["APP_SECRET"] = prev
+
+
+# Measures each nav icon's on-screen visual centre (mapping the SVG content
+# bbox, in viewBox units, through the square box), plus item heights and gaps.
+_MEASURE = r"""
+() => {
+  const items = [...document.querySelectorAll('.nav-item')];
+  const rows = items.map(it => {
+    const svg = it.querySelector('.ico');
+    const box = svg.getBoundingClientRect();
+    const bb = svg.getBBox();
+    const scale = box.width / svg.viewBox.baseVal.width;   // square box & viewBox
+    const r = it.getBoundingClientRect();
+    return {
+      nav: it.getAttribute('data-nav'),
+      visCx: box.left + (bb.x + bb.width/2)*scale,   // absolute on-screen centre x
+      vbCy: bb.y + bb.height/2,                        // content centre y, in viewBox units
+      bbW: bb.width, bbH: bb.height,
+      top: r.top, bottom: r.bottom, height: r.height,
+    };
+  });
+  return rows;
+}
+"""
+
+
+def _spread(xs):
+    return max(xs) - min(xs)
+
+
+@pytest.fixture(scope="module")
+def measured():
+    """Launch a browser once, render the dashboard, and return a probe with the
+    nav geometry in both rail states plus a live `page` for the mobile check."""
+    html = _render_dashboard()
+    with sync_playwright() as p:
+        browser = None
+        for kw in ({"channel": "chrome"}, {}):
+            try:
+                browser = p.chromium.launch(headless=True, **kw)
+                break
+            except PWError:
+                continue
+        if browser is None:
+            pytest.skip("no Chrome/Chromium available for layout measurement")
+
+        page = browser.new_page(viewport={"width": 1280, "height": 900})
+        page.route(PAGE_URL, lambda r: r.fulfill(
+            status=200, content_type="text/html", body=html))
+        page.route("**/novnc/core/rfb.js", lambda r: r.fulfill(
+            status=200, content_type="text/javascript", body=STUB_RFB))
+        page.route("**/sessions/instances/**", lambda r: r.fulfill(
+            status=200, content_type="application/json",
+            body='{"token":"t","path":"/instances/i1/vnc"}'))
+        page.goto(PAGE_URL, wait_until="networkidle")
+
+        expanded = page.evaluate(_MEASURE)
+        page.evaluate("document.getElementById('app').classList.add('collapsed')")
+        page.wait_for_timeout(60)
+        collapsed = page.evaluate(_MEASURE)
+        page.evaluate("document.getElementById('app').classList.remove('collapsed')")
+
+        yield {"page": page, "expanded": expanded, "collapsed": collapsed}
+        browser.close()
+
+
+class TestNavIconsAreOneSet:
+    """Commit 1: the five icons share a visual centre and a consistent weight."""
+
+    def test_all_five_are_present(self, measured):
+        assert [r["nav"] for r in measured["expanded"]] == \
+            ["overview", "browsers", "tasks", "connect", "settings"]
+
+    @pytest.mark.parametrize("state", ["expanded", "collapsed"])
+    def test_icon_centres_share_one_vertical_axis(self, measured, state):
+        assert _spread([r["visCx"] for r in measured[state]]) < 1.0
+
+    @pytest.mark.parametrize("state", ["expanded", "collapsed"])
+    def test_icon_content_is_vertically_centred_in_its_box(self, measured, state):
+        # Each icon's content centre should sit at the viewBox centre (12), so they
+        # line up vertically within their rows rather than riding high or low.
+        vbcy = [r["vbCy"] for r in measured[state]]
+        assert _spread(vbcy) < 1.0
+        assert all(abs(y - 12) < 1.0 for y in vbcy)
+
+    def test_icons_are_a_consistent_size(self, measured):
+        # The bug this replaces: sizes ranged 16–20 wide / 14–20 tall.
+        rows = measured["expanded"]
+        assert _spread([r["bbW"] for r in rows]) < 3.0
+        assert _spread([r["bbH"] for r in rows]) < 3.0
+
+    def test_the_badge_items_do_not_shift_their_icon(self, measured):
+        """Browsers and Tasks carry a count badge; it must not nudge the icon off
+        the shared axis."""
+        rows = {r["nav"]: r for r in measured["expanded"]}
+        axis = rows["overview"]["visCx"]
+        assert abs(rows["browsers"]["visCx"] - axis) < 1.0
+        assert abs(rows["tasks"]["visCx"] - axis) < 1.0
+
+
+class TestRailRhythmIsStable:
+    """Commit 2: collapsing the rail must not change item height or spacing."""
+
+    def test_item_height_is_equal_across_states(self, measured):
+        eh = [r["height"] for r in measured["expanded"]]
+        ch = [r["height"] for r in measured["collapsed"]]
+        assert _spread(eh) < 0.5 and _spread(ch) < 0.5, "heights differ within a state"
+        assert abs(eh[0] - ch[0]) < 0.5, f"item height jumped {eh[0]}→{ch[0]} on collapse"
+
+    @pytest.mark.parametrize("state", ["expanded", "collapsed"])
+    def test_inter_item_gaps_are_uniform(self, measured, state):
+        rows = measured[state]
+        gaps = [rows[i + 1]["top"] - rows[i]["bottom"] for i in range(len(rows) - 1)]
+        assert _spread(gaps) < 0.5, f"uneven gaps: {gaps}"
+
+
+class TestMobileKeyboard:
+    """Commit 3: on a phone-width viewport the Keyboard button pops the soft
+    keyboard by focusing the offscreen input."""
+
+    def test_taking_control_reveals_keyboard_which_focuses_the_input(self, measured):
+        page = measured["page"]
+        page.set_viewport_size({"width": 390, "height": 780})
+        # Drive the page's own controls (the buttons live inside an accordion, so
+        # dispatch clicks directly rather than fight Playwright actionability).
+        page.evaluate("document.querySelector('[data-nav=browsers]').click()")
+        page.wait_for_timeout(60)
+        assert page.query_selector('[data-section=browsers].on'), "Browsers tab is shown"
+
+        kb = page.query_selector('[data-keyboard-for="i1"]')
+        assert kb is not None, "the keyboard button is rendered for a controllable browser"
+        assert kb.get_attribute("hidden") is not None, "hidden until control is taken"
+
+        page.evaluate("document.querySelector('[data-control-for=\"i1\"]').click()")  # take control
+        page.wait_for_timeout(60)
+        assert page.query_selector('[data-keyboard-for="i1"]:not([hidden])'), \
+            "keyboard button shows once driving"
+
+        page.evaluate("document.querySelector('[data-keyboard-for=\"i1\"]').click()")  # tap Keyboard
+        focused = page.evaluate(
+            "() => document.activeElement && document.activeElement.classList.contains('pane-kbd')")
+        assert focused, "tapping Keyboard focuses the offscreen input (pops the soft keyboard)"
+
+        page.set_viewport_size({"width": 1280, "height": 900})
+
+
+def _screenshots(outdir: str) -> None:
+    out = pathlib.Path(outdir)
+    out.mkdir(parents=True, exist_ok=True)
+    html = _render_dashboard()
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, channel="chrome")
+        page = browser.new_page(viewport={"width": 1280, "height": 900})
+        page.route(PAGE_URL, lambda r: r.fulfill(
+            status=200, content_type="text/html", body=html))
+        page.route("**/novnc/core/rfb.js", lambda r: r.fulfill(
+            status=200, content_type="text/javascript", body=STUB_RFB))
+        page.route("**/sessions/instances/**", lambda r: r.fulfill(
+            status=200, content_type="application/json",
+            body='{"token":"t","path":"/instances/i1/vnc"}'))
+        page.goto(PAGE_URL, wait_until="networkidle")
+        page.locator(".side").screenshot(path=str(out / "nav-expanded.png"))
+        page.evaluate("document.getElementById('app').classList.add('collapsed')")
+        page.wait_for_timeout(80)
+        page.locator(".side").screenshot(path=str(out / "nav-collapsed.png"))
+        page.evaluate("document.getElementById('app').classList.remove('collapsed')")
+        page.set_viewport_size({"width": 390, "height": 780})
+        page.evaluate("() => { const a=document.querySelector('[data-nav=browsers]'); a && a.click(); }")
+        page.click('[data-control-for="i1"]')
+        page.wait_for_timeout(80)
+        page.screenshot(path=str(out / "mobile-control.png"), full_page=True)
+        browser.close()
+    print(f"wrote screenshots to {out}")
+
+
+if __name__ == "__main__":
+    import sys
+
+    _screenshots(sys.argv[1] if len(sys.argv) > 1 else tempfile.mkdtemp())
