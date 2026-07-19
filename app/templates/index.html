@@ -147,7 +147,7 @@
                 {% if i.expires_at %}<span class="closes">closes in <b>{{ dur(i.expires_at - now) }}</b></span>{% endif %}
               </div>
             </button>
-            <div class="acc-body" style="display:grid;grid-template-columns:1.5fr 1fr;gap:17px">
+            <div class="acc-body pane-row">
               {# Live view-only noVNC pane. The token is NOT in this markup: the
                  pane's JS fetches a fresh one from an authed endpoint at connect
                  time, so nothing that grants sight of the user's browser sits in

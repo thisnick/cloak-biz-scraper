@@ -237,6 +237,16 @@ class TestMobileKeyboard:
         assert page.query_selector('[data-keyboard-for="i1"]:not([hidden])'), \
             "keyboard button shows once driving"
 
+        # It must be reachable by a real thumb, not just present in the DOM: assert
+        # the button sits inside the 390px viewport (the pane's aspect-ratio once
+        # pushed it off-screen).
+        vw = page.viewport_size["width"]
+        rect = page.evaluate(
+            "() => { const b=document.querySelector('[data-keyboard-for=\"i1\"]')"
+            ".getBoundingClientRect(); return {left:b.left, right:b.right, w:b.width}; }")
+        assert rect["w"] > 0 and rect["left"] >= 0 and rect["right"] <= vw, \
+            f"keyboard button is off-screen on mobile: {rect} (viewport {vw})"
+
         page.evaluate("document.querySelector('[data-keyboard-for=\"i1\"]').click()")  # tap Keyboard
         focused = page.evaluate(
             "() => document.activeElement && document.activeElement.classList.contains('pane-kbd')")
@@ -266,8 +276,10 @@ def _screenshots(outdir: str) -> None:
         page.locator(".side").screenshot(path=str(out / "nav-collapsed.png"))
         page.evaluate("document.getElementById('app').classList.remove('collapsed')")
         page.set_viewport_size({"width": 390, "height": 780})
-        page.evaluate("() => { const a=document.querySelector('[data-nav=browsers]'); a && a.click(); }")
-        page.click('[data-control-for="i1"]')
+        page.evaluate("document.querySelector('[data-nav=browsers]').click()")
+        page.wait_for_timeout(60)
+        page.evaluate("document.querySelector('[data-control-for=\"i1\"]').click()")
+        page.evaluate("document.querySelector('[data-keyboard-for=\"i1\"]').click()")
         page.wait_for_timeout(80)
         page.screenshot(path=str(out / "mobile-control.png"), full_page=True)
         browser.close()

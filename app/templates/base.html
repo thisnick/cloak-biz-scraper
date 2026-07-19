@@ -181,6 +181,11 @@
   .pane.controlling{outline:2px solid var(--accent);outline-offset:-2px}
   .pane.controlling .pane-badge.view{display:none}
   .ctl-btn.active{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
+  /* Pane beside its controls, stacking on narrow screens: the pane's 4/3
+     aspect + min-height forces a ~320px min-width, which would push the
+     controls (Take control / Keyboard / Close) off a phone screen otherwise. */
+  .pane-row{display:grid;grid-template-columns:1.5fr 1fr;gap:17px}
+  @media(max-width:640px){.pane-row{grid-template-columns:1fr}}
   .kbd-btn[hidden]{display:none}
   /* Offscreen but focusable: focusing it pops a touch device's soft keyboard.
      Not display:none/visibility:hidden — those cannot take focus. */
