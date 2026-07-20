@@ -122,3 +122,39 @@ class TestScrapeResultParity:
         job = app.state.jobs.create(url="https://www.bizbuysell.com/x",
                                     source="bizbuysell_serp")
         assert _rest_payload(client, job.id) == _mcp_payload(client, job.id)
+
+
+def _rest_info(client) -> dict:
+    r = client.get("/api/server-info")
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def _mcp_info(client) -> dict:
+    r = client.post("/mcp", headers=HEADERS, json={
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "server_info", "arguments": {}},
+    })
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["result"]["isError"] is False, body
+    return body["result"]["structuredContent"]
+
+
+class TestServerInfoParity:
+    """Same pin for server_info: it holds today because both façades call the one
+    `views.server_info`, but nothing caught the drift if a field were added at one
+    façade. This drives the two real serialisation paths against each other."""
+
+    def test_the_two_facades_return_the_same_snapshot(self, client):
+        rest = _rest_info(client)
+        mcp = _mcp_info(client)
+        # Control: a real snapshot with the four sections, not two empty/error bodies.
+        assert set(rest) == {"proxy", "browser", "pool", "notion"} and rest["pool"]["max"] >= 1, rest
+        assert rest == mcp, (
+            "MCP and REST disagree about server_info. A field added at one façade "
+            "instead of in views.server_info is how it shows up.\n"
+            f"  only in REST: {set(rest) - set(mcp)}\n"
+            f"  only in MCP : {set(mcp) - set(rest)}"
+        )
+        assert _sha(rest) == _sha(mcp)

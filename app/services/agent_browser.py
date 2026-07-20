@@ -48,7 +48,11 @@ ALLOWED_VERBS = frozenset({
 
 # Verbs that take NO positional arguments — only their whitelisted flags.
 # `screenshot` is service-handled: the caller may pick full/annotate, never the
-# output path or an element, so any positional (a path, an @ref) is refused.
+# output path, so any positional is refused. agent-browser's screenshot DOES take
+# positionals (`screenshot [selector] [path]` — an element form exists); we omit
+# both deliberately, to keep this verb flags-only. The path must be ours (it is
+# the file-write surface), and a selector positional would widen the argument
+# surface for no real gain, so it stays out.
 _FLAGS_ONLY = frozenset({"screenshot"})
 
 # Options allowed *per verb*, as an explicit whitelist. This is the second half of
