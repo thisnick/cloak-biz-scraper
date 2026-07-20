@@ -204,6 +204,42 @@ class AgentBrowserResult(BaseModel):
     )
 
 
+class ProxyInfo(BaseModel):
+    configured: bool = Field(description="Whether a residential proxy is fully set up.")
+    status: str = Field(description="unconfigured / untested / working / broken.")
+    country: str | None = Field(default=None, description="Default exit country.")
+    region: str | None = Field(default=None, description="Default exit region.")
+
+
+class BrowserInfo(BaseModel):
+    pro: bool = Field(description="Whether a CloakBrowser Pro licence is configured. "
+                      "This app never runs the free browser.")
+    version: str = Field(description="The running or pinned CloakBrowser version, or 'latest'.")
+    windows_fonts: str = Field(description="Windows-font availability. Not bundled — they are "
+                               "proprietary and, per the fonts gate, not required for the "
+                               "target sites.")
+
+
+class PoolInfo(BaseModel):
+    max: int = Field(description="Most browsers that may run at once.")
+    reserved: int = Field(description="Slots kept for interactive (agent/human) use.")
+    in_use: int = Field(description="Browsers running right now.")
+
+
+class NotionInfo(BaseModel):
+    connected: bool = Field(description="Whether a Notion token and database are set.")
+
+
+class ServerInfo(BaseModel):
+    """A read-only status snapshot of the server's setup. Never carries a secret —
+    no proxy password, no licence key, no Notion token; status and version only."""
+
+    proxy: ProxyInfo
+    browser: BrowserInfo
+    pool: PoolInfo
+    notion: NotionInfo
+
+
 class Health(BaseModel):
     ok: bool = True
     service: str = "cloak-biz-scraper"

@@ -25,7 +25,14 @@ import logging
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
-from ..models import AgentBrowserResult, ArchiveResult, InstanceCreate, InstanceView, ScrapeResult
+from ..models import (
+    AgentBrowserResult,
+    ArchiveResult,
+    InstanceCreate,
+    InstanceView,
+    ScrapeResult,
+    ServerInfo,
+)
 from ..services.geo import GeoUnresolved, ProxyUnreachable
 from ..services.instances import CapExceeded, PinUnavailable
 from ..services.license import LicenseNotConfigured, LicenseNotPro
@@ -101,6 +108,14 @@ async def get_scrape_listing_results(request: Request, job_id: str) -> ScrapeRes
 async def archive_page(request: Request, body: ArchiveRequest) -> ArchiveResult:
     """Read a page and append it to a Notion page. Blocking, ~40-60s."""
     return await request.app.state.archive.archive(body.url, body.notion_page_id)
+
+
+@router.get("/server-info", response_model=ServerInfo)
+async def get_server_info(request: Request) -> ServerInfo:
+    """REST mirror of the server_info MCP tool — read-only, secret-free status."""
+    from ..services.views import server_info
+
+    return server_info(request.app.state.settings.load(), request.app.state.instances)
 
 
 @router.post("/instances", response_model=InstanceView)

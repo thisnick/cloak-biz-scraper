@@ -30,7 +30,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
 from . import __version__
-from .models import ArchiveResult, InstanceCreate, InstanceView, ScrapeResult
+from .models import ArchiveResult, InstanceCreate, InstanceView, ScrapeResult, ServerInfo
 from .routes.guard import subject_of
 from .services.tokens import OWNER
 from .services.urls import public_base
@@ -255,6 +255,19 @@ def build(app) -> FastMCP:
         if outcome.screenshot:
             blocks.append(Image(data=outcome.screenshot, format="png"))
         return blocks
+
+    @mcp.tool()
+    async def server_info() -> ServerInfo:
+        """How this server is set up: proxy, browser, pool, and Notion status.
+
+        Read-only, and carries no secrets — status and versions only. Useful to
+        check before a sweep or a browser launch: whether the residential proxy is
+        working, whether a CloakBrowser Pro licence is configured, how many
+        browser slots are free, and whether Notion is connected.
+        """
+        from .services.views import server_info as build_server_info
+
+        return build_server_info(app.state.settings.load(), app.state.instances)
 
     @mcp.tool()
     async def close_instance(instance_id: str) -> dict:

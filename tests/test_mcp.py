@@ -83,6 +83,7 @@ class TestStateless:
             "list_instances",
             "get_instance",
             "agent_browser",
+            "server_info",
         }
 
     def test_the_async_pair_is_described_as_a_pair(self, client):
