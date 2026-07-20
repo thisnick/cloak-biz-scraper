@@ -175,7 +175,13 @@ def build(app) -> FastMCP:
         ctx: Context, profile: str = "agent", country: str | None = None,
         region: str | None = None, geoip: bool = True,
     ) -> InstanceView:
-        """Launch a browser through the residential proxy.
+        """Launch a cloaked, anti-detection browser (CloakBrowser) through the
+        residential proxy.
+
+        It carries a real, consistent browser fingerprint and exits from a
+        residential IP, so it can reach sites that block bots and datacenter
+        addresses where an ordinary headless browser is turned away. A residential
+        proxy must be configured — the browser will not launch without one.
 
         profile: a persistent identity — same name, same cookies and exit IP.
         country/region: where the proxy should exit.
@@ -221,8 +227,10 @@ def build(app) -> FastMCP:
         """Drive a running browser one action at a time, and see the result.
 
         Use this to actually operate a browser you launched with create_instance:
-        open pages, read them, click, and fill forms — through the residential
-        proxy, keeping the profile's cookies and exit IP.
+        open pages, read them, click, and fill forms. The browser is the cloaked,
+        anti-detection CloakBrowser behind the residential proxy, so it can drive
+        sites that block bots and datacenter IPs, and it keeps the profile's
+        fingerprint, cookies, and exit IP across the session.
 
         The workflow is snapshot-then-act. A snapshot lists the page's elements
         with short refs like @e3; you act on those refs. Refs are reassigned on
