@@ -19,12 +19,13 @@ launches, so the CDP and VNC URLs minted later can be bound to whoever asked.
 """
 from __future__ import annotations
 
+import base64
 import logging
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
-from ..models import ArchiveResult, InstanceCreate, InstanceView, ScrapeResult
+from ..models import AgentBrowserResult, ArchiveResult, InstanceCreate, InstanceView, ScrapeResult
 from ..services.geo import GeoUnresolved, ProxyUnreachable
 from ..services.instances import CapExceeded, PinUnavailable
 from ..services.license import LicenseNotConfigured, LicenseNotPro
@@ -51,6 +52,10 @@ class ScrapeRequest(BaseModel):
 class ArchiveRequest(BaseModel):
     url: str
     notion_page_id: str
+
+
+class AgentBrowserRequest(BaseModel):
+    command: str
 
 
 def _base_url(request: Request) -> str:
@@ -138,6 +143,33 @@ async def get_instance(request: Request, instance_id: str) -> InstanceView:
     return instance_view(
         inst, secret=request.app.state.secret.current(), base_url=_base_url(request),
         subject=_subject(request),
+    )
+
+
+@router.post("/instances/{instance_id}/agent-browser", response_model=AgentBrowserResult)
+async def drive_instance(
+    request: Request, instance_id: str, body: AgentBrowserRequest
+) -> AgentBrowserResult:
+    """REST mirror of the agent_browser MCP tool — runs one allow-listed
+    agent-browser action against the instance. Same service, same guards."""
+    from ..services.agent_browser import AgentBrowserError, InstanceNotDrivable
+
+    try:
+        outcome = await request.app.state.agent_browser.drive(
+            instance_id, body.command, subject=_subject(request)
+        )
+    except AgentBrowserError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except InstanceNotDrivable as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return AgentBrowserResult(
+        instance_id=outcome.instance_id,
+        command=outcome.command,
+        ok=outcome.ok,
+        output=outcome.output,
+        screenshot_png_base64=(
+            base64.b64encode(outcome.screenshot).decode() if outcome.screenshot else None
+        ),
     )
 
 

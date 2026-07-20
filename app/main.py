@@ -24,6 +24,7 @@ from .routes import api, cdp, health, oauth, ui, vnc
 from .routes.guard import AuthGuard
 from .routes.mcp import MCPEndpoint
 from .services import heartbeat
+from .services.agent_browser import AgentBrowserService
 from .services.archive import ArchiveService
 from .services.instances import InstanceManager
 from .services.jobs import JobStore
@@ -95,6 +96,7 @@ async def lifespan(app: FastAPI):
     app.state.instances = InstanceManager(settings_service)
     app.state.scrape = ScrapeService(app.state.instances, jobs, settings_service)
     app.state.archive = ArchiveService(app.state.instances, settings_service)
+    app.state.agent_browser = AgentBrowserService(app.state.instances)
     logger.info(
         "ready: secret=%s license=%s proxy=%s notion=%s pool max=%d reserve=%d "
         "jobs=%d interrupted=%d oauth_clients=%d",

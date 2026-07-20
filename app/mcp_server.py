@@ -217,6 +217,43 @@ def build(app) -> FastMCP:
                              base_url=_base_url(ctx), subject=_subject(ctx))
 
     @mcp.tool()
+    async def agent_browser(ctx: Context, instance_id: str, command: str):
+        """Drive a running browser one action at a time, and see the result.
+
+        Use this to actually operate a browser you launched with create_instance:
+        open pages, read them, click, and fill forms — through the residential
+        proxy, keeping the profile's cookies and exit IP.
+
+        The workflow is snapshot-then-act. A snapshot lists the page's elements
+        with short refs like @e3; you act on those refs. Refs are reassigned on
+        every snapshot, so snapshot again after anything that changes the page.
+
+            navigate <url>        go to a page
+            snapshot -i           list interactive elements (@e refs). add -u for link urls
+            read                  read the page's text (no refs)
+            click @e3             click an element by its ref
+            fill @e3 "some text"  type into a field
+            press Enter           press a key
+            get url               also: get title, get text @e3
+            back / forward / reload
+
+        Each call returns agent-browser's text output AND a screenshot of the page
+        after the action. Read the output to choose your next action.
+
+        One action per call. Quote arguments that contain spaces. Only the
+        listed read/interact verbs are accepted; anything else is refused.
+        """
+        from mcp.server.fastmcp import Image
+
+        outcome = await app.state.agent_browser.drive(
+            instance_id, command, subject=_subject(ctx)
+        )
+        blocks: list = [outcome.output]
+        if outcome.screenshot:
+            blocks.append(Image(data=outcome.screenshot, format="png"))
+        return blocks
+
+    @mcp.tool()
     async def close_instance(instance_id: str) -> dict:
         """Close a browser and free its slot in the pool."""
         return {"ok": await app.state.instances.stop(instance_id), "instance_id": instance_id}

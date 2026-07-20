@@ -187,6 +187,23 @@ class InstanceView(BaseModel):
     humanize: bool = True
 
 
+class AgentBrowserResult(BaseModel):
+    """The result of one `agent_browser` action against a running browser."""
+
+    instance_id: str
+    command: str = Field(description="The command that was run, echoed back.")
+    ok: bool = Field(description="Whether the action succeeded (exit code 0).")
+    output: str = Field(
+        description="agent-browser's output — e.g. a snapshot's @eN element refs, "
+        "or the extracted text/url/title. Read this to decide the next action."
+    )
+    screenshot_png_base64: str | None = Field(
+        default=None,
+        description="A PNG screenshot of the page after the action, base64-encoded. "
+        "The MCP tool returns this as an inline image instead.",
+    )
+
+
 class Health(BaseModel):
     ok: bool = True
     service: str = "cloak-biz-scraper"

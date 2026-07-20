@@ -53,12 +53,21 @@ RUN wget -q "https://github.com/kasmtech/KasmVNC/releases/download/v1.3.3/kasmvn
     && rm "kasmvncserver_bookworm_1.3.3_${TARGETARCH}.deb" \
     && rm -rf /var/lib/apt/lists/*
 
-# Node, for exactly one job: markdown -> Notion blocks via martian. Notion's
-# block schema is fiddly enough (nested rich_text, per-object limits, which
-# markdown it silently drops) that reimplementing it in Python would be a
-# permanent liability for no gain.
+# Node, for two jobs: markdown -> Notion blocks via martian, and the
+# agent-browser CLI. Notion's block schema is fiddly enough (nested rich_text,
+# per-object limits, which markdown it silently drops) that reimplementing it in
+# Python would be a permanent liability for no gain.
 RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm \
     && rm -rf /var/lib/apt/lists/*
+
+# agent-browser: the CLI the agent_browser tool shells out to, to drive a running
+# CloakBrowser instance over its local CDP endpoint. Installed globally; the
+# native per-arch binary resolves from npm on its own. We deliberately do NOT run
+# `agent-browser install` — that downloads a ~180 MB Chrome-for-Testing that is
+# only used when agent-browser LAUNCHES its own browser. We never do: the tool
+# always attaches to CloakBrowser's Chromium via --cdp, so the download would be
+# pure image bloat. (Verified: --cdp attach works with the npm install alone.)
+RUN npm install -g agent-browser@0.32.3 && npm cache clean --force
 
 WORKDIR /app
 
