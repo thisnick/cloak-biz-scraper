@@ -147,6 +147,11 @@ def _render(request: Request, result: Result | None = None, status: int = 200,
     running = [j for j in jobs if j.status == "working"]
     history = [j for j in jobs if j.status != "working"][:25]
 
+    from ..services.profiles import DEFAULT_PROFILE
+
+    profiles = request.app.state.instances.profiles.all()
+    profiles_in_use = {i.profile for i in instances}  # names with a browser open now
+
     return templates.TemplateResponse(
         request,
         "index.html",
@@ -164,6 +169,10 @@ def _render(request: Request, result: Result | None = None, status: int = 200,
             "history_jobs": history,
             "server_url": base.rstrip("/") + "/mcp",
             "active_hint": active,
+            # profiles (consumed by the New-browser dialog + Settings→Profiles)
+            "profiles": profiles,
+            "profiles_in_use": profiles_in_use,
+            "default_profile": DEFAULT_PROFILE,
             "ago": _ago,
             "dur": _dur,
             "job_result": _job_result,
@@ -429,6 +438,7 @@ def _sessions_redirect(view: str = "browsers") -> Response:
 async def ui_new_instance(
     request: Request,
     profile: str = Form(""),
+    new_profile: str = Form(""),
     country: str = Form(""),
     region: str = Form(""),
 ) -> Response:
@@ -438,11 +448,17 @@ async def ui_new_instance(
     from ..services.geo import GeoUnresolved, ProxyUnreachable
     from ..services.instances import CapExceeded, PinUnavailable
     from ..services.license import LicenseNotConfigured, LicenseNotPro
+    from ..services.profiles import DEFAULT_PROFILE
     from ..services.proxy import ProxyNotConfigured
     from ..services.tokens import OWNER
 
+    # A typed new name wins; otherwise the picked profile; otherwise the Default.
+    # Defaulting to the Default (not a throwaway session-<time>) is the fix for the
+    # reported confusion — clicking "+ New browser" twice reuses one identity and
+    # stays logged in, instead of a fresh cookie-less browser every time.
+    picked = new_profile.strip() or (profile.strip() if profile.strip() != "__new__" else "")
     req = InstanceCreate(
-        profile=profile.strip() or f"session-{int(time.time())}",
+        profile=picked or DEFAULT_PROFILE,
         country=country.strip() or None,
         region=region.strip() or None,
     )
@@ -720,6 +736,103 @@ async def save_pool(
     except ValueError as exc:
         return _render(request, Result("pool", False, _first_error(exc)), status=400)
     return _render(request, Result("pool", True, "Saved."))
+
+
+# ── Profiles: durable browser identities (UI-only; the agent just passes a name)
+#
+# Every one is a cookie-authed state change, so — like the session and settings
+# POSTs — it is POST-only and carries both CSRF layers (_require + the Origin
+# check). These are deliberately NOT MCP tools: creating on demand is what the
+# agent gets from passing a new profile name to create_instance; renaming and
+# DELETING a cookie jar are administrative and belong to the human at the console.
+
+
+def _settings_redirect() -> Response:
+    return RedirectResponse("/?view=settings", status_code=303)
+
+
+def _profile_in_use(request: Request, name: str) -> bool:
+    return any(getattr(i, "profile", None) == name
+               for i in request.app.state.instances.running.values())
+
+
+@router.post("/settings/profiles/create")
+async def profile_create(
+    request: Request, name: str = Form(""), country: str = Form(""), region: str = Form("")
+) -> Response:
+    _require(request)
+    _require_same_origin(request)
+    if not name.strip():
+        return _render(request, Result("profiles", False, "A profile needs a name."), status=400)
+    s = request.app.state.settings.load()
+    request.app.state.instances.profiles.get_or_create(
+        name.strip(), default_country=s.proxy_country, default_region=s.proxy_region,
+        country=country.strip() or None, region=region.strip() or None,
+    )
+    return _settings_redirect()
+
+
+@router.post("/settings/profiles/rename")
+async def profile_rename(request: Request, name: str = Form(""), new_name: str = Form("")) -> Response:
+    _require(request)
+    _require_same_origin(request)
+    from ..services.profiles import ProfileError
+
+    if _profile_in_use(request, name):
+        return _render(request, Result(
+            "profiles", False,
+            f"“{name}” has a browser open right now — close it before renaming."), status=409)
+    try:
+        request.app.state.instances.profiles.rename(name, new_name)
+    except ProfileError as exc:
+        return _render(request, Result("profiles", False, str(exc)), status=400)
+    return _settings_redirect()
+
+
+@router.post("/settings/profiles/geo")
+async def profile_geo(
+    request: Request, name: str = Form(""), country: str = Form(""), region: str = Form("")
+) -> Response:
+    _require(request)
+    _require_same_origin(request)
+    from ..services.profiles import ProfileError
+
+    try:
+        request.app.state.instances.profiles.set_geo(
+            name, country=country.strip(), region=region.strip())
+    except ProfileError as exc:
+        return _render(request, Result("profiles", False, str(exc)), status=400)
+    return _settings_redirect()
+
+
+@router.post("/settings/profiles/rotate")
+async def profile_rotate(request: Request, name: str = Form("")) -> Response:
+    _require(request)
+    _require_same_origin(request)
+    if request.app.state.instances.profiles.rotate_session(name) is None:
+        return _render(request, Result("profiles", False,
+                                       f"There is no profile named “{name}”."), status=404)
+    return _settings_redirect()
+
+
+@router.post("/settings/profiles/delete")
+async def profile_delete(request: Request, name: str = Form("")) -> Response:
+    _require(request)
+    _require_same_origin(request)
+    from ..services.profiles import ProfileError
+
+    # In-use is refused server-side (deleting a live browser's cookie jar would
+    # corrupt it); the Default profile is refused inside the store. The client
+    # confirm dialog is UX only — these are the real guards.
+    if _profile_in_use(request, name):
+        return _render(request, Result(
+            "profiles", False,
+            f"“{name}” has a browser open right now — close it before deleting."), status=409)
+    try:
+        request.app.state.instances.profiles.delete(name)
+    except ProfileError as exc:
+        return _render(request, Result("profiles", False, str(exc)), status=400)
+    return _settings_redirect()
 
 
 # ── Notion ──────────────────────────────────────────────────────────────────

@@ -94,6 +94,15 @@ async def lifespan(app: FastAPI):
     app.state.register_limiter = RateLimiter(max_failures=10, window_sec=60, global_max=20)
     app.state.jobs = jobs
     app.state.instances = InstanceManager(settings_service)
+    # Guarantee the DEFAULT profile (migrating a legacy "agent" once). Non-fatal:
+    # a bad profiles file must never take down boot — log and carry on, the UI can
+    # create one later.
+    try:
+        _s = settings_service.load()
+        app.state.instances.profiles.ensure_default(
+            default_country=_s.proxy_country, default_region=_s.proxy_region)
+    except Exception:  # noqa: BLE001
+        logger.exception("could not ensure the Default profile at startup")
     app.state.scrape = ScrapeService(app.state.instances, jobs, settings_service)
     app.state.archive = ArchiveService(app.state.instances, settings_service)
     app.state.agent_browser = AgentBrowserService(app.state.instances)

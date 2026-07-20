@@ -179,7 +179,7 @@ def build(app) -> FastMCP:
 
     @mcp.tool()
     async def create_instance(
-        ctx: Context, profile: str = "agent", country: str | None = None,
+        ctx: Context, profile: str = "Default", country: str | None = None,
         region: str | None = None, geoip: bool = True,
     ) -> InstanceView:
         """Launch a cloaked, anti-detection browser (CloakBrowser) through the
@@ -193,7 +193,7 @@ def build(app) -> FastMCP:
         profile: a DURABLE identity. Cookies, logins, and local storage are kept
             in the profile's own storage and survive across relaunches, so the
             same profile name stays logged in to sites. Default to the same
-            profile ("agent") for continuity; use a NEW name only when you
+            profile ("Default") for continuity; use a NEW name only when you
             deliberately want a clean, logged-out identity. (Each profile keeps a
             stable exit IP and fingerprint too.)
         country/region: where the proxy should exit.

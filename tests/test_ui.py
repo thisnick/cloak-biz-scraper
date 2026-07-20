@@ -1067,3 +1067,109 @@ class TestLivePaneTokens:
     def test_take_control_404s_for_an_unknown_instance(self, auth, monkeypatch):
         self._stub(monkeypatch)
         assert auth.post("/sessions/instances/nope/control").status_code == 404
+
+
+class TestProfileEndpoints:
+    """Settings → Profiles: cookie-authed, CSRF'd profile management. The server
+    guards (Default undeletable, in-use blocked) are the real ones — the client
+    confirm is UX only."""
+
+    @pytest.fixture
+    def profiles(self, monkeypatch, tmp_path):
+        from app.services.profiles import ProfileStore
+        ps = ProfileStore(tmp_path / "prof")
+        monkeypatch.setattr(app.state.instances, "profiles", ps)
+        monkeypatch.setattr(app.state.instances, "running", {})
+        return ps
+
+    def _names(self, ps):
+        return {p.name for p in ps.all()}
+
+    def _mk(self, ps, name):
+        return ps.get_or_create(name, default_country="US", default_region="california")
+
+    def _running(self, monkeypatch, name):
+        # A full instance (renderable by instance_view — the 409 re-renders the
+        # dashboard), with its profile set to the one under test.
+        from test_vnc import FakeInstance
+
+        async def _noop_stop(iid):
+            return True
+
+        inst = FakeInstance(iid="i1", origin="interactive", vnc_port=None)
+        inst.profile = name
+        monkeypatch.setattr(app.state.instances, "running", {"i1": inst})
+        # The fake never really launched; shutdown must not try to close it.
+        monkeypatch.setattr(app.state.instances, "stop", _noop_stop)
+
+    def test_create(self, auth, profiles):
+        r = auth.post("/settings/profiles/create", data={"name": "research"}, follow_redirects=False)
+        assert r.status_code == 303 and r.headers["location"] == "/?view=settings"
+        assert "research" in self._names(profiles)
+
+    def test_create_needs_a_name(self, auth, profiles):
+        assert auth.post("/settings/profiles/create", data={"name": "  "},
+                         follow_redirects=False).status_code == 400
+
+    def test_rename_keeps_the_profile_under_the_new_name(self, auth, profiles):
+        self._mk(profiles, "old")
+        r = auth.post("/settings/profiles/rename", data={"name": "old", "new_name": "new"},
+                      follow_redirects=False)
+        assert r.status_code == 303 and self._names(profiles) == {"new"}
+
+    def test_rename_is_blocked_while_a_browser_is_open(self, auth, profiles, monkeypatch):
+        self._mk(profiles, "busy")
+        self._running(monkeypatch, "busy")
+        r = auth.post("/settings/profiles/rename", data={"name": "busy", "new_name": "x"},
+                      follow_redirects=False)
+        assert r.status_code == 409 and "busy" in self._names(profiles)
+
+    def test_delete_removes_the_profile(self, auth, profiles):
+        self._mk(profiles, "gone")
+        r = auth.post("/settings/profiles/delete", data={"name": "gone"}, follow_redirects=False)
+        assert r.status_code == 303 and "gone" not in self._names(profiles)
+
+    def test_delete_default_is_refused(self, auth, profiles):
+        profiles.ensure_default(default_country="US", default_region="california")
+        r = auth.post("/settings/profiles/delete", data={"name": "Default"}, follow_redirects=False)
+        assert r.status_code == 400 and "Default" in self._names(profiles)
+
+    def test_delete_is_blocked_while_a_browser_is_open(self, auth, profiles, monkeypatch):
+        self._mk(profiles, "busy")
+        self._running(monkeypatch, "busy")
+        r = auth.post("/settings/profiles/delete", data={"name": "busy"}, follow_redirects=False)
+        assert r.status_code == 409 and "busy" in self._names(profiles)
+
+    def test_rotate_changes_the_session_token(self, auth, profiles):
+        tok = self._mk(profiles, "r").session_token
+        r = auth.post("/settings/profiles/rotate", data={"name": "r"}, follow_redirects=False)
+        assert r.status_code == 303
+        assert {p.name: p for p in profiles.all()}["r"].session_token != tok
+
+    def test_geo_updates_the_exit(self, auth, profiles):
+        self._mk(profiles, "g")
+        r = auth.post("/settings/profiles/geo",
+                      data={"name": "g", "country": "GB", "region": "london"}, follow_redirects=False)
+        assert r.status_code == 303
+        assert {p.name: p for p in profiles.all()}["g"].country == "GB"
+
+    def test_all_reject_a_foreign_origin(self, auth, profiles):
+        self._mk(profiles, "p")
+        for path, data in (
+            ("/settings/profiles/create", {"name": "z"}),
+            ("/settings/profiles/rename", {"name": "p", "new_name": "q"}),
+            ("/settings/profiles/delete", {"name": "p"}),
+            ("/settings/profiles/rotate", {"name": "p"}),
+            ("/settings/profiles/geo", {"name": "p", "country": "GB"}),
+        ):
+            r = auth.post(path, data=data, headers={"Origin": "https://evil.example"},
+                          follow_redirects=False)
+            assert r.status_code == 403, f"{path} allowed a cross-origin POST"
+
+    def test_signed_out_cannot_manage_profiles(self, client, profiles):
+        r = client.post("/settings/profiles/create", data={"name": "z"}, follow_redirects=False)
+        assert r.status_code == 303 and r.headers["location"] == "/login"
+        assert "z" not in self._names(profiles)
+
+    def test_get_is_rejected(self, auth):
+        assert auth.get("/settings/profiles/create", follow_redirects=False).status_code == 405
