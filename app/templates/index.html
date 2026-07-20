@@ -87,6 +87,36 @@
         <h2 class="page-h">Overview</h2>
         <p class="page-lead">Everything running right now, at a glance.</p>
 
+        {% if not has_license or not s.proxy_configured() %}
+        <div class="setup">
+          <div class="setup-h">
+            <svg class="ico" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2 4 6v6c0 5 3.4 8.5 8 10 4.6-1.5 8-5 8-10V6l-8-4Z"/></svg>
+            Finish setting up
+          </div>
+          <p class="setup-lead">A couple of things to add in <b>Settings</b> before your first scrape:</p>
+          <ul class="setup-list">
+            <li class="{{ 'done' if has_license else 'todo' }}">
+              {% if has_license %}<svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M20 6 9 17l-5-5"/></svg>
+              {% else %}<svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 8v4"/><path d="M12 16h.01"/></svg>{% endif %}
+              <div class="g"><b>CloakBrowser licence</b><span>{{ 'Saved.' if has_license else 'The cloaked browser won’t launch without it.' }}</span></div>
+              {% if not has_license %}<a data-nav="settings" href="#">Add →</a>{% endif %}
+            </li>
+            <li class="{{ 'done' if s.proxy_configured() else 'todo' }}">
+              {% if s.proxy_configured() %}<svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M20 6 9 17l-5-5"/></svg>
+              {% else %}<svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 8v4"/><path d="M12 16h.01"/></svg>{% endif %}
+              <div class="g"><b>Residential proxy (Evomi)</b><span>{{ 'Saved.' if s.proxy_configured() else 'Sites with anti-bot detection will block you without one.' }}</span></div>
+              {% if not s.proxy_configured() %}<a data-nav="settings" href="#">Add →</a>{% endif %}
+            </li>
+            <li class="{{ 'done' if has_notion_token else 'opt' }}">
+              {% if has_notion_token %}<svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M20 6 9 17l-5-5"/></svg>
+              {% else %}<svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/></svg>{% endif %}
+              <div class="g"><b>Notion <span class="opt-tag">optional</span></b><span>{{ 'Connected.' if has_notion_token else 'Only needed to save listings into a database.' }}</span></div>
+              {% if not has_notion_token %}<a data-nav="settings" href="#">Add →</a>{% endif %}
+            </li>
+          </ul>
+        </div>
+        {% endif %}
+
         <div class="subh">Live now — {{ instances|length }} browser{{ '' if instances|length == 1 else 's' }}<a data-nav="browsers" href="#">Open Browsers →</a></div>
         {% if instances %}
           <div class="preview-grid">
@@ -257,7 +287,7 @@
                 <li>Open <b>Settings → Connectors</b>.</li>
                 <li>Choose <b>Add custom connector</b> and paste the server link above.</li>
                 <li>When it asks you to sign in, enter your secret — the same one you use here.</li>
-                <li>Done. In a chat, say <i>“find new Bay Area listings.”</i></li>
+                <li>That’s it — you’re connected. See <b>what you can ask</b> below.</li>
               </ol>
               <p class="provisional">⚠ The exact menu names are still being confirmed against the real ChatGPT connector flow; they may differ slightly.</p>
             </div>
@@ -272,7 +302,7 @@
                 <li>Open <b>Settings → Connectors</b>.</li>
                 <li>Choose <b>Add custom connector</b> and paste the server link above.</li>
                 <li>When it asks you to sign in, enter your secret — the same one you use here.</li>
-                <li>Done. In a chat, say <i>“find new Bay Area listings.”</i></li>
+                <li>That’s it — you’re connected. See <b>what you can ask</b> below.</li>
               </ol>
               <p class="provisional">⚠ The exact menu names are still being confirmed against the real Claude connector flow; they may differ slightly.</p>
             </div>
@@ -282,6 +312,67 @@
         <div class="cnote">
           <svg class="ico" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
           <div><b>Signing in is the same secret</b><p>Both apps send you here to sign in. Use your <code>APP_SECRET</code> — you never hand either app your licence, proxy, or Notion details.</p></div>
+        </div>
+
+        <div class="cando">
+          <h3 class="cando-h">What you can ask it to do</h3>
+          <p class="cando-lead">Once it’s connected, you just talk to it in plain English. A few things to try:</p>
+
+          <div class="uc">
+            <div class="uc-t">
+              <svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg>
+              Browse sites that block bots
+            </div>
+            <p class="uc-d">Open a cloaked browser and navigate any site — especially listing sites with anti-bot detection. It all runs through your residential proxy, so you read as a normal visitor.</p>
+            <ul class="uc-ex">
+              <li><i>“Open a browser, go to this listing, and tell me the asking price and cash flow.”</i></li>
+              <li><i>“Click into the third result and summarise the financials.”</i></li>
+            </ul>
+            <p class="uc-need">
+              <svg class="ico" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/><path d="M12 9v4M12 17h.01"/></svg>
+              Needs a proxy — sign up for Evomi and fill in the proxy fields in <b>Settings</b>, or these sites will block you.
+            </p>
+          </div>
+
+          <div class="uc">
+            <div class="uc-t">
+              <svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+              Scrape a page of search results
+            </div>
+            <p class="uc-d">Point it at a search-results page and it pulls every listing off it — title, location, price, cash flow, link — straight back to you. No Notion needed.</p>
+            <ul class="uc-ex">
+              <li><i>“Scrape this BizBuySell search:”</i> — paste the URL from your address bar after applying your filters.</li>
+              <li><i>“Search BizBuySell for California businesses under $1M cash flow and scrape the results.”</i></li>
+            </ul>
+
+            <div class="uc-sub">
+              <div class="uc-t sm">
+                <svg class="ico" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg>
+                …and keep them in Notion
+              </div>
+              <ul class="uc-ex">
+                <li><i>“Scrape that search and add any new ones to my Notion, skipping duplicates.”</i></li>
+                <li><i>“Save this listing’s full page to my Notion:”</i> — paste a listing URL.</li>
+              </ul>
+              <p class="uc-need">
+                <svg class="ico" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/><path d="M12 9v4M12 17h.01"/></svg>
+                Needs Notion — connect it and pick a database in <b>Settings</b> first.
+              </p>
+            </div>
+          </div>
+
+          <div class="uc">
+            <div class="uc-t">
+              <svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m8 9-3 3 3 3M16 9l3 3-3 3M13 6l-2 12"/></svg>
+              Get a CDP URL for your own tools
+              <span class="uc-tag">developers</span>
+            </div>
+            <p class="uc-d">Launch a cloaked browser and get back a CDP URL you can drive from Claude Code, Codex, Playwright, or agent-browser — cloaked, through your proxy. The browser stays up ~15 min idle (60 min max); ask again for a fresh URL to reconnect.</p>
+            <ul class="uc-ex">
+              <li><i>“Launch a browser and give me the CDP URL.”</i></li>
+              <li>Then point Playwright (<code>connectOverCDP</code>) or agent-browser at that URL and drive it yourself.</li>
+            </ul>
+          </div>
         </div>
       </section>
 
