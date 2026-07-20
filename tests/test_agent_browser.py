@@ -68,8 +68,9 @@ class TestParseCommand:
             parse_command("screenshot /etc/passwd")
 
     def test_shell_metacharacters_survive_as_literal_tokens(self):
-        # The verb is allowed; the rest are inert tokens, never operators.
-        assert parse_command("navigate a; rm -rf /") == ["navigate", "a;", "rm", "-rf", "/"]
+        # Non-option metacharacters are inert tokens, never operators. (Tokens
+        # starting with "-" are refused separately; see TestOptionInjection.)
+        assert parse_command("navigate a; touch b") == ["navigate", "a;", "touch", "b"]
         assert parse_command("navigate $(touch x)") == ["navigate", "$(touch", "x)"]
 
 
@@ -120,14 +121,82 @@ class TestInjectionIsInert:
         monkeypatch.setattr(asyncio, "create_subprocess_exec", spy_exec)
         monkeypatch.setattr(asyncio, "create_subprocess_shell", forbidden_shell)
         svc = AgentBrowserService(_FakeInstances(_FakeInst(cdp_port=4242)))
-        await svc.drive("i1", "navigate a; rm -rf /", subject=OWNER)
+        await svc.drive("i1", "navigate a; touch b", subject=OWNER)
         program, args = calls[0]  # the command itself (calls[1] is the screenshot)
         assert program == "agent-browser"
-        # --cdp <port> then the tokens, each its own argv item (";" and "rm" separate)
+        # --cdp <port> then the tokens, each its own argv item (";" is glued to "a")
         assert args[:3] == ("--cdp", "4242", "navigate")
-        # The metacharacters are literal argv items ("a;" glued, "rm"/"-rf" plain),
-        # passed to agent-browser as arguments — never a shell operator.
-        assert "a;" in args and "rm" in args and "-rf" in args
+        # The metacharacters are literal argv items, passed to agent-browser as
+        # arguments — never a shell operator.
+        assert "a;" in args and "touch" in args and "b" in args
+
+
+# ── option-injection: a smuggled --cdp must not redirect to another browser ───
+class TestOptionInjection:
+    """The refutation the Reviewer found: agent-browser parses --cdp (and other
+    global options) from anywhere in the argv, so a verb-only allow-list lets
+    `navigate --cdp <otherport>` drive a DIFFERENT instance — a cross-instance
+    scoping bypass around the subject-bound port. The per-verb flag whitelist
+    refuses every form."""
+
+    @pytest.mark.parametrize("payload", [
+        "navigate --cdp 59999 http://x",            # leading
+        "navigate http://x --cdp 59999",            # trailing — position-independent
+        "navigate --cdp=59999 http://x",            # the = form
+        "navigate --proxy http://evil:1 http://x",  # any global option, not just --cdp
+        "navigate --executable-path /bin/sh",
+        "navigate --init-script /tmp/x.js http://x",
+        "snapshot --cdp 59999",                     # even the one verb that takes flags
+        "read --cdp 59999",
+        "click @e1 --cdp 59999",
+        "fill @e2 x --cdp 59999",
+    ])
+    def test_smuggled_options_are_refused(self, payload):
+        with pytest.raises(AgentBrowserError):
+            parse_command(payload)
+
+    def test_combined_short_flags_are_refused(self):
+        # Exact-match whitelist: combined shorts must be split (-i -c), so a
+        # smuggled character can't ride in on a combined token.
+        with pytest.raises(AgentBrowserError):
+            parse_command("snapshot -ic")
+
+    def test_the_allowed_snapshot_flags_still_work(self):
+        assert parse_command("snapshot -i") == ["snapshot", "-i"]
+        assert parse_command("snapshot -i -u") == ["snapshot", "-i", "-u"]
+        assert parse_command("snapshot -c -d 3") == ["snapshot", "-c", "-d", "3"]
+        assert parse_command("snapshot -s #main") == ["snapshot", "-s", "#main"]
+        assert parse_command("snapshot --json") == ["snapshot", "--json"]
+
+    def test_ordinary_positional_arguments_are_fine(self):
+        assert parse_command("navigate https://example.com") == ["navigate", "https://example.com"]
+        assert parse_command("get attr @e1 href") == ["get", "attr", "@e1", "href"]
+        assert parse_command("click @e3") == ["click", "@e3"]
+
+    @pytest.mark.asyncio
+    async def test_the_redirect_is_refused_before_any_subprocess_runs(self, monkeypatch):
+        """End-to-end: driving instance A with a --cdp for B's port must raise
+        before agent-browser is ever spawned, so B is never touched."""
+        import asyncio
+
+        ran = []
+
+        async def spy_exec(*a, **k):
+            ran.append(a)
+
+            class _P:
+                returncode = 0
+
+                async def communicate(self):
+                    return (b"", b"")
+
+            return _P()
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", spy_exec)
+        svc = AgentBrowserService(_FakeInstances(_FakeInst(iid="A", cdp_port=1111)))
+        with pytest.raises(AgentBrowserError):
+            await svc.drive("A", "navigate --cdp 2222 http://x", subject=OWNER)
+        assert ran == [], "a subprocess ran despite the smuggled --cdp"
 
 
 # ── the same guards CDP carries ───────────────────────────────────────────────

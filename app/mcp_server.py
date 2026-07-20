@@ -241,7 +241,8 @@ def build(app) -> FastMCP:
         after the action. Read the output to choose your next action.
 
         One action per call. Quote arguments that contain spaces. Only the
-        listed read/interact verbs are accepted; anything else is refused.
+        listed read/interact verbs are accepted; anything else is refused. Only
+        snapshot takes flags (-i/-u/-c); the other verbs take plain arguments.
         """
         from mcp.server.fastmcp import Image
 

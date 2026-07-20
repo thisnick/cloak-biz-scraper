@@ -43,6 +43,20 @@ ALLOWED_VERBS = frozenset({
     "click", "dblclick", "hover", "fill", "type", "press", "select", "scroll", "wait",
 })
 
+# Options allowed *per verb*, as an explicit whitelist. This is the second half of
+# the security boundary, and it is a whitelist for a reason: agent-browser parses
+# its global options (`--cdp`, `--proxy`, `--executable-path`, `--init-script`,
+# `--extension`, …) from ANYWHERE in the argv, any position, `--` does not stop
+# them. So a verb-only allow-list is not enough — `navigate --cdp <otherport>`
+# would redirect the command to a DIFFERENT instance's browser, going around the
+# subject-bound port we resolved. Whitelisting the flags neutralises `--cdp` and
+# every other global option by construction, and a future agent-browser flag
+# cannot silently widen the hole. Only `snapshot` takes flags; every other verb
+# takes positional arguments only, so any option-looking token is refused for it.
+_VERB_FLAGS = {
+    "snapshot": frozenset({"-i", "-u", "-c", "-d", "-s", "--json"}),
+}
+
 _RUN_TIMEOUT = 45.0
 _SHOT_TIMEOUT = 20.0
 
@@ -63,9 +77,15 @@ class InstanceNotDrivable(RuntimeError):
 def parse_command(command: str) -> list[str]:
     """The allow-listed argv for one `agent-browser` action, or raise.
 
+    Two gates, both required. First the verb (`argv[0]`) must be an allowed
+    read/interact action. Then every remaining option-looking token — anything
+    starting with `-` — must be in that verb's flag whitelist; only `snapshot`
+    has one. This second gate is what stops option-injection: a smuggled
+    `--cdp <port>` (or `--proxy`, `--executable-path`, …) anywhere in the argv
+    would otherwise redirect the whole command to another instance's browser.
+
     `shlex.split` tokenises with quote handling and invokes no shell, so shell
-    metacharacters survive as ordinary tokens. Only the first token — the verb —
-    gates the call; the rest are passed through as literal arguments.
+    metacharacters survive as ordinary tokens rather than becoming operators.
     """
     try:
         argv = shlex.split(command or "")
@@ -79,6 +99,20 @@ def parse_command(command: str) -> list[str]:
             f"{verb!r} is not an allowed action. Allowed: "
             f"{', '.join(sorted(ALLOWED_VERBS))}."
         )
+    allowed_flags = _VERB_FLAGS.get(verb, frozenset())
+    for token in argv[1:]:
+        # A bare "-" is a positional (some CLIs use it for stdin), not an option.
+        # Anything else starting with "-" is an option to agent-browser's global
+        # parser — the smuggling vector — and must be explicitly whitelisted.
+        # Matched exactly, so the "=" form (--cdp=59999) and combined shorts (-ic)
+        # do not sneak through; use separate flags (-i -c).
+        if token.startswith("-") and token != "-" and token not in allowed_flags:
+            allowed = ", ".join(sorted(allowed_flags)) if allowed_flags else "none"
+            raise AgentBrowserError(
+                f"option {token!r} is not allowed for {verb!r} (allowed flags: {allowed}). "
+                f"This blocks redirecting the command to another browser. Verbs other "
+                f"than snapshot take positional arguments only."
+            )
     return argv
 
 
