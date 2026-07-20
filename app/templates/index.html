@@ -164,8 +164,30 @@
         {{ banner('browsers') }}
         <div class="bar-actions">
           <div class="count"><b>{{ instances|length }}</b> running · they close on their own when idle</div>
-          <form method="post" action="/sessions/instances"><button class="btn primary" type="submit">+ New browser</button></form>
+          <button class="btn primary" id="nb-open" type="button">+ New browser</button>
         </div>
+        <dialog id="nb-dialog" class="dlg">
+          <form method="post" action="/sessions/instances">
+            <h3 class="dlg-h">Open a browser</h3>
+            <div class="field"><label>Profile</label>
+              <select name="profile" id="nb-profile">
+                {% for p in profiles %}<option value="{{ p.name }}"{{ ' selected' if p.name == default_profile }}>{{ p.name }}{{ ' — default' if p.name == default_profile }}</option>{% endfor %}
+                <option value="__new__">＋ New profile…</option>
+              </select>
+              <div class="help">A profile keeps its cookies, logins, and exit IP. Reuse one to stay signed in; pick <em>New profile</em> for a clean identity.</div>
+            </div>
+            <div class="field" id="nb-new-wrap" hidden><label>New profile name</label>
+              <input name="new_profile" id="nb-new" placeholder="e.g. research" autocomplete="off"></div>
+            <div class="grid2">
+              <div class="field"><label>Exit country — optional</label><input name="country" placeholder="US"></div>
+              <div class="field"><label>Exit region — optional</label><input name="region" placeholder="california"></div>
+            </div>
+            <div class="btnrow">
+              <button class="btn" type="button" id="nb-cancel">Cancel</button>
+              <button class="btn primary" type="submit">Open browser</button>
+            </div>
+          </form>
+        </dialog>
         <div class="acc browsers">
           {% for i in instances %}
           <div class="acc-item {{ 'open' if loop.first }}">
@@ -534,6 +556,76 @@
               </form>
             </div>
           </div>
+
+          {# Profiles #}
+          <div class="acc-item {{ 'open' if result and result.section=='profiles' }}">
+            <button class="acc-head">
+              <svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="4"/><path d="M4 21v-1a6 6 0 0 1 12 0v1"/></svg>
+              <span class="h-title">Profiles</span>
+              <div class="h-right">
+                <span class="chip">{{ profiles|length }} saved</span>
+                <svg class="chev" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M9 6l6 6-6 6"/></svg>
+              </div>
+            </button>
+            <div class="acc-body">
+              <p class="lead-help">A profile is a durable browser identity — its cookies, logins, and exit IP persist across relaunches. Browsers use the <strong>Default</strong> profile unless you pick another when you open one.</p>
+              {{ banner('profiles') }}
+              <div class="tablewrap">
+                <table class="hist">
+                  <thead><tr><th>Profile</th><th>Exit</th><th></th></tr></thead>
+                  <tbody>
+                    {% for p in profiles %}
+                    <tr>
+                      <td><b>{{ p.name }}</b>
+                        {% if p.name == default_profile %} <span class="chip ok">default</span>{% endif %}
+                        {% if p.name in profiles_in_use %} <span class="chip warn">open now</span>{% endif %}</td>
+                      <td class="mono">{{ p.country }}{% if p.region %} · {{ p.region }}{% endif %}</td>
+                      <td>
+                        <div class="btnrow" style="justify-content:flex-end;margin:0">
+                          <form method="post" action="/settings/profiles/rotate"><input type="hidden" name="name" value="{{ p.name }}"><button class="btn" type="submit" title="Fresh exit IP; keeps cookies">Rotate IP</button></form>
+                          {% if p.name != default_profile and p.name not in profiles_in_use %}
+                          <form method="post" action="/settings/profiles/delete" onsubmit="return confirm('Delete the “{{ p.name }}” profile and its saved cookies/logins? This cannot be undone.');"><input type="hidden" name="name" value="{{ p.name }}"><button class="btn danger" type="submit">Delete</button></form>
+                          {% endif %}
+                        </div>
+                      </td>
+                    </tr>
+                    {% endfor %}
+                  </tbody>
+                </table>
+              </div>
+
+              <div class="subh">Add a profile</div>
+              <form method="post" action="/settings/profiles/create">
+                <div class="grid2">
+                  <div class="field"><label>Name</label><input name="name" placeholder="e.g. research" autocomplete="off"></div>
+                  <div class="field"><label>Exit country — optional</label><input name="country" placeholder="US"></div>
+                </div>
+                <div class="btnrow"><button class="btn primary" type="submit">Create profile</button></div>
+              </form>
+
+              {% set renamable = profiles | rejectattr('name', 'equalto', default_profile) | list %}
+              {% if renamable %}
+              <div class="subh">Rename a profile</div>
+              <form method="post" action="/settings/profiles/rename">
+                <div class="grid2">
+                  <div class="field"><label>Profile</label><select name="name">{% for p in renamable %}<option value="{{ p.name }}">{{ p.name }}</option>{% endfor %}</select></div>
+                  <div class="field"><label>New name</label><input name="new_name" placeholder="new name" autocomplete="off"></div>
+                </div>
+                <div class="btnrow"><button class="btn" type="submit">Rename</button></div>
+              </form>
+              {% endif %}
+
+              <div class="subh">Change a profile's exit location</div>
+              <form method="post" action="/settings/profiles/geo">
+                <div class="grid2">
+                  <div class="field"><label>Profile</label><select name="name">{% for p in profiles %}<option value="{{ p.name }}">{{ p.name }}</option>{% endfor %}</select></div>
+                  <div class="field"><label>Country</label><input name="country" placeholder="US"></div>
+                </div>
+                <div class="field"><label>Region — optional</label><input name="region" placeholder="california"></div>
+                <div class="btnrow"><button class="btn" type="submit">Set location</button></div>
+              </form>
+            </div>
+          </div>
         </div>
 
         <div class="cnote">
@@ -575,6 +667,18 @@
     document.querySelectorAll('.acc-head').forEach(function(h){h.addEventListener('click',function(){h.parentElement.classList.toggle('open');});});
     var cb=document.getElementById('copybtn');
     if(cb)cb.addEventListener('click',function(){var u=document.getElementById('mcpurl').textContent;try{navigator.clipboard.writeText(u);}catch(e){}var o=cb.textContent;cb.textContent='Copied';setTimeout(function(){cb.textContent=o;},1400);});
+    // New-browser dialog: pick a profile (or type a new one) before opening.
+    var nbo=document.getElementById('nb-open'), nbd=document.getElementById('nb-dialog');
+    if(nbo&&nbd&&nbd.showModal){
+      nbo.addEventListener('click',function(){nbd.showModal();});
+      var nbc=document.getElementById('nb-cancel'); if(nbc)nbc.addEventListener('click',function(){nbd.close();});
+      var nbs=document.getElementById('nb-profile'), nbw=document.getElementById('nb-new-wrap');
+      if(nbs)nbs.addEventListener('change',function(){
+        nbw.hidden=(nbs.value!=='__new__');
+        if(!nbw.hidden){var n=document.getElementById('nb-new'); if(n)n.focus();}
+      });
+      nbd.addEventListener('click',function(e){if(e.target===nbd)nbd.close();}); // click backdrop to close
+    }
   })();
 </script>
 

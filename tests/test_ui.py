@@ -1173,3 +1173,46 @@ class TestProfileEndpoints:
 
     def test_get_is_rejected(self, auth):
         assert auth.get("/settings/profiles/create", follow_redirects=False).status_code == 405
+
+
+class TestNewBrowserProfile:
+    """The reported confusion and its fix: '+ New browser' defaults to the ONE
+    Default profile (not a throwaway), so opening twice reuses one identity."""
+
+    def _capture_launch(self, monkeypatch):
+        seen = {}
+
+        async def fake_launch(req, **kw):
+            seen["profile"] = req.profile
+            return object()
+
+        monkeypatch.setattr(app.state.instances, "launch", fake_launch)
+        return seen
+
+    def test_new_browser_defaults_to_the_default_profile(self, auth, monkeypatch):
+        seen = self._capture_launch(monkeypatch)
+        assert auth.post("/sessions/instances", data={}, follow_redirects=False).status_code == 303
+        assert seen["profile"] == "Default"  # not session-<time>; twice -> same identity
+
+    def test_new_browser_uses_a_picked_existing_profile(self, auth, monkeypatch):
+        seen = self._capture_launch(monkeypatch)
+        auth.post("/sessions/instances", data={"profile": "research"}, follow_redirects=False)
+        assert seen["profile"] == "research"
+
+    def test_new_browser_can_open_a_freshly_named_profile(self, auth, monkeypatch):
+        seen = self._capture_launch(monkeypatch)
+        auth.post("/sessions/instances",
+                  data={"profile": "__new__", "new_profile": "research"}, follow_redirects=False)
+        assert seen["profile"] == "research"  # the __new__ sentinel is resolved to the typed name
+
+    def test_the_dashboard_offers_the_dialog_and_the_profiles_manager(self, auth, monkeypatch, tmp_path):
+        from app.services.profiles import ProfileStore
+        ps = ProfileStore(tmp_path / "prof")
+        monkeypatch.setattr(app.state.instances, "profiles", ps)
+        monkeypatch.setattr(app.state.instances, "running", {})
+        ps.ensure_default(default_country="US", default_region="california")
+        ps.get_or_create("research", default_country="US", default_region="california")
+        page = auth.get("/").text
+        assert 'id="nb-dialog"' in page                          # B: the New-browser dialog
+        assert 'action="/settings/profiles/create"' in page      # C: the Profiles manager
+        assert "research" in page and "Default" in page           # both profiles listed
