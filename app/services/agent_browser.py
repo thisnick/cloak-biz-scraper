@@ -35,13 +35,21 @@ from .tokens import OWNER
 
 logger = logging.getLogger("cloakbiz.agent_browser")
 
-# Read and interact only. No file-writing or browser-launching subcommands, so a
-# command can neither touch the container's disk nor escape the target browser.
+# Read and interact only. `screenshot` is here but SERVICE-HANDLED (see drive):
+# agent-browser's raw `screenshot <path>` takes a caller path — the file-write
+# surface — so it never reaches the passthrough. The verb captures to a path this
+# service picks; the caller only chooses viewport vs full page.
 ALLOWED_VERBS = frozenset({
     "navigate", "open", "back", "forward", "reload",
     "snapshot", "read", "get",
     "click", "dblclick", "hover", "fill", "type", "press", "select", "scroll", "wait",
+    "screenshot",
 })
+
+# Verbs that take NO positional arguments — only their whitelisted flags.
+# `screenshot` is service-handled: the caller may pick full/annotate, never the
+# output path or an element, so any positional (a path, an @ref) is refused.
+_FLAGS_ONLY = frozenset({"screenshot"})
 
 # Options allowed *per verb*, as an explicit whitelist. This is the second half of
 # the security boundary, and it is a whitelist for a reason: agent-browser parses
@@ -55,6 +63,9 @@ ALLOWED_VERBS = frozenset({
 # takes positional arguments only, so any option-looking token is refused for it.
 _VERB_FLAGS = {
     "snapshot": frozenset({"-i", "-u", "-c", "-d", "-s", "--json"}),
+    # Display geometry only; the output path is never a flag here (the service
+    # supplies it), so no path-taking flag is whitelisted.
+    "screenshot": frozenset({"--full", "--annotate"}),
 }
 
 _RUN_TIMEOUT = 45.0
@@ -100,18 +111,24 @@ def parse_command(command: str) -> list[str]:
             f"{', '.join(sorted(ALLOWED_VERBS))}."
         )
     allowed_flags = _VERB_FLAGS.get(verb, frozenset())
+    flags_only = verb in _FLAGS_ONLY
     for token in argv[1:]:
-        # A bare "-" is a positional (some CLIs use it for stdin), not an option.
-        # Anything else starting with "-" is an option to agent-browser's global
-        # parser — the smuggling vector — and must be explicitly whitelisted.
-        # Matched exactly, so the "=" form (--cdp=59999) and combined shorts (-ic)
-        # do not sneak through; use separate flags (-i -c).
-        if token.startswith("-") and token != "-" and token not in allowed_flags:
+        is_option = token.startswith("-") and token != "-"
+        # An option to agent-browser's global parser — the smuggling vector —
+        # must be explicitly whitelisted. Matched exactly, so the "=" form
+        # (--cdp=59999) and combined shorts (-ic) do not sneak through.
+        if is_option and token not in allowed_flags:
             allowed = ", ".join(sorted(allowed_flags)) if allowed_flags else "none"
             raise AgentBrowserError(
                 f"option {token!r} is not allowed for {verb!r} (allowed flags: {allowed}). "
-                f"This blocks redirecting the command to another browser. Verbs other "
-                f"than snapshot take positional arguments only."
+                f"This blocks redirecting the command to another browser."
+            )
+        # A flags-only verb (screenshot) refuses positionals, so the caller can
+        # never supply the output path or an element — the service picks the path.
+        if not is_option and flags_only:
+            raise AgentBrowserError(
+                f"{verb!r} takes no positional arguments — the service chooses the "
+                f"output path. Allowed flags: {', '.join(sorted(allowed_flags))}."
             )
     return argv
 
@@ -165,14 +182,14 @@ class AgentBrowserService:
             raise TimeoutError(f"the browser did not respond within {int(timeout)}s") from None
         return proc.returncode, out.decode(errors="replace"), err.decode(errors="replace")
 
-    async def _screenshot(self, port: int) -> bytes | None:
-        """A PNG of the current page, to a path this service controls (never the
-        caller's). Best effort: a failure here must not sink the command's own
-        result."""
+    async def _screenshot(self, port: int, flags: list[str]) -> bytes | None:
+        """A PNG of the current page, written to a path THIS service picks (never
+        the caller's) and read back. `flags` is the already-whitelisted display
+        geometry (--full/--annotate); the path is always appended by us, last."""
         with tempfile.TemporaryDirectory(prefix="ab-shot-") as d:
             path = pathlib.Path(d) / "shot.png"
             try:
-                rc, _out, _err = await self._run(port, ["screenshot", str(path)],
+                rc, _out, _err = await self._run(port, ["screenshot", *flags, str(path)],
                                                  timeout=_SHOT_TIMEOUT)
             except TimeoutError:
                 return None
@@ -182,12 +199,27 @@ class AgentBrowserService:
 
     async def drive(self, instance_id: str, command: str, *,
                     subject: str | None = OWNER) -> DriveOutcome:
-        """Run one allow-listed action against the instance, then snapshot the page.
+        """Run one allow-listed action against the instance.
 
-        Parsing/allow-listing happens before the instance is even resolved, so a
-        disallowed command is refused without regard to who asked."""
+        Text by default: a screenshot is returned ONLY for the explicit
+        `screenshot` verb (opt-in), so a `read`/`get`/`snapshot` doesn't spend the
+        user tokens on a PNG they didn't ask for. Parsing/allow-listing happens
+        before the instance is even resolved, so a disallowed command is refused
+        without regard to who asked."""
         argv = parse_command(command)
         port = self._cdp_port(instance_id, subject)
+
+        # `screenshot` is intercepted, never passed through: the service captures
+        # to its own path with only the whitelisted display flags, so agent-browser
+        # never receives a caller-chosen path.
+        if argv[0] == "screenshot":
+            flags = argv[1:]  # already validated to whitelisted flags only
+            shot = await self._screenshot(port, flags)
+            ok = shot is not None
+            return DriveOutcome(instance_id, command, ok,
+                                "screenshot captured" if ok else "could not capture a screenshot",
+                                shot)
+
         # A browser that hangs is a failed *action* the caller can read and retry,
         # not an error about the request — so it comes back ok=False, not raised.
         try:
@@ -197,6 +229,5 @@ class AgentBrowserService:
             return DriveOutcome(instance_id, command, False, str(exc), None)
         ok = rc == 0
         output = (out.strip() or err.strip() or ("done" if ok else "failed"))
-        shot = await self._screenshot(port)
         logger.info("agent_browser %s %r rc=%s", instance_id, argv[0], rc)
-        return DriveOutcome(instance_id, command, ok, output, shot)
+        return DriveOutcome(instance_id, command, ok, output, None)

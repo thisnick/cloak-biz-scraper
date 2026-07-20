@@ -122,7 +122,7 @@ class TestInjectionIsInert:
         monkeypatch.setattr(asyncio, "create_subprocess_shell", forbidden_shell)
         svc = AgentBrowserService(_FakeInstances(_FakeInst(cdp_port=4242)))
         await svc.drive("i1", "navigate a; touch b", subject=OWNER)
-        program, args = calls[0]  # the command itself (calls[1] is the screenshot)
+        program, args = calls[0]  # the single command (no auto-screenshot)
         assert program == "agent-browser"
         # --cdp <port> then the tokens, each its own argv item (";" is glued to "a")
         assert args[:3] == ("--cdp", "4242", "navigate")
@@ -197,6 +197,95 @@ class TestOptionInjection:
         with pytest.raises(AgentBrowserError):
             await svc.drive("A", "navigate --cdp 2222 http://x", subject=OWNER)
         assert ran == [], "a subprocess ran despite the smuggled --cdp"
+
+
+# ── screenshots are opt-in, and the path stays ours ───────────────────────────
+class TestScreenshotIsOptIn:
+    """A screenshot is tens of thousands of tokens the user pays for, so it comes
+    back ONLY for the explicit `screenshot` verb — never auto-attached to a
+    read/get/snapshot. And `screenshot` is service-handled: the caller picks the
+    geometry, the service picks the output path, so agent-browser's file-writing
+    `screenshot <path>` is never reachable with caller input."""
+
+    # A stand-in binary: if 'screenshot' is among the args it writes bytes to the
+    # last arg (the path), else it just echoes — so both paths are exercised
+    # without a real browser.
+    FAKE = (
+        "#!/bin/sh\n"
+        'last=""\n'
+        'for a in "$@"; do last="$a"; done\n'
+        'case " $* " in\n'
+        '  *" screenshot "*) printf FAKEPNG > "$last"; echo "saved $last" ;;\n'
+        '  *) echo "ran: $*" ;;\n'
+        "esac\n"
+    )
+
+    @pytest.fixture
+    def svc(self, tmp_path, monkeypatch):
+        script = tmp_path / "fake-ab.sh"
+        script.write_text(self.FAKE)
+        script.chmod(0o755)
+        monkeypatch.setenv("AGENT_BROWSER_BIN", str(script))
+        return AgentBrowserService(_FakeInstances(_FakeInst()))
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("cmd", ["navigate https://x", "read", "get url", "snapshot -i"])
+    async def test_ordinary_commands_return_no_screenshot(self, svc, cmd):
+        out = await svc.drive("i1", cmd, subject=OWNER)
+        assert out.screenshot is None, f"{cmd!r} returned a screenshot nobody asked for"
+
+    @pytest.mark.asyncio
+    async def test_the_screenshot_verb_returns_an_image(self, svc):
+        out = await svc.drive("i1", "screenshot", subject=OWNER)
+        assert out.ok and out.screenshot == b"FAKEPNG"
+
+    @pytest.mark.asyncio
+    async def test_full_and_annotate_flags_are_allowed(self, svc):
+        assert (await svc.drive("i1", "screenshot --full", subject=OWNER)).screenshot == b"FAKEPNG"
+        assert (await svc.drive("i1", "screenshot --annotate", subject=OWNER)).screenshot == b"FAKEPNG"
+
+    def test_a_caller_supplied_path_or_element_is_refused(self):
+        for bad in ("screenshot /etc/passwd", "screenshot ../../x.png",
+                    "screenshot @e3", "screenshot shot.png --full"):
+            with pytest.raises(AgentBrowserError):
+                parse_command(bad)
+
+    def test_an_unwhitelisted_screenshot_flag_is_refused(self):
+        for bad in ("screenshot --output /etc/x", "screenshot --path /etc/x", "screenshot --cdp 5"):
+            with pytest.raises(AgentBrowserError):
+                parse_command(bad)
+
+    @pytest.mark.asyncio
+    async def test_the_service_owns_the_output_path(self, monkeypatch):
+        """The exec argv for a screenshot ends in a temp path the SERVICE created;
+        no caller string reaches it. This is the guard that reverting the
+        interception would break."""
+        import asyncio
+        import pathlib
+
+        calls = []
+
+        async def spy_exec(program, *args, **kw):
+            calls.append(args)
+            pathlib.Path(args[-1]).write_bytes(b"PNG")  # emulate the capture
+
+            class _P:
+                returncode = 0
+
+                async def communicate(self):
+                    return (b"", b"")
+
+            return _P()
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", spy_exec)
+        svc = AgentBrowserService(_FakeInstances(_FakeInst(cdp_port=7777)))
+        out = await svc.drive("i1", "screenshot --full", subject=OWNER)
+        assert out.screenshot == b"PNG"
+        args = calls[0]
+        assert args[:3] == ("--cdp", "7777", "screenshot")
+        assert "--full" in args
+        # last arg is the path, under a temp dir the service made — not caller input
+        assert args[-1].endswith("shot.png") and "ab-shot-" in args[-1]
 
 
 # ── the same guards CDP carries ───────────────────────────────────────────────

@@ -236,13 +236,15 @@ def build(app) -> FastMCP:
             press Enter           press a key
             get url               also: get title, get text @e3
             back / forward / reload
+            screenshot            see the page as an image (add --full for the whole scroll height)
 
-        Each call returns agent-browser's text output AND a screenshot of the page
-        after the action. Read the output to choose your next action.
+        Calls return text by default — the snapshot refs or the read text you act
+        on. Ask for `screenshot` only when you actually need to SEE the page; it
+        returns an image and costs far more, so don't screenshot after every step.
 
         One action per call. Quote arguments that contain spaces. Only the
         listed read/interact verbs are accepted; anything else is refused. Only
-        snapshot takes flags (-i/-u/-c); the other verbs take plain arguments.
+        snapshot and screenshot take flags; the other verbs take plain arguments.
         """
         from mcp.server.fastmcp import Image
 
