@@ -134,11 +134,18 @@ def build(app) -> FastMCP:
         NOT in this response. Call get_scrape_listing_results with the job_id to
         collect them.
 
-        url: a search-results page (BizBuySell only for now). The URL decides how
-            it is read, so paste the one from your address bar with filters applied.
+        url: a SEARCH-RESULTS (SERP) page, not a single listing (BizBuySell only
+            for now). The URL decides how it is read, so use one with the filters
+            already applied. If you don't have such a URL, either ask the user for
+            it, OR get one yourself: create_instance a browser, use agent_browser
+            to run the search on the site (navigate, fill the search box, apply
+            filters), read the resulting address bar (agent_browser get url), and
+            pass that here.
         max_pages: how many pages of results to walk.
-        sync: false (default) just reads the listings back. true also saves new
-            ones to your Notion database, skipping those already there.
+        sync: false (default) just reads the listings back — no Notion involved.
+            true also saves new ones to your Notion database, skipping those
+            already there. (The Notion layer is opt-in: sync=true here, plus
+            archive_page to file a page's full content into a Notion page.)
         db_id: override the configured Notion database. Only used when sync=true.
         """
         job = app.state.scrape.start(url, max_pages=max_pages, sync=sync, db_id=db_id)
@@ -183,12 +190,25 @@ def build(app) -> FastMCP:
         addresses where an ordinary headless browser is turned away. A residential
         proxy must be configured — the browser will not launch without one.
 
-        profile: a persistent identity — same name, same cookies and exit IP.
+        profile: a DURABLE identity. Cookies, logins, and local storage are kept
+            in the profile's own storage and survive across relaunches, so the
+            same profile name stays logged in to sites. Default to the same
+            profile ("agent") for continuity; use a NEW name only when you
+            deliberately want a clean, logged-out identity. (Each profile keeps a
+            stable exit IP and fingerprint too.)
         country/region: where the proxy should exit.
         geoip: match the browser's timezone and locale to the exit IP. Leave true
             unless geo resolution is failing: with it off the browser keeps the
             container's UTC, which contradicts a residential exit and is itself
             something listing sites look for.
+
+        Lifecycle: the browser closes itself after 15 minutes idle or 60 minutes
+        total, freeing its slot. The returned cdp_url is a Chrome DevTools Protocol
+        websocket carrying a short-lived token (~10 min): drive it with
+        agent_browser, or attach your own client — Playwright's
+        connectOverCDP(cdp_url). The token is minted fresh on every get_instance /
+        list_instances call, so if a connection drops, re-fetch the instance to get
+        a working cdp_url rather than reusing an old one.
         """
         subject = _subject(ctx)
         inst = await app.state.instances.launch(
@@ -212,7 +232,11 @@ def build(app) -> FastMCP:
 
     @mcp.tool()
     async def get_instance(ctx: Context, instance_id: str) -> InstanceView:
-        """One running browser, with a fresh, short-lived cdp_url and vnc_url."""
+        """One running browser, with a FRESH, short-lived cdp_url and vnc_url.
+
+        Each call mints new tokens (~10 min), so call this to get a working
+        cdp_url again after one expires or a connection drops — attach with
+        agent_browser or Playwright's connectOverCDP(cdp_url)."""
         inst = app.state.instances.get(instance_id)
         if inst is None:
             raise ValueError(
