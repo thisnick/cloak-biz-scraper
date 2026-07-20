@@ -96,28 +96,24 @@ class TestEnsureDefault:
         d = s.ensure_default(default_country="US", default_region="california")
         assert d.name == DEFAULT_PROFILE and pathlib.Path(d.user_data_dir).is_dir()
 
-    def test_migrates_a_legacy_agent_keeping_its_cookies(self, tmp_path):
+    def test_does_not_migrate_a_legacy_agent_profile(self, tmp_path):
+        # Nick's call: no migration. A pre-existing "agent" is left untouched and
+        # a fresh, empty Default is seeded alongside it (agent stays selectable).
         s = store(tmp_path)
         agent = _make(s, "agent")
         _cookie(agent).write_text("session=legacy")
         d = s.ensure_default(default_country="US", default_region="california")
         assert d.name == DEFAULT_PROFILE
-        assert d.user_data_dir == agent.user_data_dir            # same jar migrated
-        assert _cookie(d).read_text() == "session=legacy"
-        assert "agent" not in {x.name for x in s.all()}
+        assert d.user_data_dir != agent.user_data_dir            # a fresh jar, not agent's
+        assert not _cookie(d).exists()                           # empty, no carried cookies
+        names = {x.name for x in s.all()}
+        assert "agent" in names and DEFAULT_PROFILE in names     # both present
 
-    def test_is_idempotent_and_leaves_agent_alone_if_default_exists(self, tmp_path):
+    def test_is_idempotent_when_default_exists(self, tmp_path):
         s = store(tmp_path)
-        _make(s, "agent")
         first = s.ensure_default(default_country="US", default_region="california")
-        # A second call is a no-op; and since Default now exists, a separate agent
-        # (recreated) is left untouched.
         again = s.ensure_default(default_country="US", default_region="california")
-        assert first.user_data_dir == again.user_data_dir
-        a2 = _make(s, "agent")
-        s.ensure_default(default_country="US", default_region="california")
-        assert "agent" in {x.name for x in s.all()}  # not migrated a second time
-        assert a2.name == "agent"
+        assert first.user_data_dir == again.user_data_dir        # second call is a no-op
 
 
 class TestSetGeo:

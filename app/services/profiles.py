@@ -96,23 +96,18 @@ class ProfileStore:
             return p
 
     def ensure_default(self, *, default_country: str, default_region: str) -> Profile:
-        """Guarantee the DEFAULT profile exists, migrating a legacy "agent" once.
+        """Guarantee the DEFAULT profile exists, seeding a fresh one if not.
 
-        If "Default" already exists, nothing changes. Otherwise, if a legacy
-        "agent" profile exists (the old create_instance default), it is renamed to
-        "Default" so its cookies/logins carry over — a one-time, idempotent
-        rebrand. Otherwise a fresh empty "Default" is seeded. Called at startup;
-        the caller keeps it non-fatal so a bad profiles file can never crash boot.
+        If "Default" already exists, nothing changes. Otherwise a fresh empty
+        "Default" is seeded. There is deliberately no migration of a legacy
+        "agent" profile — a clean Default is fine, and if the old cookies are
+        ever wanted the "agent" profile is still selectable in the manager.
+        Called at startup; the caller keeps it non-fatal so a bad profiles file
+        can never crash boot.
         """
         with self._lock:
             if DEFAULT_PROFILE in self._cache:
                 return self._cache[DEFAULT_PROFILE]
-            legacy = self._cache.pop("agent", None)
-            if legacy is not None:
-                legacy.name = DEFAULT_PROFILE
-                self._cache[DEFAULT_PROFILE] = legacy
-                self._flush()
-                return legacy
             udd = self.root / f"{_safe(DEFAULT_PROFILE)}-{secrets.token_hex(4)}"
             udd.mkdir(parents=True, exist_ok=True)
             p = Profile(
