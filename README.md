@@ -30,7 +30,9 @@ UI — no terminal.
 
 No terminal — one visit to the Railway dashboard, everything else in the app's web UI.
 
-<!-- PLACEHOLDER: setup screencast -->
+**Watch the deploy walkthrough:**
+
+https://github.com/user-attachments/assets/3c86899d-9f1b-4946-b1ca-4b11a53514b5
 
 1. **Deploy.** Click the button above. Railway generates your `APP_SECRET` for you and
    builds the server (~3 minutes).
