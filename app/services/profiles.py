@@ -156,17 +156,34 @@ class ProfileStore:
 
         The DEFAULT profile is refused here as a hard invariant. The in-use guard
         lives in the route (it needs instances.running). Returns False if there was
-        no such profile."""
+        no such profile. A corrupt stored path is refused before changing the index:
+        deletion may only target a strict descendant of the profiles root."""
         if name == DEFAULT_PROFILE:
             raise ProfileError("the Default profile cannot be deleted")
         with self._lock:
-            p = self._cache.pop(name, None)
+            p = self._cache.get(name)
             if p is None:
                 return False
+            try:
+                root = self.root.resolve()
+                target = Path(p.user_data_dir).resolve()
+                target.relative_to(root)
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise ProfileError(
+                    f"refusing to delete {name!r}: its data directory is outside "
+                    "the profiles root"
+                ) from exc
+            if target == root:
+                raise ProfileError(
+                    f"refusing to delete {name!r}: its data directory is the "
+                    "profiles root"
+                )
+            self._cache.pop(name)
             self._flush()
         # rmtree after dropping the cache entry (and outside the lock): the profile
         # is already unreachable, so no launch can reattach to the dir we delete.
-        shutil.rmtree(p.user_data_dir, ignore_errors=True)
+        # Delete the already-checked canonical path, never the untrusted stored path.
+        shutil.rmtree(target, ignore_errors=True)
         return True
 
     def rotate_session(self, name: str) -> Profile | None:

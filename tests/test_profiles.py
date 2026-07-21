@@ -5,6 +5,7 @@ actually destroys them — both proven here against the real filesystem.
 """
 from __future__ import annotations
 
+import json
 import pathlib
 
 import pytest
@@ -23,6 +24,15 @@ def _make(s, name, **geo):
 def _cookie(profile) -> pathlib.Path:
     """A stand-in for the cookie jar: a file inside the profile's user_data_dir."""
     return pathlib.Path(profile.user_data_dir) / "Cookies"
+
+
+def _reopen_with_user_data_dir(tmp_path, name: str, user_data_dir: pathlib.Path) -> ProfileStore:
+    """Model a malformed/tampered profiles.json without trusting private state."""
+    index = tmp_path / "profiles" / "profiles.json"
+    data = json.loads(index.read_text())
+    data[name]["user_data_dir"] = str(user_data_dir)
+    index.write_text(json.dumps(data))
+    return ProfileStore(tmp_path / "profiles")
 
 
 class TestCreate:
@@ -88,6 +98,56 @@ class TestDelete:
 
     def test_deleting_a_missing_profile_is_false_not_error(self, tmp_path):
         assert store(tmp_path).delete("nope") is False
+
+    def test_corrupt_sibling_path_is_refused_and_record_is_preserved(self, tmp_path):
+        s = store(tmp_path)
+        original = pathlib.Path(_make(s, "corrupt").user_data_dir)
+        sibling = tmp_path / "outside"
+        sibling.mkdir()
+        canary = sibling / "keep-me"
+        canary.write_text("safe")
+        s = _reopen_with_user_data_dir(tmp_path, "corrupt", sibling)
+
+        with pytest.raises(ProfileError, match="outside the profiles root"):
+            s.delete("corrupt")
+
+        assert canary.read_text() == "safe"
+        assert original.is_dir()
+        assert "corrupt" in {p.name for p in s.all()}
+        assert "corrupt" in {p.name for p in store(tmp_path).all()}
+
+    def test_corrupt_root_path_is_refused_without_destroying_the_index(self, tmp_path):
+        s = store(tmp_path)
+        _make(s, "corrupt")
+        root = tmp_path / "profiles"
+        canary = root / "keep-me"
+        canary.write_text("safe")
+        s = _reopen_with_user_data_dir(tmp_path, "corrupt", root)
+
+        with pytest.raises(ProfileError, match="is the profiles root"):
+            s.delete("corrupt")
+
+        assert canary.read_text() == "safe"
+        assert (root / "profiles.json").is_file()
+        assert "corrupt" in {p.name for p in store(tmp_path).all()}
+
+    def test_symlink_escape_is_resolved_and_refused(self, tmp_path):
+        s = store(tmp_path)
+        _make(s, "corrupt")
+        sibling = tmp_path / "outside"
+        sibling.mkdir()
+        canary = sibling / "keep-me"
+        canary.write_text("safe")
+        escape = tmp_path / "profiles" / "escape"
+        escape.symlink_to(sibling, target_is_directory=True)
+        s = _reopen_with_user_data_dir(tmp_path, "corrupt", escape)
+
+        with pytest.raises(ProfileError, match="outside the profiles root"):
+            s.delete("corrupt")
+
+        assert canary.read_text() == "safe"
+        assert escape.is_symlink()
+        assert "corrupt" in {p.name for p in store(tmp_path).all()}
 
 
 class TestEnsureDefault:
