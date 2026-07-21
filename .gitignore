@@ -7,6 +7,9 @@
 data/
 .dek
 
+# Local handoff/working notes — internal ops detail, keep out of the public repo
+HANDOFF.md
+
 # Python
 __pycache__/
 *.py[cod]
