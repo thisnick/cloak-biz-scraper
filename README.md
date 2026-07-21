@@ -20,14 +20,13 @@ residential proxy account, and a Notion workspace. The server can also run the
 public CloakBrowser build without a key; it has fewer bypasses and has not been
 tested by us against the listing sites. See **What you need before you start**.
 
-> **Status: not shippable yet.** The server itself is built and tested — the
-> browser core, the settings UI, the Notion store, the scrape and archive tools,
-> and OAuth 2.1 on `/mcp` and `/api/*`. It has been deployed to Railway and run
-> end to end there against real listings.
->
-> **What's missing is the one-click part**: the deploy button below has no
-> template behind it yet, and connecting ChatGPT and Claude has not been tested
-> (Step 6). If you are reading this expecting to click and go, you are early.
+> **Status: deployable via the button below.** The server is built and tested —
+> the browser core, the settings UI, the Notion store, the scrape and archive
+> tools, the profile manager, and OAuth 2.1 on `/mcp` and `/api/*` — and it runs
+> end to end on Railway against real listings. The one piece still unverified is
+> the connector UX: **adding this server to ChatGPT and Claude has not yet been
+> tested against their live connector UIs** (see *Connecting ChatGPT or Claude*).
+> Everything up to that point works.
 
 ## Why it exists
 
@@ -69,8 +68,9 @@ for sale this week. This packages the hard part.
   the next request in about a second, with jobs kept on disk so results survive
   the nap.
 
-Not built yet: **the Railway template** (so no deploy button), live VNC, and any
-testing against real ChatGPT or Claude connectors.
+Also shipped: **the Railway template** (deploy button above) and the profile
+manager. Still unverified: **connecting real ChatGPT or Claude** through their
+connector UIs (Step 6).
 
 ## What you need before you start
 
@@ -90,23 +90,27 @@ expired key is a visible error and never silently falls back to public.
 > during a CloakBrowser outage, your server stops scraping until both are back.
 > Licences with no expiry date are not affected.
 
-**2. A residential proxy account — that allows username/password sign-in from any
-IP address.**
+**2. Recommended: a residential proxy account** — one that allows username/password
+sign-in **from any IP address**.
 
-> 🔴 **This is a hard requirement, and it is the one that catches people out.**
-> Some proxy providers make you register the IP addresses allowed to connect.
-> **That cannot work here.** Your server's outbound address is assigned by the
-> hosting platform and **changes without warning** — across three checks of the
-> same deployment we saw three different addresses. There is no address to
-> register, and no setting on our side that helps.
+Without a proxy the browser still launches, but it goes out over your server's
+datacenter address, and bot-hostile listing sites like BizBuySell will block a
+non-residential IP. A proxy is what makes those sites usable — strongly
+recommended, though no longer required just to start.
+
+> 🔴 **If you do use a proxy, this is the requirement that catches people out.**
+> Some providers make you register the IP addresses allowed to connect. **That
+> cannot work here** — your server's outbound address is assigned by the hosting
+> platform and **changes without warning** (across three checks of one deployment
+> we saw three different addresses). There is no address to register.
 >
-> **Before you pay for a proxy, ask the provider: "can I authenticate with just a
-> username and password, from any IP?"** If the answer is no, or if their plan
-> requires IP allowlisting, pick a different provider or plan.
+> **Before you pay, ask the provider: "can I authenticate with just a username and
+> password, from any IP?"** If the answer is no, or the plan requires IP
+> allowlisting, pick a different provider or plan.
 
-Everything is scraped through your proxy — the server never browses from its own
-address, and if the proxy is not working it refuses to launch a browser at all
-rather than leak.
+A *broken* proxy (wrong host, unroutable) still fails closed — the browser refuses
+to launch rather than silently leak over the datacenter address. The datacenter
+address is used only when you have deliberately configured no proxy at all.
 
 **3. A Notion workspace**, and an integration token for it. The app can either use
 a database you already have (it checks the columns and tells you exactly what is
@@ -122,14 +126,9 @@ your own notes, ratings and views freely.
 No terminal. You will be in the Railway dashboard once, and everything else
 happens in this app's own web pages.
 
-<!-- PLACEHOLDER: screenshots for each step — need a real dashboard to capture. -->
-<!-- PLACEHOLDER: deploy button — needs a published template code, which does not
-     exist yet. Do NOT invent a URL here; an incorrect one deploys someone's
-     server from the wrong branch with no error. See docs/railway-template.md. -->
-> **The deploy button is not here yet.** It needs a Railway template that has not
-> been created. Until then this section describes the flow rather than enabling it.
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/a7IwW8?referralCode=aXB6nz&utm_medium=integration&utm_source=template&utm_campaign=generic)
 
-> The one-click deploy button is not published yet. When it is, it goes here.
+<!-- PLACEHOLDER: step-by-step screenshots — capture from a real deploy. -->
 
 **1. Deploy it.** Click the button. Railway asks for one thing — `APP_SECRET` —
 and fills it in for you. Accept it and let it build (about three minutes).
@@ -477,6 +476,45 @@ A handful of tests assert what **martian** does with our markdown and need node,
 so they skip outside the container and run inside it. That is deliberate: what
 martian silently drops is the whole reason those tests exist, and asserting it
 from memory would defeat the point — the memory was wrong.
+
+## Security
+
+**One secret to deploy; everything else in the UI.** Railway sets only
+`APP_SECRET` — your dashboard password and what assistants authenticate against.
+It is read from the environment each boot and never written to the volume, so
+changing it is one edit in Railway.
+
+**Your licence key, proxy password, and Notion token** live in
+`/data/settings.json`, **encrypted at rest** with a key on the volume
+(`/data/.dek`). Be clear on what that buys: the key sits on the same volume as the
+ciphertext, so it defends against *casual* exposure — a disk snapshot, a stray
+backup — **not** against someone who can already read your volume or sign into
+your dashboard. That is inherent to self-hosting: whoever controls the box
+controls its config.
+
+What we are deliberate about, and verify:
+
+- **Secrets are never echoed back.** The settings pages show only "saved / not
+  saved" — the raw key or password never re-enters the HTML, so viewing the page
+  or its source never exposes them. A blank submit keeps the stored value.
+- **Secrets are never logged.** Proxy URLs are masked, the licence key is hashed
+  for its validation cache, and diagnostic/error paths are redacted.
+- **The status API returns booleans, not values** — never the proxy password,
+  licence key, or Notion token.
+- **`.env` is gitignored** and has never been committed; this repo is public.
+- **The browser egresses only through your proxy** (or, if you set none, the
+  datacenter address) — never your own machine, and a broken proxy fails closed.
+- **CDP and live-view URLs carry short-lived, single-browser signed tokens**, not
+  your `APP_SECRET`: a leaked one is good for ten minutes and one browser.
+
+## Contributing
+
+PRs target **`main`**, never `release` — `release` is the deployed branch, so
+merging to it ships to everyone running the template. Never commit `.env`. Run the
+tests both locally and in the container, keep MCP and REST returning identical
+payloads, and add a regression test for any behavioural change. Changes touching
+credentials, filesystem deletion, browser control, or deployment get an
+adversarial review before they land.
 
 ## Credits
 
