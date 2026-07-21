@@ -8,6 +8,10 @@ UI — no terminal.
 
 [![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/a7IwW8?referralCode=aXB6nz&utm_medium=integration&utm_source=template&utm_campaign=generic)
 
+## Demo
+
+https://github.com/user-attachments/assets/8bc957ef-130d-4516-a356-9efdcedeb60d
+
 ## Features
 
 - **Cloaked browser in the cloud** — patched Chromium (CloakBrowser) that passes
