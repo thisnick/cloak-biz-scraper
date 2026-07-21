@@ -36,6 +36,7 @@ from .services.archive import ArchiveService
 from .services.instances import InstanceManager
 from .services.jobs import JobStore
 from .services.oauth import OAuthProvider, OAuthStore
+from .services.profiles import ProfileService
 from .services.ratelimit import RateLimiter
 from .services.scrape import ScrapeService
 from .services.secret import SecretService
@@ -101,6 +102,11 @@ async def lifespan(app: FastAPI):
     app.state.register_limiter = RateLimiter(max_failures=10, window_sec=60, global_max=20)
     app.state.jobs = jobs
     app.state.instances = InstanceManager(settings_service)
+    # Read settings through app.state so tests and any future live service swap
+    # cannot leave profile status/creation bound to a stale SettingsService.
+    app.state.profile_service = ProfileService(
+        app.state.instances, lambda: app.state.settings,
+    )
     # Guarantee the DEFAULT profile (migrating a legacy "agent" once). Non-fatal:
     # a bad profiles file must never take down boot — log and carry on, the UI can
     # create one later.

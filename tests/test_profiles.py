@@ -10,7 +10,7 @@ import pathlib
 
 import pytest
 
-from app.services.profiles import DEFAULT_PROFILE, ProfileError, ProfileStore
+from app.services.profiles import DEFAULT_PROFILE, ProfileConflict, ProfileError, ProfileStore
 
 
 def store(tmp_path) -> ProfileStore:
@@ -45,6 +45,23 @@ class TestCreate:
     def test_same_name_returns_the_same_profile(self, tmp_path):
         s = store(tmp_path)
         assert _make(s, "research").user_data_dir == _make(s, "research").user_data_dir
+
+    def test_explicit_create_refuses_a_collision(self, tmp_path):
+        s = store(tmp_path)
+        s.create("research", default_country="US", default_region="california")
+        with pytest.raises(ProfileConflict, match="already exists"):
+            s.create("research", default_country="US", default_region="california")
+
+    def test_all_and_get_return_detached_snapshots(self, tmp_path):
+        s = store(tmp_path)
+        original = _make(s, "research")
+        listed = s.all()[0]
+        fetched = s.get("research")
+        listed.name = "changed-through-list"
+        fetched.country = "XX"
+        again = s.get("research")
+        assert again.name == "research" and again.country == "US"
+        assert again.session_token == original.session_token
 
 
 class TestRenamePreservesCookies:

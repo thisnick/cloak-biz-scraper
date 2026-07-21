@@ -85,7 +85,19 @@ class TestStateless:
             "get_instance",
             "agent_browser",
             "server_info",
+            "list_profiles",
+            "create_profile",
+            "update_profile",
+            "new_proxy_session",
+            "delete_profile",
         }
+
+    def test_profile_tools_describe_safety_and_destructive_boundaries(self, client):
+        tools = {t["name"]: t for t in rpc(client, "tools/list").json()["result"]["tools"]}
+        assert "never exposes" in tools["list_profiles"]["description"]
+        assert "direct mode" in tools["new_proxy_session"]["description"]
+        deletion = tools["delete_profile"]["description"]
+        assert "irreversible" in deletion and "Default" in deletion and "closing" in deletion
 
     def test_the_async_pair_is_described_as_a_pair(self, client):
         """A model that does not know to call back reports zero listings for a

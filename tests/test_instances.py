@@ -118,6 +118,9 @@ async def test_tasks_wait_by_default_and_interactive_does_not(manager):
     await asyncio.sleep(0.05)
     assert not queued.done()
     queued.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await queued
+    assert manager._profiles_opening == {}
 
     for _ in range(1):
         await _launch(manager, "interactive", wait=False)
@@ -146,6 +149,7 @@ async def test_a_failed_launch_does_not_leak_its_slot(manager, monkeypatch):
             await _launch(manager, "task", wait=False)
     # A leaked pending count would wedge the pool permanently.
     assert manager._pending == {"task": 0, "interactive": 0}
+    assert manager._profiles_opening == {}
     assert manager.counts()["total"] == 0
 
 
@@ -162,6 +166,7 @@ async def test_a_waiting_task_is_released_when_a_launch_fails(manager, monkeypat
     with pytest.raises(RuntimeError, match="nope"):
         await asyncio.wait_for(waiting, timeout=2)
     assert manager._pending["task"] == 0
+    assert manager._profiles_opening == {}
 
 
 async def test_stopping_an_unknown_instance_is_not_an_error(manager):

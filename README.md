@@ -307,11 +307,28 @@ get_scrape_listing_results(job_id)                        -> ScrapeResult
 archive_page(url, notion_page_id)                         -> ArchiveResult
 create_instance(profile?, country?, region?, geoip?)      -> InstanceView
 list_instances() / get_instance(id) / close_instance(id)
+list_profiles()                                            -> list[ProfileView]
+create_profile(name, country?, region?)                    -> ProfileView
+update_profile(name, new_name?, country?, region?)         -> ProfileView
+new_proxy_session(name)                                    -> ProfileView
+delete_profile(name)                                       -> ProfileDeleteResult
 ```
 
 Every one is mirrored in REST (`POST /api/scrape`, `GET /api/scrape/{job_id}`,
-`POST /api/archive`, `/api/instances`) over the same services, so the two return
-the same payloads.
+`POST /api/archive`, `/api/instances`, `GET|POST|PATCH|DELETE /api/profiles`, and
+`POST /api/profiles/new-proxy-session`) over the same services, so the two return
+the same payloads. Profile names are carried in request bodies (or the delete
+query), not URL path segments, so names containing `/` work unchanged.
+
+Profile responses are deliberately narrow: name, geography, Default/in-use
+status, and whether a complete proxy is configured. Fingerprint seeds, sticky
+session tokens, and cookie-storage paths never cross REST or MCP. Creating a
+profile through REST/MCP is explicit and rejects name collisions. Rename and
+delete are refused while the source identity is queued, opening, open, or
+closing; rename also guards its destination. `Default` cannot be deleted, and
+delete permanently removes that profile's cookies and logins. A new proxy
+session applies on the next launch and is refused when the server is in direct
+mode or its proxy settings are incomplete.
 
 **A sweep is asynchronous, an archive is not.** A multi-page sweep with
 block-retries takes minutes, which is past every MCP client's wall — so

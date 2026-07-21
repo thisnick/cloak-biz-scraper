@@ -150,7 +150,10 @@ def _render(request: Request, result: Result | None = None, status: int = 200,
     from ..services.profiles import DEFAULT_PROFILE
 
     profiles = request.app.state.instances.profiles.all()
-    profiles_in_use = {i.profile for i in instances}  # names with a browser open now
+    # Display hint only; the mutation guard is ProfileService. Include browsers
+    # queued/opening/closing too so the UI does not offer an action the service
+    # is about to refuse.
+    profiles_in_use = request.app.state.instances.profile_names_in_use()
 
     return templates.TemplateResponse(
         request,
@@ -799,22 +802,26 @@ async def save_pool(
     return _render(request, Result("pool", True, "Saved."))
 
 
-# ── Profiles: durable browser identities (UI-only; the agent just passes a name)
+# ── Profiles: durable browser identities
 #
 # Every one is a cookie-authed state change, so — like the session and settings
-# POSTs — it is POST-only and carries both CSRF layers (_require + the Origin
-# check). These are deliberately NOT MCP tools: creating on demand is what the
-# agent gets from passing a new profile name to create_instance; renaming and
-# DELETING a cookie jar are administrative and belong to the human at the console.
+# POSTs — it is POST-only and carries both CSRF layers. The operation itself is
+# the same ProfileService used by REST and MCP; in particular, the in-use guard
+# is not a UI-only scan that misses a browser while it is opening.
 
 
 def _settings_redirect() -> Response:
     return RedirectResponse("/?view=settings", status_code=303)
 
 
-def _profile_in_use(request: Request, name: str) -> bool:
-    return any(getattr(i, "profile", None) == name
-               for i in request.app.state.instances.running.values())
+def _profile_error_status(exc: Exception) -> int:
+    from ..services.profiles import ProfileConflict, ProfileInUse, ProfileNotFound
+
+    if isinstance(exc, ProfileNotFound):
+        return 404
+    if isinstance(exc, (ProfileInUse, ProfileConflict)):
+        return 409
+    return 400
 
 
 @router.post("/settings/profiles/create")
@@ -823,13 +830,16 @@ async def profile_create(
 ) -> Response:
     _require(request)
     _require_same_origin(request)
-    if not name.strip():
-        return _render(request, Result("profiles", False, "A profile needs a name."), status=400)
-    s = request.app.state.settings.load()
-    request.app.state.instances.profiles.get_or_create(
-        name.strip(), default_country=s.proxy_country, default_region=s.proxy_region,
-        country=country.strip() or None, region=region.strip() or None,
-    )
+    from ..services.profiles import ProfileError
+
+    try:
+        await request.app.state.profile_service.ensure_profile(
+            name, country=country.strip() or None, region=region.strip() or None,
+        )
+    except ProfileError as exc:
+        return _render(
+            request, Result("profiles", False, str(exc)), status=_profile_error_status(exc)
+        )
     return _settings_redirect()
 
 
@@ -839,14 +849,12 @@ async def profile_rename(request: Request, name: str = Form(""), new_name: str =
     _require_same_origin(request)
     from ..services.profiles import ProfileError
 
-    if _profile_in_use(request, name):
-        return _render(request, Result(
-            "profiles", False,
-            f"“{name}” has a browser open right now — close it before renaming."), status=409)
     try:
-        request.app.state.instances.profiles.rename(name, new_name)
+        await request.app.state.profile_service.update_profile(name, new_name=new_name)
     except ProfileError as exc:
-        return _render(request, Result("profiles", False, str(exc)), status=400)
+        return _render(
+            request, Result("profiles", False, str(exc)), status=_profile_error_status(exc)
+        )
     return _settings_redirect()
 
 
@@ -859,10 +867,13 @@ async def profile_geo(
     from ..services.profiles import ProfileError
 
     try:
-        request.app.state.instances.profiles.set_geo(
-            name, country=country.strip(), region=region.strip())
+        await request.app.state.profile_service.update_profile(
+            name, country=country.strip(), region=region.strip(),
+        )
     except ProfileError as exc:
-        return _render(request, Result("profiles", False, str(exc)), status=400)
+        return _render(
+            request, Result("profiles", False, str(exc)), status=_profile_error_status(exc)
+        )
     return _settings_redirect()
 
 
@@ -870,9 +881,14 @@ async def profile_geo(
 async def profile_rotate(request: Request, name: str = Form("")) -> Response:
     _require(request)
     _require_same_origin(request)
-    if request.app.state.instances.profiles.rotate_session(name) is None:
-        return _render(request, Result("profiles", False,
-                                       f"There is no profile named “{name}”."), status=404)
+    from ..services.profiles import ProfileError
+
+    try:
+        await request.app.state.profile_service.new_proxy_session(name)
+    except ProfileError as exc:
+        return _render(
+            request, Result("profiles", False, str(exc)), status=_profile_error_status(exc)
+        )
     return _settings_redirect()
 
 
@@ -882,17 +898,14 @@ async def profile_delete(request: Request, name: str = Form("")) -> Response:
     _require_same_origin(request)
     from ..services.profiles import ProfileError
 
-    # In-use is refused server-side (deleting a live browser's cookie jar would
-    # corrupt it); the Default profile is refused inside the store. The client
-    # confirm dialog is UX only — these are the real guards.
-    if _profile_in_use(request, name):
-        return _render(request, Result(
-            "profiles", False,
-            f"“{name}” has a browser open right now — close it before deleting."), status=409)
+    # The shared service refuses opening/open/closing profiles; the store also
+    # keeps Default undeletable. The client confirm dialog is UX only.
     try:
-        request.app.state.instances.profiles.delete(name)
+        await request.app.state.profile_service.delete_profile(name)
     except ProfileError as exc:
-        return _render(request, Result("profiles", False, str(exc)), status=400)
+        return _render(
+            request, Result("profiles", False, str(exc)), status=_profile_error_status(exc)
+        )
     return _settings_redirect()
 
 

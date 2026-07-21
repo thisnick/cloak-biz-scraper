@@ -30,7 +30,15 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
 from . import __version__
-from .models import ArchiveResult, InstanceCreate, InstanceView, ScrapeResult, ServerInfo
+from .models import (
+    ArchiveResult,
+    InstanceCreate,
+    InstanceView,
+    ProfileDeleteResult,
+    ProfileView,
+    ScrapeResult,
+    ServerInfo,
+)
 from .routes.guard import subject_of
 from .services.tokens import OWNER
 from .services.urls import public_base
@@ -221,6 +229,79 @@ def build(app) -> FastMCP:
         )
         return instance_view(inst, secret=app.state.secret.current(),
                              base_url=_base_url(ctx), subject=subject)
+
+    @mcp.tool()
+    async def list_profiles() -> list[ProfileView]:
+        """List the durable browser identities available to create_instance.
+
+        Safe status only: name, optional proxy geography, whether it is Default,
+        whether a browser is queued/opening/open/closing on it, and whether a
+        complete proxy is configured. Fingerprint seeds, sticky-session tokens,
+        cookie storage, and filesystem paths are never returned, so this tool
+        never exposes the profile's internal identity material.
+        """
+        return await app.state.profile_service.list_profiles()
+
+    @mcp.tool()
+    async def create_profile(
+        name: str, country: str | None = None, region: str | None = None,
+    ) -> ProfileView:
+        """Create a durable, initially logged-out browser identity.
+
+        name: unique profile name passed later to create_instance.
+        country/region: optional proxy exit target. They are stored even in
+            direct mode but only take effect when a residential proxy is
+            configured. Omitted values use the server's proxy geography defaults.
+
+        This does not launch a browser. It returns safe status and never exposes
+        the new fingerprint seed, proxy session token, or cookie directory.
+        """
+        return await app.state.profile_service.create_profile(
+            name, country=country, region=region,
+        )
+
+    @mcp.tool()
+    async def update_profile(
+        name: str,
+        new_name: str | None = None,
+        country: str | None = None,
+        region: str | None = None,
+    ) -> ProfileView:
+        """Rename a profile and/or change its future proxy exit geography.
+
+        Omitted fields stay unchanged. A rename keeps cookies, logins, and the
+        stable fingerprint, but is refused while a browser is queued, opening,
+        open, or closing on the profile. Geography changes apply to the next
+        proxied launch and may be made while the current browser is open. Default
+        cannot be renamed. Missing profiles and name collisions fail explicitly.
+        """
+        return await app.state.profile_service.update_profile(
+            name, new_name=new_name, country=country, region=region,
+        )
+
+    @mcp.tool()
+    async def new_proxy_session(name: str) -> ProfileView:
+        """Give a profile a fresh sticky proxy session for its next launch.
+
+        Use after a residential exit IP is blocked. Cookies, logins, fingerprint,
+        name, and geography stay unchanged; only the internal proxy session is
+        replaced, and its token is never returned. This is refused in direct mode
+        or with incomplete proxy settings because no usable proxy session exists.
+        An already-open browser keeps its current connection; the next launch uses
+        the new session.
+        """
+        return await app.state.profile_service.new_proxy_session(name)
+
+    @mcp.tool()
+    async def delete_profile(name: str) -> ProfileDeleteResult:
+        """Permanently delete a profile and its saved cookies/logins.
+
+        Destructive and irreversible. Default cannot be deleted. Deletion is
+        refused while any browser is queued, opening, open, or closing on the
+        profile, so it cannot race a launch. A missing name fails explicitly.
+        Close the profile's browser first, then call this once.
+        """
+        return await app.state.profile_service.delete_profile(name)
 
     @mcp.tool()
     async def list_instances(ctx: Context) -> list[InstanceView]:

@@ -1209,6 +1209,15 @@ class TestProfileEndpoints:
         assert auth.post("/settings/profiles/create", data={"name": "  "},
                          follow_redirects=False).status_code == 400
 
+    def test_duplicate_create_keeps_the_existing_ui_success_flow(self, auth, profiles):
+        existing = self._mk(profiles, "research")
+        token = existing.session_token
+        r = auth.post(
+            "/settings/profiles/create", data={"name": "research"}, follow_redirects=False,
+        )
+        assert r.status_code == 303 and r.headers["location"] == "/?view=settings"
+        assert {p.name: p for p in profiles.all()}["research"].session_token == token
+
     def test_rename_keeps_the_profile_under_the_new_name(self, auth, profiles):
         self._mk(profiles, "old")
         r = auth.post("/settings/profiles/rename", data={"name": "old", "new_name": "new"},
@@ -1239,10 +1248,26 @@ class TestProfileEndpoints:
         assert r.status_code == 409 and "busy" in self._names(profiles)
 
     def test_rotate_changes_the_session_token(self, auth, profiles):
+        app.state.settings.update(
+            proxy_user="u", proxy_password="p", proxy_host="proxy.example", proxy_port="1000",
+        )
         tok = self._mk(profiles, "r").session_token
         r = auth.post("/settings/profiles/rotate", data={"name": "r"}, follow_redirects=False)
         assert r.status_code == 303
         assert {p.name: p for p in profiles.all()}["r"].session_token != tok
+
+    def test_rotate_refuses_direct_mode_without_changing_the_token(self, auth, profiles):
+        tok = self._mk(profiles, "r").session_token
+        r = auth.post("/settings/profiles/rotate", data={"name": "r"})
+        assert r.status_code == 409 and "direct mode" in r.text
+        assert {p.name: p for p in profiles.all()}["r"].session_token == tok
+
+    def test_rotate_refuses_partial_proxy_without_changing_the_token(self, auth, profiles):
+        app.state.settings.update(proxy_user="only-one-field")
+        tok = self._mk(profiles, "r").session_token
+        r = auth.post("/settings/profiles/rotate", data={"name": "r"})
+        assert r.status_code == 409 and "incomplete" in r.text
+        assert {p.name: p for p in profiles.all()}["r"].session_token == tok
 
     def test_geo_updates_the_exit(self, auth, profiles):
         self._mk(profiles, "g")

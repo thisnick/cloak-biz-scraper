@@ -34,6 +34,7 @@ import os
 import socket
 import time
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -43,7 +44,7 @@ from . import geo
 from .display import DisplayManager
 from .geo import GeoUnresolved
 from .license import LicenseNotPro, resolve_browser_binary
-from .profiles import ProfileStore
+from .profiles import ProfileInUse, ProfileStore
 from .proxy import ProxyParts, build_proxy_url
 from .settings import SettingsService
 
@@ -166,6 +167,12 @@ class InstanceManager:
         self._settings = settings
         self._cond = asyncio.Condition()
         self._pending: dict[str, int] = {"task": 0, "interactive": 0}
+        # Reserved before a launch waits for capacity, and held until it either
+        # fails or transitions atomically into ``running``. Stop holds the same
+        # reservation while the browser context is closing. Route-level scans
+        # of ``running`` cannot see either window; profile management uses
+        # profile_guard() below so rename/delete cannot race them.
+        self._profiles_opening: dict[str, int] = {}
         self._next_cdp = _BASE_CDP_PORT
         # Status only; never stores the key. The fingerprint lets server_info
         # reject a stale result after the user changes keys without disclosing
@@ -197,6 +204,40 @@ class InstanceManager:
         return self._last_binary_path
 
     # ── capacity accounting (call under self._cond) ──────────────────────────
+    def _reserve_profile(self, name: str) -> None:
+        self._profiles_opening[name] = self._profiles_opening.get(name, 0) + 1
+
+    def _release_profile(self, name: str) -> None:
+        remaining = self._profiles_opening.get(name, 0) - 1
+        if remaining > 0:
+            self._profiles_opening[name] = remaining
+        else:
+            self._profiles_opening.pop(name, None)
+
+    def profile_names_in_use(self) -> set[str]:
+        """Profiles queued/opening/open/closing now.
+
+        Callers that mutate based on this snapshot must hold profile_guard();
+        the synchronous UI render uses it only as an honest display hint.
+        """
+        return set(self._profiles_opening) | {
+            instance.profile for instance in self.running.values()
+        }
+
+    @asynccontextmanager
+    async def profile_guard(self, *names: str, require_idle: bool = False):
+        """Serialize profile mutations against every browser lifecycle edge."""
+        async with self._cond:
+            if require_idle:
+                busy = self.profile_names_in_use()
+                for name in names:
+                    if name in busy:
+                        raise ProfileInUse(
+                            f"profile {name!r} has a browser queued, opening, open, or "
+                            "closing right now; close it before changing its identity"
+                        )
+            yield
+
     def _running_by(self, origin: str) -> int:
         return sum(1 for i in self.running.values() if i.origin == origin)
 
@@ -225,20 +266,27 @@ class InstanceManager:
             "reserve": s.interactive_reserve,
         }
 
-    async def _acquire(self, origin: str, wait: bool) -> None:
+    async def _acquire(self, origin: str, wait: bool, profile: str) -> None:
         s = self._settings.load()
         async with self._cond:
-            if wait:
-                await self._cond.wait_for(lambda: self._can(origin))
-            elif not self._can(origin):
-                if origin == "task":
-                    raise CapExceeded(f"task budget full ({s.task_budget})")
-                raise CapExceeded(f"pool full ({s.max_instances}); reserve in use")
-            self._pending[origin] += 1
+            self._reserve_profile(profile)
+            try:
+                if wait:
+                    await self._cond.wait_for(lambda: self._can(origin))
+                elif not self._can(origin):
+                    if origin == "task":
+                        raise CapExceeded(f"task budget full ({s.task_budget})")
+                    raise CapExceeded(f"pool full ({s.max_instances}); reserve in use")
+                self._pending[origin] += 1
+            except BaseException:
+                self._release_profile(profile)
+                self._cond.notify_all()
+                raise
 
-    async def _release_pending(self, origin: str) -> None:
+    async def _release_pending(self, origin: str, profile: str) -> None:
         async with self._cond:
             self._pending[origin] -= 1
+            self._release_profile(profile)
             self._cond.notify_all()
 
     def _alloc_cdp_port(self) -> int:
@@ -258,16 +306,29 @@ class InstanceManager:
                      wait: bool | None = None) -> Instance:
         if wait is None:
             wait = origin == "task"
-        await self._acquire(origin, wait)
+        await self._acquire(origin, wait, req.profile)
+        inst: Instance | None = None
         try:
             inst = await self._do_launch(req, origin, owner, subject)
+            # Registration is the last cancellable edge. If cancellation lands
+            # while this waits for the lifecycle lock, the browser has already
+            # opened but is not reachable through ``running`` yet. Keep it in
+            # this try so the exception path below releases both the capacity /
+            # profile reservation and the otherwise orphaned browser resources.
+            async with self._cond:
+                self._pending[origin] -= 1
+                self._release_profile(req.profile)
+                self.running[inst.id] = inst
+                self._cond.notify_all()
         except BaseException:
-            await self._release_pending(origin)
+            await self._release_pending(origin, req.profile)
+            if inst is not None:
+                try:
+                    await inst.context.close()
+                except Exception as exc:
+                    logger.warning("close unregistered ctx %s: %s", inst.id, exc)
+                await self.displays.stop(inst.display)
             raise
-        async with self._cond:
-            self._pending[origin] -= 1
-            self.running[inst.id] = inst
-            self._cond.notify_all()
         logger.info("launched %s origin=%s owner=%s (display=:%d cdp=%d ip=%s) [%d/%d]",
                     inst.id, origin, owner, inst.display, inst.cdp_port, inst.proxy_ip,
                     len(self.running), self._settings.load().max_instances)
@@ -402,22 +463,36 @@ class InstanceManager:
     async def _on_closed(self, iid: str) -> None:
         async with self._cond:
             inst = self.running.pop(iid, None)
+            if inst:
+                self._reserve_profile(inst.profile)
             self._cond.notify_all()
         if inst:
-            await self.displays.stop(inst.display)
-            logger.info("instance %s closed, freed :%d", iid, inst.display)
+            try:
+                await self.displays.stop(inst.display)
+                logger.info("instance %s closed, freed :%d", iid, inst.display)
+            finally:
+                async with self._cond:
+                    self._release_profile(inst.profile)
+                    self._cond.notify_all()
 
     async def stop(self, iid: str) -> bool:
         async with self._cond:
             inst = self.running.pop(iid, None)
+            if inst:
+                self._reserve_profile(inst.profile)
             self._cond.notify_all()
         if not inst:
             return False
         try:
-            await inst.context.close()
-        except Exception as exc:
-            logger.warning("close ctx %s: %s", iid, exc)
-        await self.displays.stop(inst.display)
+            try:
+                await inst.context.close()
+            except Exception as exc:
+                logger.warning("close ctx %s: %s", iid, exc)
+            await self.displays.stop(inst.display)
+        finally:
+            async with self._cond:
+                self._release_profile(inst.profile)
+                self._cond.notify_all()
         return True
 
     def get(self, iid: str) -> Instance | None:

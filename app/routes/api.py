@@ -30,6 +30,11 @@ from ..models import (
     ArchiveResult,
     InstanceCreate,
     InstanceView,
+    ProfileCreate,
+    ProfileDeleteResult,
+    ProfileNameRequest,
+    ProfileUpdate,
+    ProfileView,
     ScrapeResult,
     ServerInfo,
 )
@@ -63,6 +68,16 @@ class ArchiveRequest(BaseModel):
 
 class AgentBrowserRequest(BaseModel):
     command: str
+
+
+def _profile_http_error(exc: Exception) -> HTTPException:
+    from ..services.profiles import ProfileConflict, ProfileInUse, ProfileNotFound
+
+    if isinstance(exc, ProfileNotFound):
+        return HTTPException(status_code=404, detail=str(exc))
+    if isinstance(exc, (ProfileInUse, ProfileConflict)):
+        return HTTPException(status_code=409, detail=str(exc))
+    return HTTPException(status_code=400, detail=str(exc))
 
 
 def _base_url(request: Request) -> str:
@@ -116,6 +131,59 @@ async def get_server_info(request: Request) -> ServerInfo:
     from ..services.views import server_info
 
     return server_info(request.app.state.settings.load(), request.app.state.instances)
+
+
+@router.get("/profiles", response_model=list[ProfileView])
+async def list_profiles(request: Request) -> list[ProfileView]:
+    """List safe durable-browser profile status; never profile credentials."""
+    return await request.app.state.profile_service.list_profiles()
+
+
+@router.post("/profiles", response_model=ProfileView, status_code=201)
+async def create_profile(request: Request, body: ProfileCreate) -> ProfileView:
+    from ..services.profiles import ProfileError
+
+    try:
+        return await request.app.state.profile_service.create_profile(
+            body.name, country=body.country, region=body.region,
+        )
+    except ProfileError as exc:
+        raise _profile_http_error(exc) from exc
+
+
+@router.patch("/profiles", response_model=ProfileView)
+async def update_profile(request: Request, body: ProfileUpdate) -> ProfileView:
+    from ..services.profiles import ProfileError
+
+    try:
+        return await request.app.state.profile_service.update_profile(
+            body.name,
+            new_name=body.new_name,
+            country=body.country,
+            region=body.region,
+        )
+    except ProfileError as exc:
+        raise _profile_http_error(exc) from exc
+
+
+@router.post("/profiles/new-proxy-session", response_model=ProfileView)
+async def new_proxy_session(request: Request, body: ProfileNameRequest) -> ProfileView:
+    from ..services.profiles import ProfileError
+
+    try:
+        return await request.app.state.profile_service.new_proxy_session(body.name)
+    except ProfileError as exc:
+        raise _profile_http_error(exc) from exc
+
+
+@router.delete("/profiles", response_model=ProfileDeleteResult)
+async def delete_profile(request: Request, name: str) -> ProfileDeleteResult:
+    from ..services.profiles import ProfileError
+
+    try:
+        return await request.app.state.profile_service.delete_profile(name)
+    except ProfileError as exc:
+        raise _profile_http_error(exc) from exc
 
 
 @router.post("/instances", response_model=InstanceView)

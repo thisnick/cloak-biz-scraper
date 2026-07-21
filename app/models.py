@@ -156,6 +156,56 @@ class InstanceCreate(BaseModel):
     height: int = 900
 
 
+class ProfileCreate(BaseModel):
+    """Create one durable browser identity."""
+
+    name: str
+    country: str | None = None
+    region: str | None = None
+
+
+class ProfileUpdate(BaseModel):
+    """Changes applied to a durable profile; omitted fields stay unchanged."""
+
+    name: str
+    new_name: str | None = None
+    country: str | None = None
+    region: str | None = None
+
+
+class ProfileNameRequest(BaseModel):
+    """Select a profile for a non-update management operation."""
+
+    name: str
+
+
+class ProfileView(BaseModel):
+    """A safe profile status.
+
+    A profile contains a fingerprint seed, sticky proxy session token, cookie
+    directory, and browser storage internally. None of those credentials or
+    identifiers are exposed here.
+    """
+
+    name: str
+    country: str
+    region: str
+    is_default: bool
+    in_use: bool = Field(
+        description="True while a browser is queued, opening, open, or closing on this profile."
+    )
+    proxy_configured: bool = Field(
+        description="Whether a complete residential proxy is configured for profile sessions."
+    )
+
+
+class ProfileDeleteResult(BaseModel):
+    """Confirmation that a profile and its persisted browser data were deleted."""
+
+    ok: bool = True
+    name: str
+
+
 class InstanceView(BaseModel):
     """A running browser.
 
