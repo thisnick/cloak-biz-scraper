@@ -63,6 +63,7 @@ def _running_binary(settings) -> dict:
     `actually_running` reads it back off the live process instead of trusting us.
     """
     from cloakbrowser import ensure_binary
+    from app.services.license import is_pro
 
     resolved = ensure_binary(
         license_key=settings.cloakbrowser_license_key,
@@ -81,6 +82,7 @@ def _running_binary(settings) -> dict:
     return {
         "pin_in_settings": settings.cloakbrowser_version or "(none — track latest)",
         "resolved": resolved,
+        "build": "pro" if is_pro(resolved) else "public",
         "actually_running": sorted(running),
     }
 

@@ -158,7 +158,7 @@ class TestSaving:
         auth.post("/settings/cloakbrowser", data={"cloakbrowser_license_key": "cb_verysecret"})
         page = auth.get("/")
         assert "cb_verysecret" not in page.text
-        assert "Licence saved" in page.text
+        assert "Pro key saved" in page.text
 
     def test_blank_secret_field_keeps_the_saved_value(self, auth):
         auth.post("/settings/cloakbrowser", data={"cloakbrowser_license_key": "cb_keepme"})
@@ -168,6 +168,18 @@ class TestSaving:
         settings = app.state.settings.load()
         assert settings.cloakbrowser_license_key == "cb_keepme"
         assert settings.cloakbrowser_version == "148.0.7778.215.5"
+
+    def test_public_action_explicitly_clears_a_saved_key(self, auth):
+        auth.post("/settings/cloakbrowser", data={"cloakbrowser_license_key": "cb_remove"})
+        response = auth.post(
+            "/settings/cloakbrowser",
+            data={"action": "public", "cloakbrowser_license_key": ""},
+        )
+        assert response.status_code == 200
+        assert app.state.settings.load().cloakbrowser_license_key == ""
+        page = shown(response)
+        assert "Public build selected" in page
+        assert "not been tested by us against the listing sites" in page
 
     def test_malformed_pin_is_reported_not_stored(self, auth):
         response = auth.post("/settings/cloakbrowser", data={"cloakbrowser_version": "latest"})
@@ -279,10 +291,37 @@ class TestLicenceVerify:
         # "did my licence work?" answerable only by reading the banner colour.
         assert response.status_code == 400
 
-    def test_no_key_yet_asks_for_one(self, auth):
+    def test_no_key_verifies_as_public(self, auth, monkeypatch):
+        from app.services import license as license_service
+        from app.services.license import LicenseReport
+
+        async def public(key, pin=""):
+            assert key == ""
+            return LicenseReport(
+                ok=True,
+                version="146.0.7680.177.3",
+                message="CloakBrowser public build ready; fewer bypasses; not tested.",
+                pro=False,
+                binary_path="/cache/chromium-146.0.7680.177.3/chrome",
+            )
+
+        monkeypatch.setattr(license_service, "verify", public)
         response = auth.post("/settings/cloakbrowser", data={"action": "verify"})
-        assert response.status_code == 400
-        assert "No licence key yet" in shown(response)
+        assert response.status_code == 200
+        assert "public build ready" in shown(response)
+
+    def test_public_mode_is_labelled_and_caveated(self, auth):
+        page = shown(auth.get("/"))
+        assert "Public build" in page
+        assert "Without a key you're on the public build" in page
+        assert "fewer bot detectors" in page
+        assert "not tested" in page.lower() and "listing sites" in page.lower()
+
+    def test_verify_wait_state_names_the_measured_delay(self, auth):
+        page = auth.get("/").text
+        assert 'id="licence-form"' in page
+        assert "Getting the browser — about ten seconds" in page
+        assert "e.submitter" in page
 
 
 class TestProxyTest:
@@ -916,50 +955,14 @@ class TestSessionsControls:
                          follow_redirects=False).status_code == 403
 
 
-class TestNewBrowserWithoutALicence:
-    """The first-boot footgun. Clicking "New browser" — or calling its REST twin
-    — before a licence is set must be a helpful 400 that names the fix, never a
-    raw 500. The dashboard and the API share the same failure, so they must
-    answer the same way; these test both, so the two cannot drift.
-    """
+class TestNewBrowserLicenceErrors:
+    """A present bad key must remain a visible UI/API error, never downgrade."""
 
     def _launch_raises(self, monkeypatch, exc):
         async def boom(req, **kw):
             raise exc
 
         monkeypatch.setattr(app.state.instances, "launch", boom)
-
-    def test_the_dashboard_button_shows_a_helpful_banner_not_raw_json(self, auth, monkeypatch):
-        from app.services.license import LicenseNotConfigured
-
-        self._launch_raises(monkeypatch, LicenseNotConfigured(
-            "CloakBrowser licence key is not configured. Add it under Settings — "
-            "without it only the free binary is available, which this app does not use."
-        ))
-        r = auth.post("/sessions/instances", data={"profile": "p"}, follow_redirects=False)
-        # Status is unchanged — the Reviewer's security tests assert on it — but a
-        # human sees the dashboard with a banner, not {"detail": ...} on a blank page.
-        assert r.status_code == 400, "a missing licence must be a 400, not a 500"
-        assert 'class="banner' in r.text, "the error renders as a dashboard banner, not JSON"
-        assert '{"detail"' not in r.text, "no raw HTTPException body reaches the user"
-        assert "Add it under Settings" in shown(r), "the banner names the fix"
-        assert 'data-section="browsers" class="on"' in r.text, "and lands on the Browsers tab"
-
-    def test_the_rest_twin_keeps_its_json(self, client, monkeypatch):
-        from conftest import mint_access
-
-        from app.services.license import LicenseNotConfigured
-
-        self._launch_raises(monkeypatch, LicenseNotConfigured(
-            "CloakBrowser licence key is not configured. Add it under Settings."
-        ))
-        r = client.post("/api/instances", json={"profile": "p"},
-                        headers={"Authorization": f"Bearer {mint_access(app)}"})
-        # The API caller is an agent, not a browser, so it keeps the JSON body —
-        # the mirror is at the status code (both 400, neither a 500), not the
-        # presentation. Only the human-facing UI endpoint renders a banner.
-        assert r.status_code == 400, "REST must mirror the UI's status — same failure, same 400"
-        assert "Settings" in r.json()["detail"]
 
     def test_an_unusable_key_also_gets_a_banner_400(self, auth, monkeypatch):
         """A mistyped or expired key is the very next first-boot moment, and it
@@ -972,6 +975,22 @@ class TestNewBrowserWithoutALicence:
         r = auth.post("/sessions/instances", data={"profile": "p"}, follow_redirects=False)
         assert r.status_code == 400
         assert 'class="banner' in r.text and '{"detail"' not in r.text
+
+    def test_the_rest_twin_keeps_the_bad_key_error_as_json(self, client, monkeypatch):
+        from conftest import mint_access
+        from app.services.license import LicenseNotPro
+
+        self._launch_raises(
+            monkeypatch,
+            LicenseNotPro("Saved key was rejected; refusing a public downgrade."),
+        )
+        r = client.post(
+            "/api/instances",
+            json={"profile": "p"},
+            headers={"Authorization": f"Bearer {mint_access(app)}"},
+        )
+        assert r.status_code == 400
+        assert "public downgrade" in r.json()["detail"]
 
     def test_a_full_pool_keeps_its_own_status_under_the_banner(self, auth, monkeypatch):
         """The banner is presentation only: a non-licence failure still carries

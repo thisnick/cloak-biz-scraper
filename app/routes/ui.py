@@ -135,7 +135,7 @@ def _render(request: Request, result: Result | None = None, status: int = 200,
             active: str | None = None) -> Response:
     settings: Settings = request.app.state.settings.load()
     from ..services.urls import public_base
-    from ..services.views import instance_view
+    from ..services.views import browser_info, instance_view
 
     secret = request.app.state.secret.current()
     base = public_base(request)
@@ -160,6 +160,7 @@ def _render(request: Request, result: Result | None = None, status: int = 200,
             "result": result,
             "pool_warning": settings.pool_warning(),
             "has_license": bool(settings.cloakbrowser_license_key),
+            "browser": browser_info(settings, request.app.state.instances),
             "has_proxy_password": bool(settings.proxy_password),
             "has_notion_token": bool(settings.notion_api_token),
             "proxy_checked_at": _when(settings.proxy_last_check_at),
@@ -446,8 +447,8 @@ async def ui_new_instance(
     _require_same_origin(request)
     from ..models import InstanceCreate
     from ..services.geo import GeoUnresolved, ProxyUnreachable
-    from ..services.instances import CapExceeded, PinUnavailable
-    from ..services.license import LicenseNotConfigured, LicenseNotPro
+    from ..services.instances import BrowserUnavailable, CapExceeded
+    from ..services.license import LicenseNotPro
     from ..services.profiles import DEFAULT_PROFILE
     from ..services.proxy import ProxyNotConfigured
     from ..services.tokens import OWNER
@@ -468,16 +469,16 @@ async def ui_new_instance(
     # button is for. The status codes are unchanged (the same 429/400 the REST
     # twin returns); only the presentation differs. The REST endpoint
     # POST /api/instances keeps its JSON error — its caller is an agent, not a
-    # browser. A missing or unusable licence is the first-boot footgun this
-    # button reaches; its message already names the fix ("Add it under Settings").
+    # browser. A present but unusable key is the licensing footgun this button
+    # reaches: it must be a visible error, never a silent public downgrade.
     try:
         await request.app.state.instances.launch(
             req, origin="interactive", subject=OWNER
         )
     except CapExceeded as exc:
         return _render(request, Result("browsers", False, str(exc)), status=429)
-    except (LicenseNotConfigured, LicenseNotPro, ProxyNotConfigured, ProxyUnreachable,
-            GeoUnresolved, PinUnavailable) as exc:
+    except (LicenseNotPro, ProxyNotConfigured, ProxyUnreachable,
+            GeoUnresolved, BrowserUnavailable) as exc:
         return _render(request, Result("browsers", False, str(exc)), status=400)
     return _sessions_redirect()
 
@@ -596,6 +597,31 @@ async def save_cloakbrowser(
     store = request.app.state.settings
     current = store.load()
 
+    if action == "public":
+        # Secret inputs are intentionally write-only, so blank retains a saved
+        # key on ordinary saves. This explicit action is the unambiguous way to
+        # remove one and deliberately choose the public build.
+        try:
+            store.update(
+                cloakbrowser_license_key="",
+                cloakbrowser_version=cloakbrowser_version.strip(),
+            )
+        except ValueError as exc:
+            return _render(
+                request, Result("cloakbrowser", False, _first_error(exc)), status=400
+            )
+        request.app.state.instances.forget_binary()
+        return _render(
+            request,
+            Result(
+                "cloakbrowser",
+                True,
+                "Public build selected. It has fewer bypasses than Pro and has not "
+                "been tested by us against the listing sites.",
+                level="warn",
+            ),
+        )
+
     try:
         settings = store.update(
             cloakbrowser_license_key=_keep(cloakbrowser_license_key, current.cloakbrowser_license_key),
@@ -614,6 +640,10 @@ async def save_cloakbrowser(
     report = await license_service.verify(
         settings.cloakbrowser_license_key, settings.cloakbrowser_version
     )
+    if report.ok and report.binary_path:
+        request.app.state.instances.note_binary(report.binary_path, settings)
+    elif not report.ok:
+        request.app.state.instances.forget_binary()
     return _render(
         request,
         Result("cloakbrowser", report.ok, report.message, report),

@@ -107,6 +107,9 @@ class TestStateless:
         assert "direct datacenter connection" in description
         assert "never bypassed with a direct retry" in description
         assert "must be configured" not in description
+        assert "public build" in description
+        assert "fewer" in description and "not been tested by us" in description
+        assert "never silently" in description
 
 
 class TestTheEndpointIsExactlySlashMcp:

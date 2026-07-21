@@ -110,7 +110,7 @@ async def lifespan(app: FastAPI):
         "ready: secret=%s license=%s proxy=%s notion=%s pool max=%d reserve=%d "
         "jobs=%d interrupted=%d oauth_clients=%d",
         "set" if secret else "MISSING",
-        "set" if settings.cloakbrowser_license_key else "MISSING",
+        "pro-key-saved" if settings.cloakbrowser_license_key else "public",
         settings.proxy_status(),
         "set" if settings.notion_configured() else "MISSING",
         settings.max_instances,

@@ -34,8 +34,8 @@ from ..models import (
     ServerInfo,
 )
 from ..services.geo import GeoUnresolved, ProxyUnreachable
-from ..services.instances import CapExceeded, PinUnavailable
-from ..services.license import LicenseNotConfigured, LicenseNotPro
+from ..services.instances import BrowserUnavailable, CapExceeded
+from ..services.license import LicenseNotPro
 from ..services.proxy import ProxyNotConfigured
 from ..services.scrape import NotionNotConfigured
 from ..services.tokens import OWNER
@@ -127,11 +127,10 @@ async def create_instance(request: Request, body: InstanceCreate) -> InstanceVie
         )
     except CapExceeded as exc:
         raise HTTPException(status_code=429, detail=str(exc)) from exc
-    except (LicenseNotConfigured, LicenseNotPro, ProxyNotConfigured, ProxyUnreachable,
-            GeoUnresolved, PinUnavailable) as exc:
-        # A missing or unusable licence is the first-boot footgun: without this it
-        # is a raw 500 the moment someone clicks "new browser" before setting up.
-        # Its message already names the fix ("Add it under Settings").
+    except (LicenseNotPro, ProxyNotConfigured, ProxyUnreachable,
+            GeoUnresolved, BrowserUnavailable) as exc:
+        # A present but unusable key must be a visible configuration failure,
+        # never a raw 500 or a silent downgrade to the public build.
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return instance_view(
         inst, secret=request.app.state.secret.current(), base_url=_base_url(request),

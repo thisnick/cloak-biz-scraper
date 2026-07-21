@@ -59,7 +59,9 @@ def _manager(tmp_path, monkeypatch, **settings_changes) -> tuple[InstanceManager
     displays = _Displays()
     manager.displays = displays
     monkeypatch.setattr(manager, "_alloc_cdp_port", lambda: 9333)
-    monkeypatch.setattr(instances, "resolve_pro_binary", lambda key, version: "/fake/pro")
+    monkeypatch.setattr(
+        instances, "resolve_browser_binary", lambda key, version: "/fake/pro"
+    )
     return manager, displays
 
 

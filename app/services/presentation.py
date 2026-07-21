@@ -17,16 +17,16 @@ import re
 #   "... Retry in a moment. To use the free binary instead, unset
 #    CLOAKBROWSER_LICENSE_KEY."
 #
-# Wrong three times over for this app, which is why it is worth intercepting
-# rather than tolerating:
+# Wrong for this app, which is why it is worth intercepting rather than
+# tolerating:
 #   1. There is no terminal to unset a variable from — Railway's user has a web
 #      form and nothing else.
 #   2. The variable is not set anyway. config.purge_binary_env() removes it at
 #      boot so a stale deploy-time value can never outrank the licence in the
 #      settings store, so "unset it" is already done and changes nothing.
-#   3. The escape hatch it offers does not exist here. This app launches the Pro
-#      binary and only the Pro binary; falling back to the free tier is not a
-#      mode we have, so following the advice could not help even if it worked.
+#   3. Public mode is a deliberate settings choice. A user who supplied a key
+#      asked for Pro, so quietly unsetting it would recreate the exact silent
+#      downgrade this app refuses.
 #
 # So a user who reads it goes hunting for a variable they cannot see, to enable a
 # fallback we do not implement, on a machine they cannot log into.
@@ -36,9 +36,10 @@ _FREE_BINARY_ADVICE = re.compile(
 )
 
 _ACTIONABLE = (
-    " This app only runs the licensed Pro browser. Check the licence key in Settings "
-    "is the one from your CloakBrowser account and has not expired; if it is correct, "
-    "this is usually temporary — wait a moment and verify again."
+    " This saved key will not be silently switched to the public build. Check the "
+    "licence key in Settings is the one from your CloakBrowser account and has not "
+    "expired; if it is correct, this is usually temporary — wait a moment and verify "
+    "again."
 )
 
 

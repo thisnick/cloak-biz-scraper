@@ -1,9 +1,9 @@
-"""The licence gate.
+"""The public/Pro selection and the keyed downgrade gate.
 
-The bug these exist to prevent: `ensure_binary` does not raise on a bad key, it
-returns the FREE browser. Anything that treats "it did not throw" as "Pro works"
-reports success while resolving a binary the Step 0 fonts gate never covered —
-which is the one conclusion this whole product rests on.
+Blank deliberately selects public. The bug these exist to prevent is narrower:
+`ensure_binary` does not raise on a bad *present* key, it returns public. Anything
+that treats "it did not throw" as "Pro works" silently downgrades someone who
+explicitly asked for Pro.
 """
 from __future__ import annotations
 
@@ -11,10 +11,9 @@ import pytest
 
 from app.services import license as license_service
 from app.services.license import (
-    LicenseNotConfigured,
     LicenseNotPro,
     is_pro,
-    resolve_pro_binary,
+    resolve_browser_binary,
 )
 
 # The real cache-directory names, measured in-container.
@@ -34,13 +33,15 @@ def package(monkeypatch):
     class Fake:
         info: object = Info(True)
         path: str = PRO
-        ensure_called: bool = False
+        validate_calls: list[str] = []
+        ensure_calls: list[tuple[str | None, str | None]] = []
 
         def validate_license(self, key):
+            self.validate_calls.append(key)
             return self.info
 
         def ensure_binary(self, license_key=None, browser_version=None):
-            self.ensure_called = True
+            self.ensure_calls.append((license_key, browser_version))
             return self.path
 
     fake = Fake()
@@ -62,26 +63,31 @@ class TestIsPro:
         assert not is_pro("/data/.cloakbrowser/chromium-1.2.3.4-proto/chrome")
 
 
-class TestResolveProBinary:
+class TestResolveBrowserBinary:
     def test_valid_key_returns_the_pro_path(self, package):
-        assert resolve_pro_binary("real-key") == PRO
+        assert resolve_browser_binary("real-key") == PRO
+        assert package.validate_calls == ["real-key"]
 
-    def test_empty_key_refuses(self, package):
-        with pytest.raises(LicenseNotConfigured):
-            resolve_pro_binary("")
+    def test_empty_key_deliberately_resolves_public_without_validation(self, package):
+        package.path = FREE
+        assert resolve_browser_binary("") == FREE
+        assert package.validate_calls == [], "public mode must not contact licensing"
+        assert package.ensure_calls == [(None, None)]
 
     def test_invalid_key_refuses_and_names_the_plan(self, package):
         package.info = Info(False, "unknown")
         with pytest.raises(LicenseNotPro, match="rejected this licence key"):
-            resolve_pro_binary("totally-bogus-key-123")
+            resolve_browser_binary("totally-bogus-key-123")
 
     def test_invalid_key_never_downloads_the_free_binary(self, package):
-        # Bailing before ensure_binary keeps 150 MB of a browser we refuse to run
-        # off the user's volume.
+        # This proves the keyed refusal occurs before the package's built-in
+        # public fallback. Removing the validation guard makes this call return
+        # FREE and this assertion fail.
         package.info = Info(False, "unknown")
+        package.path = FREE
         with pytest.raises(LicenseNotPro):
-            resolve_pro_binary("bogus")
-        assert not package.ensure_called
+            resolve_browser_binary("bogus")
+        assert package.ensure_calls == []
 
     def test_licensing_outage_with_nothing_cached_fails_closed(self, package):
         # validate_license returns None only when the server is unreachable AND
@@ -89,13 +95,18 @@ class TestResolveProBinary:
         # is precisely when ensure_binary hands back free 146.
         package.info = None
         with pytest.raises(LicenseNotPro, match="licensing server did not respond"):
-            resolve_pro_binary("real-key")
+            resolve_browser_binary("real-key")
 
     def test_free_path_refused_even_when_validation_says_yes(self, package):
         # The claim and the artefact disagree; believe the artefact.
         package.path = FREE
         with pytest.raises(LicenseNotPro, match="not the Pro build"):
-            resolve_pro_binary("real-key")
+            resolve_browser_binary("real-key")
+
+    def test_blank_mode_will_not_mislabel_a_pro_artifact_public(self, package):
+        package.path = PRO
+        with pytest.raises(RuntimeError, match="Refusing to mislabel"):
+            resolve_browser_binary("")
 
 
 class TestVerifyReportsHonestly:
@@ -105,6 +116,7 @@ class TestVerifyReportsHonestly:
         assert report.ok
         assert report.version == "148.0.7778.215.5"
         assert "Pro" in report.message
+        assert report.pro is True and report.binary_path == PRO
 
     @pytest.mark.asyncio
     async def test_bogus_key_is_never_reported_as_accepted(self, package):
@@ -132,12 +144,31 @@ class TestVerifyReportsHonestly:
         assert "accepted" not in report.message.lower()
 
     @pytest.mark.asyncio
-    async def test_no_key_asks_for_one(self, package):
+    async def test_no_key_reports_the_public_build_and_caveat(self, package):
+        package.path = FREE
         report = await license_service.verify("")
-        assert not report.ok and "No licence key yet" in report.message
+        assert report.ok and report.pro is False and report.binary_path == FREE
+        assert "public build" in report.message
+        assert "fewer bypasses" in report.message
+        assert "not been tested by us against the listing sites" in report.message
 
 
-class TestLaunchRefusesFree:
+class TestLaunchSelection:
+    def test_resolved_status_is_invalidated_when_the_selected_key_changes(self, tmp_path):
+        from app.services.instances import InstanceManager
+        from app.services.settings import SettingsService
+
+        store = SettingsService(tmp_path / "settings.json", tmp_path / ".dek")
+        manager = InstanceManager(store)
+        public = store.load()
+        manager.note_binary(FREE, public)
+        assert manager.binary_path_for(public) == FREE
+
+        keyed = store.update(cloakbrowser_license_key="a-new-key")
+        assert manager.binary_path_for(keyed) is None, (
+            "a path resolved for public mode must never make a new key look verified"
+        )
+
     @pytest.mark.asyncio
     async def test_an_invalid_key_cannot_launch(self, package, tmp_path, monkeypatch):
         """instances.py guarded only the EMPTY key, so an invalid one launched
@@ -159,3 +190,54 @@ class TestLaunchRefusesFree:
         with pytest.raises(LicenseNotPro):
             await manager.launch(InstanceCreate(profile="x"), origin="interactive")
         assert len(manager.running) == 0, "a refused launch must not hold a pool slot"
+
+    @pytest.mark.asyncio
+    async def test_blank_key_launches_public_and_is_passed_blank_to_browser(
+        self, package, tmp_path, monkeypatch
+    ):
+        """Drive the real manager boundary, not just the resolver in isolation."""
+        from app.models import InstanceCreate
+        from app.services.instances import InstanceManager
+        from app.services.profiles import ProfileStore
+        from app.services.settings import SettingsService
+
+        package.path = FREE
+        store = SettingsService(tmp_path / "settings.json", tmp_path / ".dek")
+        manager = InstanceManager(store)
+        manager.profiles = ProfileStore(tmp_path / "profiles")
+
+        class Displays:
+            async def allocate(self):
+                return 100
+
+            async def start(self, number, width, height):
+                return None
+
+            async def stop(self, number):
+                return None
+
+        class Context:
+            def on(self, event, callback):
+                pass
+
+            async def close(self):
+                pass
+
+        manager.displays = Displays()
+        monkeypatch.setattr(manager, "_alloc_cdp_port", lambda: 9333)
+
+        import cloakbrowser
+
+        launch_calls = []
+
+        async def launch(**kwargs):
+            launch_calls.append(kwargs)
+            return Context()
+
+        monkeypatch.setattr(cloakbrowser, "launch_persistent_context_async", launch)
+
+        inst = await manager.launch(InstanceCreate(profile="Default"), origin="interactive")
+        assert inst.id in manager.running
+        assert launch_calls[0]["license_key"] is None
+        assert manager.binary_path_for(store.load()) == FREE
+        assert package.validate_calls == [], "blank launch must not validate a licence"

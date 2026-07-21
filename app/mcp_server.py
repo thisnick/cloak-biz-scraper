@@ -184,7 +184,11 @@ def build(app) -> FastMCP:
     ) -> InstanceView:
         """Launch a cloaked, anti-detection browser (CloakBrowser).
 
-        It carries a real, consistent browser fingerprint. If an Evomi proxy is
+        It carries a real, consistent browser fingerprint. With no CloakBrowser
+        key configured it deliberately runs the public build, which has fewer
+        bypasses and has not been tested by us against the listing sites. A
+        saved key must resolve Pro or launch fails visibly; it is never silently
+        downgraded to public. If an Evomi proxy is
         configured, it exits through that residential IP, which is recommended
         for listing sites that block datacenter addresses. Without a proxy it
         launches through this server's direct datacenter connection. A proxy
@@ -295,8 +299,9 @@ def build(app) -> FastMCP:
 
         Read-only, and carries no secrets — status and versions only. Useful to
         check before a sweep or a browser launch: whether the optional residential
-        proxy is direct/configured/working, whether a CloakBrowser Pro licence is
-        configured, how many browser slots are free, and whether Notion is connected.
+        proxy is direct/configured/working, whether the selected CloakBrowser build
+        is public, resolved Pro, or has an unverified Pro key, how many browser slots
+        are free, and whether Notion is connected.
         """
         from .services.views import server_info as build_server_info
 

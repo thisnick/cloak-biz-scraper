@@ -28,6 +28,7 @@ Two consumer classes share one memory-bound pool via a reservation:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import socket
@@ -41,7 +42,7 @@ from ..config import CONFIG
 from . import geo
 from .display import DisplayManager
 from .geo import GeoUnresolved
-from .license import resolve_pro_binary
+from .license import LicenseNotPro, resolve_browser_binary
 from .profiles import ProfileStore
 from .proxy import ProxyParts, build_proxy_url, masked
 from .settings import SettingsService
@@ -60,7 +61,11 @@ class CapExceeded(RuntimeError):
     pass
 
 
-class PinUnavailable(RuntimeError):
+class BrowserUnavailable(RuntimeError):
+    """The selected browser could not be resolved or launched."""
+
+
+class PinUnavailable(BrowserUnavailable):
     """The pinned version could not be downloaded."""
 
 
@@ -92,6 +97,17 @@ def _diagnose_pin(exc: BaseException, pin: str) -> str | None:
         f"in Settings to track the latest build instead. "
         f"(Resolved platform: {get_platform_tag()}. Underlying error: {exc})"
     )
+
+
+def _browser_error(exc: BaseException, pin: str) -> BrowserUnavailable:
+    """Make package/download failures safe and actionable at every launch edge."""
+    diagnosis = _diagnose_pin(exc, pin)
+    if diagnosis:
+        return PinUnavailable(diagnosis)
+
+    from .presentation import humanize_binary_error
+
+    return BrowserUnavailable(humanize_binary_error(str(exc)))
 
 
 @dataclass
@@ -151,6 +167,34 @@ class InstanceManager:
         self._cond = asyncio.Condition()
         self._pending: dict[str, int] = {"task": 0, "interactive": 0}
         self._next_cdp = _BASE_CDP_PORT
+        # Status only; never stores the key. The fingerprint lets server_info
+        # reject a stale result after the user changes keys without disclosing
+        # either value. The path is what was actually resolved, and therefore
+        # the only honest source for public-vs-Pro labelling.
+        self._last_binary_path: str | None = None
+        self._last_binary_selection: tuple[str, str] | None = None
+
+    @staticmethod
+    def _binary_selection(settings) -> tuple[str, str]:
+        key_hash = hashlib.sha256(settings.cloakbrowser_license_key.encode()).hexdigest()
+        return key_hash, settings.cloakbrowser_version
+
+    def note_binary(self, path: str, settings=None) -> None:
+        """Remember a successfully resolved artifact for secret-free status."""
+        settings = settings or self._settings.load()
+        self._last_binary_path = path
+        self._last_binary_selection = self._binary_selection(settings)
+
+    def forget_binary(self) -> None:
+        """Drop status after a verification failure for the same saved key."""
+        self._last_binary_path = None
+        self._last_binary_selection = None
+
+    def binary_path_for(self, settings) -> str | None:
+        """Return the resolved path only while it matches current settings."""
+        if self._last_binary_selection != self._binary_selection(settings):
+            return None
+        return self._last_binary_path
 
     # ── capacity accounting (call under self._cond) ──────────────────────────
     def _running_by(self, origin: str) -> int:
@@ -235,17 +279,21 @@ class InstanceManager:
 
         settings = self._settings.load()
 
-        # Resolve the binary before anything else, and refuse anything but Pro.
-        # Guarding only the *empty* key is not enough: an invalid one does not
-        # raise, it silently resolves the free browser — which is a different,
-        # older binary that the Step 0 fonts gate never covered. Cheap to do
-        # here: every launch path calls ensure_binary anyway, so this hits the
-        # same cache a moment earlier and simply looks at what came back.
-        await asyncio.to_thread(
-            resolve_pro_binary,
-            settings.cloakbrowser_license_key,
-            settings.cloakbrowser_version,
-        )
+        # Resolve the selected build before anything else. Blank key is the
+        # deliberate public mode; a present key must resolve Pro or fail rather
+        # than letting the package silently downgrade it. Cheap to do here:
+        # every launch calls ensure_binary anyway, so this hits the same cache a
+        # moment earlier and gives us the artifact path as status ground truth.
+        try:
+            binary_path = await asyncio.to_thread(
+                resolve_browser_binary,
+                settings.cloakbrowser_license_key,
+                settings.cloakbrowser_version,
+            )
+        except LicenseNotPro:
+            raise
+        except Exception as exc:
+            raise _browser_error(exc, settings.cloakbrowser_version) from exc
         # No proxy fields is an intentional, supported direct mode. Any partial
         # configuration still raises here: a typo or half-filled form must never
         # be reinterpreted as permission to bypass the proxy.
@@ -321,16 +369,17 @@ class InstanceManager:
                     proxy=proxy_url, args=args, timezone=tz, locale=locale,
                     humanize=req.humanize, human_preset=req.human_preset, geoip=launch_geoip,
                     viewport=None, env={**os.environ, "DISPLAY": f":{display}"},
-                    license_key=settings.cloakbrowser_license_key,
+                    license_key=settings.cloakbrowser_license_key.strip() or None,
                     browser_version=settings.cloakbrowser_version or None)
             except Exception as exc:
-                diagnosis = _diagnose_pin(exc, settings.cloakbrowser_version)
-                if diagnosis:
-                    raise PinUnavailable(diagnosis) from exc
-                raise
+                raise _browser_error(exc, settings.cloakbrowser_version) from exc
         except BaseException:
             await self.displays.stop(display)
             raise
+
+        # Record only after the browser itself launched. A successful download
+        # followed by a launch failure is not a running-build status.
+        self.note_binary(binary_path, settings)
 
         now_wall, now_mono = time.time(), time.monotonic()
         inst = Instance(

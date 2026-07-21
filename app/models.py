@@ -1,6 +1,8 @@
 """Request/response models shared by the service layer and its façades."""
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 from .config import CONFIG
@@ -222,8 +224,14 @@ class ProxyInfo(BaseModel):
 
 
 class BrowserInfo(BaseModel):
-    pro: bool = Field(description="Whether a CloakBrowser Pro licence is configured. "
-                      "This app never runs the free browser.")
+    build: Literal["public", "pro", "pro-unverified"] = Field(
+        description="Selected/resolved build: public, pro, or pro-unverified."
+    )
+    pro: bool | None = Field(
+        description="True/false only after the selected artifact is known (or public was "
+                    "explicitly selected); null means a Pro key is saved but has not been "
+                    "resolved successfully in this process."
+    )
     version: str = Field(description="The running or pinned CloakBrowser version, or 'latest'.")
     windows_fonts: str = Field(description="Windows-font availability. Not bundled — they are "
                                "proprietary and, per the fonts gate, not required for the "
@@ -255,7 +263,8 @@ class Health(BaseModel):
     service: str = "cloak-biz-scraper"
     version: str
     configured: bool = Field(
-        description="Whether settings currently required to launch a browser are present. "
-        "The recommended residential proxy is optional and does not affect health."
+        description="Whether launch settings are structurally complete. A licence and "
+                    "residential proxy are optional; a partial proxy is not. This does not "
+                    "retest a saved key or proxy."
     )
     instances: int = 0

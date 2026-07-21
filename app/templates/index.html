@@ -98,8 +98,8 @@
             <li class="{{ 'done' if has_license else 'todo' }}">
               {% if has_license %}<svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M20 6 9 17l-5-5"/></svg>
               {% else %}<svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 8v4"/><path d="M12 16h.01"/></svg>{% endif %}
-              <div class="g"><b>CloakBrowser licence</b><span>{{ 'Saved.' if has_license else 'The cloaked browser won’t launch without it.' }}</span></div>
-              {% if not has_license %}<a data-nav="settings" href="#">Add →</a>{% endif %}
+              <div class="g"><b>CloakBrowser licence</b><span>{{ 'Pro key saved.' if has_license else "Without a key you're on the public build, which gets past fewer bot detectors. We have not tested it against listing sites." }}</span></div>
+              {% if not has_license %}<a data-nav="settings" href="#">Add Pro key →</a>{% endif %}
             </li>
             <li class="{{ 'done' if s.proxy_configured() else 'todo' }}">
               {% if s.proxy_configured() %}<svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M20 6 9 17l-5-5"/></svg>
@@ -411,17 +411,23 @@
               <svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 8h18"/></svg>
               <span class="h-title">Browser licence</span>
               <div class="h-right">
-                <span class="chip {{ 'ok' if has_license else 'bad' }}">{{ 'Licence saved' if has_license else 'No licence' }}</span>
+                {% if browser.build == 'pro' %}
+                  <span class="chip ok">Pro build</span>
+                {% elif browser.build == 'pro-unverified' %}
+                  <span class="chip warn">Pro key saved</span>
+                {% else %}
+                  <span class="chip warn">Public build</span>
+                {% endif %}
                 <svg class="chev" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M9 6l6 6-6 6"/></svg>
               </div>
             </button>
             <div class="acc-body">
-              <p class="lead-help">Your CloakBrowser Pro key. The browser (~150 MB) downloads on demand and stays on this server's disk — verifying fetches it now, so your first scrape doesn't wait.</p>
+              <p class="lead-help">Your CloakBrowser key. It works without one — you'll get the public build, which gets past fewer bot detectors. A Pro key unlocks the private builds with more bypasses. <a href="https://cloakbrowser.dev/" target="_blank" rel="noreferrer">Get a key →</a> We have not tested the public build against listing sites.</p>
               {{ banner('cloakbrowser') }}
               {% if result and result.section == 'cloakbrowser' and result.ok and result.detail and result.detail.version %}
                 <p class="lead-help mono">Resolved version: {{ result.detail.version }} · cached in {{ result.detail.cache_dir }}</p>
               {% endif %}
-              <form method="post" action="/settings/cloakbrowser">
+              <form method="post" action="/settings/cloakbrowser" id="licence-form">
                 <div class="field"><label>Licence key</label>
                   <input type="password" name="cloakbrowser_license_key" autocomplete="off"
                          placeholder="{{ '•••••••••• (saved — leave blank to keep it)' if has_license else 'cb_...' }}"></div>
@@ -431,7 +437,9 @@
                 <div class="btnrow">
                   <button class="btn" type="submit" name="action" value="save">Save</button>
                   <button class="btn primary" type="submit" name="action" value="verify">Save &amp; verify</button>
+                  {% if has_license %}<button class="btn" type="submit" name="action" value="public">Use public build</button>{% endif %}
                 </div>
+                <div class="help" id="licence-wait" role="status" hidden>Getting the browser — about ten seconds. This download happens once.</div>
               </form>
             </div>
           </div>
@@ -675,6 +683,16 @@
     document.querySelectorAll('.acc-head').forEach(function(h){h.addEventListener('click',function(){h.parentElement.classList.toggle('open');});});
     var cb=document.getElementById('copybtn');
     if(cb)cb.addEventListener('click',function(){var u=document.getElementById('mcpurl').textContent;try{navigator.clipboard.writeText(u);}catch(e){}var o=cb.textContent;cb.textContent='Copied';setTimeout(function(){cb.textContent=o;},1400);});
+    // Verification downloads the selected build on first use. Make the wait
+    // explicit so a ten-second request does not look like a dead button.
+    var lf=document.getElementById('licence-form');
+    if(lf)lf.addEventListener('submit',function(e){
+      var b=e.submitter;
+      if(!b||b.value!=='verify')return;
+      lf.querySelectorAll('button').forEach(function(x){x.disabled=true;});
+      b.textContent='Getting browser — about ten seconds…';
+      var w=document.getElementById('licence-wait');if(w)w.hidden=false;
+    });
     // New-browser dialog: pick a profile (or type a new one) before opening.
     var nbo=document.getElementById('nb-open'), nbd=document.getElementById('nb-dialog');
     if(nbo&&nbd&&nbd.showModal){

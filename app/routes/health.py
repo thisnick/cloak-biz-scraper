@@ -17,11 +17,9 @@ async def healthz(request: Request) -> Health:
     instances = request.app.state.instances
     return Health(
         version=__version__,
-        # A residential proxy improves anti-bot success but is not required to
-        # launch: direct server egress is a complete configuration too.
-        configured=(
-            bool(settings.cloakbrowser_license_key)
-            and settings.proxy_status() != "incomplete"
-        ),
+        # Public CloakBrowser and direct egress are both deliberate modes. The
+        # one shape that is not launchable is a half-entered proxy: it must fail
+        # visibly rather than being mistaken for permission to go direct.
+        configured=settings.proxy_status() != "incomplete",
         instances=len(instances.running),
     )

@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 from app.main import app
 
 
-def test_healthz_is_ok_with_nothing_configured():
+def test_healthz_is_ok_and_public_direct_is_a_complete_mode():
     # The deploy must come up before the user has filled in a single setting;
     # otherwise Railway marks it unhealthy and they never reach the form.
     with TestClient(app) as client:
@@ -14,7 +14,7 @@ def test_healthz_is_ok_with_nothing_configured():
     assert response.status_code == 200
     body = response.json()
     assert body["ok"] is True
-    assert body["configured"] is False
+    assert body["configured"] is True
     assert body["instances"] == 0
 
 
@@ -33,6 +33,17 @@ def test_healthz_does_not_treat_the_optional_proxy_as_required():
     with TestClient(app) as client:
         app.state.settings.update(
             cloakbrowser_license_key="cb_present",
+            proxy_user="", proxy_password="", proxy_host="", proxy_port="",
+        )
+        response = client.get("/healthz")
+    assert response.status_code == 200
+    assert response.json()["configured"] is True
+
+
+def test_healthz_does_not_treat_a_licence_as_required():
+    with TestClient(app) as client:
+        app.state.settings.update(
+            cloakbrowser_license_key="",
             proxy_user="", proxy_password="", proxy_host="", proxy_port="",
         )
         response = client.get("/healthz")

@@ -15,9 +15,10 @@ It is your server, your Notion, your data. Nobody else's account is involved and
 there is nothing to log into but your own. Setting it up is a deploy button and
 four web forms — **no terminal, ever.**
 
-You bring three things you already pay for or can sign up for in a few minutes: a
-CloakBrowser Pro licence, a residential proxy account, and a Notion workspace.
-See **What you need before you start**.
+For the strongest listing-site setup, bring a CloakBrowser Pro licence, a
+residential proxy account, and a Notion workspace. The server can also run the
+public CloakBrowser build without a key; it has fewer bypasses and has not been
+tested by us against the listing sites. See **What you need before you start**.
 
 > **Status: not shippable yet.** The server itself is built and tested — the
 > browser core, the settings UI, the Notion store, the scrape and archive tools,
@@ -44,9 +45,9 @@ for sale this week. This packages the hard part.
 - The browser core: a pool of stealth Chromium instances, one Evomi sticky-session
   residential proxy each, with a reserve so interactive sessions are never starved
   by a batch sweep.
-- On-demand download of the CloakBrowser Pro binary into the volume.
-- **A settings UI** behind a login: licence (with a "verify" that proves the key
-  works and pre-downloads the browser), proxy (with a "test" that reports the
+- On-demand download of the selected public or Pro CloakBrowser build into the volume.
+- **A settings UI** behind a login: licence (with a "verify" that proves the
+  selected build works and pre-downloads it), proxy (with a "test" that reports the
   measured exit IP and geo), Notion, pool sizes, and secret rotation.
 - **The Notion store**: pick an existing database and see exactly what its schema
   is missing, or create one explicitly. Never auto-created; never writes a column
@@ -76,10 +77,11 @@ testing against real ChatGPT or Claude connectors.
 Four things. Read the proxy one **before you buy a proxy** — it rules some
 providers out entirely, and you cannot work around it afterwards.
 
-**1. A CloakBrowser Pro licence.** You buy this yourself and paste it into the
-settings page; the browser downloads itself onto your server the first time you
-verify the licence. Pro is required — the free build is a different, older
-browser that we have not tested against these sites.
+**1. Optional: a CloakBrowser Pro licence.** Leave the key blank to deliberately
+use the public build. It has fewer bypasses and we have not tested it against the
+listing sites. A Pro key unlocks CloakBrowser's private builds with more bypasses;
+paste it into Settings and verify it before scraping. A present but invalid or
+expired key is a visible error and never silently falls back to public.
 
 > **If your licence has an expiry date, know this one thing.** Your server caches
 > the licence check, so if CloakBrowser's servers go down, your scraping keeps
@@ -154,7 +156,7 @@ templates cannot carry the setting at all. (We checked all 1500 public templates
 not one has it. `docs/railway-template.md` has the evidence.)
 
 **4. Open the app and finish in the browser.** Go to your Railway URL, log in with
-`APP_SECRET`, and fill in the settings pages: your CloakBrowser licence, your
+`APP_SECRET`, and fill in the settings pages: your optional CloakBrowser licence, your
 proxy, and your Notion workspace. Each page tests itself and tells you what it
 actually found.
 
@@ -386,8 +388,9 @@ unknown rather than defaulted to something plausible.
 
 **The binary is not in the image.** The Pro Chromium is proprietary and
 non-redistributable, and a mounted volume shadows the image layer anyway, so
-baking it in was always pointless. The `cloakbrowser` package downloads it on
-first launch into `/data/.cloakbrowser` and reuses it forever after. One
+baking any build in was always pointless. The `cloakbrowser` package downloads
+the selected public or Pro build on first launch into `/data/.cloakbrowser` and
+reuses it afterward. One
 consequence worth knowing: **unpinned tracks the latest build, pinned does not.**
 Set a pin in settings to freeze it.
 
@@ -405,7 +408,7 @@ derived from `APP_SECRET`, so rotating the secret never strands the settings.
 Needs Docker. You do not need a Python environment on your machine.
 
 ```bash
-cp .env.example .env     # fill in your license + proxy
+cp .env.example .env     # optional: add a Pro licence and proxy
 docker compose up -d
 curl localhost:18800/healthz
 open http://localhost:18800   # log in with APP_SECRET

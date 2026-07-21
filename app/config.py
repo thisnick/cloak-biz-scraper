@@ -88,11 +88,11 @@ CONFIG = Config.from_env()
 def bootstrap_binary_cache() -> Path:
     """Point cloakbrowser's binary cache at the volume.
 
-    The package downloads the Pro Chromium on demand; without this it would land
-    in ~/.cloakbrowser inside the container's ephemeral layer and be re-fetched
-    (~150 MB) after every sleep or redeploy. get_cache_dir() reads this variable
-    on each call, so setting it before the first launch is sufficient — but we do
-    it at process start so there is one obvious place it happens.
+    The package downloads the selected public or Pro Chromium on demand; without
+    this it would land in ~/.cloakbrowser inside the container's ephemeral layer
+    and be re-fetched after every sleep or redeploy. get_cache_dir() reads this
+    variable on each call, so setting it before the first launch is sufficient —
+    but we do it at process start so there is one obvious place it happens.
     """
     cache = CONFIG.binary_cache_dir
     cache.mkdir(parents=True, exist_ok=True)

@@ -91,16 +91,6 @@ def server_info(settings, instances) -> ServerInfo:
     cloakbrowser_license_key, or notion_api_token.
     """
     counts = instances.counts()
-    # Cache-only: reports the version already on disk, if any; never downloads.
-    version = (settings.cloakbrowser_version or "").strip() or "latest"
-    try:
-        from cloakbrowser import binary_info
-
-        info = binary_info(settings.cloakbrowser_version or None)
-        if info.get("installed") and info.get("version"):
-            version = info["version"]
-    except Exception:  # noqa: BLE001 — an info snapshot never fails on this
-        pass
 
     proxy_configured = settings.proxy_configured()
     return ServerInfo(
@@ -113,15 +103,51 @@ def server_info(settings, instances) -> ServerInfo:
             country=(settings.proxy_country or None) if proxy_configured else None,
             region=(settings.proxy_region or None) if proxy_configured else None,
         ),
-        browser=BrowserInfo(
-            pro=bool(settings.cloakbrowser_license_key),
-            version=version,
-            windows_fonts="not bundled",
-        ),
+        browser=browser_info(settings, instances),
         pool=PoolInfo(
             max=counts["max"],
             reserved=counts["reserve"],
             in_use=counts["total"],
         ),
         notion=NotionInfo(connected=settings.notion_configured()),
+    )
+
+
+def browser_info(settings, instances) -> BrowserInfo:
+    """The selected build without confusing a saved key with a Pro artifact.
+
+    `cloakbrowser.binary_info()` prefers any cached Pro binary, even when the
+    current settings deliberately select the public build, so it cannot answer
+    this question on a volume that has used both modes. The manager remembers
+    the exact path returned for the current key fingerprint + pin; `is_pro(path)`
+    is then the ground truth. Before a keyed build resolves, status stays
+    `pro-unverified` rather than claiming that the key worked.
+    """
+    from .license import _version_from_path, is_pro
+
+    path = None
+    get_path = getattr(instances, "binary_path_for", None)
+    if callable(get_path):
+        path = get_path(settings)
+
+    if path:
+        pro = is_pro(path)
+        build = "pro" if pro else "public"
+        version = _version_from_path(path)
+    elif settings.cloakbrowser_license_key:
+        pro = None
+        build = "pro-unverified"
+        version = settings.cloakbrowser_version or "latest"
+    else:
+        # Blank key is itself the deliberate public selection. There is no
+        # licensing-server outcome that can turn it into Pro.
+        pro = False
+        build = "public"
+        version = settings.cloakbrowser_version or "latest"
+
+    return BrowserInfo(
+        build=build,
+        pro=pro,
+        version=version,
+        windows_fonts="not bundled",
     )

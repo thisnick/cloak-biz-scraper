@@ -14,6 +14,8 @@ SECRET = "test-secret-value-long-enough"
 LICENSE = "LICENSE-SECRET-abc123"
 PROXY_PW = "PROXY-PASSWORD-xyz789"
 NOTION_TOK = "NOTION-TOKEN-qwerty"
+PRO_PATH = "/data/.cloakbrowser/chromium-148.0.7778.215.2-pro/chrome"
+PUBLIC_PATH = "/data/.cloakbrowser/chromium-146.0.7680.177.3/chrome"
 
 
 def _settings() -> Settings:
@@ -28,12 +30,16 @@ def _settings() -> Settings:
 
 
 class _FakeInstances:
-    def __init__(self, in_use=2):
+    def __init__(self, in_use=2, binary_path=None):
         self._in_use = in_use
+        self._binary_path = binary_path
 
     def counts(self):
         return {"task": 1, "interactive": 1, "total": self._in_use,
                 "max": 4, "task_budget": 3, "reserve": 1}
+
+    def binary_path_for(self, settings):
+        return self._binary_path
 
 
 class TestNoSecretLeaks:
@@ -41,17 +47,18 @@ class TestNoSecretLeaks:
     at any depth — ever appears in the serialized snapshot."""
 
     def test_the_serialized_snapshot_contains_no_secret_value(self):
-        info = server_info(_settings(), _FakeInstances())
+        info = server_info(_settings(), _FakeInstances(binary_path=PRO_PATH))
         blob = info.model_dump_json()
         for secret in (LICENSE, PROXY_PW, NOTION_TOK):
             assert secret not in blob, f"a secret leaked into server_info: {secret!r}"
 
     def test_status_is_reported_without_the_secret_that_produced_it(self):
-        info = server_info(_settings(), _FakeInstances())
-        # Configured and pro are TRUE — derived from secrets that are set — but the
-        # secrets themselves are absent (checked above).
+        info = server_info(_settings(), _FakeInstances(binary_path=PRO_PATH))
+        # Pro is TRUE because the resolved path says so, not because a secret is
+        # merely present; the secrets themselves remain absent (checked above).
         assert info.proxy.configured is True
         assert info.browser.pro is True
+        assert info.browser.build == "pro"
         assert info.notion.connected is True
 
 
@@ -70,7 +77,19 @@ class TestSnapshotContent:
         assert info.proxy.configured is False and info.proxy.status == "direct"
         assert info.proxy.country is None and info.proxy.region is None
         assert info.browser.pro is False
+        assert info.browser.build == "public"
         assert info.notion.connected is False
+
+    def test_a_saved_key_is_not_called_pro_before_its_artifact_resolves(self):
+        info = server_info(_settings(), _FakeInstances(binary_path=None))
+        assert info.browser.pro is None
+        assert info.browser.build == "pro-unverified"
+
+    def test_a_resolved_public_path_is_labelled_public(self):
+        info = server_info(Settings(), _FakeInstances(binary_path=PUBLIC_PATH))
+        assert info.browser.pro is False
+        assert info.browser.build == "public"
+        assert info.browser.version == "146.0.7680.177.3"
 
     def test_partial_proxy_is_not_misreported_as_direct_or_located(self):
         info = server_info(Settings(proxy_user="u"), _FakeInstances(in_use=0))
