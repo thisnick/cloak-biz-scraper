@@ -37,6 +37,24 @@ CONTENT_SECURITY_POLICY = "; ".join(
     )
 )
 
+# The OAuth authorization pages submit a login form that, on success, redirects
+# the browser to the *client's* registered callback (e.g. claude.ai) — a
+# cross-origin navigation.  Chromium enforces ``form-action`` across that
+# redirect, so ``form-action 'self'`` would block the whole OAuth flow and no
+# ChatGPT/Claude connector could ever finish authorizing.  The redirect target
+# is already validated server-side (the AS only ever redirects to a registered
+# ``redirect_uri``), which is the real control — so ``form-action`` is dropped
+# for these paths only.  Every other page, including the dashboard login, keeps
+# the strict policy.
+_CSP_OAUTH = "; ".join(
+    d for d in CONTENT_SECURITY_POLICY.split("; ") if not d.startswith("form-action")
+)
+_OAUTH_PREFIX = "/authorize"
+
+
+def _csp_for(path: str) -> str:
+    return _CSP_OAUTH if path.startswith(_OAUTH_PREFIX) else CONTENT_SECURITY_POLICY
+
 _NO_STORE = "no-store"
 _HSTS = "max-age=31536000"
 # ``no-referrer`` looks stricter, but Fetch uses the active referrer policy when
@@ -78,6 +96,7 @@ class ResponseSecurity:
             return
 
         is_https = _external_scheme(scope) == "https"
+        csp = _csp_for(scope.get("path", ""))
 
         async def send_hardened(message: Message) -> None:
             if message["type"] == "http.response.start":
@@ -85,7 +104,7 @@ class ResponseSecurity:
                 headers["X-Content-Type-Options"] = "nosniff"
                 headers["Referrer-Policy"] = REFERRER_POLICY
                 headers["X-Frame-Options"] = "SAMEORIGIN"
-                headers["Content-Security-Policy"] = CONTENT_SECURITY_POLICY
+                headers["Content-Security-Policy"] = csp
 
                 # Treat every route as sensitive by default so a new endpoint
                 # cannot forget to opt in.  This deliberately includes noVNC:

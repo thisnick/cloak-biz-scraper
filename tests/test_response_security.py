@@ -49,6 +49,19 @@ class TestAppWidePolicy:
         _assert_browser_hardening(response)
         assert response.headers["cache-control"] == "no-store"
 
+    def test_oauth_pages_drop_form_action_so_the_client_callback_is_not_blocked(self, client):
+        # The /authorize login form, on success, redirects the browser to the MCP
+        # client's registered callback (cross-origin, e.g. claude.ai). Chromium
+        # enforces form-action ACROSS that redirect, so a strict form-action would
+        # block every ChatGPT/Claude connector from finishing auth. These paths
+        # must omit form-action while keeping the rest of the hardening; the
+        # redirect_uri is validated server-side, which is the real control.
+        csp = client.get("/authorize/login").headers["content-security-policy"]
+        assert "form-action" not in csp
+        assert "default-src 'self'" in csp and "frame-ancestors 'self'" in csp
+        # Every non-OAuth page — including the dashboard login — keeps it strict.
+        assert "form-action 'self'" in client.get("/login").headers["content-security-policy"]
+
     def test_https_gets_hsts_without_claiming_subdomains(self, client):
         value = client.get("/healthz").headers["strict-transport-security"]
         assert value == "max-age=31536000"
