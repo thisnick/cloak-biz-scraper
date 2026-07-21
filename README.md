@@ -81,9 +81,6 @@ approve, and the tools appear.
 **Organization settings → Connectors**.
 [Anthropic's connector docs](https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp).
 
-*Claude Code:* its default tool timeout is 60s; `archive_page` runs ~20s, comfortably
-inside it. Raise it with `MCP_TOOL_TIMEOUT=180000` if you ever need to.
-
 ## What you can do
 
 Once it's connected, just ask:
@@ -110,16 +107,7 @@ Once it's connected, just ask:
 ## Security
 
 Your licence key, proxy password, and Notion token are stored on the volume, **encrypted
-at rest** with a volume-local key. Honest limit: the key sits on the same volume as the
-data, so it guards against *casual* exposure — a disk snapshot, a stray backup — not
-against someone who can already read your volume or sign into your dashboard. That's
-inherent to self-hosting.
-
-We verify that secrets are **never echoed** back into the settings form, **never logged**
-(proxy URLs masked, licence keys hashed), and **never returned by the status API**;
-`.env` is gitignored (this repo is public); the browser egresses only through your proxy
-(or, with none configured, the datacenter address — a broken proxy fails closed); and
-CDP/live-view tokens expire in ten minutes.
+at rest** with a volume-local key.
 
 **Developing against it:** run the tests locally and in the container (`docker compose up`,
 then `pytest`), keep MCP and REST returning identical payloads, and expect an adversarial
