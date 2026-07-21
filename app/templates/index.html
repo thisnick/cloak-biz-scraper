@@ -224,13 +224,13 @@
               <div class="pane-slot">This browser has no live view.<br>It fell back to a plain display.</div>
               {% endif %}
               <div class="bctrl">
-                <div class="kv"><span class="k">Doing</span><span class="v">{% if i.origin=='task' %}Running a sweep{% else %}<small>you opened this</small>{% endif %}</span></div>
-                <div class="kv"><span class="k">Open for</span><span class="v">{{ dur(i.age_sec) }}</span></div>
-                <div class="kv"><span class="k">Connection &amp; location</span><span class="v">{% if i.proxy_ip %}Proxy · {{ i.timezone or 'unknown' }}{% if i.locale %} · {{ i.locale }}{% endif %}{% else %}Direct · server location not measured{% endif %}</span></div>
-                <div class="btnrow">
+                <div class="btnrow bctrl-actions">
                   {% if i.origin != 'task' and i.vnc_url %}
                   <button class="btn ctl-btn" type="button" data-control-for="{{ i.instance_id }}">Take control</button>
                   <button class="btn kbd-btn" type="button" data-keyboard-for="{{ i.instance_id }}" hidden>⌨ Keyboard</button>
+                  {% endif %}
+                  {% if i.vnc_url %}
+                  <button class="btn fs-btn" type="button" data-fs-for="{{ i.instance_id }}">⛶ Full screen</button>
                   {% endif %}
                   <form method="post" action="/sessions/instances/{{ i.instance_id }}/close">
                     <button class="btn danger" type="submit">Close</button>
@@ -239,6 +239,9 @@
                 {% if i.origin != 'task' and i.vnc_url %}
                 <p class="ctl-note">Take control gives you full keyboard and mouse. This browser holds any configured proxy credentials and signed-in sessions, so control is off until you ask for it.</p>
                 {% endif %}
+                <div class="kv"><span class="k">Doing</span><span class="v">{% if i.origin=='task' %}Running a sweep{% else %}<small>you opened this</small>{% endif %}</span></div>
+                <div class="kv"><span class="k">Open for</span><span class="v">{{ dur(i.age_sec) }}</span></div>
+                <div class="kv"><span class="k">Connection &amp; location</span><span class="v">{% if i.proxy_ip %}Proxy · {{ i.timezone or 'unknown' }}{% if i.locale %} · {{ i.locale }}{% endif %}{% else %}Direct · server location not measured{% endif %}</span></div>
               </div>
             </div>
           </div>
@@ -861,6 +864,34 @@
       if(!taking){ var input = pane.querySelector('.pane-kbd'); if(input) input.blur(); }
     });
   });
+
+  // Full screen: expand a pane to fill the display. noVNC's scaleViewport
+  // rescales the canvas when the pane resizes, so nothing else is needed.
+  document.querySelectorAll('[data-fs-for]').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      var pane = paneNear(btn);
+      if(!pane) return;
+      var open = document.fullscreenElement || document.webkitFullscreenElement;
+      if(open){
+        (document.exitFullscreen || document.webkitExitFullscreen || function(){}).call(document);
+      } else {
+        (pane.requestFullscreen || pane.webkitRequestFullscreen || function(){}).call(pane);
+      }
+    });
+  });
+
+  // Spinner on slow form submits (verify licence, + New browser, Save & test):
+  // the page stays up during the POST, so mark the clicked button as loading and
+  // block stray clicks until the response reloads the page. Disabling is deferred
+  // to a timeout so the submitter's name/value still reaches the server (the
+  // proxy form's Save vs Save-&-test action rides on the button value).
+  document.addEventListener('submit', function(e){
+    var btn = e.submitter || document.activeElement;
+    if(!btn || btn.tagName !== 'BUTTON' || (btn.type && btn.type !== 'submit')) return;
+    btn.classList.add('loading');
+    document.body.classList.add('busy');
+    setTimeout(function(){ btn.disabled = true; }, 0);
+  }, true);
   var start = document.querySelector('[data-section].on') || document.querySelector('[data-section]');
   if(start) activate(start.getAttribute('data-section'));
 </script>

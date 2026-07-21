@@ -196,6 +196,16 @@
      Not display:none/visibility:hidden — those cannot take focus. */
   .pane-kbd{position:absolute;bottom:0;left:0;width:1px;height:1px;padding:0;border:0;opacity:0;background:transparent;color:transparent;pointer-events:none}
   .ctl-note{margin:12px 0 0;font-size:12px;color:var(--muted);line-height:1.5}
+  .bctrl>.btnrow.bctrl-actions{margin-top:0;margin-bottom:4px}
+  .pane:fullscreen,.pane:-webkit-full-screen{aspect-ratio:auto;min-height:0;width:100vw;height:100vh;border:none;border-radius:0}
+  .pane:fullscreen .pane-screen,.pane:-webkit-full-screen .pane-screen{inset:0}
+
+  /* form-submit spinner: slow POSTs (verify licence, new browser, save & test) */
+  .btn.loading{pointer-events:none;opacity:.9}
+  .btn.loading::before{content:"";display:inline-block;width:12px;height:12px;margin-right:7px;vertical-align:-2px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:btnspin .6s linear infinite}
+  @keyframes btnspin{to{transform:rotate(360deg)}}
+  body.busy{cursor:progress}
+  body.busy::after{content:"";position:fixed;inset:0;z-index:60}
   .preview-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:14px;margin-bottom:8px}
   .preview-card{padding:13px}
   .preview-head{display:flex;gap:9px;align-items:center;margin-bottom:10px;font-size:13.5px}
