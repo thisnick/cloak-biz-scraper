@@ -200,48 +200,47 @@
                 {% if i.expires_at %}<span class="closes">closes in <b>{{ dur(i.expires_at - now) }}</b></span>{% endif %}
               </div>
             </button>
-            <div class="acc-body pane-row">
-              {# Live view-only noVNC pane. The token is NOT in this markup: the
-                 pane's JS fetches a fresh one from an authed endpoint at connect
-                 time, so nothing that grants sight of the user's browser sits in
-                 the page source. #}
-              {% if i.vnc_url %}
-              <div class="pane" data-instance="{{ i.instance_id }}"{% if i.origin=='task' %} data-view-only="1"{% endif %}>
-                <div class="pane-screen"></div>
-                <div class="pane-msg">Connecting to live view…</div>
-                <span class="pane-badge view">View only</span>
-                {% if i.origin != 'task' %}
-                {# Offscreen input the Keyboard button focuses, so a phone's soft
-                   keyboard pops for a browser you're driving (desktop has a real
-                   keyboard already). Keystrokes are forwarded to rfb.sendKey; on a
-                   view-only pane the server drops KeyEvents regardless. #}
-                <input class="pane-kbd" type="text" inputmode="text" autocomplete="off"
-                       autocapitalize="off" autocorrect="off" spellcheck="false"
-                       aria-hidden="true" tabindex="-1">
-                {% endif %}
-              </div>
-              {% else %}
-              <div class="pane-slot">This browser has no live view.<br>It fell back to a plain display.</div>
-              {% endif %}
-              <div class="bctrl">
-                <div class="btnrow bctrl-actions">
-                  {% if i.origin != 'task' and i.vnc_url %}
-                  <button class="btn ctl-btn" type="button" data-control-for="{{ i.instance_id }}">Take control</button>
-                  <button class="btn kbd-btn" type="button" data-keyboard-for="{{ i.instance_id }}" hidden>⌨ Keyboard</button>
-                  {% endif %}
-                  {% if i.vnc_url %}
-                  <button class="btn fs-btn" type="button" data-fs-for="{{ i.instance_id }}">⛶ Full screen</button>
-                  {% endif %}
-                  <form method="post" action="/sessions/instances/{{ i.instance_id }}/close">
-                    <button class="btn danger" type="submit">Close</button>
-                  </form>
-                </div>
+            <div class="acc-body">
+              {# Controls live in a toolbar ABOVE the live view. #}
+              <div class="btnrow bctrl-actions">
                 {% if i.origin != 'task' and i.vnc_url %}
-                <p class="ctl-note">Take control gives you full keyboard and mouse. This browser holds any configured proxy credentials and signed-in sessions, so control is off until you ask for it.</p>
+                <button class="btn ctl-btn" type="button" data-control-for="{{ i.instance_id }}">Take control</button>
+                <button class="btn kbd-btn" type="button" data-keyboard-for="{{ i.instance_id }}" hidden>⌨ Keyboard</button>
                 {% endif %}
-                <div class="kv"><span class="k">Doing</span><span class="v">{% if i.origin=='task' %}Running a sweep{% else %}<small>you opened this</small>{% endif %}</span></div>
-                <div class="kv"><span class="k">Open for</span><span class="v">{{ dur(i.age_sec) }}</span></div>
-                <div class="kv"><span class="k">Connection &amp; location</span><span class="v">{% if i.proxy_ip %}Proxy · {{ i.timezone or 'unknown' }}{% if i.locale %} · {{ i.locale }}{% endif %}{% else %}Direct · server location not measured{% endif %}</span></div>
+                {% if i.vnc_url %}
+                <button class="btn fs-btn" type="button" data-fs-for="{{ i.instance_id }}">⛶ Full screen</button>
+                {% endif %}
+                <form method="post" action="/sessions/instances/{{ i.instance_id }}/close">
+                  <button class="btn danger" type="submit">Close</button>
+                </form>
+              </div>
+              <div class="pane-row">
+                {# Live view-only noVNC pane. The token is NOT in this markup: the
+                   pane's JS fetches a fresh one from an authed endpoint at connect
+                   time, so nothing that grants sight of the user's browser sits in
+                   the page source. #}
+                {% if i.vnc_url %}
+                <div class="pane" data-instance="{{ i.instance_id }}"{% if i.origin=='task' %} data-view-only="1"{% endif %}>
+                  <div class="pane-screen"></div>
+                  <div class="pane-msg">Connecting to live view…</div>
+                  <span class="pane-badge view">View only</span>
+                  {% if i.origin != 'task' %}
+                  {# Offscreen input the Keyboard button focuses, so a phone's soft
+                     keyboard pops for a browser you're driving. Keystrokes are
+                     forwarded to rfb.sendKey; a view-only pane drops KeyEvents. #}
+                  <input class="pane-kbd" type="text" inputmode="text" autocomplete="off"
+                         autocapitalize="off" autocorrect="off" spellcheck="false"
+                         aria-hidden="true" tabindex="-1">
+                  {% endif %}
+                </div>
+                {% else %}
+                <div class="pane-slot">This browser has no live view.<br>It fell back to a plain display.</div>
+                {% endif %}
+                <div class="bctrl">
+                  <div class="kv"><span class="k">Doing</span><span class="v">{% if i.origin=='task' %}Running a sweep{% else %}<small>you opened this</small>{% endif %}</span></div>
+                  <div class="kv"><span class="k">Open for</span><span class="v">{{ dur(i.age_sec) }}</span></div>
+                  <div class="kv"><span class="k">Connection &amp; location</span><span class="v">{% if i.proxy_ip %}Proxy · {{ i.timezone or 'unknown' }}{% if i.locale %} · {{ i.locale }}{% endif %}{% else %}Direct · server location not measured{% endif %}</span></div>
+                </div>
               </div>
             </div>
           </div>
