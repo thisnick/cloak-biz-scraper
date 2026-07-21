@@ -347,6 +347,23 @@ def run_agent_browser(command: Sequence[str], *, timeout: int = 120) -> CommandR
     return CommandResult(elapsed, result.stdout.strip(), result.stderr.strip())
 
 
+def proxy_phase_failure(exc: BaseException) -> RuntimeError:
+    """Report a useful Phase B failure without reflecting proxy credentials.
+
+    Browser/Playwright errors can include their full launch arguments, including
+    an authenticated proxy URL and sticky-session suffix. Even URL-encoding is
+    not a safe redaction, so the underlying text is intentionally omitted. The
+    exception type plus the UI action is enough to distinguish a timeout from a
+    configuration failure without copying secrets into Railway logs.
+    """
+    return RuntimeError(
+        "Phase B could not launch or navigate through the saved proxy. Run Test proxy "
+        f"in Settings immediately before retrying. Underlying error type: "
+        f"{type(exc).__name__}; details omitted because browser errors may contain "
+        "authenticated proxy credentials."
+    )
+
+
 def diagnostic_browser_pids(ports: Sequence[int], proc_root: Path = Path("/proc")) -> set[int]:
     """Find only Chromium parents carrying one of our exact CDP-port flags."""
     if not proc_root.is_dir():
@@ -387,7 +404,11 @@ async def close_context(context, label: str, cdp_port: int) -> None:
         try:
             await asyncio.wait_for(context.close(), timeout=10)
         except Exception as exc:  # noqa: BLE001 - cleanup must continue to exact-port fallback
-            log(f"WARNING: could not close the {label} diagnostic context cleanly: {exc}")
+            log(
+                f"WARNING: could not close the {label} diagnostic context cleanly "
+                f"({type(exc).__name__}); details omitted because browser errors may "
+                "contain authenticated proxy credentials"
+            )
     # Preflight proved these ports were empty before this run. Exact-port process
     # cleanup therefore targets only browsers this harness started, and cannot
     # overlap the application's 9222-9321 pool.
@@ -423,6 +444,7 @@ async def run_diagnostic(diagnostic: DiagnosticConfig, url: str) -> None:
             await close_context(direct_context, "direct", DIRECT_CDP_PORT)
             direct_context = None
 
+            proxy_failure = None
             try:
                 proxy_context = await launch_browser(
                     diagnostic,
@@ -432,10 +454,12 @@ async def run_diagnostic(diagnostic: DiagnosticConfig, url: str) -> None:
                 )
                 proxy_elapsed = await bare_cdp_navigate(PROXY_CDP_PORT, url)
             except Exception as exc:
-                raise RuntimeError(
-                    "Phase B could not launch or navigate through the saved proxy. Run "
-                    f"Test proxy in Settings immediately before retrying. Underlying error: {exc}"
-                ) from exc
+                # Build this inside the handler, then raise only after leaving
+                # it. That keeps the secret-bearing source exception out of
+                # both the message and Python's implicit exception context.
+                proxy_failure = proxy_phase_failure(exc)
+            if proxy_failure is not None:
+                raise proxy_failure
             log(
                 f"B  bare CDP navigate, WITH proxy   : {proxy_elapsed:6.2f}s   "
                 f"(B-A = {proxy_elapsed - direct_elapsed:+.2f}s)"

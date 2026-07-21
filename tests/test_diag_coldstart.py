@@ -3,12 +3,15 @@ from __future__ import annotations
 
 import os
 import subprocess
+import traceback
 from pathlib import Path
+from urllib.parse import quote, quote_plus
 
 import pytest
 
 from app.config import Config
 from app.services.settings import SettingsService
+from scripts import diag_coldstart as diag_script
 from scripts.diag_coldstart import (
     DIRECT_CDP_PORT,
     PROXY_CDP_PORT,
@@ -201,6 +204,58 @@ def test_launch_argument_builder_rejects_application_pool_ports(tmp_path):
             user_data_dir=tmp_path / "bad",
             proxy_url=None,
         )
+
+
+@pytest.mark.asyncio
+async def test_proxy_launch_error_omits_raw_and_encoded_credentials(tmp_path, monkeypatch):
+    diagnostic = load_diagnostic_config(
+        configured_volume(tmp_path),
+        validate_pro=lambda _key, _pin: "/cache/chromium-pro/chrome",
+        token_factory=lambda: "STICKY123",
+    )
+    credentials = diagnostic.proxy_url.split("://", 1)[1].rsplit("@", 1)[0]
+    encoded_url = quote(diagnostic.proxy_url, safe="")
+    encoded_credentials = quote(credentials, safe="")
+    plus_encoded_url = quote_plus(diagnostic.proxy_url, safe="")
+    source_text = " | ".join(
+        (diagnostic.proxy_url, encoded_url, encoded_credentials, plus_encoded_url)
+    )
+
+    class FakeContext:
+        async def close(self):
+            return None
+
+    async def fake_launch(_diagnostic, *, proxy_url, **_kwargs):
+        if proxy_url is None:
+            return FakeContext()
+        raise RuntimeError(source_text)
+
+    async def fake_navigate(_port, _url):
+        return 0.01
+
+    monkeypatch.setattr(diag_script, "launch_browser", fake_launch)
+    monkeypatch.setattr(diag_script, "bare_cdp_navigate", fake_navigate)
+    monkeypatch.setattr(diag_script, "stop_diagnostic_browsers", lambda _ports: None)
+
+    with pytest.raises(RuntimeError) as failure_info:
+        await diag_script.run_diagnostic(diagnostic, "https://example.com")
+
+    failure = failure_info.value
+    rendered = "".join(traceback.format_exception(failure))
+
+    assert "Test proxy in Settings" in rendered
+    assert "Underlying error type: RuntimeError" in rendered
+    assert failure.__context__ is None, "the secret-bearing source exception must be detached"
+    for secret_form in (
+        diagnostic.proxy_url,
+        encoded_url,
+        credentials,
+        encoded_credentials,
+        plus_encoded_url,
+        "proxy-secret",
+        "STICKY123",
+    ):
+        assert secret_form not in rendered
 
 
 def test_agent_browser_commands_attach_only_to_the_diagnostic_port():
