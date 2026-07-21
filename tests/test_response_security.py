@@ -28,7 +28,7 @@ def client(tmp_path, monkeypatch):
 
 def _assert_browser_hardening(response) -> None:
     assert response.headers["x-content-type-options"] == "nosniff"
-    assert response.headers["referrer-policy"] == "no-referrer"
+    assert response.headers["referrer-policy"] == "same-origin"
     assert response.headers["x-frame-options"] == "SAMEORIGIN"
     csp = response.headers["content-security-policy"]
     assert "frame-ancestors 'self'" in csp
@@ -67,6 +67,61 @@ class TestAppWidePolicy:
             isolate_auth(app, tmp_path)
             response = edge.get("/healthz", headers={"X-Forwarded-Proto": "https"})
             assert response.headers["strict-transport-security"] == "max-age=31536000"
+
+    def test_real_browser_keeps_same_origin_form_origin_concrete(self, client):
+        """Chromium, not TestClient, proves the response policy and CSRF seam.
+
+        Fetch serializes a non-CORS POST's Origin using its referrer policy.
+        Under ``no-referrer`` Chromium sends the opaque value ``null`` even for
+        this same-origin form; ``origin_allowed`` must reject it.  Render the
+        real login form under the real response policy and observe only the
+        Origin value the guard consumes; the destination host is fixed by the
+        intercepted URL.
+        """
+        try:
+            from playwright.sync_api import Error as PWError
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            pytest.skip("Playwright is not installed")
+
+        login = client.get("/login")
+        response_headers = {
+            "Content-Type": "text/html; charset=utf-8",
+            "Referrer-Policy": login.headers["referrer-policy"],
+        }
+        observed: list[str | None] = []
+
+        with sync_playwright() as playwright:
+            browser = None
+            for launch in ({"channel": "chrome"}, {}):
+                try:
+                    browser = playwright.chromium.launch(headless=True, **launch)
+                    break
+                except PWError:
+                    continue
+            if browser is None:
+                pytest.skip("no Chrome/Chromium available for referrer-policy check")
+
+            page = browser.new_page()
+
+            def serve(route):
+                request = route.request
+                if request.method == "GET":
+                    route.fulfill(status=200, body=login.text, headers=response_headers)
+                    return
+                headers = request.all_headers()
+                observed.append(headers.get("origin"))
+                route.fulfill(status=200, content_type="text/plain", body="ok")
+
+            page.route("https://policy.test/**", serve)
+            try:
+                page.goto("https://policy.test/login")
+                page.locator("input[name=secret]").fill("synthetic-browser-test-secret")
+                page.locator("button[type=submit]").click()
+            finally:
+                browser.close()
+
+        assert observed == ["https://policy.test"]
 
 
 class TestSensitiveResponsesNeverCache:
@@ -200,7 +255,7 @@ class TestVncTokenCaching:
         assert response.status_code == 200
         assert response.json()["token"]
         assert response.headers["cache-control"] == "no-store"
-        assert response.headers["referrer-policy"] == "no-referrer"
+        assert response.headers["referrer-policy"] == "same-origin"
 
     def test_control_token_is_never_cacheable(self, client, monkeypatch):
         client.post("/login", data={"secret": SECRET})

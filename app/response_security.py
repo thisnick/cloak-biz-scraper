@@ -39,6 +39,14 @@ CONTENT_SECURITY_POLICY = "; ".join(
 
 _NO_STORE = "no-store"
 _HSTS = "max-age=31536000"
+# ``no-referrer`` looks stricter, but Fetch uses the active referrer policy when
+# it serializes Origin for non-CORS form submissions.  Chromium therefore sends
+# ``Origin: null`` even for our own same-origin POSTs, and the CSRF guard must
+# reject that indistinguishable opaque origin.  ``same-origin`` keeps a concrete
+# Origin on our forms while still sending no Referer at all to external sites —
+# in particular, a live-view URL's short-lived query token never leaves this
+# deployment in an off-site navigation.
+REFERRER_POLICY = "same-origin"
 
 
 def _external_scheme(scope: Scope) -> str:
@@ -75,7 +83,7 @@ class ResponseSecurity:
             if message["type"] == "http.response.start":
                 headers = MutableHeaders(scope=message)
                 headers["X-Content-Type-Options"] = "nosniff"
-                headers["Referrer-Policy"] = "no-referrer"
+                headers["Referrer-Policy"] = REFERRER_POLICY
                 headers["X-Frame-Options"] = "SAMEORIGIN"
                 headers["Content-Security-Policy"] = CONTENT_SECURITY_POLICY
 
