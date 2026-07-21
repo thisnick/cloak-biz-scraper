@@ -71,11 +71,9 @@ class Config:
 
     @classmethod
     def from_env(cls) -> "Config":
-        # Deliberately no app_secret field. APP_SECRET only *seeds* the volume's
-        # secret on first boot (see services/secret.py), so a Config attribute
-        # holding the env value would be a stale copy the moment anyone rotates
-        # in the UI — and exactly the thing a caller would reach for thinking it
-        # was the real secret. Read it through SecretService only.
+        # Deliberately no app_secret field. SecretService reads the authoritative
+        # APP_SECRET environment variable directly, so Config must not create a
+        # second, import-time snapshot that could be mistaken for the live value.
         return cls(
             data_dir=Path(os.environ.get("DATA_DIR", "/data")),
             port=_int("PORT", 8000),

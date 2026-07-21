@@ -21,7 +21,6 @@ SECRET = "test-secret-value-long-enough"
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_SECRET", SECRET)
-    monkeypatch.delenv("APP_SECRET_RESET", raising=False)
     with TestClient(app, base_url="https://testserver", follow_redirects=False) as c:
         isolate_auth(app, tmp_path)
         yield c

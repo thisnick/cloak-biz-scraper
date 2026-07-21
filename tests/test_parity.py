@@ -36,7 +36,6 @@ HEADERS = {"Content-Type": "application/json",
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_SECRET", "test-secret-value-long-enough")
-    monkeypatch.delenv("APP_SECRET_RESET", raising=False)
     with TestClient(app, base_url="https://testserver", follow_redirects=False) as c:
         c.headers["Authorization"] = f"Bearer {mint_access(app)}"
         yield c

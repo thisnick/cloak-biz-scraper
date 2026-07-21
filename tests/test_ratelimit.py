@@ -78,7 +78,6 @@ class TestTheLimiter:
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_SECRET", SECRET)
-    monkeypatch.delenv("APP_SECRET_RESET", raising=False)
     with TestClient(app, base_url="https://testserver", follow_redirects=False) as c:
         # Also resets the limiter: it is a singleton on the shared app, and one
         # test's flood would otherwise be another's starting budget.

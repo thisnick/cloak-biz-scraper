@@ -39,7 +39,7 @@ from .services.views import instance_view
 logger = logging.getLogger("cloakbiz.mcp")
 
 INSTRUCTIONS = """\
-Finds business-for-sale listings and files them into Notion.
+Finds business-for-sale listings and can file them into Notion.
 
 Sweeps are asynchronous: scrape_listings starts one and returns immediately with
 a job_id, then get_scrape_listing_results collects it. A sweep takes a few

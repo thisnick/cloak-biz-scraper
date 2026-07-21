@@ -26,7 +26,6 @@ REDIRECT = "https://client.example/callback"
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_SECRET", SECRET)
-    monkeypatch.delenv("APP_SECRET_RESET", raising=False)
     with TestClient(app, base_url="https://testserver", follow_redirects=False) as c:
         isolate_auth(app, tmp_path)
         yield c
@@ -462,6 +461,13 @@ class TestTheConsentPageSaysWhoIsAsking:
         page = self.consent_page(client)
         assert "full use of this server" in page
         assert "close this page" in page.lower()
+
+    def test_it_points_to_the_authoritative_railway_variable(self, client):
+        page = self.consent_page(client)
+        assert "APP_SECRET" in page
+        assert "Railway service's" in page and "Variables" in page
+        assert "changed it here" not in page
+
     def test_the_wrong_secret_yields_no_code(self, client):
         _, challenge = pkce()
         info = register(client)

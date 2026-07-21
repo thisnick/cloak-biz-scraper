@@ -22,9 +22,9 @@ for _leak in (
     "EVOMI_PROXY_PORT", "EVOMI_DEFAULT_COUNTRY", "EVOMI_DEFAULT_REGION",
     "NOTION_API_TOKEN", "NOTION_DB_ID",
     "MAX_INSTANCES", "INTERACTIVE_RESERVE",
-    # A real secret in the ambient environment would seed the store and make the
-    # login tests pass against the wrong value — or, worse, quietly pass.
-    "APP_SECRET", "APP_SECRET_RESET",
+    # A real secret in the ambient environment would make login tests pass
+    # against the wrong value — or, worse, quietly pass.
+    "APP_SECRET",
     # Would widen the Origin rule under the tests' feet.
     "MCP_ALLOWED_ORIGINS",
 ):
@@ -32,19 +32,11 @@ for _leak in (
 
 
 def isolate_auth(app, tmp_path):
-    """Give this test its own volume for the secret and the OAuth store.
+    """Give this test its own environment-backed secret and OAuth store.
 
-    The module-level `app` is shared by every test, and its lifespan points the
-    secret at the one real DATA_DIR — so a test that legitimately exercises
-    APP_SECRET_RESET rewrites the stored secret that every *other* module's
-    fixture assumes. That already happened: test_ui's reset test re-seeded the
-    shared volume with its own constant, and the modules that ran after it were
-    signing tokens with a secret the server no longer held. Their negative tests
-    passed anyway — "refused" is what a wrong secret produces too — so the
-    breakage stayed invisible until a *positive* control asked for a success.
-
-    Isolating per test is the fix, and it is what test_ui's own client fixture
-    already does for settings.
+    The module-level app is shared by every test. Rebuilding the provider here
+    keeps registered clients, authorization codes, and rate-limit state from one
+    test from becoming another test's fixture.
     """
     from app.services.oauth import OAuthProvider, OAuthStore
     from app.services.secret import SecretService

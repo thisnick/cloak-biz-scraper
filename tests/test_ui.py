@@ -40,7 +40,6 @@ def shown(response) -> str:
 def client(tmp_path, monkeypatch):
     """A signed-out client on a private volume."""
     monkeypatch.setenv("APP_SECRET", SECRET)
-    monkeypatch.delenv("APP_SECRET_RESET", raising=False)
     with TestClient(app, base_url="https://testserver") as c:
         # Repoint the services at a per-test volume; the module-level app is
         # shared, and one test's saved licence key must not be another's fixture.
@@ -88,7 +87,8 @@ class TestLogin:
     def test_signed_in_sees_the_settings(self, auth):
         response = auth.get("/")
         assert response.status_code == 200
-        assert "Everything this server needs" in response.text
+        assert "Set up this server here" in response.text
+        assert "Everything this server needs" not in response.text
 
     def test_logout_clears_the_session(self, auth):
         auth.post("/logout")
@@ -109,8 +109,6 @@ class TestLogin:
         page = shown(client.get("/login"))
         assert "Forgotten it?" in page
         assert "Variables" in page
-        # The old multi-step reset ritual is gone from the page entirely.
-        assert "APP_SECRET_RESET" not in page
 
     def test_login_page_explains_an_unconfigured_deployment(self, tmp_path, monkeypatch):
         monkeypatch.delenv("APP_SECRET", raising=False)
@@ -223,10 +221,14 @@ class TestSaving:
             # measured false: the check is skipped from a trusted address, not absent
             "accepts any password",
             "only rejects a wrong username",
-            # measured false: a template cannot carry sleepApplication, so this is
-            # conditional on a switch the user must find themselves
+            # Capacity cost/billing moved to the setup documentation. The
+            # Settings accordion now explains only what the two controls do.
             "you only pay while a sweep is actually running",
             "it's cheap because it sleeps",
+            "0.5–1 GB",
+            "$10/GB per month",
+            "every hour of the month",
+            "costs pennies",
         )
         for path in files:
             src = re.sub(r"\s+", " ", path.read_text())
@@ -236,21 +238,54 @@ class TestSaving:
                     "check comments as well as copy"
                 )
 
-    def test_pool_cost_copy_does_not_promise_sleep_we_cannot_ship(self, auth):
-        """The page used to tell the reader, while they chose how many browsers
-        to run, that "you only pay while a sweep is actually running" — as a fact
-        about the product. It is a fact about a switch we cannot set for them: a
-        Railway template cannot carry sleepApplication (0 of 2964 services across
-        every public template), so the deploy leaves it off silently. Measured,
-        idle-after-a-sweep holds ~0.86 GB until the process dies, which is ~$8-9
-        a month for nothing. The copy must make the promise conditional and name
-        the price of the condition, because this is the paragraph someone reads
-        while deciding their bill.
-        """
-        page = auth.get("/").text
-        assert "only pay while a sweep is actually running" not in page
-        assert "Serverless" in page, "the condition must be named"
-        assert "every hour of the month" in page, "and the cost of skipping it"
+    def test_approved_settings_helpers_and_links_are_present(self, auth):
+        page = shown(auth.get("/"))
+        assert (
+            "Your CloakBrowser key. It works without one — you'll get the public build, "
+            "which gets past fewer bot detectors. A Pro key unlocks the private builds "
+            "with more bypasses."
+        ) in page
+        assert 'href="https://cloakbrowser.dev/"' in page and "Get a key →" in page
+        assert (
+            "Use an Evomi proxy to get past IP and datacenter-IP detection — it makes your "
+            "browser look like it's coming from a residential location. Optional, but "
+            "websites like BizBuySell will block you if your IP comes from a non-residential "
+            "location."
+        ) in page
+        assert 'href="https://evomi.com"' in page and "Get a proxy at Evomi →" in page
+        assert "Choose the Residential product; Core Residential is a good place to start." in page
+        assert "Country and region match the targeting options in your Evomi dashboard." in page
+        assert (
+            "Connect Notion so scraped listings can be saved into a database. (1) create an "
+            "integration and copy its secret, (2) open the database or page you want it to "
+            "use and share it with that integration — Notion blocks the key from touching "
+            "anything you haven't shared."
+        ) in page
+        assert 'href="https://www.notion.so/my-integrations"' in page
+        assert "Create an integration →" in page
+        assert 'href="https://developers.notion.com/docs/create-a-notion-integration"' in page
+        assert "How to share a page →" in page
+        assert (
+            "A profile is a saved browser identity — its cookies, logins, and location. "
+            "Everything uses your Default profile unless you pick another, so you stay "
+            "signed in across sessions."
+        ) in page
+
+    def test_capacity_copy_explains_the_controls_without_cost_copy(self, auth):
+        page = shown(auth.get("/"))
+        assert "Most browsers at once" in page
+        assert "The total that can run at the same time." in page
+        assert "Reserved for non-built-in tasks" in page
+        assert (
+            "Kept free so you or your assistant can drive a browser by hand, even while "
+            "built-in tasks like sweeps are running."
+        ) in page
+        assert (
+            "At 4 / 1: up to 4 browsers at once, 1 always free for you or your assistant "
+            "to control directly, and 3 for built-in tasks."
+        ) in page
+        for retired in ("Serverless", "0.5–1 GB", "$10/GB per month", "costs pennies"):
+            assert retired not in page
 
     def test_pool_warns_above_eight_but_obeys(self, auth):
         response = auth.post("/settings/pool", data={"max_instances": "12", "interactive_reserve": "1"})
@@ -265,14 +300,6 @@ class TestSaving:
         assert "must be less than" in page
         assert "type=value_error" not in page and "validation error for Settings" not in page
         assert app.state.settings.load().max_instances == 4
-
-    def test_the_cost_guidance_is_on_the_page(self, auth):
-        page = auth.get("/").text
-        assert "0.5–1 GB" in page
-        assert "$10/GB per month" in page
-        assert "sleeps when idle" in page
-        assert "costs pennies" in page
-
 
 class TestLicenceVerify:
     def test_failure_is_reported_as_a_failure(self, auth, monkeypatch):
@@ -334,6 +361,9 @@ class TestLicenceVerify:
         assert 'id="licence-form"' in page
         assert "Getting the browser — about ten seconds" in page
         assert "e.submitter" in page
+        assert "if(!b||b.value!=='verify')return;" in page
+        assert "a.name='action';a.value='verify'" in page
+        assert "lf.querySelectorAll('button').forEach(function(x){x.disabled=true;});" in page
 
 
 class TestProxyTest:
@@ -681,11 +711,9 @@ class TestNotionUi:
         assert "rejected the API token" in response.text
 
 
-# In-app secret rotation, the volume-authoritative secret, and APP_SECRET_RESET
-# were all removed: APP_SECRET is now just the Railway variable (test_secret.py).
-# The forgotten-secret note lives on the login page, where a locked-out user can
-# reach it — the old settings-page note sat behind the very login it was meant to
-# rescue.
+# APP_SECRET is managed in Railway rather than this settings page. The
+# forgotten-secret note lives on the login page, where a locked-out user can
+# reach it.
 
 
 class TestRunEvidenceIsReachableButNotPublic:

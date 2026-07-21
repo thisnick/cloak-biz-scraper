@@ -17,8 +17,8 @@ therefore gone between two tool calls of the same conversation:
   watching.
 * **Access and refresh tokens are stateless**, signed with APP_SECRET
   (services/signing.py). Nothing to persist, nothing to garbage-collect, and
-  they survive sleep for free. Their revocation story is APP_SECRET rotation,
-  which kills every token at once — appropriate when there is one user.
+  they survive sleep for free. Changing APP_SECRET in Railway and redeploying
+  kills every token at once — appropriate when there is one user.
 * **Authorization codes live on the volume**, because single-use is a
   requirement (OAuth 2.1 / RFC 6749 §10.5) and single-use is the one property a
   stateless token cannot have: you cannot know it was already spent without
@@ -28,8 +28,8 @@ therefore gone between two tool calls of the same conversation:
 
 **Why no revocation endpoint.** Access tokens are stateless, so `/revoke` could
 not honour a revocation of one; advertising an endpoint that silently does
-nothing is worse than not advertising it. Rotating APP_SECRET in the settings UI
-revokes everything, and that is what the docs point at.
+nothing is worse than not advertising it. Changing APP_SECRET in Railway and
+redeploying revokes everything, and that is what the docs point at.
 
 **Why no scope theatre.** There is exactly one scope, `mcp`, and every token
 carries it. A single-user deployment has no partial privileges to express — a

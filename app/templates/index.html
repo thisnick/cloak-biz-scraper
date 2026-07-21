@@ -401,7 +401,7 @@
       {# ── SETTINGS ────────────────────────────────────────────────────── #}
       <section data-section="settings" class="{{ 'on' if active=='settings' }}">
         <h2 class="page-h">Settings</h2>
-        <p class="page-lead">Everything this server needs, set once and kept on this server. Tap a section to open it.</p>
+        <p class="page-lead">Set up this server here. Tap a section to open it.</p>
 
         <div class="acc">
 
@@ -509,7 +509,7 @@
               </div>
             </button>
             <div class="acc-body">
-              <p class="lead-help">Where found listings are saved. Create an integration at <a href="https://www.notion.so/my-integrations" target="_blank" rel="noreferrer">notion.so/my-integrations</a>, paste its token, then <em>share</em> your database with it from Notion's ••• menu.</p>
+              <p class="lead-help">Connect Notion so scraped listings can be saved into a database. (1) create an integration and copy its secret, (2) open the database or page you want it to use and share it with that integration — Notion blocks the key from touching anything you haven't shared. <a href="https://www.notion.so/my-integrations" target="_blank" rel="noreferrer">Create an integration →</a> · <a href="https://developers.notion.com/docs/create-a-notion-integration" target="_blank" rel="noreferrer">How to share a page →</a></p>
               {{ banner('notion') }}
               <form method="post" action="/settings/notion">
                 <div class="field"><label>API token</label>
@@ -559,15 +559,14 @@
               </div>
             </button>
             <div class="acc-body">
-              <p class="lead-help">How many browsers can run at once. Each running browser uses roughly <strong>0.5–1 GB</strong>, billed on actual usage (about $10/GB per month). If you turned on <strong>Serverless</strong> in Railway, the server sleeps when idle and you pay only for the minutes a sweep runs — a 3-minute sweep with 4 browsers costs pennies. <strong>If you didn't, you're paying for every hour of the month</strong> (~$8–9) whether you scrape or not.</p>
               {{ banner('pool') }}
               {% if pool_warning %}<div class="banner warn">{{ pool_warning }}</div>{% endif %}
               <form method="post" action="/settings/pool">
                 <div class="grid2">
-                  <div class="field"><label>Most browsers at once</label><input type="number" name="max_instances" min="1" value="{{ s.max_instances }}"></div>
-                  <div class="field"><label>Always keep free for you</label><input type="number" name="interactive_reserve" min="0" value="{{ s.interactive_reserve }}"></div>
+                  <div class="field"><label>Most browsers at once</label><input type="number" name="max_instances" min="1" value="{{ s.max_instances }}"><div class="help">The total that can run at the same time.</div></div>
+                  <div class="field"><label>Reserved for non-built-in tasks</label><input type="number" name="interactive_reserve" min="0" value="{{ s.interactive_reserve }}"><div class="help">Kept free so you or your assistant can drive a browser by hand, even while built-in tasks like sweeps are running.</div></div>
                 </div>
-                <div class="help">Reserved slots stay free so you can always open a browser by hand, even mid-sweep. Scraping gets the rest ({{ s.task_budget }} right now).</div>
+                <div class="help">At {{ s.max_instances }} / {{ s.interactive_reserve }}: up to {{ s.max_instances }} browsers at once, {{ s.interactive_reserve }} always free for you or your assistant to control directly, and {{ s.task_budget }} for built-in tasks.</div>
                 <div class="btnrow"><button class="btn primary" type="submit">Save</button></div>
               </form>
             </div>

@@ -1,14 +1,9 @@
-"""APP_SECRET is the environment variable, read every boot — nothing else.
+"""APP_SECRET has one source: the environment, read directly by SecretService.
 
-This replaces the volume-authoritative model (seed-once, in-app rotate,
-APP_SECRET_RESET recovery). Step 5 measured away the two hazards that model
-guarded against — Railway's secret() is stable across redeploys and readable —
-so the secret is now simply the Railway variable. These tests pin that, and pin
-that the old machinery is gone rather than merely unused.
+These tests pin environment authority, the absence of a second persisted copy,
+and the independent volume key used to encrypt application settings.
 """
 from __future__ import annotations
-
-import pytest
 
 from app.services.secret import SecretService
 from app.services.settings import SettingsService
@@ -24,13 +19,7 @@ class TestEnvIsTheSourceOfTruth:
         assert SecretService().current() == GOOD
 
     def test_a_changed_env_value_takes_effect(self, monkeypatch):
-        """Editing the Railway variable and redeploying IS how the secret changes.
-
-        The old model deliberately ignored a changed env on later boots, because
-        the volume copy was authoritative and a re-read would have reverted an
-        in-app rotation. There is no volume copy now, so the env value simply
-        wins — which is the whole point of the simplification.
-        """
+        """Editing the Railway variable and redeploying is how it changes."""
         monkeypatch.setenv("APP_SECRET", GOOD)
         assert SecretService().current() == GOOD
         monkeypatch.setenv("APP_SECRET", OTHER)  # the redeploy Railway would do
@@ -67,39 +56,22 @@ class TestVerify:
         assert not s.verify("anything")
 
 
-class TestTheOldMachineryIsGone:
-    """Not just unused — removed. If any of these come back, so does the
-    two-places confusion the change existed to delete."""
-
+class TestThereIsOnlyOneSource:
     def test_there_is_no_in_app_rotation(self):
         assert not hasattr(SecretService(), "rotate"), (
             "rotate() is back — the secret is the Railway variable, changed there"
         )
 
     def test_nothing_is_written_to_the_volume(self, tmp_path, monkeypatch):
-        """The secret used to be encrypted onto the volume as auth.json. It must
-        not be persisted at all now — env is the only home."""
+        """The environment value must not be persisted as a second source."""
         monkeypatch.setenv("DATA_DIR", str(tmp_path))
         monkeypatch.setenv("APP_SECRET", GOOD)
         SecretService().bootstrap()
-        assert not (tmp_path / "auth.json").exists(), "a secret file reappeared on the volume"
-
-    def test_APP_SECRET_RESET_does_nothing(self, monkeypatch):
-        """The recovery flag is meaningless now: there is no stored value to
-        override, so a boot with the flag set behaves like any other boot."""
-        monkeypatch.setenv("APP_SECRET", GOOD)
-        monkeypatch.setenv("APP_SECRET_RESET", "true")
-        assert SecretService().current() == GOOD
-        # And changing APP_SECRET still just works, flag or no flag.
-        monkeypatch.setenv("APP_SECRET", OTHER)
-        assert SecretService().current() == OTHER
+        assert not (tmp_path / "auth.json").exists(), "APP_SECRET was copied to the volume"
 
 
 def test_changing_the_secret_never_strands_the_settings(tmp_path, monkeypatch):
-    """The property that made rotation safe before, now doing nothing but staying
-    true: settings are encrypted with the volume DEK, never with APP_SECRET, so
-    changing the secret cannot put them behind a key nobody has.
-    """
+    """Settings use the volume DEK, never APP_SECRET, as their encryption key."""
     monkeypatch.setenv("APP_SECRET", GOOD)
     settings = SettingsService(tmp_path / "settings.json", tmp_path / ".dek")
     settings.update(proxy_host="proxy.example.com", notion_db_id="db-123")

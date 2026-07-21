@@ -1,10 +1,10 @@
 # Local development. The deployed app needs none of this: Railway sets APP_SECRET,
 # mounts a volume at /data, and everything else is configured in the web UI.
 #
-# `.env` is optional. With it, the variables inside seed the settings on first
-# boot so a local run can skip the UI. Without it, `APP_SECRET=... docker compose
-# up` is a complete deployment — which is the whole product bet, so it stays
-# testable here.
+# `.env` is optional. APP_SECRET is read from the environment on every boot; the
+# other variables seed settings on first boot so a local run can skip the UI.
+# Without it, `APP_SECRET=... docker compose up` is a complete deployment — which
+# is the whole product bet, so it stays testable here.
 services:
   app:
     build: .
@@ -14,11 +14,6 @@ services:
         required: false
     environment:
       APP_SECRET: ${APP_SECRET:-}
-      # The recovery path for a forgotten secret. Compose only forwards what it
-      # names, so without this line `APP_SECRET_RESET=true docker compose up`
-      # silently does nothing and the recovery looks broken when it is not —
-      # Railway passes its variables straight through and never had the gap.
-      APP_SECRET_RESET: ${APP_SECRET_RESET:-}
     # 18800 on the host: 18791/18792 belong to browserd. Overridable because a
     # hardcoded host port means two checkouts — or two people — cannot run this
     # at once: the second bind fails and the container stalls in "Created", which

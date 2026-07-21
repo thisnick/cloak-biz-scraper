@@ -1060,8 +1060,6 @@ async def create_database(
     return _render(request, Result("notion", report.complete, message, report))
 
 
-# In-app APP_SECRET rotation used to live here, backed by a volume-authoritative
-# secret and an APP_SECRET_RESET escape hatch. All of that is gone: APP_SECRET is
-# now just the Railway variable, read every boot (services/secret.py). To change
-# it, edit the variable and redeploy; to recover it, read it off the Variables
-# tab. There is nothing left for a settings form to do.
+# APP_SECRET is managed in Railway's Variables tab, not in this settings UI.
+# SecretService reads that environment value directly; changing it means editing
+# the variable and redeploying, and recovery means reading the value there.

@@ -36,7 +36,6 @@ INIT = {
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_SECRET", "test-secret-value-long-enough")
-    monkeypatch.delenv("APP_SECRET_RESET", raising=False)
     # follow_redirects=False on purpose. Mounting the endpoint (rather than
     # routing it) made a bare POST /mcp answer 307 to /mcp/, and every one of
     # these tests passed anyway because the client quietly followed it. A real
@@ -67,7 +66,9 @@ class TestStateless:
         r = client.post("/mcp", json=INIT, headers=HEADERS)
         assert r.status_code == 200
         assert "mcp-session-id" not in {k.lower() for k in r.headers}
-        assert r.json()["result"]["serverInfo"]["name"] == "cloak-biz-scraper"
+        result = r.json()["result"]
+        assert result["serverInfo"]["name"] == "cloak-biz-scraper"
+        assert "can file them into Notion" in result["instructions"]
 
     def test_tools_list_without_a_handshake(self, client):
         """A stateless server answers the first message it is given, whatever it is."""
