@@ -598,10 +598,9 @@ class TestNotionUi:
 
         # Reports precisely what is wrong...
         page = shown(response)
-        assert "'Normalized URL' is missing — add it as a Text column." in page
-        assert "'Listing ID' is missing — add it as a Text column." in page
-        assert "cannot sync yet" in page
-        assert "Add these before syncing can work" in page
+        assert "can't sync yet" in page
+        assert "<b>Normalized URL</b> — add a Text column" in page
+        assert "<b>Listing ID</b> — add a Text column" in page
         # ...and keeps the selection so the user can fix Notion and re-verify.
         assert app.state.settings.load().notion_db_id == "db-1"
 
@@ -636,14 +635,14 @@ class TestNotionUi:
         page = shown(response)
 
         assert '<div class="banner warn">' in response.text, "not a success, not a failure"
-        assert "will sync, but these columns will be left empty" in page
-        assert "Add these before syncing can work" not in page, "there is no blocker here"
-        # The consequence, in their words — and the payoff for fixing it.
-        assert "'Asking Price' is a Text column, but this app writes Number values." in page
-        assert "sort and filter" in page
+        assert "will sync" in page
+        assert "can't sync yet" not in page, "there is no blocker here"
+        # The mismatch and its one-line fix appear in the collapsed detail.
+        assert "<b>Asking Price</b> — change it from Text to Number" in page
         assert "rich_text" not in page, "API type names mean nothing to the reader"
-        # Their column is visible to us and explicitly out of bounds.
-        assert "Bot Triage" in page and "left exactly as they are" in page
+        # Their column is counted, not enumerated — no wall of names.
+        assert "1 column is never touched" in page
+        assert "Bot Triage" not in page
 
     @respx.mock
     def test_create_is_only_ever_explicit(self, auth):
@@ -688,8 +687,8 @@ class TestNotionUi:
         auth.post("/settings/notion", data={"notion_api_token": "ntn_x"})
         response = auth.post("/settings/notion/create", data={"parent_page_id": "page-1"})
         page = shown(response)
-        assert "has every column this app writes" not in page
-        assert "'Listing ID' is missing" in page
+        assert "every field will sync" not in page
+        assert "<b>Listing ID</b> — add a Text column" in page
 
     def test_create_without_a_parent_is_refused(self, auth):
         auth.post("/settings/notion", data={"notion_api_token": "ntn_x"})

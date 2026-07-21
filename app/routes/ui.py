@@ -1027,20 +1027,15 @@ def _schema_message(report) -> str:
     have, or ignoring one they do.
     """
     if report.complete:
-        return f"'{report.title}' has everything this app needs."
+        return f"'{report.title}' is ready — new listings will sync with every field filled."
     if report.usable:
-        skipped = ", ".join(
-            i.name for i in [*report.missing_recommended, *report.mismatched_recommended]
-        )
+        n = len(report.missing_recommended) + len(report.mismatched_recommended)
+        s = "s" if n != 1 else ""
         return (
-            f"'{report.title}' will sync, but these columns will be left empty: "
-            f"{skipped}. Everything else saves normally — here is what each one costs "
-            f"you and how to fix it."
+            f"'{report.title}' will sync. {n} column{s} won't be filled in — "
+            f"the rest saves normally."
         )
-    return (
-        f"'{report.title}' cannot sync yet — this app needs these columns before it can "
-        f"save anything into it."
-    )
+    return f"'{report.title}' can't sync yet — add the columns below first."
 
 
 @router.post("/settings/notion/create", response_class=HTMLResponse)

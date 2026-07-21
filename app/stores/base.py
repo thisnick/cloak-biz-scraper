@@ -47,6 +47,13 @@ class PropIssue:
             )
         return f"{head} {self.consequence}".strip()
 
+    def fix(self) -> str:
+        """The action to take, in one short imperative — add a column vs change
+        an existing one are genuinely different fixes."""
+        if self.found is None:
+            return f"add a {self.expected} column"
+        return f"change it from {self.found} to {self.expected}"
+
 
 @dataclass(frozen=True)
 class SchemaReport:

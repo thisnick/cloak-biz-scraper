@@ -9,25 +9,25 @@
         {% set r = result.detail %}
         {# Two grades, never merged. Required = nothing syncs until you fix it.
            Recommended = everything syncs except this column. #}
+        {# Blocking: required columns must be fixed before anything syncs. #}
         {% if r.missing_required or r.mismatched_required %}
-          <p style="margin:10px 0 2px"><strong>Add these before syncing can work:</strong></p>
-          <ul>
-            {% for i in r.missing_required %}<li>{{ i.describe() }}</li>{% endfor %}
-            {% for i in r.mismatched_required %}<li>{{ i.describe() }}</li>{% endfor %}
+          <ul class="schema-fix">
+            {% for i in r.missing_required %}<li><b>{{ i.name }}</b> — {{ i.fix() }}</li>{% endfor %}
+            {% for i in r.mismatched_required %}<li><b>{{ i.name }}</b> — {{ i.fix() }}</li>{% endfor %}
           </ul>
         {% endif %}
-        {% if r.missing_recommended or r.mismatched_recommended %}
-          <p style="margin:10px 0 2px"><strong>These columns will be left empty — everything else still syncs:</strong></p>
-          <ul>
-            {% for i in r.missing_recommended %}<li>{{ i.describe() }}</li>{% endfor %}
-            {% for i in r.mismatched_recommended %}<li>{{ i.describe() }}</li>{% endfor %}
-          </ul>
+        {# Non-blocking: recommended columns that won't be filled — collapsed. #}
+        {% set rec = r.missing_recommended + r.mismatched_recommended %}
+        {% if rec %}
+          <details class="schema-more">
+            <summary>See which {{ rec|length }} column{{ '' if rec|length == 1 else 's' }} won’t be filled &amp; how to fix</summary>
+            <ul class="schema-fix">
+              {% for i in rec %}<li><b>{{ i.name }}</b> — {{ i.fix() }}</li>{% endfor %}
+            </ul>
+          </details>
         {% endif %}
         {% if r.untouched %}
-          <p class="hint" style="margin-bottom:0">
-            Your own {{ r.untouched|length }} column(s) — {{ r.untouched|join(', ') }} —
-            are left exactly as they are. This app only ever writes the columns listed above.
-          </p>
+          <p class="hint" style="margin:9px 0 0">Your other {{ r.untouched|length }} {{ 'column is' if r.untouched|length == 1 else 'columns are' }} never touched.</p>
         {% endif %}
       {% endif %}
     </div>
