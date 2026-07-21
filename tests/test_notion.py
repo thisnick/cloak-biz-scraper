@@ -545,3 +545,362 @@ class TestErrors:
         )
         report = await NotionStore(TOKEN).verify_schema(DB)
         assert report.usable, "a 429 mid-sweep is Notion pacing us, not a failure"
+
+
+# ── column mapping: verify, target-sensitive writes, dedupe ─────────────────
+#
+# The map is {field-key -> the user's column NAME, or None}. An empty/None map
+# is the back-compat sentinel and means identity mapping (every case above runs
+# on that path). These exercise the explicit-map path a configured database uses.
+
+from app.stores.notion import build_map_rows, default_column_map  # noqa: E402
+
+# A database whose columns are named nothing like our defaults — the whole point
+# of the feature. "Deal" is the title, prices are text, the id lives in a column
+# the user calls "Ref".
+RENAMED = {
+    "Deal": prop("title", "t"),
+    "Link": prop("url", "u"),
+    "Canonical": prop("rich_text", "c"),
+    "Ref": prop("rich_text", "r"),
+    "Ask": prop("number", "a"),
+    "Notes": prop("rich_text", "no"),
+}
+
+RENAMED_MAP = {
+    "listing_title": "Deal",
+    "url": "Link",
+    "normalized_url": "Canonical",
+    "listing_id": "Ref",
+    "asking_price": "Ask",
+}
+
+
+def mapped_row(page_id: str, cols: dict) -> dict:
+    """A page whose properties are keyed by real column names/types.
+
+    `cols` is {name: (type, value)}. A rich_text/title value is wrapped as a text
+    run; a url value is a bare string, matching what Notion returns per type.
+    """
+    props: dict = {}
+    for name, (ptype, value) in cols.items():
+        if ptype == "url":
+            props[name] = {"type": "url", "url": value or None}
+        elif ptype == "title":
+            props[name] = {"type": "title", "title": [{"plain_text": value}] if value else []}
+        else:
+            props[name] = {"type": ptype, ptype: [{"plain_text": value}] if value else []}
+    return {"id": page_id, "properties": props}
+
+
+class TestDefaultColumnMap:
+    def test_maps_present_columns_by_identity(self):
+        m = default_column_map({"Listing Title", "URL", "Normalized URL", "Listing ID", "EBITDA"})
+        assert m["listing_title"] == "Listing Title"
+        assert m["ebitda"] == "EBITDA"
+
+    def test_unmatched_required_is_left_unmapped(self):
+        # No "Listing ID" column present -> the key is absent, so the user is
+        # forced to choose one (a required field cannot silently become None).
+        m = default_column_map({"Listing Title", "URL"})
+        assert "listing_id" not in m
+        assert "normalized_url" not in m
+
+    def test_unmatched_optional_defaults_to_dont_sync(self):
+        m = default_column_map({"Listing Title", "URL", "Normalized URL", "Listing ID"})
+        assert m["ebitda"] is None
+        assert m["source"] is None
+
+    def test_is_never_empty_so_it_is_never_mistaken_for_no_map(self):
+        # Even a database matching nothing yields the optional None entries, so the
+        # result is truthy and always treated as an explicit map.
+        assert default_column_map(set()) != {}
+
+
+class TestVerifyWithMap:
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_renamed_columns_verify_clean(self):
+        mock_db(RENAMED)
+        report = await NotionStore(TOKEN).verify_schema(DB, RENAMED_MAP)
+        assert report.usable and report.complete
+        assert report.problems == []
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_unmapped_required_field_blocks(self):
+        m = {k: v for k, v in RENAMED_MAP.items() if k != "listing_id"}
+        mock_db(RENAMED)
+        report = await NotionStore(TOKEN).verify_schema(DB, m)
+        assert not report.usable
+        assert [i.name for i in report.missing_required] == ["Listing ID"]
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_required_mapped_to_a_missing_column_blocks(self):
+        m = {**RENAMED_MAP, "listing_id": "Gone"}  # no such column
+        mock_db(RENAMED)
+        report = await NotionStore(TOKEN).verify_schema(DB, m)
+        assert not report.usable
+        assert [i.name for i in report.missing_required] == ["Listing ID"]
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_url_mapped_to_a_text_column_is_compatible(self):
+        # We can always write a link as text, so a URL field over a Text column is
+        # allowed (and will be written as text).
+        schema = {**RENAMED, "Link": prop("rich_text", "u")}
+        mock_db(schema)
+        report = await NotionStore(TOKEN).verify_schema(DB, RENAMED_MAP)
+        assert report.usable
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_title_field_needs_a_title_column(self):
+        schema = {**RENAMED, "Deal": prop("rich_text", "t")}  # title mapped to text
+        mock_db(schema)
+        report = await NotionStore(TOKEN).verify_schema(DB, RENAMED_MAP)
+        assert not report.usable
+        assert [i.name for i in report.mismatched_required] == ["Listing Title"]
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_optional_mapped_to_any_type_is_fine_no_nag(self):
+        # Asking Price mapped to a TEXT column is not a problem under mapping —
+        # the value adapts. This is the deliberate change from the old model.
+        schema = {**RENAMED, "Ask": prop("rich_text", "a")}
+        mock_db(schema)
+        report = await NotionStore(TOKEN).verify_schema(DB, RENAMED_MAP)
+        assert report.usable and report.complete
+        assert report.mismatched_recommended == []
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_optional_mapped_to_none_is_fine(self):
+        m = {**RENAMED_MAP, "asking_price": None}
+        mock_db(RENAMED)
+        report = await NotionStore(TOKEN).verify_schema(DB, m)
+        assert report.usable and report.complete
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_untouched_is_every_column_no_field_maps_to(self):
+        mock_db(RENAMED)
+        report = await NotionStore(TOKEN).verify_schema(DB, RENAMED_MAP)
+        # "Notes" is the only column no field points at.
+        assert report.untouched == ["Notes"]
+
+
+class TestMappedWrites:
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_writes_to_the_users_real_column_names(self):
+        import json
+
+        mock_db(RENAMED)
+        mock_query([])
+        route = respx.post(f"{API}/pages").mock(return_value=httpx.Response(200, json={"id": "n"}))
+        await NotionStore(TOKEN).upsert_new(
+            DB, [listing(asking_price="$1,258,000")], column_map=RENAMED_MAP
+        )
+        sent = json.loads(route.calls[0].request.read())["properties"]
+        assert set(sent) == {"Deal", "Link", "Canonical", "Ref", "Ask"}
+        assert sent["Deal"] == {"title": [{"type": "text", "text": {"content": "A Business"}}]}
+        assert sent["Ask"] == {"number": 1258000.0}
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_money_adapts_to_a_text_column_as_verbatim_string(self):
+        import json
+
+        schema = {**RENAMED, "Ask": prop("rich_text", "a")}
+        mock_db(schema)
+        mock_query([])
+        route = respx.post(f"{API}/pages").mock(return_value=httpx.Response(200, json={"id": "n"}))
+        await NotionStore(TOKEN).upsert_new(
+            DB, [listing(asking_price="$81,000 + Inventory")], column_map=RENAMED_MAP
+        )
+        sent = json.loads(route.calls[0].request.read())["properties"]
+        # The exact string the card stated — no parsing, no loss — because the
+        # column is text. The old model dropped this value entirely.
+        assert sent["Ask"] == {"rich_text": [{"type": "text", "text": {"content": "$81,000 + Inventory"}}]}
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_url_adapts_to_a_text_column(self):
+        import json
+
+        schema = {**RENAMED, "Link": prop("rich_text", "u")}
+        mock_db(schema)
+        mock_query([])
+        route = respx.post(f"{API}/pages").mock(return_value=httpx.Response(200, json={"id": "n"}))
+        await NotionStore(TOKEN).upsert_new(DB, [listing()], column_map=RENAMED_MAP)
+        sent = json.loads(route.calls[0].request.read())["properties"]
+        assert sent["Link"]["rich_text"][0]["text"]["content"].startswith("https://")
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_select_and_dates_land_when_mapped(self):
+        import json
+
+        schema = {**RENAMED, "Site": prop("select", "s"), "Seen": prop("date", "se")}
+        mock_db(schema)
+        mock_query([])
+        route = respx.post(f"{API}/pages").mock(return_value=httpx.Response(200, json={"id": "n"}))
+        m = {**RENAMED_MAP, "source": "Site", "first_seen_at": "Seen"}
+        await NotionStore(TOKEN).upsert_new(DB, [listing(source="bizbuysell_serp")], column_map=m)
+        sent = json.loads(route.calls[0].request.read())["properties"]
+        assert sent["Site"] == {"select": {"name": "bizbuysell_serp"}}
+        assert "start" in sent["Seen"]["date"]
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_a_status_type_column_is_never_written(self):
+        import json
+
+        # A Notion "status" column's options cannot be created via the API, so
+        # writing "New" to one would 400 the whole page. We skip it rather than
+        # risk losing the row — even though the field is mapped to it.
+        schema = {**RENAMED, "State": prop("status", "st")}
+        mock_db(schema)
+        mock_query([])
+        route = respx.post(f"{API}/pages").mock(return_value=httpx.Response(200, json={"id": "n"}))
+        m = {**RENAMED_MAP, "status": "State"}
+        result = await NotionStore(TOKEN).upsert_new(DB, [listing()], column_map=m)
+        sent = json.loads(route.calls[0].request.read())["properties"]
+        assert "State" not in sent
+        assert result.new == 1, "the row still saves; only the status cell is left empty"
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_never_writes_a_column_not_in_the_map(self):
+        import json
+
+        # "Notes" exists and is a perfectly writable text column, but no field is
+        # mapped to it — so it must never appear in a write. This is the guarantee
+        # the whole feature rests on.
+        mock_db(RENAMED)
+        mock_query([])
+        route = respx.post(f"{API}/pages").mock(return_value=httpx.Response(200, json={"id": "n"}))
+        await NotionStore(TOKEN).upsert_new(DB, [listing()], column_map=RENAMED_MAP)
+        sent = json.loads(route.calls[0].request.read())["properties"]
+        assert "Notes" not in sent
+        assert set(sent) <= set(RENAMED_MAP.values())
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_a_field_set_to_dont_sync_is_never_written(self):
+        import json
+
+        m = {**RENAMED_MAP, "asking_price": None}
+        mock_db(RENAMED)
+        mock_query([])
+        route = respx.post(f"{API}/pages").mock(return_value=httpx.Response(200, json={"id": "n"}))
+        await NotionStore(TOKEN).upsert_new(DB, [listing(asking_price="$1,000")], column_map=m)
+        sent = json.loads(route.calls[0].request.read())["properties"]
+        assert "Ask" not in sent
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_a_field_mapped_to_a_deleted_column_is_skipped_not_recreated(self):
+        import json
+
+        # The map still references "Ask", but the database no longer has it. We
+        # skip it silently on write rather than trying to create it.
+        schema = {k: v for k, v in RENAMED.items() if k != "Ask"}
+        mock_db(schema)
+        mock_query([])
+        route = respx.post(f"{API}/pages").mock(return_value=httpx.Response(200, json={"id": "n"}))
+        await NotionStore(TOKEN).upsert_new(DB, [listing(asking_price="$1,000")], column_map=RENAMED_MAP)
+        sent = json.loads(route.calls[0].request.read())["properties"]
+        assert "Ask" not in sent
+        assert "Deal" in sent  # the rest of the row still writes
+
+
+class TestMappedDedupe:
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_reads_dedupe_keys_from_the_mapped_columns(self):
+        mock_db(RENAMED)
+        mock_query([mapped_row("p1", {"Ref": ("rich_text", "2485121"),
+                                      "Canonical": ("rich_text", "bizbuysell.com/x")})])
+        index = await NotionStore(TOKEN).index(DB, RENAMED_MAP)
+        assert index.listing_ids == {"2485121"}
+        assert index.normalized_urls == {"bizbuysell.com/x"}
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_asks_only_for_the_mapped_dedupe_columns(self):
+        mock_db(RENAMED)
+        mock_query([])
+        await NotionStore(TOKEN).index(DB, RENAMED_MAP)
+        query = [c for c in respx.calls if "query" in c.request.url.path][0]
+        # "Ref" -> id r, "Canonical" -> id c
+        assert sorted(query.request.url.params.get_list("filter_properties")) == ["c", "r"]
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_a_known_listing_under_a_mapping_is_not_reinserted(self):
+        mock_db(RENAMED)
+        mock_query([mapped_row("p1", {
+            "Ref": ("rich_text", "2485121"),
+            "Canonical": ("rich_text", "bizbuysell.com/business-opportunity/foo/2485121"),
+        })])
+        respx.patch(url__startswith=f"{API}/pages/").mock(
+            return_value=httpx.Response(200, json={"id": "p1"})
+        )
+        result = await NotionStore(TOKEN).upsert_new(DB, [listing()], column_map=RENAMED_MAP)
+        assert (result.new, result.existing) == (0, 1)
+        assert not [c for c in respx.calls if c.request.method == "POST"
+                    and c.request.url.path.endswith("/pages")], "nothing inserted"
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_dedupe_key_reads_back_from_a_title_column(self):
+        # listing_id mapped onto the title column: reading it back must use the
+        # title shape, not rich_text, or every row would look new.
+        schema = {"Deal": prop("title", "t"), "Link": prop("url", "u"),
+                  "Canonical": prop("rich_text", "c")}
+        m = {"listing_title": "Deal", "url": "Link", "normalized_url": "Canonical",
+             "listing_id": "Deal"}
+        mock_db(schema)
+        mock_query([mapped_row("p1", {"Deal": ("title", "2485121"),
+                                      "Canonical": ("rich_text", "u/x")})])
+        index = await NotionStore(TOKEN).index(DB, m)
+        assert index.listing_ids == {"2485121"}
+
+
+class TestMappedTouch:
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_existing_row_touch_targets_the_mapped_last_synced_column(self):
+        import json
+
+        schema = {**RENAMED, "Updated": prop("date", "up")}
+        m = {**RENAMED_MAP, "last_synced_at": "Updated"}
+        mock_db(schema)
+        mock_query([mapped_row("p1", {
+            "Ref": ("rich_text", "2485121"),
+            "Canonical": ("rich_text", "bizbuysell.com/business-opportunity/foo/2485121"),
+        })])
+        patch = respx.patch(f"{API}/pages/p1").mock(return_value=httpx.Response(200, json={"id": "p1"}))
+        await NotionStore(TOKEN).upsert_new(DB, [listing()], column_map=m)
+        sent = json.loads(patch.calls[0].request.read())["properties"]
+        assert list(sent) == ["Updated"]
+        assert "start" in sent["Updated"]["date"]
+
+
+class TestMapRows:
+    def test_rows_reflect_selection_and_saved_type(self):
+        columns = {"Deal": "title", "Ask": "rich_text", "Notes": "rich_text"}
+        rows = {r.key: r for r in build_map_rows(RENAMED_MAP, columns)}
+        assert rows["listing_title"].selected == "Deal"
+        assert rows["listing_title"].saved_type == "Title"
+        assert rows["asking_price"].selected == "Ask"
+        assert rows["asking_price"].saved_type == "Text"
+
+    def test_dont_sync_optional_shows_no_selection(self):
+        m = {**RENAMED_MAP, "revenue": None}
+        rows = {r.key: r for r in build_map_rows(m, {"Deal": "title"})}
+        assert rows["revenue"].selected == ""
+        assert rows["revenue"].dont_sync is True

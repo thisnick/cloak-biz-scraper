@@ -520,7 +520,39 @@
               </form>
               {% if s.notion_db_id %}
                 <div class="selrow"><span class="k">Saving to</span><span class="v">{{ s.notion_db_id }}</span>
-                  <form method="post" action="/settings/notion/verify" style="margin-left:auto"><button class="btn" type="submit">Verify schema</button></form></div>
+                  <form method="post" action="/settings/notion/verify" style="margin-left:auto"><button class="btn" type="submit">Verify &amp; edit columns</button></form></div>
+              {% endif %}
+              {% if notion_mapping %}
+                <hr>
+                <p class="lead-help">Match each field to a column in your database. Required fields must point at a column; optional ones can be set to <em>don't sync</em>. Values adapt to the column you choose — a price saves as a number in a Number column, or as text in a Text column. Only the columns you pick here are ever written; everything else in your database is left alone.</p>
+                <form method="post" action="/settings/notion/mapping">
+                  <div class="tablewrap">
+                    <table class="hist">
+                      <thead><tr><th>Field</th><th>Your column</th><th>Saved as</th></tr></thead>
+                      <tbody>
+                        {% for row in notion_mapping.rows %}
+                        <tr>
+                          <td><b>{{ row.label }}</b>{% if row.required %} <span class="chip bad">required</span>{% endif %}</td>
+                          <td>
+                            <select name="map_{{ row.key }}">
+                              {% if row.required %}
+                                <option value="" {{ 'selected' if not row.selected }} disabled>— choose a column —</option>
+                              {% else %}
+                                <option value="" {{ 'selected' if not row.selected }}>— don't sync —</option>
+                              {% endif %}
+                              {% for col in notion_mapping.columns %}
+                                <option value="{{ col.name }}" {{ 'selected' if col.name == row.selected }}>{{ col.name }} · {{ col.type }}</option>
+                              {% endfor %}
+                            </select>
+                          </td>
+                          <td class="mono">{{ row.saved_type or '—' }}</td>
+                        </tr>
+                        {% endfor %}
+                      </tbody>
+                    </table>
+                  </div>
+                  <div class="btnrow"><button class="btn primary" type="submit">Save column mapping</button></div>
+                </form>
               {% endif %}
               {% if result and result.section == 'notion' and result.detail and result.detail.databases is defined %}
                 <hr>

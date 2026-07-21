@@ -161,8 +161,16 @@ class ScrapeService:
         return out
 
     async def _sync(self, job: Job, listings: list[Listing]) -> SyncResult:
-        store: ListingStore = self._store_factory(self._settings.load())
-        result = await store.upsert_new(job.db_id, listings)
+        settings = self._settings.load()
+        store: ListingStore = self._store_factory(settings)
+        # The map belongs to the configured database. If the sweep targets a
+        # different db_id (an agent passing one explicitly), the map does not
+        # apply to it — fall back to identity mapping, which is safe for any
+        # correctly-named database.
+        column_map = settings.notion_column_map or None
+        if job.db_id != settings.notion_db_id:
+            column_map = None
+        result = await store.upsert_new(job.db_id, listings, column_map=column_map)
         return SyncResult(
             new=result.new, existing=result.existing, db_id=result.db_id,
             skipped=result.skipped_names,

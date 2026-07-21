@@ -147,15 +147,25 @@ class ListingStore(Protocol):
     mid-sweep.
     """
 
-    async def verify_schema(self, db_id: str) -> SchemaReport:
-        """Report what is missing or mismatched. Must never mutate the store."""
+    async def verify_schema(
+        self, db_id: str, column_map: "dict[str, str | None] | None" = None
+    ) -> SchemaReport:
+        """Report what is missing or mismatched. Must never mutate the store.
+
+        `column_map` is an optional {field-key -> user's column name, or None}
+        override; a store with no notion of columns may ignore it."""
         ...
 
-    async def index(self, db_id: str) -> DedupeIndex:
-        """The dedupe keys already stored."""
+    async def index(
+        self, db_id: str, column_map: "dict[str, str | None] | None" = None
+    ) -> DedupeIndex:
+        """The dedupe keys already stored, read from the mapped columns."""
         ...
 
-    async def upsert_new(self, db_id: str, listings: list[Listing]) -> UpsertResult:
+    async def upsert_new(
+        self, db_id: str, listings: list[Listing],
+        column_map: "dict[str, str | None] | None" = None,
+    ) -> UpsertResult:
         """Insert listings that are not already stored. Must never overwrite a
-        column the user added."""
+        column the user added, and must only write columns named in the map."""
         ...

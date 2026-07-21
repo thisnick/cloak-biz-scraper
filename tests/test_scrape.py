@@ -44,9 +44,11 @@ class FakeStore:
     def __init__(self, settings=None):
         FakeStore.built += 1
         self.upserts: list[tuple[str, list[Listing]]] = []
+        self.column_maps: list = []
 
-    async def upsert_new(self, db_id, listings):
+    async def upsert_new(self, db_id, listings, column_map=None):
         self.upserts.append((db_id, listings))
+        self.column_maps.append(column_map)
         return UpsertResult(new=len(listings), existing=0, db_id=db_id)
 
 
@@ -167,6 +169,32 @@ class TestSyncTrue:
         await _drain(svc)
 
         assert store.upserts[0][1][0].asking_price == "$1,258,000"
+
+    @pytest.mark.asyncio
+    async def test_the_configured_map_is_passed_for_the_configured_database(self, settings, jobs):
+        cmap = {"listing_title": "Deal", "url": "Link"}
+        settings.update(notion_api_token="ntn_x", notion_db_id="db-1", notion_column_map=cmap)
+        store = FakeStore()
+        svc = service(settings, jobs, store=lambda s: store)
+        svc.start(SERP, sync=True)
+        await _drain(svc)
+
+        assert store.column_maps[0] == cmap
+
+    @pytest.mark.asyncio
+    async def test_a_different_db_id_falls_back_to_identity_no_map(self, settings, jobs):
+        """The stored map belongs to the configured database. A sweep aimed at a
+        different one must not be judged against columns it never named."""
+        settings.update(
+            notion_api_token="ntn_x", notion_db_id="db-configured",
+            notion_column_map={"listing_title": "Deal"},
+        )
+        store = FakeStore()
+        svc = service(settings, jobs, store=lambda s: store)
+        svc.start(SERP, sync=True, db_id="db-other")
+        await _drain(svc)
+
+        assert store.column_maps[0] is None
 
 
 class TestFailure:

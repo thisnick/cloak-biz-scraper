@@ -132,7 +132,7 @@ def _job_result(job) -> tuple[str, str]:
 
 
 def _render(request: Request, result: Result | None = None, status: int = 200,
-            active: str | None = None) -> Response:
+            active: str | None = None, notion_mapping: Any = None) -> Response:
     settings: Settings = request.app.state.settings.load()
     from ..services.urls import public_base
     from ..services.views import browser_info, instance_view
@@ -161,6 +161,7 @@ def _render(request: Request, result: Result | None = None, status: int = 200,
         {
             "s": settings,
             "result": result,
+            "notion_mapping": notion_mapping,
             "pool_warning": settings.pool_warning(),
             "has_license": bool(settings.cloakbrowser_license_key),
             "browser": browser_info(settings, request.app.state.instances),
@@ -967,31 +968,54 @@ async def save_notion(
     return _render(request, Result("notion", False, f"Unknown action '{action}'."), status=400)
 
 
+async def _notion_mapping_view(store, db_id: str, column_map) -> dict[str, Any]:
+    """The mapping table's view model: one row per field plus the database's
+    columns for the dropdowns. Fetches the live column list so the picker only
+    ever offers columns that actually exist."""
+    from ..stores.notion import _display, build_map_rows
+
+    columns = await store.column_types(db_id)  # name -> notion type
+    return {
+        "db_id": db_id,
+        "rows": build_map_rows(column_map or None, columns),
+        "columns": [{"name": n, "type": _display(t) or t} for n, t in sorted(columns.items())],
+    }
+
+
 @router.post("/settings/notion/select", response_class=HTMLResponse)
 async def select_database(request: Request, db_id: str = Form("")) -> Response:
-    """Adopt an existing database, and say exactly what is wrong with it.
+    """Adopt an existing database, default its column mapping by identity, and say
+    exactly what is wrong with it.
 
     Selecting is deliberately separate from verifying nothing: we store the id
-    even when the schema has gaps, so the user can go fix them in Notion and
-    press Verify again rather than lose their selection.
+    (and a fresh default map) even when the schema has gaps, so the user can fix
+    the mapping below — or the columns in Notion — and re-verify rather than lose
+    their selection.
     """
     _require(request)
     _require_same_origin(request)
-    from ..stores.notion import NotionError, NotionStore
+    from ..stores.notion import NotionError, NotionStore, default_column_map
 
     db_id = db_id.strip()
     if not db_id:
         return _render(request, Result("notion", False, "Pick a database first."), status=400)
 
     settings = request.app.state.settings.load()
+    store = NotionStore(settings.notion_api_token)
     try:
-        report = await NotionStore(settings.notion_api_token).verify_schema(db_id)
+        columns = await store.column_types(db_id)
+        column_map = default_column_map(set(columns))
+        report = await store.verify_schema(db_id, column_map)
+        mapping = await _notion_mapping_view(store, db_id, column_map)
     except NotionError as exc:
         return _render(request, Result("notion", False, str(exc)), status=400)
 
-    request.app.state.settings.update(notion_db_id=db_id)
-    return _render(request, Result("notion", report.usable, _schema_message(report), report,
-                                   level=_schema_level(report)))
+    request.app.state.settings.update(notion_db_id=db_id, notion_column_map=column_map)
+    return _render(
+        request,
+        Result("notion", report.usable, _schema_message(report), report, level=_schema_level(report)),
+        notion_mapping=mapping,
+    )
 
 
 @router.post("/settings/notion/verify", response_class=HTMLResponse)
@@ -1003,12 +1027,65 @@ async def verify_database(request: Request) -> Response:
     settings = request.app.state.settings.load()
     if not settings.notion_db_id:
         return _render(request, Result("notion", False, "No database selected yet."), status=400)
+    column_map = settings.notion_column_map or None
+    store = NotionStore(settings.notion_api_token)
     try:
-        report = await NotionStore(settings.notion_api_token).verify_schema(settings.notion_db_id)
+        report = await store.verify_schema(settings.notion_db_id, column_map)
+        mapping = await _notion_mapping_view(store, settings.notion_db_id, column_map)
     except NotionError as exc:
         return _render(request, Result("notion", False, str(exc)), status=400)
-    return _render(request, Result("notion", report.usable, _schema_message(report), report,
-                                   level=_schema_level(report)))
+    return _render(
+        request,
+        Result("notion", report.usable, _schema_message(report), report, level=_schema_level(report)),
+        notion_mapping=mapping,
+    )
+
+
+@router.post("/settings/notion/mapping", response_class=HTMLResponse)
+async def save_mapping(request: Request) -> Response:
+    """Save the user's column mapping, then re-verify against it.
+
+    One <select> per field, named `map_<field-key>`; its value is the chosen
+    column name, or empty for "don't sync" (optional fields) / unset (required).
+    A submitted name is only kept if the database really has that column, so a
+    stale form can never make us believe in a column that is not there.
+    """
+    _require(request)
+    _require_same_origin(request)
+    from ..stores.notion import KNOWN_PROPS, NotionError, NotionStore
+
+    settings = request.app.state.settings.load()
+    if not settings.notion_db_id:
+        return _render(request, Result("notion", False, "No database selected yet."), status=400)
+
+    form = await request.form()
+    store = NotionStore(settings.notion_api_token)
+    try:
+        columns = await store.column_types(settings.notion_db_id)
+    except NotionError as exc:
+        return _render(request, Result("notion", False, str(exc)), status=400)
+
+    new_map: dict[str, str | None] = {}
+    for prop in KNOWN_PROPS:
+        chosen = str(form.get(f"map_{prop.key}", "")).strip()
+        if chosen and chosen in columns:
+            new_map[prop.key] = chosen
+        elif prop.required:
+            continue  # unmapped — the user must still choose a column
+        else:
+            new_map[prop.key] = None  # "don't sync"
+
+    request.app.state.settings.update(notion_column_map=new_map)
+    try:
+        report = await store.verify_schema(settings.notion_db_id, new_map)
+        mapping = await _notion_mapping_view(store, settings.notion_db_id, new_map)
+    except NotionError as exc:
+        return _render(request, Result("notion", False, str(exc)), status=400)
+    return _render(
+        request,
+        Result("notion", report.usable, _schema_message(report), report, level=_schema_level(report)),
+        notion_mapping=mapping,
+    )
 
 
 def _schema_level(report) -> str:
@@ -1027,7 +1104,7 @@ def _schema_message(report) -> str:
     have, or ignoring one they do.
     """
     if report.complete:
-        return f"'{report.title}' is ready — new listings will sync with every field filled."
+        return f"'{report.title}' is ready — new listings will sync into your columns."
     if report.usable:
         n = len(report.missing_recommended) + len(report.mismatched_recommended)
         s = "s" if n != 1 else ""
@@ -1055,14 +1132,22 @@ async def create_database(
         )
 
     settings = request.app.state.settings.load()
+    from ..stores.notion import default_column_map
+
     try:
         notion = NotionStore(settings.notion_api_token)
         created = await notion.create_database(parent_page_id, title.strip() or "Business Listings")
-        report = await notion.verify_schema(created.id)
+        # A database we just created has every default column, so its map is a
+        # clean identity map. Default it from the live columns anyway, so what we
+        # store is what Notion actually made rather than what we asked for.
+        columns = await notion.column_types(created.id)
+        column_map = default_column_map(set(columns))
+        report = await notion.verify_schema(created.id, column_map)
+        mapping = await _notion_mapping_view(notion, created.id, column_map)
     except NotionError as exc:
         return _render(request, Result("notion", False, str(exc)), status=400)
 
-    request.app.state.settings.update(notion_db_id=created.id)
+    request.app.state.settings.update(notion_db_id=created.id, notion_column_map=column_map)
     # Say what the verification found, not what we expect it to find. We create
     # the schema from the same table we check it against, so "complete" should be
     # certain — but asserting it in prose rather than reading the report is how a
@@ -1072,7 +1157,8 @@ async def create_database(
         if report.complete
         else "Notion did not create it quite as expected — see below."
     )
-    return _render(request, Result("notion", report.complete, message, report))
+    return _render(request, Result("notion", report.complete, message, report),
+                   notion_mapping=mapping)
 
 
 # APP_SECRET is managed in Railway's Variables tab, not in this settings UI.

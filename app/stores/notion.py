@@ -116,6 +116,10 @@ _DEDUPE_CONSEQUENCE = (
 
 @dataclass(frozen=True)
 class NotionProp:
+    # Stable machine key for this field, independent of the display name. The
+    # column MAPPING is keyed by this, so renaming the default column header
+    # ("SDE / Cash Flow" -> whatever the user calls it) never breaks a stored map.
+    key: str
     name: str
     type: str
     required: bool
@@ -171,58 +175,59 @@ def _money(value: object) -> dict[str, Any] | None:
 KNOWN_PROPS: tuple[NotionProp, ...] = (
     # The four the machine cannot work without.
     NotionProp(
-        "Listing Title", "title", True, {"title": {}}, source="title",
+        "listing_title", "Listing Title", "title", True, {"title": {}}, source="title",
         render=lambda v: {"title": _text_chunk(v)} if v else None,
         extract=_plain_title,
         consequence="Every Notion database needs exactly one Title column; syncing is "
                     "blocked without it.",
     ),
     NotionProp(
-        "URL", "url", True, {"url": {}}, source="url",
+        "url", "URL", "url", True, {"url": {}}, source="url",
         render=lambda v: {"url": v} if v else None,
         consequence="Without it there is no link back to the original listing, so "
                     "syncing is blocked.",
     ),
     NotionProp(
-        "Normalized URL", "rich_text", True, {"rich_text": {}}, source="normalized_url",
+        "normalized_url", "Normalized URL", "rich_text", True, {"rich_text": {}},
+        source="normalized_url",
         render=lambda v: {"rich_text": _text_chunk(v)} if v else None,
         extract=_plain, consequence=_DEDUPE_CONSEQUENCE,
     ),
     NotionProp(
-        "Listing ID", "rich_text", True, {"rich_text": {}}, source="listing_id",
+        "listing_id", "Listing ID", "rich_text", True, {"rich_text": {}}, source="listing_id",
         render=lambda v: {"rich_text": _text_chunk(v)} if v else None,
         extract=_plain, consequence=_DEDUPE_CONSEQUENCE,
     ),
     # Recommended: what turns a list of rows into a triage tool.
     NotionProp(
-        "Source", "select", False, {"select": {}}, source="source",
+        "source", "Source", "select", False, {"select": {}}, source="source",
         render=lambda v: {"select": {"name": v}} if v else None,
         consequence="Which site a listing came from will not be recorded. Everything "
                     "else still syncs.",
     ),
     NotionProp(
-        "Location", "rich_text", False, {"rich_text": {}}, source="location",
+        "location", "Location", "rich_text", False, {"rich_text": {}}, source="location",
         render=lambda v: {"rich_text": _text_chunk(v)} if v else None,
         consequence="Locations will not be recorded. Everything else still syncs.",
     ),
     NotionProp(
-        "Asking Price", "number", False, {"number": {"format": "dollar"}}, source="asking_price",
-        render=_money, consequence=_MONEY_CONSEQUENCE,
+        "asking_price", "Asking Price", "number", False, {"number": {"format": "dollar"}},
+        source="asking_price", render=_money, consequence=_MONEY_CONSEQUENCE,
     ),
     NotionProp(
-        "Revenue", "number", False, {"number": {"format": "dollar"}}, source="revenue",
-        render=_money, consequence=_MONEY_CONSEQUENCE,
+        "revenue", "Revenue", "number", False, {"number": {"format": "dollar"}},
+        source="revenue", render=_money, consequence=_MONEY_CONSEQUENCE,
     ),
     NotionProp(
-        "SDE / Cash Flow", "number", False, {"number": {"format": "dollar"}}, source="cashflow",
-        render=_money, consequence=_MONEY_CONSEQUENCE,
+        "sde_cashflow", "SDE / Cash Flow", "number", False, {"number": {"format": "dollar"}},
+        source="cashflow", render=_money, consequence=_MONEY_CONSEQUENCE,
     ),
     NotionProp(
-        "EBITDA", "number", False, {"number": {"format": "dollar"}}, source="ebitda",
-        render=_money, consequence=_MONEY_CONSEQUENCE,
+        "ebitda", "EBITDA", "number", False, {"number": {"format": "dollar"}},
+        source="ebitda", render=_money, consequence=_MONEY_CONSEQUENCE,
     ),
     NotionProp(
-        "Status", "select", False,
+        "status", "Status", "select", False,
         {"select": {"options": [
             {"name": "New", "color": "blue"},
             {"name": "Review", "color": "yellow"},
@@ -233,12 +238,12 @@ KNOWN_PROPS: tuple[NotionProp, ...] = (
                     "workflow but not the listings.",
     ),
     NotionProp(
-        "First Seen At", "date", False, {"date": {}},
+        "first_seen_at", "First Seen At", "date", False, {"date": {}},
         render=lambda v: {"date": {"start": _now_iso()}}, insert_only=True,
         consequence="You will not see when a listing first appeared.",
     ),
     NotionProp(
-        "Last Synced At", "date", False, {"date": {}},
+        "last_synced_at", "Last Synced At", "date", False, {"date": {}},
         render=lambda v: {"date": {"start": _now_iso()}},
         consequence="You will not be able to tell a listing that is still live from one "
                     "that has come off the market.",
@@ -246,7 +251,151 @@ KNOWN_PROPS: tuple[NotionProp, ...] = (
 )
 
 PROPS_BY_NAME = {p.name: p for p in KNOWN_PROPS}
+PROPS_BY_KEY = {p.key: p for p in KNOWN_PROPS}
 REQUIRED_PROPS = tuple(p for p in KNOWN_PROPS if p.required)
+
+
+# ── the column MAPPING ──────────────────────────────────────────────────────
+# The map is {field-key -> the user's column NAME, or None ("don't sync")}. A
+# missing key means "unmapped": harmless for an optional field, blocking for a
+# required one. An EMPTY map is the back-compat sentinel — it means "no map
+# stored", so every method below falls back to IDENTITY mapping (each field to a
+# same-named column), which is exactly the behaviour before this feature existed.
+
+ColumnMap = dict[str, "str | None"]
+
+
+def default_column_map(column_names: set[str]) -> ColumnMap:
+    """Build the default map for a database by IDENTITY.
+
+    Auto-map each field to a same-named column when the database has one. Leave
+    unmatched REQUIRED fields unmapped (absent) so the user is forced to choose a
+    column for them; default unmatched OPTIONAL fields to None ("don't sync").
+    The result is always non-empty, so it never collides with the empty-map
+    sentinel and is always treated as an explicit map from here on.
+    """
+    out: ColumnMap = {}
+    for prop in KNOWN_PROPS:
+        if prop.name in column_names:
+            out[prop.key] = prop.name
+        elif not prop.required:
+            out[prop.key] = None
+        # required + unmatched -> left absent (unmapped), the user must set it.
+    return out
+
+
+def _resolve(column_map: ColumnMap | None, key: str) -> str | None:
+    """The column a field points at: the map's value, or the identity name when
+    no map is stored."""
+    if not column_map:
+        return PROPS_BY_KEY[key].name
+    return column_map.get(key)
+
+
+def _required_compatible(expected: str, actual: str | None) -> bool:
+    """Whether a REQUIRED field's target column can hold what we write.
+
+    Title needs a title column and URL a url column, but a URL mapped onto a Text
+    column is fine — we simply write the link as text. Text (rich_text) fields
+    need a text column. Optional fields are never checked here: their value
+    adapts to whatever the target column is."""
+    if expected == "title":
+        return actual == "title"
+    if expected == "url":
+        return actual in ("url", "rich_text")
+    if expected == "rich_text":
+        return actual == "rich_text"
+    return expected == actual
+
+
+def _format_for_type(actual_type: str, logical: str, *, timestamp: bool) -> dict[str, Any] | None:
+    """Render one logical string value FOR the target column's actual type.
+
+    This is the heart of target-sensitive writes: the same "$1,258,000" becomes a
+    parsed Number in a number column and the verbatim string in a text column —
+    the value adapts to the column, never the other way round. An unparseable
+    money string in a number column, or an empty value, yields None (an empty
+    cell). A target type we cannot form a value for is skipped, never guessed at,
+    so a write can only ever succeed or leave a cell blank — it never 400s the row.
+    """
+    if actual_type == "number":
+        amount = parse_money(logical)
+        return {"number": amount} if amount is not None else None
+    if not logical:
+        return None
+    if actual_type == "title":
+        return {"title": _text_chunk(logical)}
+    if actual_type == "rich_text":
+        return {"rich_text": _text_chunk(logical)}
+    if actual_type == "url":
+        return {"url": logical}
+    if actual_type == "select":
+        # Notion creates a missing select option on write, so this is always safe.
+        return {"select": {"name": logical}}
+    if actual_type == "status":
+        # A Notion "status" column is NOT a select: its options are fixed and the
+        # API cannot create one. Writing an option the column lacks 400s the whole
+        # page, so we never write a status column — better an empty cell than a
+        # lost row. (Our own created databases use a select for Status, not this.)
+        return None
+    if actual_type == "date":
+        # Only an actual timestamp field (First/Last Seen) can form a valid date;
+        # a listing's text value in a date column cannot, so leave it empty.
+        return {"date": {"start": logical}} if timestamp else None
+    if actual_type == "email":
+        return {"email": logical}
+    if actual_type == "phone_number":
+        return {"phone_number": logical}
+    if actual_type == "checkbox":
+        return {"checkbox": logical.strip().lower() in ("true", "yes", "1", "x", "✓")}
+    return None
+
+
+def _logical_value(prop: NotionProp, listing: Listing) -> str:
+    """The field's value as a plain string, before it is shaped for a column.
+
+    Status is always "New" on insert; the date fields are stamped now; everything
+    else is read verbatim off the listing (money included — parsing is the
+    column's business, decided in _format_for_type)."""
+    if prop.key == "status":
+        return "New"
+    if prop.type == "date":
+        return _now_iso()
+    if prop.source:
+        return getattr(listing, prop.source) or ""
+    return ""
+
+
+@dataclass(frozen=True)
+class MapRow:
+    """One row of the settings mapping table — plain data for the template."""
+
+    key: str
+    label: str
+    required: bool
+    selected: str      # the column currently mapped, "" when unmapped or "don't sync"
+    dont_sync: bool     # True only when an optional field is explicitly set to None
+    saved_type: str     # display type of the mapped column, "" when none/missing
+
+
+def build_map_rows(column_map: ColumnMap | None, columns: dict[str, str]) -> list[MapRow]:
+    """The mapping table view: one row per field, its current selection, and the
+    display type of the column it lands in. `columns` is name -> notion type."""
+    rows: list[MapRow] = []
+    for prop in KNOWN_PROPS:
+        target = _resolve(column_map, prop.key)
+        selected = target if (target and target in columns) else ""
+        rows.append(
+            MapRow(
+                key=prop.key,
+                label=prop.name,
+                required=prop.required,
+                selected=selected,
+                dont_sync=(bool(column_map) and prop.key in column_map and column_map[prop.key] is None),
+                saved_type=_display(columns.get(selected)) or "" if selected else "",
+            )
+        )
+    return rows
 
 
 # ── transport ───────────────────────────────────────────────────────────────
@@ -449,14 +598,83 @@ class NotionStore:
         )
 
     # ── ListingStore ────────────────────────────────────────────────────────
-    async def verify_schema(self, db_id: str) -> SchemaReport:
-        """Inspect and report. Reads only — never repairs what it finds."""
-        return self._report_from(db_id, await self._client.request("GET", f"/databases/{db_id}"))
+    async def verify_schema(
+        self, db_id: str, column_map: ColumnMap | None = None
+    ) -> SchemaReport:
+        """Inspect and report. Reads only — never repairs what it finds.
 
-    def _report_from(self, db_id: str, data: dict[str, Any]) -> SchemaReport:
+        With no `column_map` this is identity mapping: exactly the pre-mapping
+        behaviour, which is what keeps a correctly-named database working with no
+        stored map. With a map, each field is judged against the column it is
+        mapped to (or found unmapped)."""
+        data = await self._client.request("GET", f"/databases/{db_id}")
+        return self._report_from(db_id, data, column_map)
+
+    async def column_types(self, db_id: str) -> dict[str, str]:
+        """The database's columns as name -> Notion type. Feeds the default map
+        and the settings mapping table."""
+        data = await self._client.request("GET", f"/databases/{db_id}")
+        return {name: prop.get("type", "") for name, prop in data.get("properties", {}).items()}
+
+    def _report_from(
+        self, db_id: str, data: dict[str, Any], column_map: ColumnMap | None = None
+    ) -> SchemaReport:
         actual = data.get("properties", {})
         title = "".join(t.get("plain_text", "") for t in data.get("title", [])) or "(untitled)"
 
+        if not column_map:
+            return self._legacy_report(db_id, title, actual)
+
+        missing_required: list[PropIssue] = []
+        mismatched_required: list[PropIssue] = []
+        missing_recommended: list[PropIssue] = []
+        mismatched_recommended: list[PropIssue] = []
+        mapped_targets: set[str] = set()
+
+        for prop in KNOWN_PROPS:
+            col = column_map.get(prop.key)
+            if col:
+                mapped_targets.add(col)
+            found = actual.get(col) if col else None
+
+            if prop.required:
+                if not col or found is None:
+                    # Unmapped, or mapped to a column the database no longer has:
+                    # either way syncing is blocked until the user picks one.
+                    missing_required.append(
+                        PropIssue(prop.name, _display(prop.type), None, True, prop.consequence)
+                    )
+                elif not _required_compatible(prop.type, found.get("type")):
+                    mismatched_required.append(
+                        PropIssue(
+                            prop.name, _display(prop.type), _display(found.get("type")),
+                            True, prop.consequence,
+                        )
+                    )
+            else:
+                # Optional. "Don't sync" (col is None) is a fine, deliberate
+                # choice. Mapped to an existing column is fine at ANY type — the
+                # write adapts the value to it, so a Number field in a Text column
+                # simply saves as text, with no nag. The only real problem is a map
+                # that points at a column the database does not have.
+                if col and found is None:
+                    missing_recommended.append(
+                        PropIssue(prop.name, _display(prop.type), None, False, prop.consequence)
+                    )
+
+        return SchemaReport(
+            db_id=db_id,
+            title=title,
+            missing_required=missing_required,
+            mismatched_required=mismatched_required,
+            missing_recommended=missing_recommended,
+            mismatched_recommended=mismatched_recommended,
+            untouched=sorted(n for n in actual if n not in mapped_targets),
+        )
+
+    def _legacy_report(self, db_id: str, title: str, actual: dict[str, Any]) -> SchemaReport:
+        """Identity mapping: field name must match column name at the expected
+        type. Unchanged from before the column map existed."""
         missing_required: list[PropIssue] = []
         mismatched_required: list[PropIssue] = []
         missing_recommended: list[PropIssue] = []
@@ -486,15 +704,21 @@ class NotionStore:
             untouched=sorted(n for n in actual if n not in PROPS_BY_NAME),
         )
 
-    async def _scan(self, db_id: str, actual: dict[str, Any]) -> list[_Row]:
+    async def _scan(
+        self, db_id: str, actual: dict[str, Any], column_map: ColumnMap | None = None
+    ) -> list[_Row]:
         """Every row's dedupe keys and page id.
 
-        Asks Notion for only the two key properties. On a database with forty
-        columns and a thousand rows that is the difference between a few hundred
-        KB and tens of MB per sweep.
+        Reads the two dedupe keys from the columns they are MAPPED to (the user's
+        real column names), so dedupe works under any mapping. Asks Notion for
+        only those two properties. On a database with forty columns and a thousand
+        rows that is the difference between a few hundred KB and tens of MB per
+        sweep.
         """
-        wanted = [PROPS_BY_NAME["Listing ID"], PROPS_BY_NAME["Normalized URL"]]
-        params = [("filter_properties", actual[p.name]["id"]) for p in wanted if p.name in actual]
+        id_col = _resolve(column_map, "listing_id")
+        url_col = _resolve(column_map, "normalized_url")
+        wanted = [c for c in (id_col, url_col) if c and c in actual]
+        params = [("filter_properties", actual[c]["id"]) for c in wanted]
 
         rows: list[_Row] = []
         cursor: str | None = None
@@ -510,13 +734,27 @@ class NotionStore:
                 rows.append(
                     _Row(
                         page_id=page["id"],
-                        listing_id=_plain(props.get("Listing ID", {})),
-                        normalized_url=_plain(props.get("Normalized URL", {})),
+                        listing_id=self._read_key(props, id_col, actual),
+                        normalized_url=self._read_key(props, url_col, actual),
                     )
                 )
             if not data.get("has_more"):
                 return rows
             cursor = data.get("next_cursor")
+
+    @staticmethod
+    def _read_key(props: dict[str, Any], col: str | None, actual: dict[str, Any]) -> str:
+        """Read a dedupe key out of a page, honouring the mapped column's type so
+        a listing id kept in a Title, or a URL in a url column, still reads back."""
+        if not col:
+            return ""
+        col_type = (actual.get(col) or {}).get("type", "rich_text")
+        prop = props.get(col, {})
+        if col_type == "title":
+            return _plain_title(prop)
+        if col_type == "url":
+            return prop.get("url") or ""
+        return _plain(prop)
 
     @staticmethod
     def _index_of(rows: list[_Row]) -> DedupeIndex:
@@ -525,9 +763,39 @@ class NotionStore:
             normalized_urls={r.normalized_url for r in rows if r.normalized_url},
         )
 
-    async def index(self, db_id: str) -> DedupeIndex:
+    async def index(self, db_id: str, column_map: ColumnMap | None = None) -> DedupeIndex:
         data = await self._client.request("GET", f"/databases/{db_id}")
-        return self._index_of(await self._scan(db_id, data.get("properties", {})))
+        return self._index_of(await self._scan(db_id, data.get("properties", {}), column_map))
+
+    def _properties_for_mapped(
+        self, listing: Listing, actual: dict[str, Any], column_map: ColumnMap, *, insert: bool
+    ) -> dict[str, Any]:
+        """Render a listing's properties under an explicit column map.
+
+        Iterates the map, and for each mapped field reads the TARGET column's
+        actual type and formats the value for that type. Two guarantees are
+        load-bearing here: we ONLY ever write columns named in the map, and only
+        when the database actually has them — a field mapped to a column that was
+        since deleted is skipped, never re-created. Everything else in the user's
+        database is invisible to this write.
+        """
+        out: dict[str, Any] = {}
+        for prop in KNOWN_PROPS:
+            if prop.insert_only and not insert:
+                continue
+            col = column_map.get(prop.key)
+            if not col:
+                continue  # unmapped or explicitly "don't sync"
+            found = actual.get(col)
+            if found is None:
+                continue  # mapped to a column the database does not have — never create it
+            rendered = _format_for_type(
+                found.get("type", ""), _logical_value(prop, listing),
+                timestamp=(prop.type == "date"),
+            )
+            if rendered is not None:
+                out[col] = rendered
+        return out
 
     def _properties_for(self, listing: Listing, actual: dict[str, Any], *, insert: bool) -> dict[str, Any]:
         """Render only properties we own AND the database actually has AND at the
@@ -553,7 +821,29 @@ class NotionStore:
                 out[prop.name] = rendered
         return out
 
-    async def upsert_new(self, db_id: str, listings: list[Listing]) -> UpsertResult:
+    def _touch_property(
+        self, column_map: ColumnMap | None, actual: dict[str, Any]
+    ) -> tuple[str | None, dict[str, Any] | None]:
+        """The one property written on an already-known row: Last Synced At.
+
+        Under a map, the value adapts to whatever column it lands in. Under
+        identity it stays strict — the column must be an actual Date — so the
+        legacy behaviour (skip a mistyped Last Synced At rather than write text
+        into it) is preserved for a database with no stored map."""
+        if column_map:
+            col = column_map.get("last_synced_at")
+            if not col or col not in actual:
+                return col, None
+            payload = _format_for_type(actual[col].get("type", ""), _now_iso(), timestamp=True)
+            return col, payload
+        touch = PROPS_BY_NAME["Last Synced At"]
+        if touch.name in actual and actual[touch.name].get("type") == touch.type:
+            return touch.name, touch.render(None)
+        return touch.name, None
+
+    async def upsert_new(
+        self, db_id: str, listings: list[Listing], column_map: ColumnMap | None = None
+    ) -> UpsertResult:
         """Insert listings that are not already there; touch nothing else.
 
         Existing rows get exactly one property written — `Last Synced At`, which
@@ -571,21 +861,19 @@ class NotionStore:
         every row rather than lose one column.
         """
         data = await self._client.request("GET", f"/databases/{db_id}")
-        schema = self._report_from(db_id, data)
+        schema = self._report_from(db_id, data, column_map)
         if not schema.usable:
             raise SchemaInvalid(schema)
 
         actual = data.get("properties", {})
-        rows = await self._scan(db_id, actual)
+        rows = await self._scan(db_id, actual, column_map)
         index = self._index_of(rows)
         by_listing_id = {r.listing_id: r for r in rows if r.listing_id}
         by_url = {r.normalized_url: r for r in rows if r.normalized_url}
 
         new = existing = 0
-        touch = PROPS_BY_NAME["Last Synced At"]
-        can_touch = (
-            touch.name in actual and actual[touch.name].get("type") == touch.type
-        )
+        touch_col, touch_payload = self._touch_property(column_map, actual)
+        can_touch = touch_payload is not None
 
         for listing in listings:
             if index.contains(listing):
@@ -597,17 +885,19 @@ class NotionStore:
                     await self._client.request(
                         "PATCH",
                         f"/pages/{row.page_id}",
-                        json={"properties": {touch.name: touch.render(None)}},
+                        json={"properties": {touch_col: touch_payload}},
                     )
                 continue
 
+            props = (
+                self._properties_for_mapped(listing, actual, column_map, insert=True)
+                if column_map
+                else self._properties_for(listing, actual, insert=True)
+            )
             await self._client.request(
                 "POST",
                 "/pages",
-                json={
-                    "parent": {"database_id": db_id},
-                    "properties": self._properties_for(listing, actual, insert=True),
-                },
+                json={"parent": {"database_id": db_id}, "properties": props},
             )
             new += 1
             # Within one sweep the same listing can appear twice (paging overlap);

@@ -68,6 +68,16 @@ class Settings(BaseModel):
     notion_api_token: str = ""
     notion_db_id: str = ""
 
+    # Column MAPPING for the chosen database: {field-key -> the user's column
+    # NAME, or None ("don't sync")}. A missing key means the field is unmapped
+    # (blocking for a required field, ignored for an optional one). An EMPTY map
+    # is the back-compat sentinel: no map stored, so writes and verification fall
+    # back to identity mapping (each field to a same-named column) — exactly the
+    # behaviour before this field existed. Defaulted by identity whenever the
+    # database is (re)selected. Keyed by db_id would be tidier, but the app tracks
+    # exactly one database, so this map belongs to notion_db_id.
+    notion_column_map: dict[str, str | None] = Field(default_factory=dict)
+
     # Pool budget. Task budget = max_instances - interactive_reserve; interactive
     # sessions are never starved by a running sweep.
     max_instances: int = Field(default=4, ge=1)

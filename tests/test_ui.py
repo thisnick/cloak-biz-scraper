@@ -133,6 +133,7 @@ class TestWriteRoutesRequireAuth:
             "/settings/notion/select",
             "/settings/notion/verify",
             "/settings/notion/create",
+            "/settings/notion/mapping",
         ],
     )
     def test_signed_out_post_is_refused(self, client, path):
@@ -605,12 +606,15 @@ class TestNotionUi:
         assert app.state.settings.load().notion_db_id == "db-1"
 
     @respx.mock
-    def test_a_hand_built_database_reads_as_a_warning_not_a_failure(self, auth):
+    def test_a_hand_built_database_maps_its_columns_and_adapts_the_values(self, auth):
         """The most likely real database anyone points at this.
 
-        Nick's actual DB has the required four and text prices — so it syncs, and
-        loses exactly the column the tool exists to sort by. Green would hide
-        that; red would send them fixing a blocker they do not have.
+        Nick's actual DB has the required four and text prices. Under column
+        mapping, selecting it defaults an identity map and the values ADAPT to the
+        columns: a price in a Text column simply saves as text, which is the
+        owner's call — no nag, no blocker. So it reads ready, the mapping table
+        shows Asking Price landing in a Text column, and the column we know
+        nothing about is left untouched.
         """
         text = lambda: {"id": "x", "type": "rich_text", "rich_text": {}}  # noqa: E731
         respx.get(f"{API}/databases/db-1").mock(
@@ -634,15 +638,18 @@ class TestNotionUi:
         response = auth.post("/settings/notion/select", data={"db_id": "db-1"})
         page = shown(response)
 
-        assert '<div class="banner warn">' in response.text, "not a success, not a failure"
-        assert "will sync" in page
+        # Ready, not a warning and not a blocker: the text price adapts.
+        assert "is ready" in page
         assert "can't sync yet" not in page, "there is no blocker here"
-        # The mismatch and its one-line fix appear in the collapsed detail.
-        assert "<b>Asking Price</b> — change it from Text to Number" in page
+        assert "change it from Text to Number" not in page, "no nag — text money is fine"
         assert "rich_text" not in page, "API type names mean nothing to the reader"
-        # Their column is counted, not enumerated — no wall of names.
-        assert "1 column is never touched" in page
-        assert "Bot Triage" not in page
+        # The mapping table shows the field landing in the user's Text column.
+        assert 'name="map_asking_price"' in page
+        assert "Asking Price · Text" in page
+        # A column we know nothing about is not mapped, so it is left untouched.
+        map_ = app.state.settings.load().notion_column_map
+        assert map_["asking_price"] == "Asking Price"
+        assert "Bot Triage" not in map_.values()
 
     @respx.mock
     def test_create_is_only_ever_explicit(self, auth):
@@ -712,6 +719,113 @@ class TestNotionUi:
         response = auth.post("/settings/notion", data={"action": "list", "notion_api_token": "ntn_bad"})
         assert response.status_code == 400
         assert "rejected the API token" in response.text
+
+
+# A database whose columns are named nothing like the app's defaults.
+_RENAMED_DB = {
+    "id": "db-1",
+    "title": [{"plain_text": "My Deals"}],
+    "properties": {
+        "Deal": {"id": "t", "type": "title", "title": {}},
+        "Link": {"id": "u", "type": "url", "url": {}},
+        "Canonical": {"id": "c", "type": "rich_text", "rich_text": {}},
+        "Ref": {"id": "r", "type": "rich_text", "rich_text": {}},
+        "Ask": {"id": "a", "type": "number", "number": {}},
+        "Notes": {"id": "no", "type": "rich_text", "rich_text": {}},
+    },
+}
+
+
+class TestNotionMapping:
+    def _renamed(self):
+        respx.get(f"{API}/databases/db-1").mock(
+            return_value=httpx.Response(200, json=_RENAMED_DB)
+        )
+
+    @respx.mock
+    def test_select_renders_the_mapping_table(self, auth):
+        self._renamed()
+        auth.post("/settings/notion", data={"notion_api_token": "ntn_x"})
+        page = shown(auth.post("/settings/notion/select", data={"db_id": "db-1"}))
+
+        # A row per field, each with its own select of the user's columns.
+        assert 'name="map_listing_title"' in page
+        assert 'name="map_asking_price"' in page
+        # Identity defaulting pre-selected the same-named columns; renamed ones
+        # are offered in the dropdown for the user to choose.
+        assert "Deal · Title" in page
+        assert "Ask · Number" in page
+        # None of these columns are named like the defaults, so identity matching
+        # leaves the required fields unmapped (the user must pick from the table)
+        # and defaults every optional to "don't sync".
+        saved = app.state.settings.load().notion_column_map
+        assert "listing_title" not in saved  # unmapped, awaiting the user's choice
+        assert saved["asking_price"] is None
+        assert saved["source"] is None
+
+    @respx.mock
+    def test_saving_a_mapping_stores_it_and_reverifies(self, auth):
+        self._renamed()
+        auth.post("/settings/notion", data={"notion_api_token": "ntn_x"})
+        auth.post("/settings/notion/select", data={"db_id": "db-1"})
+
+        response = auth.post(
+            "/settings/notion/mapping",
+            data={
+                "map_listing_title": "Deal",
+                "map_url": "Link",
+                "map_normalized_url": "Canonical",
+                "map_listing_id": "Ref",
+                "map_asking_price": "Ask",
+                "map_revenue": "",  # don't sync
+            },
+        )
+        saved = app.state.settings.load().notion_column_map
+        assert saved["normalized_url"] == "Canonical"
+        assert saved["listing_id"] == "Ref"
+        assert saved["revenue"] is None
+        # All required fields point at real columns, so it verifies clean.
+        assert "is ready" in shown(response)
+
+    @respx.mock
+    def test_mapping_a_required_field_to_nothing_blocks(self, auth):
+        self._renamed()
+        auth.post("/settings/notion", data={"notion_api_token": "ntn_x"})
+        auth.post("/settings/notion/select", data={"db_id": "db-1"})
+
+        response = auth.post(
+            "/settings/notion/mapping",
+            data={
+                "map_listing_title": "Deal",
+                "map_url": "Link",
+                "map_normalized_url": "Canonical",
+                "map_listing_id": "",  # required, left unset
+            },
+        )
+        assert "can't sync yet" in shown(response)
+        assert "listing_id" not in app.state.settings.load().notion_column_map
+
+    @respx.mock
+    def test_a_submitted_column_that_does_not_exist_is_ignored(self, auth):
+        """A tampered or stale form must not make us believe in a column that is
+        not in the database."""
+        self._renamed()
+        auth.post("/settings/notion", data={"notion_api_token": "ntn_x"})
+        auth.post("/settings/notion/select", data={"db_id": "db-1"})
+
+        auth.post(
+            "/settings/notion/mapping",
+            data={
+                "map_listing_title": "Deal",
+                "map_url": "Link",
+                "map_normalized_url": "Canonical",
+                "map_listing_id": "Ref",
+                "map_asking_price": "Nonexistent Column",
+            },
+        )
+        saved = app.state.settings.load().notion_column_map
+        # Not a real column -> treated as "don't sync", never stored as a target.
+        assert saved["asking_price"] is None
 
 
 # APP_SECRET is managed in Railway rather than this settings page. The
