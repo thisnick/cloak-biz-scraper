@@ -239,7 +239,12 @@
   .uc-t.sm{font-size:13px}
   .uc-t.sm>.ico{color:var(--muted)}
   .uc-tag{margin-left:auto;font:9.5px/1 var(--sans);text-transform:uppercase;letter-spacing:.07em;font-weight:700;color:var(--muted);background:var(--bg);border:1px solid var(--border);padding:3px 8px;border-radius:20px}
-  .uc-d{color:var(--muted);font-size:12.8px;line-height:1.5;margin:7px 0 10px}
+  .uc-d{color:var(--muted);font-size:13.5px;line-height:1.55;margin:9px 0 13px}
+  .info{position:relative;display:inline-flex;align-items:center;color:var(--muted);cursor:help;margin-left:6px;vertical-align:middle}
+  .info:hover,.info:focus{color:var(--accent);outline:none}
+  .info .tip{position:absolute;bottom:calc(100% + 8px);left:-10px;width:min(280px,72vw);background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:9px 11px;font:400 12px/1.5 var(--sans);color:var(--text);box-shadow:0 6px 20px rgba(0,0,0,.22);opacity:0;visibility:hidden;transform:translateY(3px);transition:opacity .12s,transform .12s;z-index:30;text-align:left;white-space:normal}
+  .info:hover .tip,.info:focus .tip,.info:focus-within .tip{opacity:1;visibility:visible;transform:none}
+  .info .tip b{font-weight:600;color:var(--text)}
   .uc-ex{margin:0;padding:0;list-style:none;display:flex;flex-direction:column;gap:7px}
   .uc-ex li{font-size:12.8px;line-height:1.45;color:var(--text);padding-left:14px;position:relative}
   .uc-ex li::before{content:"\203A";position:absolute;left:2px;top:-1px;color:var(--accent);font-weight:700}
