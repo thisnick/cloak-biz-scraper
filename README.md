@@ -64,7 +64,7 @@ Bring your own (both optional):
 - **Evomi residential proxy** — [pricing](https://evomi.com/); *Core Residential* is a
   fine starting tier.
 
-## Connect ChatGPT or Claude
+## Connect ChatGPT, Claude, or Claude Code
 
 Add your server as a connector using your URL with `/mcp` on the end (copy the exact link
 from the app's **Connect** page — it's pre-filled):
@@ -76,16 +76,18 @@ https://your-server.up.railway.app/mcp
 Your assistant registers itself and sends you to your own login page; paste `APP_SECRET`,
 approve, and the tools appear.
 
-**ChatGPT** — Settings → **Apps** (enable developer mode under Advanced if prompted) →
-**Create** → paste the link → choose **OAuth** and **Scan Tools** → log in with
-`APP_SECRET` → enable it for the chat.
-[OpenAI's connector docs](https://help.openai.com/en/articles/12584461-developer-mode-and-full-mcp-connectors-in-chatgpt-beta).
+**ChatGPT** — **Settings → Integrations → Plugins** → the **MCPs** tab → **Add Server** →
+give it a name, choose **Streamable HTTP**, paste the link → **Save** → click the
+**Authenticate** button that appears and enter your `APP_SECRET`.
 
-**Claude** (Free / Pro / Max) — **Customize → Connectors** → **+ → Add custom connector**
-→ paste the link (no client ID or secret — it uses dynamic registration) → **Add** →
-**Connect** → log in with `APP_SECRET`. Team/Enterprise owners add it first under
-**Organization settings → Connectors**.
+**Claude** — **Settings → Connectors** → **Add custom connector** → paste the link (no
+client ID or secret — it uses dynamic registration) → **Connect** → sign in with your
+`APP_SECRET`. Team/Enterprise owners add it first under **Organization settings →
+Connectors**.
 [Anthropic's connector docs](https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp).
+
+**Claude Code** — run `claude mcp add --transport http cloak-biz-scraper <your-url>/mcp`,
+start Claude Code, type `/mcp`, then select the server and enter your `APP_SECRET`.
 
 ## What you can do
 
