@@ -88,10 +88,19 @@ def build_proxy_url(
     region: str | None = None,
     lifetime: int = 2,
 ) -> str:
-    """Compose the full proxy URL for a given sticky session token."""
+    """Compose the full proxy URL for a given sticky session token.
+
+    Country/region are included only when set: an empty value would otherwise
+    emit a bare ``_country-_region-``, which is not valid Evomi targeting.
+    """
     c = country or parts.country
     r = region or parts.region
-    pw = f"{parts.password}_country-{c}_region-{r}_session-{session}_lifetime-{lifetime}"
+    pw = parts.password
+    if c:
+        pw += f"_country-{c}"
+    if r:
+        pw += f"_region-{r}"
+    pw += f"_session-{session}_lifetime-{lifetime}"
     return f"http://{parts.user}:{pw}@{parts.host}:{parts.port}"
 
 

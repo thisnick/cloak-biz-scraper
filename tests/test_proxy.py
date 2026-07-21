@@ -37,6 +37,22 @@ def test_per_profile_geo_overrides_the_default():
     assert "_country-CA_region-ontario_" in url
 
 
+def test_empty_geo_omits_the_segments_entirely():
+    # An empty country/region must NOT emit a bare "_country-_region-": that is
+    # not valid Evomi targeting. Each segment appears only when it has a value.
+    parts = ProxyParts(
+        user="u", password="pw", host="h.evomi.com", port="1000", country="", region=""
+    )
+    url = build_proxy_url("TOK", parts)
+    assert "_country-" not in url and "_region-" not in url
+    assert url == "http://u:pw_session-TOK_lifetime-2@h.evomi.com:1000"
+    # Region omitted, country kept, when only one is set.
+    one = build_proxy_url("TOK", ProxyParts(
+        user="u", password="pw", host="h.evomi.com", port="1000", country="US", region=""
+    ))
+    assert "_country-US_session-" in one and "_region-" not in one
+
+
 def test_session_tokens_are_unique_and_evomi_shaped():
     tokens = {new_session_token() for _ in range(200)}
     assert len(tokens) == 200
