@@ -1,0 +1,42 @@
+name: CI
+
+# Runs the test suite on every push to main and on PRs. The suite is fully
+# hermetic — respx fakes the Notion API and the IP-echo services, and the
+# fixtures set APP_SECRET — so no secrets or network are needed. The tests that
+# need a real browser (Playwright layout checks) or node+martian (Notion
+# markdown) skip themselves cleanly when those aren't present; they run in the
+# container image, not here.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# A newer push to the same branch/PR cancels the older, still-running job.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: pytest (python 3.12)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: python -m pytest -q
