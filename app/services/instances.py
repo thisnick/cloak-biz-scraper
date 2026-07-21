@@ -173,6 +173,11 @@ class InstanceManager:
         # of ``running`` cannot see either window; profile management uses
         # profile_guard() below so rename/delete cannot race them.
         self._profiles_opening: dict[str, int] = {}
+        # A caller disconnect may cancel stop() or a launch response while the
+        # underlying browser/display cleanup still has work to do. Those cleanup
+        # tasks outlive the cancelled request and own the profile reservation
+        # until they really finish.
+        self._cleanup_tasks: set[asyncio.Task[None]] = set()
         self._next_cdp = _BASE_CDP_PORT
         # Status only; never stores the key. The fingerprint lets server_info
         # reject a stale result after the user changes keys without disclosing
@@ -289,6 +294,65 @@ class InstanceManager:
             self._release_profile(profile)
             self._cond.notify_all()
 
+    def _track_cleanup(self, coroutine) -> asyncio.Task[None]:
+        """Keep cancellation-independent cleanup alive and observe failures."""
+        task = asyncio.create_task(coroutine)
+        self._cleanup_tasks.add(task)
+
+        def finished(done: asyncio.Task[None]) -> None:
+            self._cleanup_tasks.discard(done)
+            if done.cancelled():
+                return
+            exc = done.exception()
+            if exc is not None:
+                logger.warning("browser cleanup failed: %s", exc)
+
+        task.add_done_callback(finished)
+        return task
+
+    async def _finish_registered_close(
+        self, inst: Instance, *, close_context: bool, log_closed: bool = False,
+    ) -> None:
+        """Finish a close and release its profile only after cleanup completes."""
+        try:
+            if close_context:
+                try:
+                    await inst.context.close()
+                except Exception as exc:
+                    logger.warning("close ctx %s: %s", inst.id, exc)
+            await self.displays.stop(inst.display)
+            if log_closed:
+                logger.info("instance %s closed, freed :%d", inst.id, inst.display)
+        finally:
+            async with self._cond:
+                self._release_profile(inst.profile)
+                self._cond.notify_all()
+
+    async def _finish_unregistered_launch(
+        self, inst: Instance, *, origin: str, profile: str,
+    ) -> None:
+        """Close a browser cancelled after opening but before registration."""
+        try:
+            try:
+                await inst.context.close()
+            except Exception as exc:
+                logger.warning("close unregistered ctx %s: %s", inst.id, exc)
+            await self.displays.stop(inst.display)
+        finally:
+            # This launch never transitioned into ``running``. Its pending pool
+            # slot and profile reservation both remain owned until this point.
+            await self._release_pending(origin, profile)
+
+    async def _wait_for_cleanup(self) -> None:
+        """Drain tracked cleanups; used during shutdown and by lifecycle tests."""
+        while self._cleanup_tasks:
+            tasks = tuple(self._cleanup_tasks)
+            await asyncio.gather(*tasks, return_exceptions=True)
+            # A done callback is scheduled with call_soon; explicitly discard
+            # this completed snapshot so an already-done gather cannot spin the
+            # loop before those callbacks get their turn.
+            self._cleanup_tasks.difference_update(tasks)
+
     def _alloc_cdp_port(self) -> int:
         for _ in range(_CDP_RANGE):
             port = self._next_cdp
@@ -320,14 +384,18 @@ class InstanceManager:
                 self._release_profile(req.profile)
                 self.running[inst.id] = inst
                 self._cond.notify_all()
-        except BaseException:
-            await self._release_pending(origin, req.profile)
-            if inst is not None:
-                try:
-                    await inst.context.close()
-                except Exception as exc:
-                    logger.warning("close unregistered ctx %s: %s", inst.id, exc)
-                await self.displays.stop(inst.display)
+        except BaseException as exc:
+            if inst is None:
+                await self._release_pending(origin, req.profile)
+            else:
+                cleanup = self._track_cleanup(self._finish_unregistered_launch(
+                    inst, origin=origin, profile=req.profile,
+                ))
+                # A cancelled caller must return promptly while cleanup keeps the
+                # reservation in the background. For any other exceptional edge,
+                # finish cleanup before surfacing the failure.
+                if not isinstance(exc, asyncio.CancelledError):
+                    await asyncio.shield(cleanup)
             raise
         logger.info("launched %s origin=%s owner=%s (display=:%d cdp=%d ip=%s) [%d/%d]",
                     inst.id, origin, owner, inst.display, inst.cdp_port, inst.proxy_ip,
@@ -467,13 +535,10 @@ class InstanceManager:
                 self._reserve_profile(inst.profile)
             self._cond.notify_all()
         if inst:
-            try:
-                await self.displays.stop(inst.display)
-                logger.info("instance %s closed, freed :%d", iid, inst.display)
-            finally:
-                async with self._cond:
-                    self._release_profile(inst.profile)
-                    self._cond.notify_all()
+            cleanup = self._track_cleanup(self._finish_registered_close(
+                inst, close_context=False, log_closed=True,
+            ))
+            await asyncio.shield(cleanup)
 
     async def stop(self, iid: str) -> bool:
         async with self._cond:
@@ -483,16 +548,10 @@ class InstanceManager:
             self._cond.notify_all()
         if not inst:
             return False
-        try:
-            try:
-                await inst.context.close()
-            except Exception as exc:
-                logger.warning("close ctx %s: %s", iid, exc)
-            await self.displays.stop(inst.display)
-        finally:
-            async with self._cond:
-                self._release_profile(inst.profile)
-                self._cond.notify_all()
+        cleanup = self._track_cleanup(self._finish_registered_close(
+            inst, close_context=True,
+        ))
+        await asyncio.shield(cleanup)
         return True
 
     def get(self, iid: str) -> Instance | None:
@@ -514,4 +573,5 @@ class InstanceManager:
     async def cleanup_all(self) -> None:
         for iid in list(self.running.keys()):
             await self.stop(iid)
+        await self._wait_for_cleanup()
         await self.displays.cleanup_all()

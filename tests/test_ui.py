@@ -1231,6 +1231,23 @@ class TestProfileEndpoints:
                       follow_redirects=False)
         assert r.status_code == 409 and "busy" in self._names(profiles)
 
+    def test_missing_rename_keeps_the_existing_bad_request_status(self, auth, profiles):
+        r = auth.post(
+            "/settings/profiles/rename",
+            data={"name": "missing", "new_name": "new"},
+            follow_redirects=False,
+        )
+        assert r.status_code == 400
+
+    def test_default_cannot_be_renamed_by_a_crafted_form(self, auth, profiles):
+        profiles.ensure_default(default_country="US", default_region="california")
+        r = auth.post(
+            "/settings/profiles/rename",
+            data={"name": "Default", "new_name": "renamed"},
+            follow_redirects=False,
+        )
+        assert r.status_code == 409 and "Default" in self._names(profiles)
+
     def test_delete_removes_the_profile(self, auth, profiles):
         self._mk(profiles, "gone")
         r = auth.post("/settings/profiles/delete", data={"name": "gone"}, follow_redirects=False)
@@ -1240,6 +1257,12 @@ class TestProfileEndpoints:
         profiles.ensure_default(default_country="US", default_region="california")
         r = auth.post("/settings/profiles/delete", data={"name": "Default"}, follow_redirects=False)
         assert r.status_code == 400 and "Default" in self._names(profiles)
+
+    def test_delete_missing_keeps_the_existing_idempotent_redirect(self, auth, profiles):
+        r = auth.post(
+            "/settings/profiles/delete", data={"name": "missing"}, follow_redirects=False,
+        )
+        assert r.status_code == 303 and r.headers["location"] == "/?view=settings"
 
     def test_delete_is_blocked_while_a_browser_is_open(self, auth, profiles, monkeypatch):
         self._mk(profiles, "busy")
@@ -1275,6 +1298,14 @@ class TestProfileEndpoints:
                       data={"name": "g", "country": "GB", "region": "london"}, follow_redirects=False)
         assert r.status_code == 303
         assert {p.name: p for p in profiles.all()}["g"].country == "GB"
+
+    def test_missing_geo_keeps_the_existing_bad_request_status(self, auth, profiles):
+        r = auth.post(
+            "/settings/profiles/geo",
+            data={"name": "missing", "country": "GB", "region": "london"},
+            follow_redirects=False,
+        )
+        assert r.status_code == 400
 
     def test_all_reject_a_foreign_origin(self, auth, profiles):
         self._mk(profiles, "p")

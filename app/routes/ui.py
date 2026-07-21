@@ -814,11 +814,11 @@ def _settings_redirect() -> Response:
     return RedirectResponse("/?view=settings", status_code=303)
 
 
-def _profile_error_status(exc: Exception) -> int:
+def _profile_error_status(exc: Exception, *, missing: int = 404) -> int:
     from ..services.profiles import ProfileConflict, ProfileInUse, ProfileNotFound
 
     if isinstance(exc, ProfileNotFound):
-        return 404
+        return missing
     if isinstance(exc, (ProfileInUse, ProfileConflict)):
         return 409
     return 400
@@ -853,7 +853,8 @@ async def profile_rename(request: Request, name: str = Form(""), new_name: str =
         await request.app.state.profile_service.update_profile(name, new_name=new_name)
     except ProfileError as exc:
         return _render(
-            request, Result("profiles", False, str(exc)), status=_profile_error_status(exc)
+            request, Result("profiles", False, str(exc)),
+            status=_profile_error_status(exc, missing=400),
         )
     return _settings_redirect()
 
@@ -872,7 +873,8 @@ async def profile_geo(
         )
     except ProfileError as exc:
         return _render(
-            request, Result("profiles", False, str(exc)), status=_profile_error_status(exc)
+            request, Result("profiles", False, str(exc)),
+            status=_profile_error_status(exc, missing=400),
         )
     return _settings_redirect()
 
@@ -896,12 +898,16 @@ async def profile_rotate(request: Request, name: str = Form("")) -> Response:
 async def profile_delete(request: Request, name: str = Form("")) -> Response:
     _require(request)
     _require_same_origin(request)
-    from ..services.profiles import ProfileError
+    from ..services.profiles import ProfileError, ProfileNotFound
 
     # The shared service refuses opening/open/closing profiles; the store also
     # keeps Default undeletable. The client confirm dialog is UX only.
     try:
         await request.app.state.profile_service.delete_profile(name)
+    except ProfileNotFound:
+        # The settings form's delete has historically been idempotent. Keep its
+        # successful redirect while REST/MCP report a missing profile explicitly.
+        return _settings_redirect()
     except ProfileError as exc:
         return _render(
             request, Result("profiles", False, str(exc)), status=_profile_error_status(exc)

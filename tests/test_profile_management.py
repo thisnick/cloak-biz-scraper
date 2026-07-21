@@ -281,12 +281,86 @@ async def test_cancelled_registration_closes_unreachable_browser_and_releases_pr
 
     with pytest.raises(asyncio.CancelledError):
         await launch
+    await manager._wait_for_cleanup()
     assert manager.running == {}
     assert manager._pending == {"task": 0, "interactive": 0}
     assert manager._profiles_opening == {}
     assert context.closed is True
     assert stopped == [0]
     assert (await service.update_profile("opened", new_name="recovered")).name == "recovered"
+
+
+async def test_cancelled_stop_keeps_profile_reserved_until_context_and_display_close(
+    managed, monkeypatch
+):
+    """A disconnected close request cannot make an open cookie jar deletable."""
+    manager, service, _ = managed
+    await service.create_profile("closing")
+    context_entered = asyncio.Event()
+    finish_context = asyncio.Event()
+
+    class SlowContext(_Context):
+        async def close(self):
+            context_entered.set()
+            await finish_context.wait()
+            self.closed = True
+
+    instance = _instance("closing", iid="slow-close")
+    instance.context = SlowContext()
+    manager.running[instance.id] = instance
+    display_stopped = asyncio.Event()
+
+    async def stop_display(display):
+        display_stopped.set()
+
+    monkeypatch.setattr(manager.displays, "stop", stop_display)
+    stopping = asyncio.create_task(manager.stop(instance.id))
+    await asyncio.wait_for(context_entered.wait(), timeout=1)
+    stopping.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await stopping
+
+    assert "closing" in manager.profile_names_in_use()
+    assert instance.context.closed is False
+    with pytest.raises(ProfileInUse, match="closing"):
+        await service.delete_profile("closing")
+
+    finish_context.set()
+    await manager._wait_for_cleanup()
+    assert instance.context.closed is True
+    assert display_stopped.is_set()
+    assert "closing" not in manager.profile_names_in_use()
+    assert (await service.delete_profile("closing")).ok is True
+
+
+async def test_cancelled_spontaneous_cleanup_keeps_profile_reserved_until_display_stops(
+    managed, monkeypatch
+):
+    manager, service, _ = managed
+    await service.create_profile("closing")
+    instance = _instance("closing", iid="spontaneous")
+    manager.running[instance.id] = instance
+    display_entered = asyncio.Event()
+    finish_display = asyncio.Event()
+
+    async def slow_display_stop(display):
+        display_entered.set()
+        await finish_display.wait()
+
+    monkeypatch.setattr(manager.displays, "stop", slow_display_stop)
+    callback = asyncio.create_task(manager._on_closed(instance.id))
+    await asyncio.wait_for(display_entered.wait(), timeout=1)
+    callback.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await callback
+
+    assert "closing" in manager.profile_names_in_use()
+    with pytest.raises(ProfileInUse, match="closing"):
+        await service.delete_profile("closing")
+    finish_display.set()
+    await manager._wait_for_cleanup()
+    assert "closing" not in manager.profile_names_in_use()
+    assert (await service.delete_profile("closing")).ok is True
 
 
 async def test_spontaneous_close_keeps_profile_guarded_until_cleanup(managed, monkeypatch):
