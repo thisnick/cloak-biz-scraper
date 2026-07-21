@@ -88,6 +88,37 @@ def _grant_types_the_sdk_would_refuse(body: object) -> bool:
     return isinstance(grants, list) and set(grants) == {"authorization_code"}
 
 
+def _has_unsafe_redirect_uri(body: object) -> bool:
+    """Does registration ask us to send a code somewhere other than HTTP(S)?
+
+    The SDK models ``redirect_uris`` as Pydantic ``AnyUrl`` values.  That accepts
+    syntactically valid ``javascript:``, ``data:``, and ``file:`` URLs, even
+    though an authorization response must never be delivered to any of those
+    schemes.  Keep this check at our route seam and leave every other metadata
+    rule to ``RegistrationHandler`` below.
+
+    An HTTP(S) redirect is absolute only when it has an authority.  Checking
+    that here also gives relative and malformed URI strings the same RFC 7591
+    error shape as an unsupported scheme.  Non-list/non-string metadata is left
+    to the SDK's Pydantic validation rather than duplicated here.
+    """
+    if not isinstance(body, dict):
+        return False
+    redirect_uris = body.get("redirect_uris")
+    if not isinstance(redirect_uris, list):
+        return False
+    for redirect_uri in redirect_uris:
+        if not isinstance(redirect_uri, str):
+            continue
+        try:
+            parsed = urlparse(redirect_uri)
+        except ValueError:
+            return True
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+            return True
+    return False
+
+
 def _with_body(request: Request, body: bytes) -> Request:
     """The same request, re-reading a body we supply.
 
@@ -245,6 +276,16 @@ async def register(request: Request) -> Response:
         body = await request.json()
     except Exception:  # noqa: BLE001 — not ours to diagnose; the SDK reports it
         body = None
+    if _has_unsafe_redirect_uri(body):
+        return _allow_cross_origin(JSONResponse(
+            {
+                "error": "invalid_client_metadata",
+                "error_description": (
+                    "redirect_uris must contain only absolute http or https URLs"
+                ),
+            },
+            status_code=400,
+        ))
     if _grant_types_the_sdk_would_refuse(body):
         logger.info(
             "client %r registered for authorization_code only; adding refresh_token, "

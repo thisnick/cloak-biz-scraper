@@ -183,6 +183,45 @@ class TestDynamicClientRegistration:
         assert info["client_id"]
         assert REDIRECT in info["redirect_uris"]
 
+    @pytest.mark.parametrize("redirect_uri", [
+        "javascript:alert(document.domain)",
+        "data:text/html,<script>alert(1)</script>",
+        "file:///tmp/oauth-code",
+        "/relative/callback",
+        "not a URL",
+        "https:missing-authority/callback",
+    ])
+    def test_registration_rejects_non_web_or_non_absolute_redirects(
+        self, client, redirect_uri,
+    ):
+        """A successful login must only return its code over HTTP(S).
+
+        The MCP SDK deliberately accepts any URI scheme here.  In particular,
+        its ``AnyUrl`` parser accepts executable ``javascript:`` and ``data:``
+        targets, so this application-level policy has to run before the SDK.
+        Relative and malformed strings receive the same RFC 7591 error shape.
+        """
+        r = client.post("/register", json={"redirect_uris": [redirect_uri]})
+        assert r.status_code == 400, r.text
+        assert r.json()["error"] == "invalid_client_metadata"
+        assert "redirect_uris" in r.json()["error_description"]
+        assert r.headers["access-control-allow-origin"] == "*"
+
+    @pytest.mark.parametrize("redirect_uri", [
+        "https://client.example:8443/oauth/callback?source=connector",
+        "http://127.0.0.1:43121/oauth/callback?source=native",
+    ])
+    def test_registration_preserves_valid_web_redirects(self, client, redirect_uri):
+        """Custom ports, query strings, and loopback HTTP are legitimate.
+
+        Loopback HTTP is the native-client exception: its random local port is
+        how an installed connector receives the authorization response without
+        pretending to own a public TLS endpoint.
+        """
+        r = client.post("/register", json={"redirect_uris": [redirect_uri]})
+        assert r.status_code == 201, r.text
+        assert redirect_uri in r.json()["redirect_uris"]
+
     def test_a_client_asking_only_for_the_auth_code_grant_can_register(self, client):
         """The hazard: this is RFC 7591's default, spelled out, and the SDK 400s it.
 
