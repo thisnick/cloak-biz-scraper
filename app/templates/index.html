@@ -308,12 +308,12 @@
             </button>
             <div class="acc-body">
               <ol class="steps">
-                <li>Open <b>Settings → Connectors</b>.</li>
-                <li>Choose <b>Add custom connector</b> and paste the server link above.</li>
-                <li>When it asks you to sign in, enter your secret — the same one you use here.</li>
-                <li>That’s it — you’re connected. See <b>what you can ask</b> below.</li>
+                <li>Open <b>Settings</b>, and under <b>Integrations</b> click <b>Plugins</b>.</li>
+                <li>Pick the <b>MCPs</b> tab at the top, then click <b>Add Server</b>.</li>
+                <li>Give it a name, choose <b>Streamable HTTP</b>, and paste the server link above.</li>
+                <li>Click <b>Save</b>.</li>
+                <li>Click the <b>Authenticate</b> button that appears next to it, and enter your <code>APP_SECRET</code>.</li>
               </ol>
-              <p class="provisional">⚠ The exact menu names are still being confirmed against the real ChatGPT connector flow; they may differ slightly.</p>
             </div>
           </div>
           <div class="acc-item">
@@ -325,10 +325,21 @@
               <ol class="steps">
                 <li>Open <b>Settings → Connectors</b>.</li>
                 <li>Choose <b>Add custom connector</b> and paste the server link above.</li>
-                <li>When it asks you to sign in, enter your secret — the same one you use here.</li>
-                <li>That’s it — you’re connected. See <b>what you can ask</b> below.</li>
+                <li>Click <b>Connect</b>, then sign in with your <code>APP_SECRET</code> when prompted.</li>
               </ol>
-              <p class="provisional">⚠ The exact menu names are still being confirmed against the real Claude connector flow; they may differ slightly.</p>
+            </div>
+          </div>
+          <div class="acc-item">
+            <button class="acc-head">
+              <span class="clogo claude">&gt;_</span><span class="h-title">Connect in Claude Code</span>
+              <div class="h-right"><svg class="chev" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M9 6l6 6-6 6"/></svg></div>
+            </button>
+            <div class="acc-body">
+              <ol class="steps">
+                <li>In your terminal, run <code>claude mcp add --transport http cloak-biz-scraper {{ server_url }}</code></li>
+                <li>Start Claude Code and type <b>/mcp</b>.</li>
+                <li>It shows the server needs authentication — select it and enter your <code>APP_SECRET</code>.</li>
+              </ol>
             </div>
           </div>
         </div>
