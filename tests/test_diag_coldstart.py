@@ -54,20 +54,22 @@ def configured_volume(tmp_path: Path, **changes) -> Config:
 def test_loads_authoritative_volume_settings_and_builds_one_sticky_proxy(tmp_path):
     config = configured_volume(tmp_path)
     validation_calls = []
+    resolved_pro = "/data/.cloakbrowser/chromium-148.0.7778.215.5-pro/chrome"
 
     def validate(key: str, pin: str) -> str:
         validation_calls.append((key, pin))
-        return "/data/.cloakbrowser/chromium-148.0.7778.215.5-pro/chrome"
+        return resolved_pro
 
     diagnostic = load_diagnostic_config(
         config,
-        validate_pro=validate,
+        resolve_binary=validate,
         token_factory=lambda: "FIXEDTOK",
     )
 
     assert validation_calls == [("saved-pro-key", "148.0.7778.215.5")]
     assert diagnostic.settings_path == tmp_path / "settings.json"
     assert diagnostic.cache_dir == tmp_path / ".cloakbrowser"
+    assert diagnostic.resolved_pro_binary == resolved_pro
     assert os.environ["CLOAKBROWSER_CACHE_DIR"] == str(diagnostic.cache_dir)
     assert diagnostic.proxy_url == (
         "http://proxy-user:proxy-secret_country-US_region-california_"
@@ -81,7 +83,7 @@ def test_missing_settings_fails_without_creating_a_store_or_dek(tmp_path):
     config = Config(data_dir=tmp_path, port=8000)
 
     with pytest.raises(DiagnosticPreflightError, match="No existing settings store"):
-        load_diagnostic_config(config, validate_pro=lambda _key, _pin: "unused")
+        load_diagnostic_config(config, resolve_binary=lambda _key, _pin: "unused")
 
     assert list(tmp_path.iterdir()) == []
 
@@ -92,7 +94,7 @@ def test_missing_dek_does_not_replace_or_touch_existing_ciphertext(tmp_path):
     config.settings_path.write_bytes(ciphertext)
 
     with pytest.raises(DiagnosticPreflightError, match="settings key"):
-        load_diagnostic_config(config, validate_pro=lambda _key, _pin: "unused")
+        load_diagnostic_config(config, resolve_binary=lambda _key, _pin: "unused")
 
     assert config.settings_path.read_bytes() == ciphertext
     assert not config.dek_path.exists()
@@ -108,7 +110,7 @@ def test_missing_pro_key_fails_before_validation_or_daemon_work(tmp_path):
         return "unused"
 
     with pytest.raises(DiagnosticPreflightError, match="No CloakBrowser Pro licence"):
-        load_diagnostic_config(config, validate_pro=must_not_validate)
+        load_diagnostic_config(config, resolve_binary=must_not_validate)
 
     assert not called
 
@@ -129,7 +131,7 @@ def test_missing_proxy_fails_actionably_before_pro_validation(tmp_path):
         return "unused"
 
     with pytest.raises(DiagnosticPreflightError, match="complete proxy.*no proxy"):
-        load_diagnostic_config(config, validate_pro=must_not_validate)
+        load_diagnostic_config(config, resolve_binary=must_not_validate)
 
     assert not called
 
@@ -144,13 +146,40 @@ def test_invalid_or_unavailable_pro_resolution_keeps_original_guidance(tmp_path)
         DiagnosticPreflightError,
         match="could not resolve a Pro binary.*licensing server unavailable",
     ):
-        load_diagnostic_config(config, validate_pro=fail)
+        load_diagnostic_config(config, resolve_binary=fail)
+
+
+def test_whitespace_key_cannot_select_the_public_build(tmp_path):
+    config = configured_volume(tmp_path, cloakbrowser_license_key="  \t  ")
+    calls = []
+
+    with pytest.raises(DiagnosticPreflightError, match="No CloakBrowser Pro licence"):
+        load_diagnostic_config(
+            config,
+            resolve_binary=lambda key, pin: calls.append((key, pin)) or "unused",
+        )
+
+    assert calls == [], "blank public mode must be rejected before binary resolution"
+
+
+def test_resolved_public_artifact_is_rejected_without_fallback(tmp_path):
+    config = configured_volume(tmp_path)
+    public = "/data/.cloakbrowser/chromium-146.0.7680.177.3/chrome"
+
+    with pytest.raises(
+        DiagnosticPreflightError,
+        match="resolved the public/non-Pro build.*Refusing public fallback",
+    ):
+        load_diagnostic_config(
+            config,
+            resolve_binary=lambda _key, _pin: public,
+        )
 
 
 def test_untested_or_failed_proxy_is_not_accepted_as_available(tmp_path):
     untested = configured_volume(tmp_path / "untested", proxy_last_check_ok=None)
     with pytest.raises(DiagnosticPreflightError, match="no successful proxy test"):
-        load_diagnostic_config(untested, validate_pro=lambda _key, _pin: "unused")
+        load_diagnostic_config(untested, resolve_binary=lambda _key, _pin: "unused")
 
     failed = configured_volume(
         tmp_path / "failed",
@@ -158,13 +187,13 @@ def test_untested_or_failed_proxy_is_not_accepted_as_available(tmp_path):
         proxy_last_check_summary="407 rejected",
     )
     with pytest.raises(DiagnosticPreflightError, match="last saved test failed.*407"):
-        load_diagnostic_config(failed, validate_pro=lambda _key, _pin: "unused")
+        load_diagnostic_config(failed, resolve_binary=lambda _key, _pin: "unused")
 
 
 def test_launch_arguments_keep_direct_and_proxy_arms_identical_except_proxy(tmp_path):
     diagnostic = load_diagnostic_config(
         configured_volume(tmp_path),
-        validate_pro=lambda _key, _pin: "/cache/chromium-pro/chrome",
+        resolve_binary=lambda _key, _pin: "/cache/chromium-pro/chrome",
         token_factory=lambda: "TOK",
     )
     direct = browser_launch_kwargs(
@@ -195,7 +224,7 @@ def test_launch_arguments_keep_direct_and_proxy_arms_identical_except_proxy(tmp_
 def test_launch_argument_builder_rejects_application_pool_ports(tmp_path):
     diagnostic = load_diagnostic_config(
         configured_volume(tmp_path),
-        validate_pro=lambda _key, _pin: "/cache/chromium-pro/chrome",
+        resolve_binary=lambda _key, _pin: "/cache/chromium-pro/chrome",
     )
     with pytest.raises(ValueError, match="overlaps the application pool"):
         browser_launch_kwargs(
@@ -210,7 +239,7 @@ def test_launch_argument_builder_rejects_application_pool_ports(tmp_path):
 async def test_proxy_launch_error_omits_raw_and_encoded_credentials(tmp_path, monkeypatch):
     diagnostic = load_diagnostic_config(
         configured_volume(tmp_path),
-        validate_pro=lambda _key, _pin: "/cache/chromium-pro/chrome",
+        resolve_binary=lambda _key, _pin: "/cache/chromium-pro/chrome",
         token_factory=lambda: "STICKY123",
     )
     credentials = diagnostic.proxy_url.split("://", 1)[1].rsplit("@", 1)[0]

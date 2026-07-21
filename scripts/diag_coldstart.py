@@ -53,7 +53,7 @@ from typing import Callable, Sequence
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.config import CONFIG, Config  # noqa: E402
-from app.services.license import resolve_pro_binary  # noqa: E402
+from app.services.license import is_pro, resolve_browser_binary  # noqa: E402
 from app.services.proxy import (  # noqa: E402
     ProxyNotConfigured,
     ProxyParts,
@@ -103,7 +103,7 @@ def log(message: str) -> None:
 def load_diagnostic_config(
     config: Config = CONFIG,
     *,
-    validate_pro: Callable[[str, str], str] = resolve_pro_binary,
+    resolve_binary: Callable[[str, str], str] = resolve_browser_binary,
     token_factory: Callable[[], str] = new_session_token,
 ) -> DiagnosticConfig:
     """Read and validate the existing deployment settings without seeding them.
@@ -135,7 +135,8 @@ def load_diagnostic_config(
             f"{type(exc).__name__}: {exc}. Verify the mounted volume before retrying."
         ) from exc
 
-    if not settings.cloakbrowser_license_key:
+    license_key = settings.cloakbrowser_license_key.strip()
+    if not license_key:
         raise DiagnosticPreflightError(
             "No CloakBrowser Pro licence is saved in Settings. This diagnostic compares "
             "the previously observed Pro deployment and refuses to substitute the public build."
@@ -169,17 +170,30 @@ def load_diagnostic_config(
     # does not inherit runtime mutations made in uvicorn's separate process.
     os.environ["CLOAKBROWSER_CACHE_DIR"] = str(config.binary_cache_dir)
     try:
-        resolved = validate_pro(
-            settings.cloakbrowser_license_key,
+        resolved = resolve_binary(
+            license_key,
             settings.cloakbrowser_version,
         )
     except Exception as exc:  # noqa: BLE001 - preserve the licence module's actionable text
         raise DiagnosticPreflightError(
             f"The saved CloakBrowser licence could not resolve a Pro binary: {exc}"
         ) from exc
+    # `resolve_browser_binary` deliberately supports public mode for the
+    # application as a whole. This diagnostic does not: it exists to compare
+    # against the previously measured Pro deployment. Keep a path-grounded
+    # guard here as well as in the shared resolver so a future resolver change,
+    # test double, or package downgrade can never turn this into a public-build
+    # measurement without saying so.
+    if not is_pro(resolved):
+        artifact = Path(resolved).parent.name or "unidentified artifact"
+        raise DiagnosticPreflightError(
+            "The saved CloakBrowser licence resolved the public/non-Pro build "
+            f"({artifact}) instead of Pro. Refusing public fallback for this diagnostic. "
+            "Verify the licence from Settings before retrying."
+        )
 
     return DiagnosticConfig(
-        license_key=settings.cloakbrowser_license_key,
+        license_key=license_key,
         browser_version=settings.cloakbrowser_version,
         proxy_url=build_proxy_url(token_factory(), parts),
         settings_path=config.settings_path,
