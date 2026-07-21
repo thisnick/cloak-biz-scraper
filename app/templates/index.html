@@ -93,7 +93,7 @@
             <svg class="ico" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2 4 6v6c0 5 3.4 8.5 8 10 4.6-1.5 8-5 8-10V6l-8-4Z"/></svg>
             Finish setting up
           </div>
-          <p class="setup-lead">A couple of things to add in <b>Settings</b> before your first scrape:</p>
+          <p class="setup-lead">Recommended before your first scrape:</p>
           <ul class="setup-list">
             <li class="{{ 'done' if has_license else 'todo' }}">
               {% if has_license %}<svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M20 6 9 17l-5-5"/></svg>
@@ -104,7 +104,7 @@
             <li class="{{ 'done' if s.proxy_configured() else 'todo' }}">
               {% if s.proxy_configured() %}<svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M20 6 9 17l-5-5"/></svg>
               {% else %}<svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 8v4"/><path d="M12 16h.01"/></svg>{% endif %}
-              <div class="g"><b>Residential proxy (Evomi)</b><span>{{ 'Saved.' if s.proxy_configured() else 'Sites with anti-bot detection will block you without one.' }}</span></div>
+              <div class="g"><b>Evomi Proxy</b><span>{{ 'Saved.' if s.proxy_configured() else 'Without a proxy, sites like BizBuySell will block you — your IP looks like a datacenter, not residential.' }}</span></div>
               {% if not s.proxy_configured() %}<a data-nav="settings" href="#">Add →</a>{% endif %}
             </li>
             <li class="{{ 'done' if has_notion_token else 'opt' }}">
@@ -136,7 +136,7 @@
             {% else %}
             <div class="pane-slot">No live view — plain display.</div>
             {% endif %}
-            <div class="where">{{ i.timezone or 'location unknown' }}{% if i.proxy_ip %} · via proxy{% endif %}</div>
+            <div class="where">{% if i.proxy_ip %}{{ i.timezone or 'location unknown' }} · via proxy{% else %}Direct connection · server location not measured{% endif %}</div>
           </div>
           {% endfor %}
           </div>
@@ -174,14 +174,14 @@
                 {% for p in profiles %}<option value="{{ p.name }}"{{ ' selected' if p.name == default_profile }}>{{ p.name }}{{ ' — default' if p.name == default_profile }}</option>{% endfor %}
                 <option value="__new__">＋ New profile…</option>
               </select>
-              <div class="help">A profile keeps its cookies, logins, and exit IP. Reuse one to stay signed in; pick <em>New profile</em> for a clean identity.</div>
+              <div class="help">A profile keeps its cookies and logins{% if s.proxy_configured() %}, plus its proxy exit{% endif %}. Reuse one to stay signed in; pick <em>New profile</em> for a clean identity.</div>
             </div>
             <div class="field" id="nb-new-wrap" hidden><label>New profile name</label>
               <input name="new_profile" id="nb-new" placeholder="e.g. research" autocomplete="off"></div>
-            <div class="grid2">
+            {% if s.proxy_configured() %}<div class="grid2">
               <div class="field"><label>Exit country — optional</label><input name="country" placeholder="US"></div>
               <div class="field"><label>Exit region — optional</label><input name="region" placeholder="california"></div>
-            </div>
+            </div>{% endif %}
             <div class="btnrow">
               <button class="btn" type="button" id="nb-cancel">Cancel</button>
               <button class="btn primary" type="submit">Open browser</button>
@@ -226,7 +226,7 @@
               <div class="bctrl">
                 <div class="kv"><span class="k">Doing</span><span class="v">{% if i.origin=='task' %}Running a sweep{% else %}<small>you opened this</small>{% endif %}</span></div>
                 <div class="kv"><span class="k">Open for</span><span class="v">{{ dur(i.age_sec) }}</span></div>
-                <div class="kv"><span class="k">Proxy &amp; location</span><span class="v">{{ i.timezone or 'unknown' }}{% if i.locale %} · {{ i.locale }}{% endif %}</span></div>
+                <div class="kv"><span class="k">Connection &amp; location</span><span class="v">{% if i.proxy_ip %}Proxy · {{ i.timezone or 'unknown' }}{% if i.locale %} · {{ i.locale }}{% endif %}{% else %}Direct · server location not measured{% endif %}</span></div>
                 <div class="btnrow">
                   {% if i.origin != 'task' and i.vnc_url %}
                   <button class="btn ctl-btn" type="button" data-control-for="{{ i.instance_id }}">Take control</button>
@@ -237,7 +237,7 @@
                   </form>
                 </div>
                 {% if i.origin != 'task' and i.vnc_url %}
-                <p class="ctl-note">Take control gives you full keyboard and mouse. This browser holds the account's proxy and any signed-in sessions, so control is off until you ask for it.</p>
+                <p class="ctl-note">Take control gives you full keyboard and mouse. This browser holds any configured proxy credentials and signed-in sessions, so control is off until you ask for it.</p>
                 {% endif %}
               </div>
             </div>
@@ -345,14 +345,14 @@
               <svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg>
               Browse sites that block bots
             </div>
-            <p class="uc-d">Open a cloaked browser and navigate any site — especially listing sites with anti-bot detection. It all runs through your residential proxy, so you read as a normal visitor.</p>
+            <p class="uc-d">Open a cloaked browser and navigate any site. With an Evomi proxy configured, it uses a residential exit; without one, it uses this server's datacenter connection and listing sites may block it.</p>
             <ul class="uc-ex">
               <li><i>“Open a browser, go to this listing, and tell me the asking price and cash flow.”</i></li>
               <li><i>“Click into the third result and summarise the financials.”</i></li>
             </ul>
             <p class="uc-need">
               <svg class="ico" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/><path d="M12 9v4M12 17h.01"/></svg>
-              Needs a proxy — sign up for Evomi and fill in the proxy fields in <b>Settings</b>, or these sites will block you.
+              An Evomi proxy is recommended for listing sites — without one, your server IP looks like a datacenter and may be blocked.
             </p>
           </div>
 
@@ -389,7 +389,7 @@
               Get a CDP URL for your own tools
               <span class="uc-tag">developers</span>
             </div>
-            <p class="uc-d">Launch a cloaked browser and get back a CDP URL you can drive from Claude Code, Codex, Playwright, or agent-browser — cloaked, through your proxy. The browser stays up ~15 min idle (60 min max); ask again for a fresh URL to reconnect.</p>
+            <p class="uc-d">Launch a cloaked browser and get back a CDP URL you can drive from Claude Code, Codex, Playwright, or agent-browser — through your proxy when configured, or through the server directly. The browser stays up ~15 min idle (60 min max); ask again for a fresh URL to reconnect.</p>
             <ul class="uc-ex">
               <li><i>“Launch a browser and give me the CDP URL.”</i></li>
               <li>Then point Playwright (<code>connectOverCDP</code>) or agent-browser at that URL and drive it yourself.</li>
@@ -439,25 +439,31 @@
           {# Proxy #}
           {% set st = s.proxy_status() %}
           {% set chip = {'working': ('ok', 'Working'), 'broken': ('bad', 'Not working'),
-                         'untested': ('warn', 'Not tested'), 'unconfigured': ('bad', 'Not set up')}[st] %}
+                         'untested': ('warn', 'Not tested'), 'incomplete': ('bad', 'Incomplete'),
+                         'direct': ('', 'Direct')}[st] %}
           <div class="acc-item {{ 'open' if result and result.section=='proxy' }}">
             <button class="acc-head">
               <svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2c3 3 3 17 0 20M12 2c-3 3-3 17 0 20"/></svg>
-              <span class="h-title">Proxy</span>
+              <span class="h-title">Evomi Proxy</span>
               <div class="h-right">
-                <span class="chip {{ chip[0] }}">{{ chip[1] }}</span>
+                <span class="chip{% if chip[0] %} {{ chip[0] }}{% endif %}">{{ chip[1] }}</span>
                 <svg class="chev" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M9 6l6 6-6 6"/></svg>
               </div>
             </button>
             <div class="acc-body">
-              <p class="lead-help">Every browser goes out through this. Without it, nothing launches — the server never uses its own address.</p>
+              <p class="lead-help">Use an Evomi proxy to get past IP and datacenter-IP detection — it makes your browser look like it's coming from a residential location. Optional, but websites like BizBuySell will block you if your IP comes from a non-residential location. <a href="https://evomi.com" target="_blank" rel="noreferrer">Get a proxy at Evomi →</a> Choose the Residential product; Core Residential is a good place to start.</p>
               {% if st == 'broken' %}
                 <div class="banner bad"><strong>This proxy did not work when it was last tested.</strong>
                   Scrapes will fail until it does.<br><span class="hint">{{ s.proxy_last_check_summary }} (tested {{ proxy_checked_at }})</span></div>
+              {% elif st == 'incomplete' %}
+                <div class="banner bad"><strong>Proxy settings are incomplete.</strong>
+                  Complete username, password, host, and port, or choose direct connection. A browser will never silently bypass a proxy you started configuring.</div>
               {% elif st == 'untested' %}
                 <div class="banner warn">Saved, but never tested. Filling the form in does not prove the proxy routes — click <em>Save &amp; test</em> to check.</div>
               {% elif st == 'working' %}
                 <p class="lead-help">Last tested {{ proxy_checked_at }}: <span class="mono">{{ s.proxy_last_check_summary }}</span></p>
+              {% else %}
+                <p class="lead-help">Direct mode is active. Browsers use this server's datacenter internet address.</p>
               {% endif %}
               {{ banner('proxy') }}
               {% if result and result.section == 'proxy' and result.ok and result.detail %}
@@ -474,9 +480,11 @@
                   <div class="field"><label>Country</label><input type="text" name="proxy_country" value="{{ s.proxy_country }}"></div>
                   <div class="field"><label>Region</label><input type="text" name="proxy_region" value="{{ s.proxy_region }}"></div>
                 </div>
+                <div class="help">Country and region match the targeting options in your Evomi dashboard.</div>
                 <div class="btnrow">
                   <button class="btn" type="submit" name="action" value="save">Save</button>
                   <button class="btn primary" type="submit" name="action" value="test">Save &amp; test</button>
+                  {% if s.proxy_present() %}<button class="btn" type="submit" name="action" value="direct">Use direct connection</button>{% endif %}
                 </div>
               </form>
             </div>
@@ -568,7 +576,7 @@
               </div>
             </button>
             <div class="acc-body">
-              <p class="lead-help">A profile is a durable browser identity — its cookies, logins, and exit IP persist across relaunches. Browsers use the <strong>Default</strong> profile unless you pick another when you open one.</p>
+              <p class="lead-help">A profile is a saved browser identity — its cookies, logins, and location. Everything uses your Default profile unless you pick another, so you stay signed in across sessions.</p>
               {{ banner('profiles') }}
               <div class="tablewrap">
                 <table class="hist">
@@ -579,10 +587,10 @@
                       <td><b>{{ p.name }}</b>
                         {% if p.name == default_profile %} <span class="chip ok">default</span>{% endif %}
                         {% if p.name in profiles_in_use %} <span class="chip warn">open now</span>{% endif %}</td>
-                      <td class="mono">{{ p.country }}{% if p.region %} · {{ p.region }}{% endif %}</td>
+                      <td class="mono">{% if s.proxy_configured() %}{{ p.country }}{% if p.region %} · {{ p.region }}{% endif %}{% else %}Direct (no proxy){% endif %}</td>
                       <td>
                         <div class="btnrow" style="justify-content:flex-end;margin:0">
-                          <form method="post" action="/settings/profiles/rotate"><input type="hidden" name="name" value="{{ p.name }}"><button class="btn" type="submit" title="Fresh exit IP; keeps cookies">Rotate IP</button></form>
+                          {% if s.proxy_configured() %}<form method="post" action="/settings/profiles/rotate"><input type="hidden" name="name" value="{{ p.name }}"><button class="btn" type="submit" title="Fresh exit IP; keeps cookies">Rotate IP</button></form>{% endif %}
                           {% if p.name != default_profile and p.name not in profiles_in_use %}
                           <form method="post" action="/settings/profiles/delete" onsubmit="return confirm('Delete the “{{ p.name }}” profile and its saved cookies/logins? This cannot be undone.');"><input type="hidden" name="name" value="{{ p.name }}"><button class="btn danger" type="submit">Delete</button></form>
                           {% endif %}
@@ -598,7 +606,7 @@
               <form method="post" action="/settings/profiles/create">
                 <div class="grid2">
                   <div class="field"><label>Name</label><input name="name" placeholder="e.g. research" autocomplete="off"></div>
-                  <div class="field"><label>Exit country — optional</label><input name="country" placeholder="US"></div>
+                  {% if s.proxy_configured() %}<div class="field"><label>Exit country — optional</label><input name="country" placeholder="US"></div>{% endif %}
                 </div>
                 <div class="btnrow"><button class="btn primary" type="submit">Create profile</button></div>
               </form>
@@ -615,7 +623,7 @@
               </form>
               {% endif %}
 
-              <div class="subh">Change a profile's exit location</div>
+              {% if s.proxy_configured() %}<div class="subh">Change a profile's exit location</div>
               <form method="post" action="/settings/profiles/geo">
                 <div class="grid2">
                   <div class="field"><label>Profile</label><select name="name">{% for p in profiles %}<option value="{{ p.name }}">{{ p.name }}</option>{% endfor %}</select></div>
@@ -623,7 +631,7 @@
                 </div>
                 <div class="field"><label>Region — optional</label><input name="region" placeholder="california"></div>
                 <div class="btnrow"><button class="btn" type="submit">Set location</button></div>
-              </form>
+              </form>{% endif %}
             </div>
           </div>
         </div>

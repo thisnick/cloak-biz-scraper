@@ -1,8 +1,8 @@
-"""Evomi residential proxy URL builder.
+"""Optional Evomi residential proxy URL builder.
 
-Ported from browserd (app/proxy.py). The only change: the parts come from the
-settings store rather than the environment, because in this app the user fills
-them into a web form.
+Ported from browserd (app/proxy.py). The parts come from the settings store
+rather than the environment, and an entirely empty proxy is now the supported
+direct-egress mode.
 
 Composes a per-session sticky proxy. The session token pins a sticky exit IP;
 country/region pin geography so geoip stays coherent even as the exact IP drifts
@@ -23,7 +23,7 @@ _ALPHABET = string.ascii_uppercase + string.digits
 
 
 class ProxyNotConfigured(RuntimeError):
-    """No usable proxy in settings — never launch bare, the real IP would leak."""
+    """Some proxy fields are present, but they do not form a usable proxy."""
 
 
 def new_session_token(n: int = 9) -> str:
@@ -41,6 +41,18 @@ class ProxyParts:
     region: str
 
     @classmethod
+    def optional_from_settings(cls, settings: Settings) -> "ProxyParts | None":
+        """A complete proxy, or None only when direct mode is intentional.
+
+        A partial proxy is not the same thing as no proxy. Silently treating a
+        typo or a half-filled form as direct mode would turn a configured-but-
+        broken proxy into an egress fallback, violating the fail-closed promise.
+        """
+        if not settings.proxy_present():
+            return None
+        return cls.from_settings(settings)
+
+    @classmethod
     def from_settings(cls, settings: Settings) -> "ProxyParts":
         if not settings.proxy_configured():
             missing = [
@@ -54,8 +66,9 @@ class ProxyParts:
                 if not value
             ]
             raise ProxyNotConfigured(
-                f"Proxy is not configured (missing: {', '.join(missing)}). Add your "
-                f"residential proxy under Settings before launching a browser."
+                f"Proxy settings are incomplete (missing: {', '.join(missing)}). "
+                f"Complete the Evomi Proxy fields, or choose direct connection in Settings. "
+                f"The browser will not silently bypass a proxy you started configuring."
             )
         return cls(
             user=settings.proxy_user,

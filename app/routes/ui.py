@@ -333,7 +333,7 @@ async def index(request: Request) -> Response:
 # Ported from browserd, which serves the same three shapes — and with the one
 # change that matters. browserd has no auth at all, which was fine: it is a
 # private sidecar on Nick's own machine. This is a public URL, and these files
-# are screenshots of pages fetched through the user's residential proxy. Copying
+# are screenshots of pages fetched through the user's optional proxy. Copying
 # the routes as they stand would publish them.
 #
 # So the gate is the session cookie, the same one the settings pages use. On a
@@ -636,6 +636,27 @@ async def save_proxy(
     _require_same_origin(request)
     store = request.app.state.settings
     current = store.load()
+
+    if action == "direct":
+        # Password fields are intentionally never rendered back and blank means
+        # "keep the saved secret", so an explicit action is the only unambiguous
+        # way to disable a previously configured proxy. Clear the whole
+        # connection atomically; leaving one stale field would create an
+        # incomplete configuration that correctly fails rather than launching.
+        store.update(
+            proxy_user="", proxy_password="", proxy_host="", proxy_port="",
+            proxy_last_check_at=0.0, proxy_last_check_ok=None,
+            proxy_last_check_summary="",
+        )
+        return _render(
+            request,
+            Result(
+                "proxy", True,
+                "Direct connection selected. Browsers will use this server's "
+                "datacenter internet address until you configure a proxy.",
+            ),
+        )
+
     changes = dict(
         proxy_user=proxy_user.strip(),
         proxy_password=_keep(proxy_password, current.proxy_password),
@@ -654,12 +675,21 @@ async def save_proxy(
             **changes,
             proxy_last_check_at=0.0, proxy_last_check_ok=None, proxy_last_check_summary="",
         )
+        proxy_status = settings.proxy_status()
+        if proxy_status == "direct":
+            message = "Saved. Browsers will use this server's direct datacenter connection."
+        elif proxy_status == "incomplete":
+            message = (
+                "Saved, but the proxy settings are incomplete. Complete all four connection "
+                "fields or choose direct connection before launching a browser."
+            )
+        else:
+            message = "Saved — but not tested. Use 'Save & test proxy' to check it can route."
         return _render(
             request,
             Result(
-                "proxy", True,
-                "Saved — but not tested. Use 'Save & test proxy' to check it can actually route.",
-                level="warn" if settings.proxy_configured() else "ok",
+                "proxy", True, message,
+                level="warn" if proxy_status in {"incomplete", "untested"} else "ok",
             ),
         )
 

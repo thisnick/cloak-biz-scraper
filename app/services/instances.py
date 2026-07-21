@@ -1,5 +1,5 @@
 """Instance pool — launch/stop/track CloakBrowser instances, each on its own
-X display with its own Evomi per-session proxy.
+X display and optionally its own Evomi per-session proxy.
 
 Ported from browserd (app/instances.py), which in turn adapted the
 launch/track/DISPLAY-per-instance/CDP-port/singleton-cleanup/on-close skeleton
@@ -13,9 +13,12 @@ Changes made in the port:
   * the license key and version pin are passed as launch arguments from settings
     — we write no install logic, ensure_binary() downloads on demand into the
     volume (CLOAKBROWSER_CACHE_DIR, set at process start);
-  * timezone/locale are measured at the proxy's exit or reported as unknown —
-    never defaulted, and an unroutable proxy fails fast rather than holding a
-    pool slot on a browser that cannot load a page (see geo.py);
+  * when a proxy is configured, timezone/locale are measured at its exit or
+    reported as unknown — never defaulted, and an unroutable proxy fails fast
+    rather than holding a pool slot on a browser that cannot load a page;
+  * with no proxy fields configured, launch uses direct server egress and skips
+    proxy probing/geolocation entirely; a partial proxy still fails visibly and
+    is never treated as permission to fall back to direct egress;
   * Xvfb stands in for KasmVNC until live inspection is built.
 
 Two consumer classes share one memory-bound pool via a reservation:
@@ -243,44 +246,57 @@ class InstanceManager:
             settings.cloakbrowser_license_key,
             settings.cloakbrowser_version,
         )
-        parts = ProxyParts.from_settings(settings)
+        # No proxy fields is an intentional, supported direct mode. Any partial
+        # configuration still raises here: a typo or half-filled form must never
+        # be reinterpreted as permission to bypass the proxy.
+        parts = ProxyParts.optional_from_settings(settings)
 
         profile = self.profiles.get_or_create(
             req.profile,
-            default_country=parts.country,
-            default_region=parts.region,
+            default_country=parts.country if parts else settings.proxy_country,
+            default_region=parts.region if parts else settings.proxy_region,
             country=req.country,
             region=req.region,
         )
-        proxy_url = build_proxy_url(
-            profile.session_token, parts, country=profile.country, region=profile.region
-        )
-        logger.info("launch profile=%s proxy=%s", profile.name, masked(proxy_url))
-
-        # Measure the proxy before spending a display and a pool slot on it. A
-        # proxy that cannot route is not a slow proxy, it is a broken one: every
-        # page load would fail while the instance sat in the pool looking healthy.
-        # Fail fast instead, and report only what was measured — see geo.py for
-        # why a None check on the package's own resolver is not sufficient.
-        probe = await geo.probe(proxy_url, geo=req.geoip)
-        proxy_ip, tz, locale = probe.exit_ip, probe.timezone, probe.locale
-
-        if req.geoip and not probe.geo_resolved:
-            # geoip=True asks for geographic coherence and we cannot deliver it.
-            #
-            # Launching anyway is not "degraded but working": a browser reporting
-            # the container's UTC from behind a residential exit in California is
-            # itself an anti-bot tell. It would trade a visible failure for an
-            # invisible one — silent blocks, with nothing in the logs to explain
-            # them. So refuse, and never substitute a plausible default.
-            raise GeoUnresolved(
-                f"The proxy routes (exit IP {proxy_ip}), but its location could not be "
-                f"resolved. Launching now would give the browser a timezone that "
-                f"contradicts its exit IP, which is exactly what listing sites look for. "
-                f"This usually means the GeoLite2 database could not be downloaded — "
-                f"retry in a moment. To launch anyway and accept an unknown timezone, "
-                f"pass geoip=false."
+        proxy_url: str | None = None
+        proxy_ip = tz = locale = None
+        launch_geoip = False
+        if parts is not None:
+            proxy_url = build_proxy_url(
+                profile.session_token, parts, country=profile.country, region=profile.region
             )
+            logger.info("launch profile=%s proxy=%s", profile.name, masked(proxy_url))
+
+            # Measure a configured proxy before spending a display and a pool
+            # slot on it. A proxy that cannot route is broken, not optional: fail
+            # fast and never retry direct. This branch is the only place the
+            # proxy probe/geolocator runs.
+            probe = await geo.probe(proxy_url, geo=req.geoip)
+            proxy_ip, tz, locale = probe.exit_ip, probe.timezone, probe.locale
+            launch_geoip = req.geoip
+
+            if req.geoip and not probe.geo_resolved:
+                # geoip=True asks for geographic coherence and we cannot deliver it.
+                #
+                # Launching anyway is not "degraded but working": a browser reporting
+                # the container's UTC from behind a residential exit in California is
+                # itself an anti-bot tell. It would trade a visible failure for an
+                # invisible one — silent blocks, with nothing in the logs to explain
+                # them. So refuse, and never substitute a plausible default.
+                raise GeoUnresolved(
+                    f"The proxy routes (exit IP {proxy_ip}), but its location could not be "
+                    f"resolved. Launching now would give the browser a timezone that "
+                    f"contradicts its exit IP, which is exactly what listing sites look for. "
+                    f"This usually means the GeoLite2 database could not be downloaded — "
+                    f"retry in a moment. To launch anyway and accept an unknown timezone, "
+                    f"pass geoip=false."
+                )
+        else:
+            # Direct mode deliberately does not call our probe or ask the package
+            # to geolocate the server's address. That keeps all reported geo
+            # fields honest nulls and avoids turning a recommended proxy into a
+            # hidden network precondition of direct launch.
+            logger.info("launch profile=%s connection=direct", profile.name)
 
         display = await self.displays.allocate()
         try:
@@ -303,7 +319,7 @@ class InstanceManager:
                 context = await launch_persistent_context_async(
                     user_data_dir=profile.user_data_dir, headless=not req.headed,
                     proxy=proxy_url, args=args, timezone=tz, locale=locale,
-                    humanize=req.humanize, human_preset=req.human_preset, geoip=req.geoip,
+                    humanize=req.humanize, human_preset=req.human_preset, geoip=launch_geoip,
                     viewport=None, env={**os.environ, "DISPLAY": f":{display}"},
                     license_key=settings.cloakbrowser_license_key,
                     browser_version=settings.cloakbrowser_version or None)
@@ -322,7 +338,7 @@ class InstanceManager:
             subject=subject,
             context=context, display=display, cdp_port=cdp_port, vnc_port=vnc_port,
             proxy_ip=proxy_ip, timezone=tz, locale=locale,
-            headed=req.headed, geoip=req.geoip, humanize=req.humanize,
+            headed=req.headed, geoip=launch_geoip, humanize=req.humanize,
             seed=profile.fingerprint_seed, ttl_min=req.ttl_min or _HARD_TTL_MIN,
             created_wall=now_wall, created_mono=now_mono, last_used_mono=now_mono)
         context.on("close", lambda: asyncio.ensure_future(self._on_closed(inst.id)))

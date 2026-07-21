@@ -27,3 +27,25 @@ def test_healthz_leaks_no_secret():
         response = client.get("/healthz")
     assert response.json()["configured"] is True
     assert "leakme" not in response.text
+
+
+def test_healthz_does_not_treat_the_optional_proxy_as_required():
+    with TestClient(app) as client:
+        app.state.settings.update(
+            cloakbrowser_license_key="cb_present",
+            proxy_user="", proxy_password="", proxy_host="", proxy_port="",
+        )
+        response = client.get("/healthz")
+    assert response.status_code == 200
+    assert response.json()["configured"] is True
+
+
+def test_healthz_does_not_call_a_partial_proxy_complete():
+    with TestClient(app) as client:
+        app.state.settings.update(
+            cloakbrowser_license_key="cb_present",
+            proxy_user="started", proxy_password="", proxy_host="", proxy_port="",
+        )
+        response = client.get("/healthz")
+    assert response.status_code == 200
+    assert response.json()["configured"] is False

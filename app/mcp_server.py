@@ -182,25 +182,25 @@ def build(app) -> FastMCP:
         ctx: Context, profile: str = "Default", country: str | None = None,
         region: str | None = None, geoip: bool = True,
     ) -> InstanceView:
-        """Launch a cloaked, anti-detection browser (CloakBrowser) through the
-        residential proxy.
+        """Launch a cloaked, anti-detection browser (CloakBrowser).
 
-        It carries a real, consistent browser fingerprint and exits from a
-        residential IP, so it can reach sites that block bots and datacenter
-        addresses where an ordinary headless browser is turned away. A residential
-        proxy must be configured — the browser will not launch without one.
+        It carries a real, consistent browser fingerprint. If an Evomi proxy is
+        configured, it exits through that residential IP, which is recommended
+        for listing sites that block datacenter addresses. Without a proxy it
+        launches through this server's direct datacenter connection. A proxy
+        configuration that is present but incomplete, rejected, or unreachable
+        fails visibly and is never bypassed with a direct retry.
 
         profile: a DURABLE identity. Cookies, logins, and local storage are kept
             in the profile's own storage and survive across relaunches, so the
             same profile name stays logged in to sites. Default to the same
             profile ("Default") for continuity; use a NEW name only when you
-            deliberately want a clean, logged-out identity. (Each profile keeps a
-            stable exit IP and fingerprint too.)
-        country/region: where the proxy should exit.
-        geoip: match the browser's timezone and locale to the exit IP. Leave true
-            unless geo resolution is failing: with it off the browser keeps the
-            container's UTC, which contradicts a residential exit and is itself
-            something listing sites look for.
+            deliberately want a clean, logged-out identity. Each profile keeps a
+            stable fingerprint and, when a proxy is configured, a sticky exit IP.
+        country/region: where the optional proxy should exit; ignored in direct mode.
+        geoip: with a proxy, match the browser's timezone and locale to the exit
+            IP. Leave true unless proxy geo resolution is failing. Direct mode
+            does not probe or geolocate the server, so these fields remain unknown.
 
         Lifecycle: the browser closes itself after 15 minutes idle or 60 minutes
         total, freeing its slot. The returned cdp_url is a Chrome DevTools Protocol
@@ -252,9 +252,10 @@ def build(app) -> FastMCP:
 
         Use this to actually operate a browser you launched with create_instance:
         open pages, read them, click, and fill forms. The browser is the cloaked,
-        anti-detection CloakBrowser behind the residential proxy, so it can drive
-        sites that block bots and datacenter IPs, and it keeps the profile's
-        fingerprint, cookies, and exit IP across the session.
+        anti-detection CloakBrowser and keeps the profile's fingerprint and
+        cookies across the session. When an optional residential proxy is
+        configured, it also keeps that profile's sticky exit IP; direct mode uses
+        the server's datacenter connection and may be blocked by listing sites.
 
         The workflow is snapshot-then-act. A snapshot lists the page's elements
         with short refs like @e3; you act on those refs. Refs are reassigned on
@@ -293,9 +294,9 @@ def build(app) -> FastMCP:
         """How this server is set up: proxy, browser, pool, and Notion status.
 
         Read-only, and carries no secrets — status and versions only. Useful to
-        check before a sweep or a browser launch: whether the residential proxy is
-        working, whether a CloakBrowser Pro licence is configured, how many
-        browser slots are free, and whether Notion is connected.
+        check before a sweep or a browser launch: whether the optional residential
+        proxy is direct/configured/working, whether a CloakBrowser Pro licence is
+        configured, how many browser slots are free, and whether Notion is connected.
         """
         from .services.views import server_info as build_server_info
 

@@ -44,9 +44,17 @@ def test_session_tokens_are_unique_and_evomi_shaped():
 
 
 def test_missing_proxy_names_what_is_missing_rather_than_launching_bare():
-    # Launching without a proxy would send the host's real IP to the target.
+    # Some proxy input means the user attempted to configure one. A partial
+    # attempt must fail visibly, never become permission to launch direct.
     with pytest.raises(ProxyNotConfigured, match="proxy_password, proxy_host, proxy_port"):
         ProxyParts.from_settings(Settings(proxy_user="only-user"))
+
+
+def test_optional_proxy_distinguishes_direct_from_incomplete():
+    assert ProxyParts.optional_from_settings(Settings()) is None
+    with pytest.raises(ProxyNotConfigured):
+        ProxyParts.optional_from_settings(Settings(proxy_user="only-user"))
+    assert ProxyParts.optional_from_settings(FULL) == ProxyParts.from_settings(FULL)
 
 
 class TestMasked:

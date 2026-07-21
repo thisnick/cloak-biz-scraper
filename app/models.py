@@ -142,7 +142,11 @@ class InstanceCreate(BaseModel):
     region: str | None = None
     owner: str | None = None  # optional label for interactive callers (agent id, etc.)
     headed: bool = True
-    geoip: bool = True
+    geoip: bool = Field(
+        default=True,
+        description="With a configured proxy, match timezone/locale to its measured exit. "
+        "Ignored in direct mode, which is not geolocated by this service.",
+    )
     humanize: bool = True
     human_preset: str = "careful"
     ttl_min: int | None = None
@@ -183,7 +187,10 @@ class InstanceView(BaseModel):
     expires_at: float | None = None
     age_sec: float = 0.0
     idle_sec: float = 0.0
-    geoip: bool = True
+    geoip: bool = Field(
+        default=True,
+        description="Whether proxy-exit geolocation was applied. False in direct mode.",
+    )
     humanize: bool = True
 
 
@@ -205,10 +212,13 @@ class AgentBrowserResult(BaseModel):
 
 
 class ProxyInfo(BaseModel):
-    configured: bool = Field(description="Whether a residential proxy is fully set up.")
-    status: str = Field(description="unconfigured / untested / working / broken.")
-    country: str | None = Field(default=None, description="Default exit country.")
-    region: str | None = Field(default=None, description="Default exit region.")
+    configured: bool = Field(
+        description="Whether the optional residential proxy is fully set up. False can mean "
+        "the valid direct mode; inspect status to distinguish direct from incomplete."
+    )
+    status: str = Field(description="direct / incomplete / untested / working / broken.")
+    country: str | None = Field(default=None, description="Configured proxy's default country.")
+    region: str | None = Field(default=None, description="Configured proxy's default region.")
 
 
 class BrowserInfo(BaseModel):
@@ -245,6 +255,7 @@ class Health(BaseModel):
     service: str = "cloak-biz-scraper"
     version: str
     configured: bool = Field(
-        description="Whether a license and proxy are set — false means the UI setup is unfinished."
+        description="Whether settings currently required to launch a browser are present. "
+        "The recommended residential proxy is optional and does not affect health."
     )
     instances: int = 0

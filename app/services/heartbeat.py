@@ -2,7 +2,7 @@
 
 Railway sleeps a service when it sends no **outbound** packets for ten minutes;
 inbound traffic is explicitly excluded and only wakes it. A running sweep mostly
-pins the machine by doing its job — Chromium's egress through the proxy counts,
+pins the machine by doing its job — Chromium's direct or proxied egress counts,
 and it is measured at the service's network interface rather than per-process.
 
 The gap this closes is the CPU-bound stretch: Readability and Turndown parsing,

@@ -67,9 +67,15 @@ class TestSnapshotContent:
 
     def test_an_unconfigured_server_reads_as_such(self):
         info = server_info(Settings(), _FakeInstances(in_use=0))
-        assert info.proxy.configured is False and info.proxy.status == "unconfigured"
+        assert info.proxy.configured is False and info.proxy.status == "direct"
+        assert info.proxy.country is None and info.proxy.region is None
         assert info.browser.pro is False
         assert info.notion.connected is False
+
+    def test_partial_proxy_is_not_misreported_as_direct_or_located(self):
+        info = server_info(Settings(proxy_user="u"), _FakeInstances(in_use=0))
+        assert info.proxy.configured is False and info.proxy.status == "incomplete"
+        assert info.proxy.country is None and info.proxy.region is None
 
 
 class TestRestEndpoint:

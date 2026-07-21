@@ -101,6 +101,13 @@ class TestStateless:
         for field in ("asking_price", "revenue", "cashflow", "ebitda"):
             assert listing[field]["type"] == "string", field
 
+    def test_create_instance_describes_optional_proxy_and_fail_closed_fallback(self, client):
+        tools = {t["name"]: t for t in rpc(client, "tools/list").json()["result"]["tools"]}
+        description = tools["create_instance"]["description"]
+        assert "direct datacenter connection" in description
+        assert "never bypassed with a direct retry" in description
+        assert "must be configured" not in description
+
 
 class TestTheEndpointIsExactlySlashMcp:
     def test_post_to_mcp_is_answered_not_redirected(self, client):

@@ -122,15 +122,29 @@ class Settings(BaseModel):
         """Whether the form is filled in. Says nothing about whether it works."""
         return bool(self.proxy_user and self.proxy_password and self.proxy_host and self.proxy_port)
 
+    def proxy_present(self) -> bool:
+        """Whether the user has entered any proxy connection detail.
+
+        This distinction is load-bearing now that direct egress is supported:
+        no connection fields means an intentional direct launch, while a
+        partially filled form is an attempted proxy configuration and must fail
+        visibly rather than silently falling back to the server's address.
+        Country and region do not count by themselves because they have useful
+        defaults even before a proxy is configured.
+        """
+        return any((self.proxy_user, self.proxy_password, self.proxy_host, self.proxy_port))
+
     def proxy_status(self) -> str:
-        """unconfigured | untested | working | broken — what we actually know.
+        """direct | incomplete | untested | working | broken — what we know.
 
         'untested' is a real state and not a polite way of saying fine: filling
         the form in is not evidence of anything, and claiming otherwise would be
         the same sin as reporting an unmeasured timezone.
         """
+        if not self.proxy_present():
+            return "direct"
         if not self.proxy_configured():
-            return "unconfigured"
+            return "incomplete"
         if self.proxy_last_check_ok is None:
             return "untested"
         return "working" if self.proxy_last_check_ok else "broken"

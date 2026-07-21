@@ -1,4 +1,4 @@
-"""Launch a real browser through the proxy and report what the internet sees.
+"""Launch a real browser and report what the internet sees.
 
 Runs inside the container, against the service layer directly — no HTTP façade
 involved, which is the point: if behaviour lives in services/ then it is
@@ -6,8 +6,9 @@ testable without a route.
 
   docker compose exec app python scripts/verify_browser.py
 
-Prints a JSON report: the binary that was used, the exit IP and geo as resolved
-from the proxy, and the same values as observed from inside the page.
+Prints a JSON report: the binary that was used, direct-versus-proxy mode, any
+proxy exit IP/geo this service measured, and the values observed in the page.
+This supports both validation arms for optional proxy behavior.
 """
 from __future__ import annotations
 
@@ -115,6 +116,7 @@ async def main() -> int:
     report["binary"] = _running_binary(settings)
     report["instance"] = {
         "id": inst.id,
+        "connection_mode": "proxy" if inst.proxy_ip else "direct",
         "proxy_ip": inst.proxy_ip,
         "timezone": inst.timezone,
         "locale": inst.locale,

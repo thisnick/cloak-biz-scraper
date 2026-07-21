@@ -286,6 +286,41 @@ class TestLicenceVerify:
 
 
 class TestProxyTest:
+    def test_empty_proxy_is_presented_as_valid_direct_mode(self, auth):
+        page = shown(auth.get("/"))
+        assert '<span class="chip">Direct</span>' in auth.get("/").text
+        assert "Direct mode is active" in page
+        assert "Evomi Proxy" in page
+        assert "Optional, but websites like BizBuySell will block you" in page
+        assert "Without it, nothing launches" not in page
+
+    def test_explicit_direct_action_clears_a_saved_proxy(self, auth):
+        app.state.settings.update(
+            proxy_user="u", proxy_password="secret", proxy_host="proxy.example",
+            proxy_port="1000", proxy_last_check_ok=True,
+            proxy_last_check_at=123.0, proxy_last_check_summary="working",
+        )
+        response = auth.post("/settings/proxy", data={"action": "direct"})
+        assert response.status_code == 200
+        settings = app.state.settings.load()
+        assert (settings.proxy_user, settings.proxy_password,
+                settings.proxy_host, settings.proxy_port) == ("", "", "", "")
+        assert settings.proxy_status() == "direct"
+        assert settings.proxy_last_check_ok is None
+        assert "Direct connection selected" in shown(response)
+
+    def test_partial_proxy_is_visible_and_never_labelled_direct(self, auth):
+        response = auth.post(
+            "/settings/proxy",
+            data={"action": "save", "proxy_user": "u", "proxy_host": "proxy.example"},
+        )
+        assert response.status_code == 200
+        assert app.state.settings.load().proxy_status() == "incomplete"
+        page = shown(response)
+        assert "Proxy settings are incomplete" in page
+        assert '<span class="chip bad">Incomplete</span>' in response.text
+        assert "Direct mode is active" not in page
+
     @respx.mock
     def test_reports_what_it_measured(self, auth, monkeypatch):
         from app.services import geo
@@ -1216,3 +1251,14 @@ class TestNewBrowserProfile:
         assert 'id="nb-dialog"' in page                          # B: the New-browser dialog
         assert 'action="/settings/profiles/create"' in page      # C: the Profiles manager
         assert "research" in page and "Default" in page           # both profiles listed
+
+    def test_direct_mode_does_not_claim_profile_geo_is_the_exit(self, auth, monkeypatch, tmp_path):
+        from app.services.profiles import ProfileStore
+        ps = ProfileStore(tmp_path / "prof")
+        monkeypatch.setattr(app.state.instances, "profiles", ps)
+        monkeypatch.setattr(app.state.instances, "running", {})
+        ps.ensure_default(default_country="US", default_region="california")
+        page = auth.get("/").text
+        assert "Direct (no proxy)" in page
+        assert "Rotate IP" not in page
+        assert "Change a profile's exit location" not in page

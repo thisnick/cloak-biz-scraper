@@ -102,12 +102,16 @@ def server_info(settings, instances) -> ServerInfo:
     except Exception:  # noqa: BLE001 — an info snapshot never fails on this
         pass
 
+    proxy_configured = settings.proxy_configured()
     return ServerInfo(
         proxy=ProxyInfo(
-            configured=settings.proxy_configured(),
+            configured=proxy_configured,
             status=settings.proxy_status(),
-            country=settings.proxy_country or None,
-            region=settings.proxy_region or None,
+            # Defaults such as US/california are targeting choices, not an
+            # observed direct-egress location. Never present them as active
+            # when there is no complete proxy configuration.
+            country=(settings.proxy_country or None) if proxy_configured else None,
+            region=(settings.proxy_region or None) if proxy_configured else None,
         ),
         browser=BrowserInfo(
             pro=bool(settings.cloakbrowser_license_key),

@@ -5,7 +5,7 @@ did not need and this does — browserd sat on a private network; this is a publ
 Railway URL.
 
 **What is being exposed.** CDP is total control of a browser that holds the
-user's residential proxy credentials and every cookie it has collected. An
+user's optional proxy credentials and every cookie it has collected. An
 unauthenticated CDP endpoint is not "a debug feature", it is a remote browser
 someone else can drive as the user. So every upgrade must present a token that
 is machine-minted, scoped to one instance, and short-lived (services/tokens.py),

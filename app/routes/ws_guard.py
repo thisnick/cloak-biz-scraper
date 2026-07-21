@@ -3,7 +3,7 @@
 Shared by the CDP and VNC endpoints because they are the same decision with one
 difference, and writing it twice is how the copy that gets a fix and the copy
 that does not come to exist. Both endpoints hand out control of a browser
-holding the user's residential proxy credentials and cookies; both are refused
+holding the user's optional proxy credentials and cookies; both are refused
 **before** `accept()`, so nothing is ever attached to the browser by a caller
 who turns out not to be allowed.
 

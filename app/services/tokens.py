@@ -1,7 +1,7 @@
 """Ephemeral, instance-scoped tokens for the CDP and VNC endpoints.
 
-CDP is **full control** of a browser holding the user's residential proxy and
-whatever cookies it has collected. So the token that opens it is minted by the
+CDP is **full control** of a browser holding the user's optional proxy credentials
+and whatever cookies it has collected. So the token that opens it is minted by the
 machine, never handled by the user, scoped to one instance, and dies in minutes.
 
 **Why the token goes in the URL.** WebSocket clients frequently cannot set

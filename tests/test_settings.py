@@ -140,3 +140,9 @@ class TestProxyConfigured:
         assert Settings(
             proxy_user="u", proxy_password="p", proxy_host="h", proxy_port="1000"
         ).proxy_configured()
+
+    def test_direct_and_partial_are_distinct_states(self):
+        direct = Settings()
+        partial = Settings(proxy_user="u")
+        assert direct.proxy_present() is False and direct.proxy_status() == "direct"
+        assert partial.proxy_present() is True and partial.proxy_status() == "incomplete"

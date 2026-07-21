@@ -3,11 +3,11 @@
 Ported from browserd (app/profiles.py). The only change: geo defaults are passed
 in from settings rather than read from the environment.
 
-A profile is a durable browser identity: a name, its geo pin (country/region),
-its sticky Evomi session token, and a fingerprint seed — all paired for the life
-of the profile per CloakBrowser guidance ("one profile, one seed"). Cookies live
-in the profile's user-data dir. Stored as one JSON file under the profiles dir so
-a later instance reattaches warm + geo-coherent even after the container restarts.
+A profile is a durable browser identity: a name, optional proxy geo pin
+(country/region), sticky Evomi session token, and fingerprint seed — all paired
+for the life of the profile per CloakBrowser guidance ("one profile, one seed").
+Cookies live in the profile's user-data dir. Stored as one JSON file under the
+profiles dir so a later instance reattaches warm after the container restarts.
 """
 from __future__ import annotations
 
