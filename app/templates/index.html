@@ -437,7 +437,7 @@
                 <div class="btnrow">
                   <button class="btn" type="submit" name="action" value="save">Save</button>
                   <button class="btn primary" type="submit" name="action" value="verify">Save &amp; verify</button>
-                  {% if has_license %}<button class="btn" type="submit" name="action" value="public">Use public build</button>{% endif %}
+                  {% if has_license %}<button class="btn" type="submit" name="action" value="public" title="Removes the saved key; later launches use the public build">Clear licence key</button>{% endif %}
                 </div>
                 <div class="help" id="licence-wait" role="status" hidden>Getting the browser — about ten seconds. This download happens once.</div>
               </form>
@@ -584,6 +584,7 @@
             </button>
             <div class="acc-body">
               <p class="lead-help">A profile is a saved browser identity — its cookies, logins, and location. Everything uses your Default profile unless you pick another, so you stay signed in across sessions.</p>
+              {% if s.proxy_configured() %}<p class="lead-help">New proxy session keeps the profile's cookies and logins, but asks the proxy for a fresh exit address the next time that profile opens. It does not change a browser that is already open.</p>{% endif %}
               {{ banner('profiles') }}
               <div class="tablewrap">
                 <table class="hist">
@@ -597,7 +598,7 @@
                       <td class="mono">{% if s.proxy_configured() %}{{ p.country }}{% if p.region %} · {{ p.region }}{% endif %}{% else %}Direct (no proxy){% endif %}</td>
                       <td>
                         <div class="btnrow" style="justify-content:flex-end;margin:0">
-                          {% if s.proxy_configured() %}<form method="post" action="/settings/profiles/rotate"><input type="hidden" name="name" value="{{ p.name }}"><button class="btn" type="submit" title="Fresh exit IP; keeps cookies">Rotate IP</button></form>{% endif %}
+                          {% if s.proxy_configured() %}<form method="post" action="/settings/profiles/rotate"><input type="hidden" name="name" value="{{ p.name }}"><button class="btn" type="submit" title="Fresh proxy session on the next launch; keeps cookies and logins">New proxy session</button></form>{% endif %}
                           {% if p.name != default_profile and p.name not in profiles_in_use %}
                           <form method="post" action="/settings/profiles/delete" onsubmit="return confirm('Delete the “{{ p.name }}” profile and its saved cookies/logins? This cannot be undone.');"><input type="hidden" name="name" value="{{ p.name }}"><button class="btn danger" type="submit">Delete</button></form>
                           {% endif %}

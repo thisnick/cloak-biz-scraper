@@ -616,8 +616,9 @@ async def save_cloakbrowser(
             Result(
                 "cloakbrowser",
                 True,
-                "Public build selected. It has fewer bypasses than Pro and has not "
-                "been tested by us against the listing sites.",
+                "Licence key cleared. Later launches will use the public build, which "
+                "has fewer bypasses than Pro and has not been tested by us against the "
+                "listing sites.",
                 level="warn",
             ),
         )

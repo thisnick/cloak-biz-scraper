@@ -169,6 +169,9 @@ class TestSaving:
 
     def test_public_action_explicitly_clears_a_saved_key(self, auth):
         auth.post("/settings/cloakbrowser", data={"cloakbrowser_license_key": "cb_remove"})
+        before = auth.get("/").text
+        assert "Clear licence key" in before
+        assert "Use public build" not in before
         response = auth.post(
             "/settings/cloakbrowser",
             data={"action": "public", "cloakbrowser_license_key": ""},
@@ -176,7 +179,8 @@ class TestSaving:
         assert response.status_code == 200
         assert app.state.settings.load().cloakbrowser_license_key == ""
         page = shown(response)
-        assert "Public build selected" in page
+        assert "Licence key cleared" in page
+        assert "Later launches will use the public build" in page
         assert "not been tested by us against the listing sites" in page
 
     def test_malformed_pin_is_reported_not_stored(self, auth):
@@ -1319,5 +1323,23 @@ class TestNewBrowserProfile:
         ps.ensure_default(default_country="US", default_region="california")
         page = auth.get("/").text
         assert "Direct (no proxy)" in page
-        assert "Rotate IP" not in page
+        assert "New proxy session" not in page
         assert "Change a profile's exit location" not in page
+
+    def test_proxy_mode_explains_that_a_new_session_applies_on_the_next_launch(
+        self, auth, monkeypatch, tmp_path
+    ):
+        from app.services.profiles import ProfileStore
+
+        ps = ProfileStore(tmp_path / "prof")
+        monkeypatch.setattr(app.state.instances, "profiles", ps)
+        monkeypatch.setattr(app.state.instances, "running", {})
+        ps.ensure_default(default_country="US", default_region="california")
+        app.state.settings.update(
+            proxy_user="u", proxy_password="p", proxy_host="proxy.example", proxy_port="1000"
+        )
+
+        page = auth.get("/").text
+        assert "New proxy session" in page
+        assert "keeps the profile's cookies and logins" in page
+        assert "It does not change a browser that is already open" in page
