@@ -91,6 +91,14 @@ class TestSnapshotContent:
         assert info.browser.build == "public"
         assert info.browser.version == "146.0.7680.177.3"
 
+    @pytest.mark.parametrize("blank", ["   ", "\t", "\n", " \t\r\n "])
+    def test_whitespace_key_is_public_not_unverified_pro(self, blank):
+        settings = Settings(cloakbrowser_license_key=blank)
+        info = server_info(settings, _FakeInstances(binary_path=None))
+        assert settings.cloakbrowser_license_key == ""
+        assert info.browser.pro is False
+        assert info.browser.build == "public"
+
     def test_partial_proxy_is_not_misreported_as_direct_or_located(self):
         info = server_info(Settings(proxy_user="u"), _FakeInstances(in_use=0))
         assert info.proxy.configured is False and info.proxy.status == "incomplete"

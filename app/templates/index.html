@@ -689,6 +689,12 @@
     if(lf)lf.addEventListener('submit',function(e){
       var b=e.submitter;
       if(!b||b.value!=='verify')return;
+      // Disabled controls are omitted from native form serialization. Preserve
+      // the clicked action before disabling the buttons, or the server receives
+      // its default action="save" and never runs verification.
+      var a=document.createElement('input');
+      a.type='hidden';a.name='action';a.value='verify';a.setAttribute('data-verify-action','');
+      lf.appendChild(a);
       lf.querySelectorAll('button').forEach(function(x){x.disabled=true;});
       b.textContent='Getting browser — about ten seconds…';
       var w=document.getElementById('licence-wait');if(w)w.hidden=false;

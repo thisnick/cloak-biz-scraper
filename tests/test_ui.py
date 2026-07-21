@@ -279,7 +279,10 @@ class TestLicenceVerify:
         from app.services import license as license_service
         from app.services.license import LicenseReport
 
+        calls = []
+
         async def failed(key, pin=""):
+            calls.append((key, pin))
             return LicenseReport(ok=False, message="Nope.")
 
         monkeypatch.setattr(license_service, "verify", failed)
@@ -290,6 +293,7 @@ class TestLicenceVerify:
         # A failed verification is not a successful page. 200 here would make
         # "did my licence work?" answerable only by reading the banner colour.
         assert response.status_code == 400
+        assert calls == [("cb_x", "")], "action=verify must reach the verify service path"
 
     def test_no_key_verifies_as_public(self, auth, monkeypatch):
         from app.services import license as license_service
@@ -316,6 +320,14 @@ class TestLicenceVerify:
         assert "Without a key you're on the public build" in page
         assert "fewer bot detectors" in page
         assert "not tested" in page.lower() and "listing sites" in page.lower()
+
+    def test_whitespace_key_renders_every_ui_status_as_public(self, auth):
+        app.state.settings.update(cloakbrowser_license_key=" \t\r\n ")
+        assert app.state.settings.load().cloakbrowser_license_key == ""
+        page = shown(auth.get("/"))
+        assert "Public build" in page
+        assert "Without a key you're on the public build" in page
+        assert "Pro key saved" not in page
 
     def test_verify_wait_state_names_the_measured_delay(self, auth):
         page = auth.get("/").text

@@ -73,6 +73,18 @@ class Settings(BaseModel):
     max_instances: int = Field(default=4, ge=1)
     interactive_reserve: int = Field(default=1, ge=0)
 
+    @field_validator("cloakbrowser_license_key", mode="before")
+    @classmethod
+    def _normalize_license_key(cls, v: Any) -> str:
+        """Whitespace-only is the deliberate public-build selection everywhere.
+
+        Normalizing at the model boundary keeps UI chips, health/status payloads,
+        launch selection, and startup logging from each inventing a slightly
+        different definition of "blank". Leading/trailing whitespace is never
+        part of a real key and commonly arrives through copy/paste.
+        """
+        return "" if v is None else str(v).strip()
+
     @field_validator("cloakbrowser_version")
     @classmethod
     def _check_pin(cls, v: str) -> str:

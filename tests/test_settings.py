@@ -90,6 +90,20 @@ def test_redacted_does_not_invent_a_secret_that_is_unset(store):
     assert store().load().redacted()["proxy_password"] == ""
 
 
+@pytest.mark.parametrize("blank", ["   ", "\t", "\n", " \t\r\n "])
+def test_whitespace_only_licence_keys_normalize_to_public(blank, store):
+    assert Settings(cloakbrowser_license_key=blank).cloakbrowser_license_key == ""
+    saved = store().update(cloakbrowser_license_key=blank)
+    assert saved.cloakbrowser_license_key == ""
+    assert store().load().redacted()["cloakbrowser_license_key"] == ""
+
+
+def test_licence_key_copy_paste_whitespace_is_trimmed():
+    assert Settings(cloakbrowser_license_key=" \tcb_real\r\n").cloakbrowser_license_key == (
+        "cb_real"
+    )
+
+
 class TestVersionPin:
     def test_empty_means_latest(self):
         assert Settings().cloakbrowser_version == ""

@@ -1,6 +1,8 @@
 """/healthz — Railway's prober hits this unauthenticated, so watch what it says."""
 from __future__ import annotations
 
+import logging
+
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -49,6 +51,28 @@ def test_healthz_does_not_treat_a_licence_as_required():
         response = client.get("/healthz")
     assert response.status_code == 200
     assert response.json()["configured"] is True
+
+
+def test_whitespace_licence_is_public_in_health_and_startup_status(caplog):
+    # Seed through the real central model before startup. This exercises both
+    # the unauthenticated health payload and main.py's ready log — two surfaces
+    # that previously used raw truthiness independently.
+    from app.config import CONFIG
+    from app.services.settings import SettingsService
+
+    SettingsService(CONFIG.settings_path, CONFIG.dek_path).update(
+        cloakbrowser_license_key=" \t\r\n ",
+        proxy_user="", proxy_password="", proxy_host="", proxy_port="",
+    )
+    with caplog.at_level(logging.INFO, logger="cloakbiz.main"):
+        with TestClient(app) as client:
+            response = client.get("/healthz")
+            assert app.state.settings.load().cloakbrowser_license_key == ""
+
+    assert response.status_code == 200 and response.json()["configured"] is True
+    ready = [r.getMessage() for r in caplog.records if r.getMessage().startswith("ready:")]
+    assert ready and "license=public" in ready[-1]
+    assert "pro-key-saved" not in ready[-1]
 
 
 def test_healthz_does_not_call_a_partial_proxy_complete():

@@ -311,6 +311,40 @@ class TestControlLandsOnTheRightPane:
         )
 
 
+class TestLicenceVerifySubmission:
+    """The loading state must not turn Verify into an ordinary Save.
+
+    HTML serializes only successful controls. A disabled submit button is not
+    successful, so disabling every button from the submit handler used to erase
+    its ``name=action value=verify`` before the browser built the POST body. This
+    runs the real dashboard JavaScript in Chrome and asks the DOM's own FormData
+    implementation what would be sent after the loading-state handler fires.
+    """
+
+    def test_disabled_loading_controls_preserve_verify_in_the_serialized_post(self, measured):
+        page = measured["page"]
+        result = page.evaluate("""() => new Promise(resolve => {
+          const form = document.getElementById('licence-form');
+          const verify = form.querySelector('button[name="action"][value="verify"]');
+          form.addEventListener('submit', event => {
+            event.preventDefault();
+            const fields = [...new FormData(form).entries()];
+            resolve({
+              fields,
+              allButtonsDisabled: [...form.querySelectorAll('button')].every(b => b.disabled),
+              waitShown: !document.getElementById('licence-wait').hidden,
+              buttonText: verify.textContent,
+            });
+          }, {once: true});
+          verify.click();
+        })""")
+
+        actions = [value for name, value in result["fields"] if name == "action"]
+        assert actions == ["verify"], f"serialized POST lost/duplicated verify: {result['fields']}"
+        assert result["allButtonsDisabled"], "loading state must still prevent repeat submits"
+        assert result["waitShown"] and "about ten seconds" in result["buttonText"]
+
+
 _PROBE = r"""
 () => {
   const vis = e => { if(!e) return false; const s=getComputedStyle(e);
