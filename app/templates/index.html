@@ -720,6 +720,21 @@
    block is the only place that opens a socket. A pane connects only while its
    section is visible and disconnects when you navigate away, so at most one
    section's worth of framebuffers is live at a time. #}
+{# Some containment/automation wrappers replace `window.WebSocket` but omit
+   its four standard numeric state constants. noVNC 1.3 snapshots those values
+   while its module loads; missing constants make its send queue stay forever
+   in "unknown" even though the socket is open. This classic script runs before
+   the deferred module import and restores only absent standard constants. #}
+<script>
+  (function(){
+    var states = {CONNECTING:0, OPEN:1, CLOSING:2, CLOSED:3};
+    Object.keys(states).forEach(function(name){
+      if(typeof WebSocket[name] !== 'number'){
+        Object.defineProperty(WebSocket, name, {value:states[name], configurable:true});
+      }
+    });
+  })();
+</script>
 <script type="module">
   import RFB from '/novnc/core/rfb.js';
 

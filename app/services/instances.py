@@ -44,7 +44,7 @@ from .display import DisplayManager
 from .geo import GeoUnresolved
 from .license import LicenseNotPro, resolve_browser_binary
 from .profiles import ProfileStore
-from .proxy import ProxyParts, build_proxy_url, masked
+from .proxy import ProxyParts, build_proxy_url
 from .settings import SettingsService
 
 logger = logging.getLogger("cloakbiz.instances")
@@ -313,7 +313,13 @@ class InstanceManager:
             proxy_url = build_proxy_url(
                 profile.session_token, parts, country=profile.country, region=profile.region
             )
-            logger.info("launch profile=%s proxy=%s", profile.name, masked(proxy_url))
+            # Usernames can be account identifiers and the password also carries
+            # the sticky-session token. Neither belongs in logs; host/port are
+            # sufficient to distinguish proxy from direct launches.
+            logger.info(
+                "launch profile=%s connection=proxy host=%s:%s",
+                profile.name, parts.host, parts.port,
+            )
 
             # Measure a configured proxy before spending a display and a pool
             # slot on it. A proxy that cannot route is broken, not optional: fail

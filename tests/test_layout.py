@@ -36,6 +36,7 @@ PAGE_URL = "https://dash.test/"
 # without this the whole module errors and none of the keyboard wiring attaches.
 # None of the layout checks touch a real socket.
 STUB_RFB = """
+window.__wsOpenAtRfbImport = WebSocket.OPEN;
 export default class RFB {
   constructor(target, url){
     this._l={};
@@ -53,6 +54,60 @@ export default class RFB {
   set scaleViewport(v){} set background(v){}
 }
 """
+
+
+def test_live_view_repairs_wrapped_websocket_states_before_novnc_import():
+    """The exact live failure: containment wrappers can omit static constants.
+
+    noVNC snapshots ``WebSocket.OPEN`` at module evaluation. If our compatibility
+    script moves below the static import (or is deleted), the captured value is
+    undefined and noVNC queues the RFB version forever instead of sending it.
+    """
+    html = _render_dashboard()
+    with sync_playwright() as p:
+        browser = None
+        for kw in ({"channel": "chrome"}, {}):
+            try:
+                browser = p.chromium.launch(headless=True, **kw)
+                break
+            except PWError:
+                continue
+        if browser is None:
+            pytest.skip("no Chrome/Chromium available for WebSocket wrapper check")
+
+        page = browser.new_page(viewport={"width": 1280, "height": 900})
+        page.add_init_script("""
+          (() => {
+            const Native = window.WebSocket;
+            window.WebSocket = function(url, protocols) {
+              return protocols === undefined
+                ? new Native(url) : new Native(url, protocols);
+            };
+            window.WebSocket.prototype = Native.prototype;
+            // Deliberately do not copy CONNECTING/OPEN/CLOSING/CLOSED: this is
+            // the shape of the containment wrapper that exposed the failure.
+          })();
+        """)
+        page.route(PAGE_URL, lambda r: r.fulfill(
+            status=200, content_type="text/html", body=html))
+        page.route("**/novnc/core/rfb.js", lambda r: r.fulfill(
+            status=200, content_type="text/javascript", body=STUB_RFB))
+        page.route("**/sessions/instances/**", lambda r: r.fulfill(
+            status=200, content_type="application/json",
+            body='{"token":"t","path":"/instances/i1/vnc"}'))
+        try:
+            page.goto(PAGE_URL, wait_until="networkidle")
+            states = page.evaluate("""() => ({
+              connecting: WebSocket.CONNECTING, open: WebSocket.OPEN,
+              closing: WebSocket.CLOSING, closed: WebSocket.CLOSED,
+              openSeenByNoVNC: window.__wsOpenAtRfbImport,
+            })""")
+            assert states == {
+                "connecting": 0, "open": 1, "closing": 2, "closed": 3,
+                "openSeenByNoVNC": 1,
+            }
+        finally:
+            browser.close()
 
 
 class _Fake:

@@ -13,6 +13,12 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+from .services.log_safety import install_log_sanitizer
+
+# Uvicorn configures its access logger before importing the ASGI app. A record
+# factory still sees those records, plus dependency logs emitted during startup.
+install_log_sanitizer()
+
 from fastapi import FastAPI, Request
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles

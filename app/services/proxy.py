@@ -96,16 +96,15 @@ def build_proxy_url(
 
 
 def masked(url: str) -> str:
-    """Redact the password portion for logging.
+    """Redact all proxy userinfo for logging.
 
-    Splits on the LAST '@' rather than the first: the credentials are the user's
-    to choose, and one containing '@' would otherwise split early and leave the
-    tail of the password sitting in the log line pretending to be a hostname.
+    Usernames are account identifiers too, not harmless labels. Splitting on the
+    LAST '@' also matters: one inside credentials must not leave the password
+    tail sitting in the log line pretending to be a hostname.
     """
     try:
         scheme, rest = url.split("://", 1)
-        creds, hostport = rest.rsplit("@", 1)
-        user = creds.split(":", 1)[0]
-        return f"{scheme}://{user}:***@{hostport}"
+        _, hostport = rest.rsplit("@", 1)
+        return f"{scheme}://***@{hostport}"
     except ValueError:
         return "***"

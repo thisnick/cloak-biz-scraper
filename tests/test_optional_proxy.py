@@ -7,6 +7,7 @@ silent fallback after a configured proxy failed.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 import pytest
@@ -143,6 +144,38 @@ async def test_configured_proxy_is_probed_and_passed_to_browser(tmp_path, monkey
         "203.0.113.8", "America/New_York", "en-US"
     )
     assert (displays.allocated, displays.started) == (1, 1)
+
+
+async def test_proxy_launch_log_contains_endpoint_but_no_raw_or_encoded_userinfo(
+    tmp_path, monkeypatch, caplog
+):
+    user = "account%40example.invalid"
+    password = "raw-p%40ss%2Fcredential"
+    manager, _ = _manager(
+        tmp_path, monkeypatch,
+        proxy_user=user, proxy_password=password,
+        proxy_host="proxy.example", proxy_port="1000",
+    )
+    _capture_browser_launch(monkeypatch)
+
+    async def fake_probe(url: str, *, geo: bool = True) -> ProxyProbe:
+        return ProxyProbe(
+            exit_ip="203.0.113.8", timezone="America/New_York",
+            locale="en-US", country="US", city="New York",
+        )
+
+    monkeypatch.setattr(geo, "probe", fake_probe)
+    with caplog.at_level(logging.INFO, logger="cloakbiz.instances"):
+        await manager._do_launch(
+            InstanceCreate(profile="Default", geoip=True), "interactive", None, "owner"
+        )
+
+    lines = [record.getMessage() for record in caplog.records
+             if record.name == "cloakbiz.instances"]
+    assert lines and any("connection=proxy host=proxy.example:1000" in line for line in lines)
+    joined = "\n".join(lines)
+    for secret in (user, password, "account", "%40", "%2F", "session-"):
+        assert secret not in joined
 
 
 async def test_broken_configured_proxy_fails_before_launch_and_never_retries_direct(

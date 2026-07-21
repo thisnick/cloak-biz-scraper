@@ -58,13 +58,14 @@ def test_optional_proxy_distinguishes_direct_from_incomplete():
 
 
 class TestMasked:
-    def test_password_is_hidden_and_host_kept(self):
+    def test_all_userinfo_is_hidden_and_host_kept(self):
         url = build_proxy_url("TOK", ProxyParts.from_settings(FULL))
-        assert masked(url) == "http://user1:***@core-residential.example.com:1000"
+        assert masked(url) == "http://***@core-residential.example.com:1000"
 
     def test_no_fragment_of_the_secret_survives(self):
         url = build_proxy_url("TOK", ProxyParts.from_settings(FULL))
         out = masked(url)
+        assert "user1" not in out
         assert "s3cret" not in out
         assert "lifetime" not in out  # the whole suffix goes, not just the password
 
@@ -76,5 +77,14 @@ class TestMasked:
         # in the log line, disguised as a hostname.
         parts = ProxyParts.from_settings(FULL.model_copy(update={"proxy_password": "p@ss"}))
         assert masked(build_proxy_url("TOK", parts)) == (
-            "http://user1:***@core-residential.example.com:1000"
+            "http://***@core-residential.example.com:1000"
         )
+
+    def test_url_encoded_userinfo_is_redacted_as_userinfo_not_treated_as_host(self):
+        parts = ProxyParts.from_settings(FULL.model_copy(update={
+            "proxy_user": "account%40example.invalid",
+            "proxy_password": "raw%2Fencoded%3Fcredential",
+        }))
+        out = masked(build_proxy_url("TOK", parts))
+        assert out == "http://***@core-residential.example.com:1000"
+        assert "account" not in out and "%2F" not in out
