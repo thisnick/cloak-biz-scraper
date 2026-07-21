@@ -23,6 +23,7 @@ from .config import CONFIG, bootstrap_binary_cache, purge_binary_env
 from .routes import api, cdp, health, oauth, ui, vnc
 from .routes.guard import AuthGuard
 from .routes.mcp import MCPEndpoint
+from .response_security import ResponseSecurity
 from .services import heartbeat
 from .services.agent_browser import AgentBrowserService
 from .services.archive import ArchiveService
@@ -177,6 +178,10 @@ else:
 # Above the router, so it sees /mcp and /api/* before any route does. This is
 # the gate: without it both surfaces answer 200 to anyone with the URL.
 app.add_middleware(AuthGuard, get_provider=lambda: getattr(app.state, "oauth", None))
+# Added after AuthGuard so Starlette places it outside the bearer gate.  That is
+# what gives guard-generated 401/503 responses the same no-store/security policy
+# as FastAPI, SDK OAuth, and raw MCP responses.
+app.add_middleware(ResponseSecurity)
 
 # A Route, deliberately, not a Mount. `Mount("/mcp")` compiles to the regex
 # ^/mcp/(?P<path>.*)$ — it never matches a bare "/mcp", so Starlette's
