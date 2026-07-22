@@ -74,6 +74,26 @@ class TestListingId:
         assert listing_id_from(SACRAMENTO) is None
 
 
+class TestSourceLabels:
+    """`name` is the machine id; `label` is the human display name. `label_for`
+    resolves a stored id to the owning adapter's label, so labels live with the
+    source and unknown ids fall back to the id itself."""
+
+    def test_each_adapter_declares_a_distinct_id_and_label(self):
+        serp, broker = BizBuySellSerp(), BizBuySellBroker()
+        assert serp.name == "bizbuysell_serp" and serp.label == "BizBuySell"
+        assert broker.name == "bizbuysell_broker" and broker.label == "BizBuySell broker"
+
+    def test_label_for_resolves_a_known_id(self):
+        assert sources.label_for("bizbuysell_serp") == "BizBuySell"
+        assert sources.label_for("bizbuysell_broker") == "BizBuySell broker"
+
+    def test_label_for_falls_back_to_the_raw_id_when_unknown(self):
+        # A retired/foreign source id must render as itself, never raise.
+        assert sources.label_for("craigslist_biz") == "craigslist_biz"
+        assert sources.label_for("") == ""
+
+
 class TestDispatch:
     @pytest.mark.parametrize("url", [BAY_AREA, SACRAMENTO])
     def test_a_serp_selects_the_bizbuysell_adapter(self, url):

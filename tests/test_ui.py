@@ -1047,6 +1047,13 @@ class TestRunResultsEndpoint:
         assert f'href="/runs/{job.id}/results"' in page
         assert 'target="_blank"' in page and 'rel="noopener"' in page
 
+    def test_the_history_names_the_task_specifically(self, auth):
+        """The Task column shows the specific label, not the bare word "Sweep"."""
+        self._job_with_listings()
+        page = auth.get("/").text
+        assert "Listing sweep · BizBuySell" in page
+        assert "<b>Sweep</b>" not in page, "the generic label is gone"
+
 
 class TestSessionsControls:
     """The full-control actions on the dashboard: new instance, run sweep, close.

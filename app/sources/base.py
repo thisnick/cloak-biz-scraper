@@ -39,7 +39,13 @@ class Source(Protocol):
     """One site's search-results pages."""
 
     # Recorded on every Listing, and the value of the Notion `Source` column.
+    # This is the machine id (e.g. "bizbuysell_serp"); it is not shown to a person.
     name: str
+    # A short human name for this source, shown on the dashboard (e.g. in a task's
+    # label). Distinct from `name`: `name` is the stored id, `label` is display
+    # text. A new source declares its own here, in the one place it is registered,
+    # so nothing central has to learn it. See sources.label_for.
+    label: str
     # Shown when a URL matches nothing — so it must describe the URL a person
     # would paste, not a regex.
     describes: str

@@ -25,4 +25,21 @@ def supported(url: str) -> bool:
     return any(s.matches(url) for s in SOURCES)
 
 
-__all__ = ["CardPage", "Source", "SOURCES", "UnsupportedURL", "for_url", "supported"]
+def label_for(name: str) -> str:
+    """The human display label for a source id (a Listing/Job `source`).
+
+    Resolved from the adapter that owns that `name`, so a new source's label
+    lives with the source and nothing here has to be updated. Falls back to the
+    raw `name` when no adapter matches — an old job whose source was retired must
+    still render *something* rather than break the page.
+    """
+    for source in SOURCES:
+        if source.name == name:
+            return source.label
+    return name
+
+
+__all__ = [
+    "CardPage", "Source", "SOURCES", "UnsupportedURL",
+    "for_url", "supported", "label_for",
+]

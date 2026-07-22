@@ -13,7 +13,7 @@ import asyncio
 
 import pytest
 
-from app.models import Listing
+from app.models import Job, Listing
 from app.services.jobs import JobStore
 from app.services.profiles import ProfileStore
 from app.services.scrape import (
@@ -21,6 +21,7 @@ from app.services.scrape import (
     _WAITING_SUMMARY,
     NotionNotConfigured,
     ScrapeService,
+    describe,
 )
 from app.services.settings import SettingsService
 from app.services.task_profiles import TaskProfilePool
@@ -349,6 +350,32 @@ class TestMultiUrlFanOut:
         assert result.status == "completed"
         assert [l.listing_id for l in result.listings] == ["kept"]
         assert "1 of 2 source(s) failed" in result.error
+
+
+class TestJobLabel:
+    """`describe(job)` is the sweep task's own label formatter — verb · source
+    label · count — colocated with the sweep and resolving the source's human
+    name via the source registry, not a string baked into the template."""
+
+    def test_multi_source_names_the_source_and_count(self):
+        job = Job(id="a", source="bizbuysell_serp", urls=[SERP, SERP2, BROKER])
+        assert describe(job) == "Listing sweep · BizBuySell · 3 sources"
+
+    def test_single_source_drops_the_count(self):
+        job = Job(id="b", source="bizbuysell_serp", urls=[SERP])
+        # No "1 sources" noise for a single-URL sweep.
+        assert describe(job) == "Listing sweep · BizBuySell"
+        assert "sources" not in describe(job)
+
+    def test_broker_source_uses_its_own_label(self):
+        job = Job(id="c", source="bizbuysell_broker", urls=[BROKER])
+        assert describe(job) == "Listing sweep · BizBuySell broker"
+
+    def test_unknown_source_falls_back_to_the_raw_id(self):
+        """An old job whose source was retired must still render, not break — the
+        registry returns the raw id when no adapter owns it."""
+        job = Job(id="d", source="craigslist_biz", urls=[SERP, SERP2])
+        assert describe(job) == "Listing sweep · craigslist_biz · 2 sources"
 
 
 class TestFanOutRespectsCapacity:

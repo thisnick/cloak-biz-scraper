@@ -51,6 +51,29 @@ class NotionNotConfigured(RuntimeError):
     """sync=true was asked for without a database to sync into."""
 
 
+# ── The task-label interface ─────────────────────────────────────────────────
+#
+# Every task type provides a `describe(job) -> str` that names one of its jobs
+# for the dashboard, COLOCATED with that task. The common interface is just this
+# signature — there is no central dispatcher to edit. Today the listing sweep is
+# the only task, so `describe` below is the only implementation; a future task
+# type adds its own `describe` next to ITS definition and wires that in where the
+# job is displayed. The UI asks the task for the label; it never builds one from
+# site or task strings itself.
+def describe(job: Job) -> str:
+    """Name a listing-sweep job: verb · source label · count.
+
+    The source label comes from the adapter that owns the job's `source` id
+    (`sources.label_for`), so the site's display name lives with the site, not
+    here. A single-URL sweep drops the count — "1 sources" would be noise.
+    """
+    label = sources.label_for(job.source)
+    n = len(job.urls)
+    if n > 1:
+        return f"Listing sweep · {label} · {n} sources"
+    return f"Listing sweep · {label}"
+
+
 def _collect_message(job_id: str) -> str:
     """The instruction the model reads when a sweep starts.
 

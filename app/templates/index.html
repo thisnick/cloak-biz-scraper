@@ -124,7 +124,7 @@
           <div class="card preview-card">
             <div class="preview-head">
               <span class="statepill {{ 'live' if i.origin=='task' else 'idle' }}"><span class="dot {{ 'live' if i.origin=='task' else 'idle' }}"></span>{{ 'Working' if i.origin=='task' else 'Idle' }}</span>
-              <b>{{ 'Sweep browser' if i.origin=='task' else 'Manual browser' }}</b>
+              <b>{{ 'Task Browser' if i.origin=='task' else 'Manual browser' }}</b>
               <span class="tagb {{ '' if i.origin=='task' else 'int' }}">{{ 'Task' if i.origin=='task' else 'Interactive' }}</span>
             </div>
             {% if i.vnc_url %}
@@ -149,7 +149,7 @@
           {% for j in running_jobs %}
           <div class="card trun">
             <span class="statepill live"><span class="dot live"></span>Running</span>
-            <div class="g"><b>Sweep</b><div class="where">page {{ j.pages_crawled }} / {{ j.max_pages }} · started {{ ago(j.created_at) }}</div></div>
+            <div class="g"><b>{{ job_label(j) }}</b><div class="where">page {{ j.pages_crawled }} / {{ j.max_pages }} · started {{ ago(j.created_at) }}</div></div>
             <div class="el">{{ dur(now - j.created_at) }}</div>
           </div>
           {% endfor %}
@@ -193,7 +193,7 @@
           <div class="acc-item {{ 'open' if loop.first }}">
             <button class="acc-head">
               <svg class="chev" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M9 6l6 6-6 6"/></svg>
-              <span class="h-title">{{ 'Sweep browser' if i.origin=='task' else 'Manual browser' }}</span>
+              <span class="h-title">{{ 'Task Browser' if i.origin=='task' else 'Manual browser' }}</span>
               <div class="h-right">
                 <span class="tagb {{ '' if i.origin=='task' else 'int' }}">{{ 'Task' if i.origin=='task' else 'Interactive' }}</span>
                 <span class="statepill {{ 'live' if i.origin=='task' else 'idle' }}"><span class="dot {{ 'live' if i.origin=='task' else 'idle' }}"></span>{{ 'Live' if i.origin=='task' else 'Idle' }}</span>
@@ -259,7 +259,7 @@
           {% for j in running_jobs %}
           <div class="card trun">
             <span class="statepill live"><span class="dot live"></span>Running</span>
-            <div class="g"><b>Sweep</b><div class="where">page {{ j.pages_crawled }} / {{ j.max_pages }}</div></div>
+            <div class="g"><b>{{ job_label(j) }}</b><div class="where">page {{ j.pages_crawled }} / {{ j.max_pages }}</div></div>
             <div class="el">{{ dur(now - j.created_at) }}</div>
           </div>
           {% endfor %}
@@ -276,7 +276,7 @@
                 {% for j in history_jobs %}
                   {% set r = job_result(j) %}
                   <tr>
-                    <td><b>Sweep</b></td>
+                    <td><b>{{ job_label(j) }}</b></td>
                     <td class="mono">{{ ago(j.created_at) }}</td>
                     <td class="mono">{{ dur(j.updated_at - j.created_at) }}</td>
                     <td>{% if r[0]=='ok' %}<span class="res">{{ r[1] }}</span>{% else %}<span class="statepill {{ r[0] }}"><span class="dot {{ r[0] }}"></span>{{ r[1] }}</span>{% endif %}</td>

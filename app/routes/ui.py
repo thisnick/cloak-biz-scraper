@@ -135,6 +135,7 @@ def _job_result(job) -> tuple[str, str]:
 def _render(request: Request, result: Result | None = None, status: int = 200,
             active: str | None = None, notion_mapping: Any = None) -> Response:
     settings: Settings = request.app.state.settings.load()
+    from ..services.scrape import describe as job_label
     from ..services.urls import public_base
     from ..services.views import browser_info, instance_view
 
@@ -183,6 +184,7 @@ def _render(request: Request, result: Result | None = None, status: int = 200,
             "ago": _ago,
             "dur": _dur,
             "job_result": _job_result,
+            "job_label": job_label,
             "now": time.time(),
         },
         status_code=status,

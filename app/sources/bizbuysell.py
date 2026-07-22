@@ -116,6 +116,7 @@ class BizBuySellSerp:
     """The BizBuySell search-results adapter."""
 
     name = "bizbuysell_serp"
+    label = "BizBuySell"
     describes = "BizBuySell search results (bizbuysell.com … businesses-for-sale)"
     example = "https://www.bizbuysell.com/california/san-francisco-bay-area-businesses-for-sale/"
     warmup_url = WARMUP_URL
@@ -296,6 +297,7 @@ class BizBuySellBroker:
     """
 
     name = "bizbuysell_broker"
+    label = "BizBuySell broker"
     describes = "BizBuySell broker profile (bizbuysell.com/business-broker/…)"
     example = "https://www.bizbuysell.com/business-broker/murali-barathi/krea-business/41243/"
     warmup_url = WARMUP_URL
