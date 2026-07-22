@@ -603,6 +603,45 @@
             </div>
           </div>
 
+          {# Connected apps #}
+          <div class="acc-item {{ 'open' if result and result.section=='connections' }}">
+            <button class="acc-head">
+              <svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1"/></svg>
+              <span class="h-title">Connected apps</span>
+              <div class="h-right">
+                <span class="chip {{ 'ok' if connected_apps else '' }}">{{ connected_apps|length }} connected</span>
+                <svg class="chev" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M9 6l6 6-6 6"/></svg>
+              </div>
+            </button>
+            <div class="acc-body">
+              <p class="lead-help">Apps you've connected to this server — ChatGPT, Claude, or Claude Code — each authorized with your <code>APP_SECRET</code>. Disconnect one to stop it renewing access.</p>
+              {{ banner('connections') }}
+              {% if connected_apps %}
+              <div class="tablewrap">
+                <table class="hist">
+                  <thead><tr><th>App</th><th>Connected</th><th></th></tr></thead>
+                  <tbody>
+                    {% for app in connected_apps %}
+                    <tr>
+                      <td><b>{{ app.client_name }}</b><br><span class="mono hint">{{ app.client_id[:18] }}…</span></td>
+                      <td class="mono">{{ ago(app.registered_at) if app.registered_at else '—' }}</td>
+                      <td>
+                        <div class="btnrow" style="justify-content:flex-end;margin:0">
+                          <form method="post" action="/settings/connections/disconnect" onsubmit="return confirm('Disconnect “{{ app.client_name }}”? It loses access within an hour and must be re-authorized to reconnect.');"><input type="hidden" name="client_id" value="{{ app.client_id }}"><button class="btn danger" type="submit">Disconnect</button></form>
+                        </div>
+                      </td>
+                    </tr>
+                    {% endfor %}
+                  </tbody>
+                </table>
+              </div>
+              {% else %}
+              <p class="lead-help">No apps connected yet — add one from the Connect tab.</p>
+              {% endif %}
+              <div class="help">Disconnect stops the app renewing access; it loses access within an hour. To revoke everything immediately, change <code>APP_SECRET</code> in Railway and redeploy.</div>
+            </div>
+          </div>
+
           {# Capacity #}
           <div class="acc-item {{ 'open' if result and result.section=='pool' }}">
             <button class="acc-head">

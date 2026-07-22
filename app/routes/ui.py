@@ -167,6 +167,7 @@ def _render(request: Request, result: Result | None = None, status: int = 200,
             "browser": browser_info(settings, request.app.state.instances),
             "has_proxy_password": bool(settings.proxy_password),
             "has_notion_token": bool(settings.notion_api_token),
+            "connected_apps": request.app.state.oauth.list_clients(),
             "proxy_checked_at": _when(settings.proxy_last_check_at),
             # dashboard sections
             "instances": instances,
@@ -1159,6 +1160,43 @@ async def create_database(
     )
     return _render(request, Result("notion", report.complete, message, report),
                    notion_mapping=mapping)
+
+
+# ── Connected apps ────────────────────────────────────────────────────────────
+#
+# The OAuth clients (ChatGPT, Claude, Claude Code) that registered themselves via
+# DCR and can drive this server with a bearer token. This is the cookie-authed
+# owner's view of them, with a Disconnect that removes the registration.
+#
+# UI-only on purpose: this list and its delete are never exposed over MCP or the
+# bearer-auth /api surface. One connected app must not be able to enumerate or
+# disconnect another — the only principal allowed to manage the roster is the
+# person holding the session cookie, here.
+
+
+@router.post("/settings/connections/disconnect", response_class=HTMLResponse)
+async def disconnect_app(request: Request, client_id: str = Form("")) -> Response:
+    """Remove one OAuth client's registration.
+
+    Same shape as every other settings mutation: POST-only, session cookie
+    (`_require`) plus same-origin (`_require_same_origin`). Deleting the
+    registration is what revokes: the client can no longer exchange a code or
+    refresh, so it loses access within the access-token TTL (≤1h) and must
+    re-authorize. Idempotent — disconnecting an already-gone client still lands
+    on a clean re-render, never an error.
+    """
+    _require(request)
+    _require_same_origin(request)
+    client_id = client_id.strip()
+    if not client_id:
+        return _render(
+            request, Result("connections", False, "No app was specified."), status=400
+        )
+    request.app.state.oauth.delete_client(client_id)
+    return _render(
+        request,
+        Result("connections", True, "That app has been disconnected. It loses access within an hour."),
+    )
 
 
 # APP_SECRET is managed in Railway's Variables tab, not in this settings UI.

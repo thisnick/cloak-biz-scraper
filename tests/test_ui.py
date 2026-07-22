@@ -134,6 +134,7 @@ class TestWriteRoutesRequireAuth:
             "/settings/notion/verify",
             "/settings/notion/create",
             "/settings/notion/mapping",
+            "/settings/connections/disconnect",
         ],
     )
     def test_signed_out_post_is_refused(self, client, path):
@@ -1512,3 +1513,68 @@ class TestNewBrowserProfile:
         assert "New proxy session" in page
         assert "keeps the profile's cookies and logins" in page
         assert "It does not change a browser that is already open" in page
+
+
+class TestConnectedAppsUi:
+    """Settings → Connected apps: the cookie-authed owner's view of the OAuth
+    clients, with a Disconnect that removes a registration. Mirrors every other
+    settings mutation — POST-only, session cookie plus same-origin."""
+
+    @pytest.fixture
+    def wired(self, auth, tmp_path):
+        """Point the shared app at a clean OAuth store for this test, keeping the
+        signed-in secret so the session and any minted token still verify."""
+        from app.services.oauth import OAuthProvider, OAuthStore
+
+        app.state.oauth = OAuthProvider(
+            OAuthStore(tmp_path / "oauth.json", tmp_path / ".dek"), app.state.secret
+        )
+        return auth
+
+    def _register(self, client, name="ChatGPT", host="chatgpt.example"):
+        r = client.post(
+            "/register",
+            json={"redirect_uris": [f"https://{host}/cb"], "client_name": name},
+        )
+        assert r.status_code == 201, r.text
+        return r.json()
+
+    def test_empty_state_points_at_the_connect_tab(self, wired):
+        page = wired.get("/").text
+        assert "No apps connected yet — add one from the Connect tab." in page
+
+    def test_a_connected_app_is_listed_by_name(self, wired):
+        self._register(wired, name="Claude Code")
+        page = wired.get("/").text
+        assert "Claude Code" in page
+        assert "Disconnect" in page
+
+    def test_the_page_carries_the_revocation_note(self, wired):
+        """The one-line honesty about what Disconnect does and does not do."""
+        page = shown(wired.get("/"))
+        assert "loses access within an hour" in page
+        assert "To revoke everything immediately" in page
+        assert "in Railway and redeploy" in page
+
+    def test_disconnect_removes_the_client(self, wired):
+        info = self._register(wired, name="ChatGPT")
+        assert "ChatGPT" in wired.get("/").text
+
+        r = wired.post("/settings/connections/disconnect",
+                       data={"client_id": info["client_id"]}, follow_redirects=False)
+        assert r.status_code == 200, r.text
+        assert app.state.oauth._store.get_client(info["client_id"]) is None
+        assert "disconnected" in shown(r).lower()
+
+    def test_disconnect_rejects_a_foreign_origin(self, wired):
+        info = self._register(wired)
+        r = wired.post("/settings/connections/disconnect",
+                       data={"client_id": info["client_id"]},
+                       headers={"Origin": "https://evil.example"}, follow_redirects=False)
+        assert r.status_code == 403, "a state change that revokes access gets the same Origin rule"
+        assert app.state.oauth._store.get_client(info["client_id"]) is not None
+
+    def test_the_rendered_page_never_shows_a_client_secret(self, wired):
+        info = self._register(wired)  # confidential client: gets a secret
+        assert info.get("client_secret")
+        assert info["client_secret"] not in wired.get("/").text

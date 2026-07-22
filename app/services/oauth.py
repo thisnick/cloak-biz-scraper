@@ -58,6 +58,7 @@ import time
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from mcp.server.auth.provider import (
     AccessToken,
@@ -118,6 +119,31 @@ def _hash(value: str) -> str:
     return sha256(value.encode()).hexdigest()
 
 
+def _public_client_view(client_id: str, record: dict[str, Any]) -> dict[str, Any]:
+    """The safe-to-show fields of a stored client, and nothing else.
+
+    A registered client's name is whatever it typed at DCR, so it may be absent;
+    when it is, the redirect host is the next most recognisable thing (it is
+    where codes physically go), and "Unknown app" is the last resort rather than
+    a blank row. `client_secret`, tokens and codes are never read here — the
+    returned dict is built field by field from the allowlist below, so nothing
+    secret can ride along by accident.
+    """
+    name = (record.get("client_name") or "").strip()
+    if not name:
+        uris = record.get("redirect_uris") or []
+        host = urlparse(uris[0]).netloc if uris else ""
+        name = host or "Unknown app"
+    view: dict[str, Any] = {"client_id": client_id, "client_name": name}
+    # RFC 7591's registration timestamp; the SDK stamps it, but a record written
+    # by something that did not is not given a fabricated one — the field is
+    # simply omitted, and the UI shows no date rather than a false one.
+    issued_at = record.get("client_id_issued_at")
+    if issued_at:
+        view["registered_at"] = issued_at
+    return view
+
+
 class PendingInvalid(ValueError):
     """The login blob is forged, expired, or was minted for another secret."""
 
@@ -172,6 +198,36 @@ class OAuthStore:
     def client_count(self) -> int:
         with self._lock:
             return len(self._load()["clients"])
+
+    def list_clients(self) -> list[dict[str, Any]]:
+        """Display-only view of every registered client, for the settings UI.
+
+        Returns ONLY fields that are safe to render: the id, a human name, and a
+        registered-at timestamp when the record carries one. The stored record
+        also holds `client_secret` (for confidential clients) — it is read here
+        but never copied into the returned dict, so a leak cannot happen by a
+        caller forgetting to strip it. There is nothing to strip.
+        """
+        with self._lock:
+            raw = list(self._load()["clients"].items())
+        return [_public_client_view(cid, rec) for cid, rec in raw]
+
+    def delete_client(self, client_id: str) -> bool:
+        """Remove a registration and flush. True if one was actually removed.
+
+        Deleting the registration is the disconnect: the SDK refuses a /token
+        call from an unknown client, and `exchange_refresh_token` re-checks the
+        store, so a removed client can neither exchange a code nor refresh — it
+        loses access within the access-token TTL and must re-authorize.
+        """
+        with self._lock:
+            clients = self._load()["clients"]
+            existed = clients.pop(client_id, None) is not None
+            if existed:
+                self._flush()
+        if existed:
+            logger.info("disconnected oauth client %s", client_id)
+        return existed
 
     # ── authorization codes ─────────────────────────────────────────────────
     def put_code(self, code: str, record: dict) -> None:
@@ -240,6 +296,14 @@ class OAuthProvider:
         """How many clients have registered — for the boot log, so an operator
         can see at a glance whether their connector's registration survived."""
         return self._store.client_count()
+
+    def list_clients(self) -> list[dict[str, Any]]:
+        """Display-only client list for the settings UI. See OAuthStore."""
+        return self._store.list_clients()
+
+    def delete_client(self, client_id: str) -> bool:
+        """Disconnect a client — remove its registration. See OAuthStore."""
+        return self._store.delete_client(client_id)
 
     # ── clients (DCR) ───────────────────────────────────────────────────────
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
@@ -384,6 +448,21 @@ class OAuthProvider:
         claims = signing.verify(refresh_token.token, self._secrets.current(), audience=_AUD_REFRESH)
         if claims is None:
             raise TokenError("invalid_grant", "refresh token is not valid")
+        # A disconnected client must not be able to refresh. The registration is
+        # the standing authorization; deleting it (Settings → Connected apps, or
+        # OAuthStore.delete_client) has to end the client's ability to mint fresh
+        # access tokens, or "Disconnect" would be cosmetic — a 30-day refresh
+        # token would keep renewing an hour of access indefinitely.
+        #
+        # The SDK's ClientAuthenticator already rejects an unknown client at
+        # /token (it calls get_client before any grant runs), so over HTTP a
+        # deleted client never reaches here. This is the second lock on the same
+        # door: the mint point itself refuses a client the store no longer knows,
+        # so the guarantee does not rest on the SDK's call order. The stateless
+        # access token already out there still lives out its ≤1h TTL — that
+        # bounded window is the intended behaviour, not a per-request blocklist.
+        if self._store.get_client(client.client_id) is None:
+            raise TokenError("invalid_grant", "client is no longer registered")
         return self._mint(
             subject=claims.get("sub") or OWNER,
             client_id=client.client_id,

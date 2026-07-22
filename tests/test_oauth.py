@@ -631,3 +631,115 @@ class TestCodesAreSingleUse:
 
         r = exchange(client, second, code, verifier)
         assert r.status_code in (400, 401)
+
+
+class TestConnectedAppsListing:
+    """The display-only view behind Settings → Connected apps. It must show every
+    registered client and never a secret, token, or code."""
+
+    def test_list_returns_registered_clients(self, client):
+        register(client, client_name="ChatGPT")
+        register(client, client_name="Claude")
+
+        apps = app.state.oauth.list_clients()
+        names = {a["client_name"] for a in apps}
+        assert {"ChatGPT", "Claude"} <= names
+        assert all(a["client_id"] for a in apps)
+
+    def test_a_registered_at_timestamp_is_surfaced_when_present(self, client):
+        """The SDK stamps client_id_issued_at at registration, so a freshly
+        registered client carries a registered-at the UI can show."""
+        register(client, client_name="ChatGPT")
+        app_view = app.state.oauth.list_clients()[0]
+        assert app_view.get("registered_at")
+
+    def test_a_record_without_a_timestamp_gets_none_fabricated(self, client):
+        """If the stored record has no client_id_issued_at, the view omits it
+        rather than inventing one."""
+        register(client, client_name="ChatGPT")
+        store = app.state.oauth._store
+        cid = next(iter(store._load()["clients"]))
+        store._load()["clients"][cid].pop("client_id_issued_at", None)
+        assert "registered_at" not in store.list_clients()[0]
+
+    def test_a_nameless_client_falls_back_to_its_redirect_host(self, client):
+        """DCR does not require client_name; the redirect host is where codes
+        physically go, so it is the honest label when no name was given."""
+        info = register(client)
+        store = app.state.oauth._store
+        store._load()["clients"][info["client_id"]]["client_name"] = None
+        view = next(a for a in store.list_clients() if a["client_id"] == info["client_id"])
+        assert view["client_name"] == "client.example"
+
+    def test_the_listing_never_contains_a_secret_token_or_code(self, client):
+        """A confidential client has a client_secret in the store; it must never
+        reach the view. Checked against the raw JSON so a nested leak cannot hide.
+        """
+        import json as _json
+
+        info = register(client)  # confidential: gets a client_secret
+        assert info.get("client_secret"), "expected a confidential client for this test"
+
+        blob = _json.dumps(app.state.oauth.list_clients())
+        assert info["client_secret"] not in blob
+        for banned in ("client_secret", "code", "refresh_token", "access_token", "secret"):
+            assert banned not in blob
+
+
+class TestDisconnectRevokes:
+    """Deleting a registration is the disconnect, and it has to actually revoke:
+    the point is that a removed client cannot mint a new access token."""
+
+    def test_delete_removes_the_client(self, client):
+        info = register(client)
+        assert app.state.oauth.delete_client(info["client_id"]) is True
+        assert app.state.oauth._store.get_client(info["client_id"]) is None
+        ids = {a["client_id"] for a in app.state.oauth.list_clients()}
+        assert info["client_id"] not in ids
+
+    def test_deleting_an_unknown_client_is_a_harmless_false(self, client):
+        assert app.state.oauth.delete_client("no-such-client") is False
+
+    def test_a_disconnected_client_cannot_refresh_over_http(self, client):
+        """The end-to-end guarantee: obtain a refresh token, disconnect the
+        client, and the refresh grant no longer buys an access token."""
+        verifier, challenge = pkce()
+        info = register(client)
+        code = login_and_get_code(client, info, challenge)
+        first = exchange(client, info, code, verifier).json()
+
+        assert app.state.oauth.delete_client(info["client_id"]) is True
+
+        r = client.post("/token", data={
+            "grant_type": "refresh_token",
+            "refresh_token": first["refresh_token"],
+            "client_id": info["client_id"],
+            "client_secret": info.get("client_secret"),
+        })
+        # The SDK's ClientAuthenticator rejects the unknown client at /token (401)
+        # before the grant runs; either way the client gets no new access token.
+        assert r.status_code in (400, 401)
+        assert "access_token" not in r.json()
+
+    @pytest.mark.asyncio
+    async def test_the_provider_itself_refuses_a_deleted_clients_refresh(self, client):
+        """The second lock: even reached directly — past the SDK's client
+        authentication — exchange_refresh_token refuses a client the store no
+        longer knows. This is what keeps the guarantee off the SDK's call order.
+        """
+        from mcp.server.auth.provider import RefreshToken, TokenError
+
+        verifier, challenge = pkce()
+        info = register(client)
+        code = login_and_get_code(client, info, challenge)
+        first = exchange(client, info, code, verifier).json()
+
+        provider = app.state.oauth
+        stored = provider._store.get_client(info["client_id"])
+        loaded = await provider.load_refresh_token(stored, first["refresh_token"])
+        assert loaded is not None
+
+        provider.delete_client(info["client_id"])
+        with pytest.raises(TokenError) as excinfo:
+            await provider.exchange_refresh_token(stored, loaded, loaded.scopes)
+        assert excinfo.value.error == "invalid_grant"
