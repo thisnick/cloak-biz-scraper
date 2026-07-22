@@ -75,6 +75,19 @@ class ScrapeService:
         if self._task_profiles is None and instances is not None:
             self._task_profiles = TaskProfilePool(instances.profiles, settings)
         self._running: set[asyncio.Task] = set()
+        # Admission gate: at most task_budget sweeps run past this point at once.
+        # The instance pool's cap only bites INSIDE launch, but start() spawns an
+        # unbounded background task per call, so without this every concurrent
+        # sweep would acquire (and mint) a profile before any of them blocked on a
+        # slot — the profile count would track peak concurrency, not the budget.
+        # A sweep leases its task profile only after passing this gate, so the pool
+        # can never mint more than task_budget profiles. The bound is re-read from
+        # settings on every wait, so it tracks the Pool setting rather than a stale
+        # value captured at construction. Excess sweeps queue here — they would
+        # have queued on the instance slot anyway, so there is no throughput loss
+        # and no deadlock (the gate cap equals the instance pool's task cap).
+        self._gate = asyncio.Condition()
+        self._past_gate = 0
 
     @property
     def in_flight(self) -> int:
@@ -123,7 +136,27 @@ class ScrapeService:
         job = self._jobs.get(job_id)
         return ScrapeResult.of(job) if job else None
 
+    async def _enter_gate(self) -> None:
+        """Block until fewer than task_budget sweeps are past the gate, then admit.
+
+        The budget is re-read from settings on each wake, so raising or lowering
+        the Pool setting takes effect without a restart.
+        """
+        async with self._gate:
+            await self._gate.wait_for(
+                lambda: self._past_gate < self._settings.load().task_budget
+            )
+            self._past_gate += 1
+
+    async def _leave_gate(self) -> None:
+        async with self._gate:
+            self._past_gate -= 1
+            self._gate.notify_all()
+
     async def _run(self, job: Job, source) -> None:
+        # Admission first: a sweep leases its profile only once it is past the
+        # gate, capping minted profiles at task_budget under any concurrency.
+        await self._enter_gate()
         try:
             res = await self._sweep(job, source)
             listings: list[Listing] = res.get("data", {}).get("listings", [])
@@ -162,6 +195,10 @@ class ScrapeService:
                 self._task_profiles.release(job.id)
             self._jobs.save(job)
             logger.info("job %s -> %s (%d listings)", job.id, job.status, len(job.listings))
+            # Leave the gate last, and shielded, so the slot is returned even if
+            # this sweep is cancelled during shutdown — the job is already saved,
+            # so a queued sweep can take the freed slot.
+            await asyncio.shield(self._leave_gate())
 
     def _summarize(self, job: Job) -> str:
         pages = f"{job.pages_crawled} page{'s' if job.pages_crawled != 1 else ''}"

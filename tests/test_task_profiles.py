@@ -40,8 +40,22 @@ class TestNaming:
         assert not is_task_profile("task-force")
         assert not is_task_profile("task-")
         assert not is_task_profile("task-01")  # not a canonical integer
+        assert not is_task_profile("task-0")   # zero is not a pool number
         assert not is_task_profile("Default")
         assert not is_task_profile("research")
+
+    def test_non_ascii_digit_suffix_is_false_not_a_crash(self):
+        # "²".isdigit() is True but int("²") raises — is_task_profile must return
+        # False rather than propagate, or a single such profile breaks every sweep.
+        assert is_task_profile("task-²") is False
+        assert is_task_profile("task-³⁴") is False
+
+    def test_acquire_tolerates_a_stored_non_ascii_digit_profile(self, pool):
+        # A user can create "task-²" (names aren't charset-checked). acquire scans
+        # every profile through is_task_profile, so this must not raise.
+        p, profiles, _ = pool
+        profiles.get_or_create("task-²", default_country="US", default_region="california")
+        assert p.acquire("job-1") == "task-1"
 
 
 class TestDistinctLeases:
@@ -84,6 +98,21 @@ class TestReuseVsMint:
         again = p.acquire("job-2")
         assert again == "task-1", "the hole is re-minted"
         assert _pool_names(profiles) == ["task-1"]
+
+    def test_mint_fills_the_lowest_hole_not_max_plus_one(self, pool):
+        # task-1 and task-3 leased, task-2 a free gap. With every existing profile
+        # leased, the next mint must fill the hole (task-2), not extend to task-4 —
+        # this is what keeps the count bounded at the concurrency ceiling.
+        p, profiles, _ = pool
+        p.acquire("job-1")  # task-1
+        p.acquire("job-2")  # task-2
+        p.acquire("job-3")  # task-3
+        p.release("job-2")
+        assert profiles.delete("task-2") is True  # task-2 becomes a free gap
+        # task-1 and task-3 are still leased -> no existing free profile to reuse.
+        filled = p.acquire("job-4")
+        assert filled == "task-2", "the lowest missing number is minted, not max+1"
+        assert _pool_names(profiles) == ["task-1", "task-2", "task-3"]
 
 
 class TestBounded:

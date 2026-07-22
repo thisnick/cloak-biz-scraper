@@ -285,6 +285,50 @@ class TestTaskProfiles:
         assert pool.leased_by(job.id) == [], "lease freed despite the crash"
         assert pool.acquire("next") == "task-1", "the freed profile is reused, not leaked"
 
+    @pytest.mark.asyncio
+    async def test_concurrent_sweeps_never_mint_more_than_task_budget_profiles(
+        self, settings, jobs, monkeypatch, tmp_path,
+    ):
+        """The bound that b9f972c claimed but did not hold: start() spawns an
+        unbounded task per sweep, so without the admission gate N concurrent
+        sweeps each acquire+mint before any blocks on a slot. With task_budget=3,
+        ten simultaneous sweeps must mint AT MOST 3 durable profiles."""
+        settings.update(max_instances=4, interactive_reserve=1)
+        assert settings.load().task_budget == 3
+
+        release = asyncio.Event()
+        in_retry = 0
+
+        async def retry(instances, *, profile, **kw):
+            # A sweep only reaches here once it is past the gate AND has leased a
+            # profile. Park it so all admitted sweeps are in flight at once.
+            nonlocal in_retry
+            in_retry += 1
+            await release.wait()
+            return {"blocked": False, "error": None,
+                    "data": {"listings": list(CARDS), "pages_crawled": 1}}
+
+        svc, pool, profiles = self._pooled(settings, jobs, monkeypatch, tmp_path, retry)
+        for _ in range(10):
+            svc.start(SERP)
+
+        # Let the admitted sweeps reach the (blocked) launch and settle.
+        for _ in range(200):
+            await asyncio.sleep(0.005)
+            if in_retry >= 3:
+                break
+        await asyncio.sleep(0.05)  # give any wrongly-admitted extras time to mint
+
+        pooled = [p.name for p in profiles.all() if p.name.startswith("task-")]
+        assert in_retry == 3, "only task_budget sweeps run past the gate at once"
+        assert len(pooled) <= 3, f"minted {pooled}, expected at most 3"
+
+        # Drain: the remaining seven reuse the three profiles, never minting more.
+        release.set()
+        await _drain(svc)
+        final = sorted(p.name for p in profiles.all() if p.name.startswith("task-"))
+        assert final == ["task-1", "task-2", "task-3"], "ten sweeps, three profiles"
+
 
 class TestCollecting:
     def test_an_unknown_job_is_none(self, settings, jobs):

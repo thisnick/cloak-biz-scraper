@@ -36,14 +36,22 @@ TASK_PROFILE_PREFIX = "task-"
 def is_task_profile(name: str) -> bool:
     """True for a name the pool mints (``task-1``, ``task-2``, …).
 
-    Deliberately strict: the suffix must be a positive integer, so a user's own
-    profile that merely starts with "task-" (e.g. "task-force") is never mistaken
-    for a pooled one.
+    Deliberately strict: the suffix must be a canonical positive ASCII integer,
+    so a user's own profile that merely starts with "task-" (e.g. "task-force")
+    is never mistaken for a pooled one. The ``isascii()`` guard is load-bearing,
+    not decorative: ``str.isdigit()`` is true for characters like "²" that then
+    raise ValueError under ``int()``. Profile names are not charset-checked, so a
+    user could create ``task-²`` — and because ``acquire`` scans every profile
+    through this predicate, letting that raise would break every sweep. Guarding
+    on ``isascii()`` first (it short-circuits before ``int()``) returns a plain
+    False instead.
     """
     if not name.startswith(TASK_PROFILE_PREFIX):
         return False
     suffix = name[len(TASK_PROFILE_PREFIX):]
-    return suffix.isdigit() and suffix == str(int(suffix)) and int(suffix) >= 1
+    if not (suffix.isascii() and suffix.isdigit()):
+        return False
+    return suffix == str(int(suffix)) and int(suffix) >= 1
 
 
 def _number(name: str) -> int:

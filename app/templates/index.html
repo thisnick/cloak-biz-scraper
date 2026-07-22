@@ -690,8 +690,11 @@
                         {% if p.name == default_profile %} <span class="chip ok">default</span>{% endif %}
                         {# Pooled sweep identities (task-1, task-2, …) are minted and reused
                            automatically. Tagged so they're distinguishable from your own
-                           named profiles; still listed and deletable when free. #}
-                        {% if p.name.startswith('task-') and p.name[5:].isdigit() %} <span class="chip" title="Reusable identity for sweeps — created and reused automatically">auto</span>{% endif %}
+                           named profiles; still listed and deletable when free. The suffix
+                           test mirrors is_task_profile() exactly — canonical positive ASCII
+                           integer — so task-0/task-01/task-² are not mislabeled "auto". #}
+                        {% set _suf = p.name[5:] %}
+                        {% if p.name.startswith('task-') and _suf.isascii() and _suf.isdigit() and _suf == _suf|int|string and _suf|int >= 1 %} <span class="chip" title="Reusable identity for sweeps — created and reused automatically">auto</span>{% endif %}
                         {% if p.name in profiles_in_use %} <span class="chip warn">open now</span>{% endif %}</td>
                       <td class="mono">{% if s.proxy_configured() %}{{ p.country }}{% if p.region %} · {{ p.region }}{% endif %}{% else %}Direct (no proxy){% endif %}</td>
                       <td>
