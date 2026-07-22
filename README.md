@@ -100,13 +100,11 @@ start Claude Code, type `/mcp`, then select the server and enter your `APP_SECRE
 
 Once it's connected, just ask:
 
-- *"Open my Default browser, go to this listing, and tell me the asking price and cash flow."*
-- *"Search BizBuySell for California businesses under $2M cash flow, then sweep the first five pages."*
+- *"Open my cloaked scraper, go to this listing, and tell me the asking price and cash flow."*
+- *"Search BizBuySell for California businesses under $2M cash flow, then sweep the first five pages using cloaked scraper."*
 - *"Sweep this search and save new listings to my Notion, skipping ones already there."*
 - *"Archive this listing's full page into my Notion."*
-- *"Create a profile called Broker Research with a US/California exit, then open it."*
-- *"Launch my Default profile and give me a CDP URL"* — then drive it from Playwright yourself.
-- *"What's my server status — Pro or public build, is the proxy working, how many slots, is Notion connected?"*
+- *"Launch my Default profile in cloaked scraper and give me a CDP URL"* — then drive it from Playwright yourself.
 
 ## Design
 
