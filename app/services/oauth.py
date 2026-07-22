@@ -95,6 +95,19 @@ CODE_TTL_SEC = 120
 # The login form's own lifetime: issued at /authorize, spent at /authorize/login.
 # This one IS user think-time (finding the secret in Railway's Variables tab).
 PENDING_TTL_SEC = 15 * 60
+# How long a DCR registration that never completed authorization is kept before it
+# is swept. DCR happens *before* auth, so a client that starts a connection and
+# abandons it — or a bare /register probe — leaves a registration holding no
+# access (there is no token without proving APP_SECRET). An hour is deliberately
+# far beyond PENDING_TTL_SEC (15 min): a client that is genuinely mid-login is
+# never inside this window, so the sweep can only ever catch an abandonment.
+UNAUTHORIZED_REG_TTL_SEC = 60 * 60
+
+# The one-time backfill marker (see OAuthStore._backfill_authorized_at). Its
+# presence in the stored data means "authorized_at has been grandfathered onto
+# every client that predated the field" — so migration never runs twice and a
+# brand-new unauthorized client is not mistaken for a legacy connected one.
+_BACKFILL_MARKER = "authorized_at_backfilled"
 
 _AUD_ACCESS = "oauth:access"
 _AUD_REFRESH = "oauth:refresh"
@@ -141,6 +154,12 @@ def _public_client_view(client_id: str, record: dict[str, Any]) -> dict[str, Any
     issued_at = record.get("client_id_issued_at")
     if issued_at:
         view["registered_at"] = issued_at
+    # When the client first proved APP_SECRET — the connect time the UI shows.
+    # list_clients() only ever returns records that have this, so it is always
+    # present here in practice; guarded anyway so the helper stays total.
+    authorized_at = record.get("authorized_at")
+    if authorized_at:
+        view["authorized_at"] = authorized_at
     return view
 
 
@@ -168,11 +187,43 @@ class OAuthStore:
             return self._data
         if not self._path.exists():
             self._data = {"clients": {}, "codes": {}}
-            return self._data
-        self._data = json.loads(self._cipher.decrypt(self._path.read_bytes()))
-        self._data.setdefault("clients", {})
-        self._data.setdefault("codes", {})
+        else:
+            self._data = json.loads(self._cipher.decrypt(self._path.read_bytes()))
+            self._data.setdefault("clients", {})
+            self._data.setdefault("codes", {})
+        # First access after the store is read into memory is where the one-time
+        # migration runs — the single gateway every read and write passes
+        # through, so no caller can see un-migrated data.
+        self._backfill_authorized_at()
         return self._data
+
+    def _backfill_authorized_at(self) -> None:
+        """One-time migration: grandfather every client that predates the
+        `authorized_at` field, then never do it again.
+
+        Before this field existed, a registered client *was* a connected client —
+        the only records in the store were ones a user had approved at the login
+        form. Which of them completed authorization is unknowable after the fact
+        (access and refresh tokens are stateless and unstored; their auth codes
+        are long expired), so all of them are grandfathered: `authorized_at` is
+        stamped on every record missing it, and a persistent marker is written.
+
+        The marker is what makes this both safe and one-shot. Without it,
+        "stamp anything missing authorized_at" would run on every load and would
+        perpetually grandfather brand-new *unauthorized* registrations — undoing
+        the whole feature. With it, a client that registers AFTER migration and
+        has no authorized_at is a genuinely-new unauthorized client, still
+        subject to the authorized-only filter and the 1h sweep.
+        """
+        data = self._data
+        if data is None or data.get(_BACKFILL_MARKER):
+            return
+        now = int(time.time())
+        for rec in data.get("clients", {}).values():
+            if not rec.get("authorized_at"):
+                rec["authorized_at"] = now
+        data[_BACKFILL_MARKER] = True
+        self._flush()
 
     def _flush(self) -> None:
         data = self._data or {"clients": {}, "codes": {}}
@@ -191,25 +242,92 @@ class OAuthStore:
 
     def save_client(self, client: OAuthClientInformationFull) -> None:
         with self._lock:
-            self._load()["clients"][client.client_id] = json.loads(client.model_dump_json())
+            clients = self._load()["clients"]
+            # Serverless has no cron, so the sweep of never-authorized
+            # registrations must ride on activity — and registration is the
+            # reliable heartbeat (new clients register regularly, the settings
+            # page might never be opened). Sweep FIRST so the store stays bounded
+            # on its own, then add the new client; one flush covers both.
+            self._gc_unauthorized(clients)
+            clients[client.client_id] = json.loads(client.model_dump_json())
             self._flush()
         logger.info("registered oauth client %s (%s)", client.client_id, client.client_name or "unnamed")
+
+    def mark_authorized(self, client_id: str) -> int | None:
+        """Stamp the moment a client first proved APP_SECRET, and return it.
+
+        Called on a completed authorization_code exchange — the point the client
+        stops being a bare DCR registration and becomes a genuinely connected
+        app. This is the field the listing and the GC both key on: only stamped
+        clients are shown, and a stamped client is never swept.
+
+        `authorized_at` is written directly onto the stored record dict rather
+        than through save_client(), because OAuthClientInformationFull has no
+        such field — model_dump_json() would drop it. It is set once; a later
+        exchange refreshes `last_seen` but leaves the original connect time
+        intact, so "Connected <when>" does not jump forward on every reconnect.
+        """
+        now = int(time.time())
+        with self._lock:
+            rec = self._load()["clients"].get(client_id)
+            if rec is None:
+                # The registration was deleted between the code being minted and
+                # exchanged; nothing to stamp.
+                return None
+            first = not rec.get("authorized_at")
+            if first:
+                rec["authorized_at"] = now
+            rec["last_seen"] = now
+            self._flush()
+            return rec["authorized_at"]
 
     def client_count(self) -> int:
         with self._lock:
             return len(self._load()["clients"])
 
-    def list_clients(self) -> list[dict[str, Any]]:
-        """Display-only view of every registered client, for the settings UI.
+    def _gc_unauthorized(self, clients: dict[str, Any]) -> int:
+        """Drop registrations that never completed authorization and have aged
+        out. Mutates `clients` in place; returns how many were removed.
 
-        Returns ONLY fields that are safe to render: the id, a human name, and a
-        registered-at timestamp when the record carries one. The stored record
-        also holds `client_secret` (for confidential clients) — it is read here
-        but never copied into the returned dict, so a leak cannot happen by a
-        caller forgetting to strip it. There is nothing to strip.
+        Only a record with no `authorized_at` is a candidate, so a connected app
+        is never touched however old it is. A candidate is aged by
+        `client_id_issued_at`; a record missing that (the SDK always stamps it,
+        but a hand-written one might not) cannot be dated, so it is KEPT rather
+        than swept on a guessed age — the conservative choice, since the cost of
+        keeping a stray row is cosmetic while wrongly deleting a client is not.
+        """
+        now = time.time()
+        stale = [
+            cid for cid, rec in clients.items()
+            if not rec.get("authorized_at")
+            and rec.get("client_id_issued_at")
+            and now - rec["client_id_issued_at"] > UNAUTHORIZED_REG_TTL_SEC
+        ]
+        for cid in stale:
+            del clients[cid]
+        if stale:
+            logger.info("swept %d unauthorized oauth registration(s)", len(stale))
+        return len(stale)
+
+    def list_clients(self) -> list[dict[str, Any]]:
+        """Display-only view of the genuinely connected clients, for the UI.
+
+        "Connected" means authorized, not merely registered: DCR happens before
+        auth, so a client that registered and then abandoned the login holds no
+        access and is not shown. Two filters enforce that — a lazy sweep of
+        aged-out never-authorized registrations, then a plain skip of any that
+        are still unauthorized (young enough to survive the sweep, e.g. mid-auth).
+
+        Returns ONLY safe fields: id, name, registered-at, and the connect time.
+        The stored record also holds `client_secret` (for confidential clients);
+        it is read here but never copied into the returned dict, so a leak cannot
+        happen by a caller forgetting to strip it. There is nothing to strip.
         """
         with self._lock:
-            raw = list(self._load()["clients"].items())
+            clients = self._load()["clients"]
+            if self._gc_unauthorized(clients):
+                self._flush()
+            raw = [(cid, rec) for cid, rec in clients.items() if rec.get("authorized_at")]
         return [_public_client_view(cid, rec) for cid, rec in raw]
 
     def delete_client(self, client_id: str) -> bool:
@@ -421,6 +539,13 @@ class OAuthProvider:
             # honest answer is "that code is not exchangeable", and a replay of a
             # spent code lands here.
             raise TokenError("invalid_grant", "authorization code has already been used")
+        # The code was live and single-use, so reaching here means the client
+        # completed a real authorization — it proved APP_SECRET at the login
+        # form. Stamp that: it promotes the bare DCR registration to a connected
+        # app (shown in Settings → Connected apps) and exempts it from the 1h
+        # sweep of never-authorized registrations. Set once; harmless on replay
+        # of a later legitimate re-authorization.
+        self._store.mark_authorized(client.client_id)
         return self._mint(
             subject=record.get("subject") or OWNER,
             client_id=client.client_id,

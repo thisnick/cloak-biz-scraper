@@ -92,6 +92,21 @@ def exchange(client, info: dict, code: str, verifier: str | None, **overrides):
     return client.post("/token", data=body)
 
 
+def connect(client, **overrides) -> dict:
+    """Register AND complete an authorization_code exchange.
+
+    A registration alone is a client that has NOT proven APP_SECRET; only a
+    completed exchange makes it a genuinely connected app (authorized_at
+    stamped), which is what the listing and the GC key on. Tests that want a
+    client to *appear* connected must use this, not register() alone.
+    """
+    verifier, challenge = pkce()
+    info = register(client, **overrides)
+    code = login_and_get_code(client, info, challenge)
+    assert exchange(client, info, code, verifier).status_code == 200
+    return info
+
+
 class TestDiscovery:
     def test_the_issuer_is_the_host_that_was_asked(self, client):
         """Built per request, because Railway assigns the domain and never tells
@@ -635,37 +650,67 @@ class TestCodesAreSingleUse:
 
 class TestConnectedAppsListing:
     """The display-only view behind Settings → Connected apps. It must show every
-    registered client and never a secret, token, or code."""
+    *connected* (authorized) client — not a bare registration — and never a
+    secret, token, or code."""
 
-    def test_list_returns_registered_clients(self, client):
-        register(client, client_name="ChatGPT")
-        register(client, client_name="Claude")
+    def test_list_returns_connected_clients(self, client):
+        connect(client, client_name="ChatGPT")
+        connect(client, client_name="Claude")
 
         apps = app.state.oauth.list_clients()
         names = {a["client_name"] for a in apps}
         assert {"ChatGPT", "Claude"} <= names
         assert all(a["client_id"] for a in apps)
 
+    def test_a_merely_registered_client_is_not_listed(self, client):
+        """DCR happens before auth. A client that registered but never proved
+        APP_SECRET holds no access and must not read as 'connected'."""
+        register(client, client_name="Abandoned")
+        assert app.state.oauth.list_clients() == []
+
+    def test_the_connect_time_is_surfaced(self, client):
+        """authorized_at is the moment the client proved the secret — the
+        'Connected <when>' the UI shows."""
+        connect(client, client_name="ChatGPT")
+        view = app.state.oauth.list_clients()[0]
+        assert view.get("authorized_at")
+
+    def test_authorized_at_is_stamped_once_and_not_moved_by_a_later_exchange(self, client):
+        """A reconnection refreshes last_seen but must not rewrite the original
+        connect time, or 'Connected 3 days ago' would jump to 'just now'."""
+        info = connect(client, client_name="ChatGPT")
+        store = app.state.oauth._store
+        first = store._load()["clients"][info["client_id"]]["authorized_at"]
+
+        # A second, independent authorization for the same client.
+        verifier, challenge = pkce()
+        code = login_and_get_code(client, info, challenge)
+        assert exchange(client, info, code, verifier).status_code == 200
+
+        rec = store._load()["clients"][info["client_id"]]
+        assert rec["authorized_at"] == first  # unchanged
+        assert rec["last_seen"] >= first       # last_seen tracks the reconnection
+
     def test_a_registered_at_timestamp_is_surfaced_when_present(self, client):
-        """The SDK stamps client_id_issued_at at registration, so a freshly
-        registered client carries a registered-at the UI can show."""
-        register(client, client_name="ChatGPT")
-        app_view = app.state.oauth.list_clients()[0]
-        assert app_view.get("registered_at")
+        """The SDK stamps client_id_issued_at at registration, so a connected
+        client carries a registered-at the UI can show."""
+        connect(client, client_name="ChatGPT")
+        view = app.state.oauth.list_clients()[0]
+        assert view.get("registered_at")
 
     def test_a_record_without_a_timestamp_gets_none_fabricated(self, client):
         """If the stored record has no client_id_issued_at, the view omits it
-        rather than inventing one."""
-        register(client, client_name="ChatGPT")
+        rather than inventing one — but a connected client is still listed."""
+        info = connect(client, client_name="ChatGPT")
         store = app.state.oauth._store
-        cid = next(iter(store._load()["clients"]))
-        store._load()["clients"][cid].pop("client_id_issued_at", None)
-        assert "registered_at" not in store.list_clients()[0]
+        store._load()["clients"][info["client_id"]].pop("client_id_issued_at", None)
+        view = next(a for a in store.list_clients() if a["client_id"] == info["client_id"])
+        assert "registered_at" not in view
 
     def test_a_nameless_client_falls_back_to_its_redirect_host(self, client):
         """DCR does not require client_name; the redirect host is where codes
         physically go, so it is the honest label when no name was given."""
-        info = register(client)
+        info = connect(client)
         store = app.state.oauth._store
         store._load()["clients"][info["client_id"]]["client_name"] = None
         view = next(a for a in store.list_clients() if a["client_id"] == info["client_id"])
@@ -677,13 +722,158 @@ class TestConnectedAppsListing:
         """
         import json as _json
 
-        info = register(client)  # confidential: gets a client_secret
+        info = connect(client)  # confidential: gets a client_secret
         assert info.get("client_secret"), "expected a confidential client for this test"
 
         blob = _json.dumps(app.state.oauth.list_clients())
         assert info["client_secret"] not in blob
         for banned in ("client_secret", "code", "refresh_token", "access_token", "secret"):
             assert banned not in blob
+
+
+class TestUnauthorizedRegistrationsAreSwept:
+    """A registration that never completed authorization is stale clutter after
+    an hour and is swept; a connected app never is."""
+
+    def _issued_at(self, client_id: str, epoch: float) -> None:
+        # The SDK stamps this as an int; keep it one so get_client still validates.
+        app.state.oauth._store._load()["clients"][client_id]["client_id_issued_at"] = int(epoch)
+
+    def test_a_fresh_unauthorized_registration_is_kept(self, client):
+        """Under an hour old, it might still be mid-login, so it stays in the
+        store — just not shown as connected."""
+        info = register(client, client_name="MidAuth")
+        app.state.oauth.list_clients()  # triggers the lazy sweep
+        assert app.state.oauth._store.get_client(info["client_id"]) is not None
+
+    def test_an_aged_unauthorized_registration_is_swept(self, client):
+        info = register(client, client_name="Abandoned")
+        self._issued_at(info["client_id"], time.time() - 3601)
+        app.state.oauth.list_clients()  # triggers the lazy sweep
+        assert app.state.oauth._store.get_client(info["client_id"]) is None
+
+    def test_a_register_call_sweeps_an_aged_registration(self, client):
+        """The primary, load-bearing trigger: registration itself sweeps stale
+        registrations, so the store stays bounded even if the settings page is
+        NEVER opened (serverless has no cron). Prove it fires on /register, not
+        only on list."""
+        stale = register(client, client_name="Abandoned")
+        self._issued_at(stale["client_id"], time.time() - 3601)
+
+        # A brand-new, unrelated registration must prune the stale one first —
+        # without any call to list_clients().
+        register(client, client_name="Fresh")
+        assert app.state.oauth._store.get_client(stale["client_id"]) is None
+
+    def test_a_connected_client_is_never_swept_however_old(self, client):
+        """authorized_at exempts it; backdate its registration well past the TTL
+        and it must survive."""
+        info = connect(client, client_name="ChatGPT")
+        self._issued_at(info["client_id"], time.time() - 10 * 24 * 3600)
+        app.state.oauth.list_clients()
+        assert app.state.oauth._store.get_client(info["client_id"]) is not None
+        assert info["client_id"] in {a["client_id"] for a in app.state.oauth.list_clients()}
+
+    def test_a_registration_without_issued_at_is_kept_not_mis_aged(self, client):
+        """Missing client_id_issued_at cannot be dated; keeping it is the
+        conservative choice over deleting on a guessed age."""
+        info = register(client, client_name="NoTimestamp")
+        app.state.oauth._store._load()["clients"][info["client_id"]].pop("client_id_issued_at", None)
+        app.state.oauth.list_clients()
+        assert app.state.oauth._store.get_client(info["client_id"]) is not None
+
+
+class TestBackfillMigration:
+    """Grandfathering existing connections. Before authorized_at existed, every
+    stored client was one the user had approved; without a migration the
+    authorized-only filter would hide them and the 1h sweep would DELETE them —
+    breaking a real connector. The one-time backfill stamps them all as
+    connected, and a persistent marker keeps it from ever grandfathering a
+    genuinely-new unauthorized client."""
+
+    def _store(self, tmp_path):
+        from app.services.oauth import OAuthStore
+
+        return OAuthStore(tmp_path / "oauth.json", tmp_path / ".dek")
+
+    def _legacy_record(self, cid: str, *, host: str, age_days: int) -> dict:
+        """A pre-change client record: registered and approved, but with NO
+        authorized_at (the field did not exist when it was written)."""
+        return {
+            "client_id": cid,
+            "redirect_uris": [f"https://{host}/cb"],
+            "client_name": f"Existing {host}",
+            "client_id_issued_at": int(time.time()) - age_days * 24 * 3600,
+        }
+
+    def _write_legacy(self, store, clients: dict) -> None:
+        """Persist a pre-change store shape straight to disk: given records, and
+        crucially NO backfill marker. Reset the cache so the next access reads it
+        back and runs the one-time migration, exactly as a real upgrade would."""
+        store._data = {"clients": clients, "codes": {}}
+        store._flush()
+        store._data = None
+
+    def test_a_preexisting_client_is_grandfathered_and_never_swept(self, tmp_path):
+        """The client the user already connected: no authorized_at, ancient — it
+        must be backfilled to connected, shown, and immune to the sweep."""
+        store = self._store(tmp_path)
+        self._write_legacy(store, {"legacy-1": self._legacy_record(
+            "legacy-1", host="chatgpt.example", age_days=30)})
+
+        views = store.list_clients()  # first access → one-time backfill
+        assert "legacy-1" in {v["client_id"] for v in views}
+        assert views[0]["authorized_at"]  # stamped as connected
+
+        # And it survives the sweep despite being 30 days old.
+        store.list_clients()
+        assert store.get_client("legacy-1") is not None
+
+    def test_the_marker_is_set_after_the_first_access(self, tmp_path):
+        from app.services.oauth import _BACKFILL_MARKER
+
+        store = self._store(tmp_path)
+        self._write_legacy(store, {"legacy-1": self._legacy_record(
+            "legacy-1", host="a.example", age_days=30)})
+        # The persisted legacy shape carries no marker; the first access migrates
+        # and records it, so it stays set across a fresh read from disk.
+        store.list_clients()
+        store._data = None
+        assert store._load().get(_BACKFILL_MARKER) is True
+
+    def test_a_new_unauthorized_client_after_migration_is_still_swept(self, tmp_path):
+        """The marker's whole point: once migration has run, a genuinely-new
+        unauthorized registration aged past the TTL is NOT grandfathered — it is
+        swept like any other abandonment."""
+        store = self._store(tmp_path)
+        self._write_legacy(store, {})   # empty legacy store: nothing to backfill
+        store.list_clients()            # migration runs, marker set
+
+        # A brand-new unauthorized client, injected AFTER migration, aged out.
+        store._load()["clients"]["new-1"] = self._legacy_record(
+            "new-1", host="probe.example", age_days=1)  # >1h, no authorized_at
+        store._flush()
+
+        store.list_clients()  # sweep
+        assert store.get_client("new-1") is None
+
+    def test_the_backfill_does_not_re_run_on_later_access(self, tmp_path):
+        """Directly proves one-shot: a legacy-shaped record added AFTER the
+        marker is set is swept, not grandfathered — the backfill did not run a
+        second time."""
+        store = self._store(tmp_path)
+        self._write_legacy(store, {"legacy-1": self._legacy_record(
+            "legacy-1", host="real.example", age_days=30)})
+        store.list_clients()  # migrate: legacy-1 grandfathered, marker set
+
+        # Post-migration, inject another ancient no-authorized_at record.
+        store._load()["clients"]["post-1"] = self._legacy_record(
+            "post-1", host="late.example", age_days=30)
+        store._flush()
+
+        store.list_clients()
+        assert store.get_client("post-1") is None       # swept, NOT grandfathered
+        assert store.get_client("legacy-1") is not None  # the true legacy one stays
 
 
 class TestDisconnectRevokes:

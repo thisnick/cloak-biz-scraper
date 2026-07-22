@@ -624,7 +624,7 @@
                     {% for app in connected_apps %}
                     <tr>
                       <td><b>{{ app.client_name }}</b><br><span class="mono hint">{{ app.client_id[:18] }}…</span></td>
-                      <td class="mono">{{ ago(app.registered_at) if app.registered_at else '—' }}</td>
+                      <td class="mono">{{ 'Connected ' + ago(app.authorized_at) if app.authorized_at else '—' }}</td>
                       <td>
                         <div class="btnrow" style="justify-content:flex-end;margin:0">
                           <form method="post" action="/settings/connections/disconnect" onsubmit="return confirm('Disconnect “{{ app.client_name }}”? It loses access within an hour and must be re-authorized to reconnect.');"><input type="hidden" name="client_id" value="{{ app.client_id }}"><button class="btn danger" type="submit">Disconnect</button></form>

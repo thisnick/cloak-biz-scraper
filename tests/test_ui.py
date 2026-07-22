@@ -1539,15 +1539,31 @@ class TestConnectedAppsUi:
         assert r.status_code == 201, r.text
         return r.json()
 
+    def _connect(self, client, name="ChatGPT", host="chatgpt.example"):
+        """Register AND mark authorized, so the app is genuinely connected and
+        appears in the listing. The full OAuth HTTP flow is exercised in
+        test_oauth; here we only need the resulting store state."""
+        info = self._register(client, name=name, host=host)
+        app.state.oauth._store.mark_authorized(info["client_id"])
+        return info
+
     def test_empty_state_points_at_the_connect_tab(self, wired):
         page = wired.get("/").text
         assert "No apps connected yet — add one from the Connect tab." in page
 
     def test_a_connected_app_is_listed_by_name(self, wired):
-        self._register(wired, name="Claude Code")
+        self._connect(wired, name="Claude Code")
         page = wired.get("/").text
         assert "Claude Code" in page
         assert "Disconnect" in page
+
+    def test_a_merely_registered_app_is_not_listed(self, wired):
+        """A DCR registration that never completed auth holds no access; it must
+        not clutter the page as 'connected'."""
+        self._register(wired, name="Abandoned")
+        page = wired.get("/").text
+        assert "Abandoned" not in page
+        assert "No apps connected yet — add one from the Connect tab." in page
 
     def test_the_page_carries_the_revocation_note(self, wired):
         """The one-line honesty about what Disconnect does and does not do."""
@@ -1557,7 +1573,7 @@ class TestConnectedAppsUi:
         assert "in Railway and redeploy" in page
 
     def test_disconnect_removes_the_client(self, wired):
-        info = self._register(wired, name="ChatGPT")
+        info = self._connect(wired, name="ChatGPT")
         assert "ChatGPT" in wired.get("/").text
 
         r = wired.post("/settings/connections/disconnect",
@@ -1575,6 +1591,6 @@ class TestConnectedAppsUi:
         assert app.state.oauth._store.get_client(info["client_id"]) is not None
 
     def test_the_rendered_page_never_shows_a_client_secret(self, wired):
-        info = self._register(wired)  # confidential client: gets a secret
+        info = self._connect(wired)  # confidential client: gets a secret
         assert info.get("client_secret")
         assert info["client_secret"] not in wired.get("/").text
