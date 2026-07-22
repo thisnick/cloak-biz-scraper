@@ -15,8 +15,10 @@ import pytest
 
 from app.models import Listing
 from app.services.jobs import JobStore
+from app.services.profiles import ProfileStore
 from app.services.scrape import NotionNotConfigured, ScrapeService
 from app.services.settings import SettingsService
+from app.services.task_profiles import TaskProfilePool
 from app.sources import UnsupportedURL
 from app.stores.base import UpsertResult
 
@@ -226,6 +228,62 @@ class TestFailure:
         result = svc.result(job.id)
         assert result.status == "failed"
         assert "the wheels came off" in result.error
+
+
+class TestTaskProfiles:
+    """The sweep leases a pooled task-N identity instead of minting serp-<path>,
+    and returns it on every exit path."""
+
+    def _pooled(self, settings, jobs, monkeypatch, tmp_path, retry):
+        """A ScrapeService whose real _sweep runs against a real pool, with the
+        browser launch (scrape_with_retry) replaced by `retry`."""
+        monkeypatch.setattr("app.services.scrape.scrape_with_retry", retry)
+        profiles = ProfileStore(tmp_path / "profiles")
+        pool = TaskProfilePool(profiles, settings)
+        # instances is a dummy: with a pool injected, __init__ never touches it,
+        # and the patched scrape_with_retry never uses it.
+        svc = ScrapeService(instances=object(), jobs=jobs, settings=settings,
+                            store_factory=FakeStore, task_profiles=pool)
+        return svc, pool, profiles
+
+    @pytest.mark.asyncio
+    async def test_the_sweep_leases_a_task_profile_and_never_creates_serp(
+        self, settings, jobs, monkeypatch, tmp_path,
+    ):
+        captured: dict = {}
+
+        async def retry(instances, *, profile, owner, **kw):
+            captured["profile"], captured["owner"] = profile, owner
+            return {"blocked": False, "error": None,
+                    "data": {"listings": list(CARDS), "pages_crawled": 1}}
+
+        svc, pool, profiles = self._pooled(settings, jobs, monkeypatch, tmp_path, retry)
+        job = svc.start(SERP)
+        await _drain(svc)
+
+        assert captured["profile"] == "task-1", "launched on a pooled identity"
+        assert captured["owner"] == f"job:{job.id}", "owner tag preserved"
+        names = [p.name for p in profiles.all()]
+        assert "task-1" in names
+        assert not any(n.startswith("serp-") for n in names), "no per-URL profile minted"
+        assert pool.leased_by(job.id) == [], "lease returned after a clean sweep"
+
+    @pytest.mark.asyncio
+    async def test_a_crashed_sweep_releases_its_lease(
+        self, settings, jobs, monkeypatch, tmp_path,
+    ):
+        """The finally path in _run: even a launch that explodes must not leak the
+        lease and pin the profile as busy forever."""
+        async def retry(instances, *, profile, **kw):
+            raise RuntimeError("launch exploded")
+
+        svc, pool, _ = self._pooled(settings, jobs, monkeypatch, tmp_path, retry)
+        job = svc.start(SERP)
+        await _drain(svc)
+
+        assert svc.result(job.id).status == "failed"
+        assert pool.leased_by(job.id) == [], "lease freed despite the crash"
+        assert pool.acquire("next") == "task-1", "the freed profile is reused, not leaked"
 
 
 class TestCollecting:

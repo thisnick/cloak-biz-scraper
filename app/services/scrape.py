@@ -24,9 +24,10 @@ from ..config import CONFIG
 from ..models import Job, Listing, ScrapeResult, SyncResult
 from ..stores.base import ListingStore
 from .blocker import text_contains_blocker
-from .browsing import capture, gesture, scrape_with_retry, slug
+from .browsing import capture, gesture, scrape_with_retry
 from .jobs import JobStore
 from .settings import SettingsService
+from .task_profiles import TaskProfilePool
 
 logger = logging.getLogger("cloakbiz.scrape")
 
@@ -57,7 +58,7 @@ def _collect_message(job_id: str) -> str:
 
 class ScrapeService:
     def __init__(self, instances, jobs: JobStore, settings: SettingsService,
-                 store_factory=None) -> None:
+                 store_factory=None, task_profiles: TaskProfilePool | None = None) -> None:
         self._instances = instances
         self._jobs = jobs
         self._settings = settings
@@ -65,6 +66,14 @@ class ScrapeService:
         # lazily and only when sync=true, so a user with no Notion token can
         # still scrape.
         self._store_factory = store_factory or _default_store
+        # A bounded pool of reusable task-N browser identities, replacing the old
+        # per-URL serp-<path> profiles that accumulated on the volume forever.
+        # Injectable for tests; built from the instance manager's ProfileStore in
+        # normal use. None only when there is no instance manager (unit tests that
+        # stub _sweep) — release() below is guarded for that case.
+        self._task_profiles = task_profiles
+        if self._task_profiles is None and instances is not None:
+            self._task_profiles = TaskProfilePool(instances.profiles, settings)
         self._running: set[asyncio.Task] = set()
 
     @property
@@ -144,6 +153,13 @@ class ScrapeService:
             job.error = str(exc)
             job.summary = "Sweep failed."
         finally:
+            # Return the task profile on every path — success, block, error, or
+            # cancel — so a crashed sweep never leaks a lease and pins a profile
+            # as busy forever. Released even if the launch itself failed, since
+            # acquire happens before scrape_with_retry inside _sweep. Idempotent,
+            # so a sweep that never acquired (stubbed _sweep) is a safe no-op.
+            if self._task_profiles is not None:
+                self._task_profiles.release(job.id)
             self._jobs.save(job)
             logger.info("job %s -> %s (%d listings)", job.id, job.status, len(job.listings))
 
@@ -178,12 +194,16 @@ class ScrapeService:
 
     async def _sweep(self, job: Job, source) -> dict:
         evidence = CONFIG.evidence_dir / job.id
+        # Lease a pooled task-N identity for this sweep. Bounded and reused across
+        # sweeps, so profiles no longer accumulate one-per-URL on the volume. The
+        # lease is returned in _run's finally, so acquiring here (before any launch)
+        # means even a launch failure releases it. Two concurrent sweeps can never
+        # get the same profile — the pool is the sole lease authority — so they
+        # cannot collide on Chromium's singleton lock.
+        profile = self._task_profiles.acquire(job.id)
         return await scrape_with_retry(
             self._instances,
-            # Per-URL, never per-host: two sweeps of the same site at once would
-            # otherwise share a user-data-dir and collide on Chromium's singleton
-            # lock. The URL is what distinguishes them.
-            profile=f"serp-{slug(urlparse(job.url).path)}",
+            profile=profile,
             owner=f"job:{job.id}",
             wait_ms=_WAIT_MS,
             attempts=_ATTEMPTS,
