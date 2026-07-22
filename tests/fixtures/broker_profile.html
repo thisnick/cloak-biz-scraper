@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Krea Business — Business Broker | BizBuySell</title>
+  <!-- Two of the three listings mirror their clean name/description/url in an
+       ld+json Product node keyed by productid (== the listing id). The third
+       (41243003) has no Product node, so it exercises the tile-text fallback. -->
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@graph": [
+      {
+        "@type": "Product",
+        "productid": "41243001",
+        "name": "Established Neighborhood Cafe & Bakery",
+        "description": "A profitable cafe and bakery with a loyal customer base, strong margins, and a fully trained staff in place.",
+        "url": "https://www.bizbuysell.com/business-opportunity/established-neighborhood-cafe-bakery/41243001/"
+      },
+      {
+        "@type": "Product",
+        "productid": "41243002",
+        "name": "Turnkey Auto Repair Shop",
+        "description": "Well-equipped auto repair shop on a busy corridor, real estate available, seller will train.",
+        "url": "https://www.bizbuysell.com/business-opportunity/turnkey-auto-repair-shop/41243002/"
+      }
+    ]
+  }
+  </script>
+</head>
+<body>
+  <h1>Krea Business</h1>
+  <div id="bdProfileTabs">
+    <ul class="bdProfileMyListings">
+      <li class="bdProfileMyListing listing-card">
+        <a class="bdProfileMyListingsListingLink"
+           href="https://www.bizbuysell.com/business-opportunity/established-neighborhood-cafe-bakery/41243001/">
+          <span class="bdProfileFiguresBusiness">Established Neighborhood Cafe &amp; Bakery</span>
+          <span class="bdProfileFiguresLocation">San Francisco, CA</span>
+          <span class="bdProfileFiguresAsking">Asking Price: $1,258,000 + Inventory</span>
+          <p class="bdProfileMyListingsData_summary">Turn-key cafe with strong repeat business.</p>
+        </a>
+      </li>
+      <li class="bdProfileMyListing listing-card">
+        <a class="bdProfileMyListingsListingLink"
+           href="https://www.bizbuysell.com/business-opportunity/turnkey-auto-repair-shop/41243002/">
+          <span class="bdProfileFiguresBusiness">Turnkey Auto Repair Shop</span>
+          <span class="bdProfileFiguresLocation">Sacramento, CA</span>
+          <span class="bdProfileFiguresAsking">Not Disclosed</span>
+          <p class="bdProfileMyListingsData_summary">Busy corridor location, seller financing available.</p>
+        </a>
+      </li>
+      <li class="bdProfileMyListing listing-card">
+        <a class="bdProfileMyListingsListingLink"
+           href="https://www.bizbuysell.com/business-opportunity/family-dry-cleaner/41243003/">
+          <span class="bdProfileFiguresBusiness">Family-Owned Dry Cleaner</span>
+          <span class="bdProfileFiguresLocation">Relocatable</span>
+          <span class="bdProfileFiguresAsking">$675,000</span>
+          <p class="bdProfileMyListingsData_summary">Established dry cleaning business with a steady book of commercial accounts and room to grow.</p>
+        </a>
+      </li>
+    </ul>
+  </div>
+</body>
+</html>

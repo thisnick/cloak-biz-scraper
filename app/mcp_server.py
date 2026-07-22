@@ -136,20 +136,23 @@ def build(app) -> FastMCP:
     async def scrape_listings(
         url: str, max_pages: int = 1, sync: bool = False, db_id: str | None = None
     ) -> ScrapeResult:
-        """Start sweeping a search-results page for business listings.
+        """Start sweeping a listings page for business listings.
 
         Returns immediately with status="working" and a job_id — the listings are
         NOT in this response. Call get_scrape_listing_results with the job_id to
         collect them.
 
-        url: a SEARCH-RESULTS (SERP) page, not a single listing (BizBuySell only
-            for now). The URL decides how it is read, so use one with the filters
-            already applied. If you don't have such a URL, either ask the user for
-            it, OR get one yourself: create_instance a browser, use agent_browser
-            to run the search on the site (navigate, fill the search box, apply
-            filters), read the resulting address bar (agent_browser get url), and
-            pass that here.
-        max_pages: how many pages of results to walk.
+        url: a page that lists many businesses, not a single listing (BizBuySell
+            only for now) — either a SEARCH-RESULTS (SERP) page, or a broker's
+            profile page (bizbuysell.com/business-broker/…), whose for-sale
+            listings are swept. The URL decides how it is read, so for a search use
+            one with the filters already applied. If you don't have such a URL,
+            either ask the user for it, OR get one yourself: create_instance a
+            browser, use agent_browser to run the search on the site (navigate,
+            fill the search box, apply filters), read the resulting address bar
+            (agent_browser get url), and pass that here.
+        max_pages: how many pages of results to walk. A broker profile pages its
+            for-sale tab too, so raise this to sweep a broker with many listings.
         sync: false (default) just reads the listings back — no Notion involved.
             true also saves new ones to your Notion database, skipping those
             already there. (The Notion layer is opt-in: sync=true here, plus

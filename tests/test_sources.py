@@ -6,12 +6,18 @@ database, and nobody notices until it is full of duplicates.
 """
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 
 from app import sources
 from app.sources import UnsupportedURL
-from app.sources.bizbuysell import BizBuySellSerp, listing_id_from
+from app.sources.bizbuysell import BizBuySellBroker, BizBuySellSerp, listing_id_from
 from app.sources.urls import canonical_url, normalize_url
+
+MURALI = "https://www.bizbuysell.com/business-broker/murali-barathi/krea-business/41243/"
+RICK = "https://www.bizbuysell.com/business-broker/rick-teh-emba-cbi/accel-business-advisors/36034/"
 
 BAY_AREA = (
     "https://www.bizbuysell.com/california/san-francisco-bay-area-businesses-for-sale/"
@@ -108,10 +114,12 @@ class TestDispatch:
             "https://www.bizbuysell.com/business-opportunity/premier-restoration/2515728/"
         )
 
-    def test_a_broker_profile_is_out_of_scope(self):
-        assert not BizBuySellSerp().matches(
-            "https://www.bizbuysell.com/business-broker/andrew-rogerson/rogerson/20770/"
-        )
+    def test_a_broker_profile_is_not_a_search_page(self):
+        """A broker profile is the right site and a different job — it is handled
+        by BizBuySellBroker, not swept as a search feed."""
+        broker = "https://www.bizbuysell.com/business-broker/andrew-rogerson/rogerson/20770/"
+        assert not BizBuySellSerp().matches(broker)
+        assert sources.for_url(broker).name == "bizbuysell_broker"
 
     def test_a_lookalike_domain_does_not_match(self):
         assert not BizBuySellSerp().matches("https://bizbuysell.com.evil.example/x-businesses-for-sale/")
@@ -137,3 +145,263 @@ class TestPaging:
         assert BizBuySellSerp().page_url(paged, 2) == (
             "https://www.bizbuysell.com/california/sacramento-area-businesses-for-sale/2/"
         )
+
+
+class TestBrokerDispatch:
+    @pytest.mark.parametrize("url", [MURALI, RICK])
+    def test_a_broker_profile_selects_the_broker_adapter(self, url):
+        assert sources.for_url(url).name == "bizbuysell_broker"
+
+    @pytest.mark.parametrize("url", [MURALI, RICK])
+    def test_a_broker_profile_is_never_the_search_adapter(self, url):
+        """The two paths are disjoint, so exactly one adapter claims each URL —
+        routing a broker URL to the SERP source would sweep only the handful of
+        cards it links to, not the broker's for-sale book."""
+        assert not BizBuySellSerp().matches(url)
+        assert BizBuySellBroker().matches(url)
+
+    @pytest.mark.parametrize("url", [SACRAMENTO, BAY_AREA])
+    def test_a_search_page_is_never_the_broker_adapter(self, url):
+        assert not BizBuySellBroker().matches(url)
+
+    def test_a_listing_page_is_not_a_broker_profile(self):
+        assert not BizBuySellBroker().matches(
+            "https://www.bizbuysell.com/business-opportunity/premier-restoration/2515728/"
+        )
+
+    def test_a_broker_landing_without_an_id_does_not_match(self):
+        """The profile pattern needs slug/company/id; a bare directory URL is not
+        a specific broker and must not be swept as one."""
+        assert not BizBuySellBroker().matches("https://www.bizbuysell.com/business-broker/")
+
+    def test_a_lookalike_domain_does_not_match(self):
+        assert not BizBuySellBroker().matches(
+            "https://www.bizbuysell.com.evil.example/business-broker/x/y/1/"
+        )
+
+
+class TestBrokerPaging:
+    def test_page_one_carries_the_paging_params(self):
+        assert BizBuySellBroker().page_url(MURALI, 1) == (
+            "https://www.bizbuysell.com/business-broker/murali-barathi/krea-business/41243/"
+            "?bp_cfspg=1&bplt=10#bdProfileTabs"
+        )
+
+    def test_later_pages_bump_bp_cfspg(self):
+        assert BizBuySellBroker().page_url(MURALI, 2) == (
+            "https://www.bizbuysell.com/business-broker/murali-barathi/krea-business/41243/"
+            "?bp_cfspg=2&bplt=10#bdProfileTabs"
+        )
+
+    def test_paging_is_idempotent_on_an_already_paged_url(self):
+        """page 3 of "page 2 of X" is page 3 of X — the stale bp_cfspg is dropped,
+        not stacked, and the page size is not doubled."""
+        paged = BizBuySellBroker().page_url(MURALI, 2)
+        assert BizBuySellBroker().page_url(paged, 3) == (
+            "https://www.bizbuysell.com/business-broker/murali-barathi/krea-business/41243/"
+            "?bp_cfspg=3&bplt=10#bdProfileTabs"
+        )
+
+
+class _FakeLocator:
+    def __init__(self, count: int, on_click=None):
+        self._count = count
+        self._on_click = on_click
+
+    async def count(self) -> int:
+        return self._count
+
+    @property
+    def first(self):
+        return self
+
+    async def click(self, **kwargs) -> None:
+        if self._on_click:
+            self._on_click()
+
+
+class _FakePage:
+    """A page whose `evaluate` hands back canned JS_BROKER output.
+
+    The real JS is exercised against a browser in TestBrokerExtraction; this
+    stands in for it so the Python mapping — verbatim money, the shared
+    normalization, and the For-Sale fallback — can be pinned without one.
+    """
+
+    def __init__(self, payloads: list[dict], for_sale: bool = False):
+        self._payloads = list(payloads)
+        self._for_sale = for_sale
+        self.evaluations = 0
+        self.clicked = False
+
+    async def evaluate(self, js: str):
+        self.evaluations += 1
+        payload = self._payloads[min(len(self._payloads) - 1, self.evaluations - 1)]
+        return json.dumps(payload)
+
+    def get_by_role(self, role: str, name=None):
+        hit = self._for_sale and not self.clicked
+        return _FakeLocator(1 if hit else 0, on_click=lambda: setattr(self, "clicked", True))
+
+    def get_by_text(self, pattern):
+        return _FakeLocator(0)
+
+    async def wait_for_timeout(self, ms: int) -> None:
+        pass
+
+
+class TestBrokerMapping:
+    """The Python half of cards(): JS output in, Listing fields out."""
+
+    ONE = {
+        "title": "Established Neighborhood Cafe & Bakery",
+        "location": "San Francisco, CA",
+        "asking_price": "$1,258,000 + Inventory",
+        "description": "A profitable cafe and bakery.",
+        "listing_url": None,
+        "url": "https://www.bizbuysell.com/business-opportunity/cafe/41243001/?utm_source=x",
+        "listing_id": "41243001",
+    }
+
+    @pytest.mark.asyncio
+    async def test_money_is_kept_verbatim(self):
+        page = _FakePage([{"title": "Krea", "blocked": False, "cards": [self.ONE]}])
+        result = await BizBuySellBroker().cards(page)
+        assert result.listings[0].asking_price == "$1,258,000 + Inventory"
+
+    @pytest.mark.asyncio
+    async def test_fields_map_onto_the_shared_listing_shape(self):
+        page = _FakePage([{"title": "Krea", "blocked": False, "cards": [self.ONE]}])
+        listing = (await BizBuySellBroker().cards(page)).listings[0]
+        assert listing.listing_id == "41243001"
+        assert listing.url == "https://www.bizbuysell.com/business-opportunity/cafe/41243001/"
+        assert listing.normalized_url == "bizbuysell.com/business-opportunity/cafe/41243001"
+        assert listing.title == "Established Neighborhood Cafe & Bakery"
+        assert listing.location == "San Francisco, CA"
+        assert listing.excerpt == "A profitable cafe and bakery."
+        assert listing.source == "bizbuysell_broker"
+
+    @pytest.mark.asyncio
+    async def test_the_listing_id_is_recovered_from_the_url_when_absent(self):
+        card = dict(self.ONE)
+        card["listing_id"] = None
+        page = _FakePage([{"cards": [card]}])
+        assert (await BizBuySellBroker().cards(page)).listings[0].listing_id == "41243001"
+
+    @pytest.mark.asyncio
+    async def test_blocked_and_title_pass_through(self):
+        page = _FakePage([{"title": "Pardon Our Interruption", "blocked": True, "cards": []}])
+        result = await BizBuySellBroker().cards(page)
+        assert result.blocked is True
+        assert result.title == "Pardon Our Interruption"
+
+    @pytest.mark.asyncio
+    async def test_an_empty_page_clicks_for_sale_and_re_reads(self):
+        """When the bp_cfspg URL lands off the For-Sale tab, cards() clicks it and
+        reads again rather than reporting a listing-less broker."""
+        empty = {"title": "Krea", "blocked": False, "cards": []}
+        full = {"title": "Krea", "blocked": False, "cards": [self.ONE]}
+        page = _FakePage([empty, full], for_sale=True)
+        result = await BizBuySellBroker().cards(page)
+        assert page.clicked is True
+        assert page.evaluations == 2
+        assert len(result.listings) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_blocked_page_is_not_retried_as_a_missing_tab(self):
+        """A block is not an inactive tab — clicking For-Sale on a challenge page
+        would be a wasted interaction, and the block must be reported as one."""
+        page = _FakePage([{"title": "Access Denied", "blocked": True, "cards": []}], for_sale=True)
+        result = await BizBuySellBroker().cards(page)
+        assert page.clicked is False
+        assert result.blocked is True
+
+
+_FIXTURE = Path(__file__).parent / "fixtures" / "broker_profile.html"
+
+
+def _chromium_available() -> bool:
+    """Whether a Playwright chromium is installed — asked without launching one."""
+    try:
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as p:
+            path = p.chromium.executable_path
+        return bool(path) and Path(path).exists()
+    except Exception:
+        return False
+
+
+needs_chromium = pytest.mark.skipif(
+    not _chromium_available(), reason="the real JS extractor needs a Playwright chromium"
+)
+
+
+@needs_chromium
+class TestBrokerExtraction:
+    """JS_BROKER against a saved broker page, in a real browser.
+
+    Like the martian tests, this runs where the answer is real and skips where it
+    is not: asserting what the selectors extract from remembered structure is the
+    exact mistake — the whole point is that the page's markup is what it is.
+    """
+
+    async def _cards(self):
+        from playwright.async_api import async_playwright
+
+        html = _FIXTURE.read_text()
+        async with async_playwright() as p:
+            browser = await p.chromium.launch()
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+                return await BizBuySellBroker().cards(page)
+            finally:
+                await browser.close()
+
+    @pytest.mark.asyncio
+    async def test_every_listing_card_is_extracted(self):
+        result = await self._cards()
+        ids = sorted(listing.listing_id for listing in result.listings)
+        assert ids == ["41243001", "41243002", "41243003"]
+
+    @pytest.mark.asyncio
+    async def test_the_product_backed_card_reads_its_clean_fields(self):
+        result = await self._cards()
+        cafe = next(x for x in result.listings if x.listing_id == "41243001")
+        assert cafe.title == "Established Neighborhood Cafe & Bakery"
+        assert cafe.location == "San Francisco, CA"
+        # The "Asking Price:" label is stripped; the "+ Inventory" the site wrote
+        # is not — that is the verbatim-money contract, on the broker path too.
+        assert cafe.asking_price == "$1,258,000 + Inventory"
+        assert cafe.url == (
+            "https://www.bizbuysell.com/business-opportunity/"
+            "established-neighborhood-cafe-bakery/41243001/"
+        )
+        assert cafe.normalized_url == (
+            "bizbuysell.com/business-opportunity/established-neighborhood-cafe-bakery/41243001"
+        )
+        assert "profitable cafe and bakery" in cafe.excerpt
+
+    @pytest.mark.asyncio
+    async def test_not_disclosed_is_kept_as_written(self):
+        result = await self._cards()
+        auto = next(x for x in result.listings if x.listing_id == "41243002")
+        assert auto.asking_price == "Not Disclosed"
+
+    @pytest.mark.asyncio
+    async def test_a_card_without_structured_data_falls_back_to_its_tile(self):
+        """41243003 has no ld+json Product, so its name/price/description come
+        from the tile markup alone."""
+        result = await self._cards()
+        cleaner = next(x for x in result.listings if x.listing_id == "41243003")
+        assert cleaner.title == "Family-Owned Dry Cleaner"
+        assert cleaner.location == "Relocatable"
+        assert cleaner.asking_price == "$675,000"
+        assert "dry cleaning business" in cleaner.excerpt
+
+    @pytest.mark.asyncio
+    async def test_a_clean_page_is_not_reported_as_blocked(self):
+        result = await self._cards()
+        assert result.blocked is False
+        assert result.title.startswith("Krea Business")

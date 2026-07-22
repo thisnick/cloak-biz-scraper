@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 from .base import CardPage, Source, UnsupportedURL
-from .bizbuysell import BizBuySellSerp
+from .bizbuysell import BizBuySellBroker, BizBuySellSerp
 
-# v1 is BizBuySell only. The list is the single place a new site is added, and
-# the error message below is generated from it, so a new adapter cannot be added
-# without the "what is supported?" answer following it.
-SOURCES: list[Source] = [BizBuySellSerp()]
+# v1 is BizBuySell only, via two adapters: the region search feed and a broker's
+# own profile. Their URL paths are disjoint (`businesses-for-sale` vs
+# `business-broker`), so order is not load-bearing — `for_url` still returns
+# exactly one. The list is the single place a new site is added, and the error
+# message below is generated from it, so a new adapter cannot be added without
+# the "what is supported?" answer following it.
+SOURCES: list[Source] = [BizBuySellSerp(), BizBuySellBroker()]
 
 
 def for_url(url: str) -> Source:
