@@ -28,18 +28,22 @@ from app.sources import UnsupportedURL
 from app.stores.base import UpsertResult
 
 SERP = "https://www.bizbuysell.com/california/sacramento-area-businesses-for-sale/"
+SERP2 = "https://www.bizbuysell.com/california/san-francisco-bay-area-businesses-for-sale/"
+BROKER = "https://www.bizbuysell.com/business-broker/jane-doe/acme-advisors/41243/"
 
-CARDS = [
-    Listing(
-        listing_id="2485121",
-        url="https://www.bizbuysell.com/business-opportunity/foo/2485121/",
-        normalized_url="bizbuysell.com/business-opportunity/foo/2485121",
-        title="A Business",
+
+def _listing(listing_id: str, source: str = "bizbuysell_serp") -> Listing:
+    return Listing(
+        listing_id=listing_id,
+        url=f"https://www.bizbuysell.com/business-opportunity/foo/{listing_id}/",
+        normalized_url=f"bizbuysell.com/business-opportunity/foo/{listing_id}",
+        title=f"Business {listing_id}",
         asking_price="$1,258,000",
-        excerpt="**A Business** — San Francisco, CA",
-        source="bizbuysell_serp",
+        source=source,
     )
-]
+
+
+CARDS = [_listing("2485121")]
 
 
 class FakeStore:
@@ -78,11 +82,14 @@ def reset_store_counter():
 def service(settings, jobs, store=None, sweep=None):
     svc = ScrapeService(instances=None, jobs=jobs, settings=settings,
                         store_factory=store or FakeStore)
-    svc._sweep = sweep or (lambda job, source: _ok(job))
+    # `_sweep` is the per-source seam: (job, i, url, source, prog) -> result dict.
+    # Stubbing it bypasses the pool and the browser while still exercising the
+    # fan-out, admission gate and merge in _run/_sweep_url.
+    svc._sweep = sweep or _ok
     return svc
 
 
-async def _ok(job):
+async def _ok(job, i=0, url=SERP, source=None, prog=None):
     return {"blocked": False, "error": None, "data": {"listings": list(CARDS), "pages_crawled": 1}}
 
 
@@ -100,20 +107,20 @@ class TestStarting:
         """A job id for a URL we cannot read would be a promise of a result that
         can never come."""
         with pytest.raises(UnsupportedURL):
-            service(settings, jobs).start("https://abc.xyz/investor/")
+            service(settings, jobs).start(["https://abc.xyz/investor/"])
         assert jobs.all() == []
 
     def test_sync_without_notion_fails_before_any_browsing(self, settings, jobs):
         """Told now, not after a two-minute sweep that then has nowhere to go."""
         with pytest.raises(NotionNotConfigured) as exc:
-            service(settings, jobs).start(SERP, sync=True)
+            service(settings, jobs).start([SERP], sync=True)
         assert "sync=false" in str(exc.value), "name the way out"
         assert jobs.all() == []
 
     @pytest.mark.asyncio
     async def test_starting_returns_working_and_says_how_to_collect(self, settings, jobs):
         svc = service(settings, jobs)
-        job = svc.start(SERP)
+        job = svc.start([SERP])
         assert job.status == "working"
         assert job.listings == [], "the listings are not in this response"
         assert f"job_id={job.id}" in job.summary
@@ -128,7 +135,7 @@ class TestSyncFalse:
         guarded by a flag — the absence of one, which is what lets someone who
         has never configured Notion still use this."""
         svc = service(settings, jobs)
-        job = svc.start(SERP, sync=False)
+        job = svc.start([SERP], sync=False)
         await _drain(svc)
 
         result = svc.result(job.id)
@@ -146,7 +153,7 @@ class TestSyncTrue:
         store = FakeStore()
         svc = service(settings, jobs, store=lambda s: store)
 
-        job = svc.start(SERP, sync=True)
+        job = svc.start([SERP], sync=True)
         await _drain(svc)
 
         assert store.upserts == [("db-configured", CARDS)]
@@ -160,7 +167,7 @@ class TestSyncTrue:
         store = FakeStore()
         svc = service(settings, jobs, store=lambda s: store)
 
-        svc.start(SERP, sync=True, db_id="db-override")
+        svc.start([SERP], sync=True, db_id="db-override")
         await _drain(svc)
 
         assert store.upserts[0][0] == "db-override"
@@ -172,7 +179,7 @@ class TestSyncTrue:
         settings.update(notion_api_token="ntn_x", notion_db_id="db-1")
         store = FakeStore()
         svc = service(settings, jobs, store=lambda s: store)
-        svc.start(SERP, sync=True)
+        svc.start([SERP], sync=True)
         await _drain(svc)
 
         assert store.upserts[0][1][0].asking_price == "$1,258,000"
@@ -183,7 +190,7 @@ class TestSyncTrue:
         settings.update(notion_api_token="ntn_x", notion_db_id="db-1", notion_column_map=cmap)
         store = FakeStore()
         svc = service(settings, jobs, store=lambda s: store)
-        svc.start(SERP, sync=True)
+        svc.start([SERP], sync=True)
         await _drain(svc)
 
         assert store.column_maps[0] == cmap
@@ -198,7 +205,7 @@ class TestSyncTrue:
         )
         store = FakeStore()
         svc = service(settings, jobs, store=lambda s: store)
-        svc.start(SERP, sync=True, db_id="db-other")
+        svc.start([SERP], sync=True, db_id="db-other")
         await _drain(svc)
 
         assert store.column_maps[0] is None
@@ -207,11 +214,11 @@ class TestSyncTrue:
 class TestFailure:
     @pytest.mark.asyncio
     async def test_a_block_is_recorded_as_a_failure_with_advice(self, settings, jobs):
-        async def blocked(job, source):
+        async def blocked(job, i, url, source, prog):
             return {"blocked": True, "error": None, "data": {"listings": [], "pages_crawled": 1}}
 
         svc = service(settings, jobs, sweep=blocked)
-        job = svc.start(SERP)
+        job = svc.start([SERP])
         await _drain(svc)
 
         result = svc.result(job.id)
@@ -223,16 +230,182 @@ class TestFailure:
     async def test_an_exception_lands_on_the_job_not_in_a_lost_task(self, settings, jobs):
         """A background task that raises into nothing leaves the job saying
         "working" forever."""
-        async def boom(job, source):
+        async def boom(job, i, url, source, prog):
             raise RuntimeError("the wheels came off")
 
         svc = service(settings, jobs, sweep=boom)
-        job = svc.start(SERP)
+        job = svc.start([SERP])
         await _drain(svc)
 
         result = svc.result(job.id)
         assert result.status == "failed"
         assert "the wheels came off" in result.error
+
+
+class TestMultiUrlFanOut:
+    """`urls` is a list: several sources fan out into ONE job, merged and deduped,
+    and one source failing does not sink the others (browserd semantics)."""
+
+    def _by_url(self, results: dict):
+        """A `_sweep` stub that returns a canned result per URL, so a test can
+        script mixed success/failure across the batch."""
+        async def sweep(job, i, url, source, prog):
+            return results[url]
+        return sweep
+
+    @pytest.mark.asyncio
+    async def test_empty_list_is_refused_before_any_job(self, settings, jobs):
+        with pytest.raises(ValueError) as exc:
+            service(settings, jobs).start([])
+        assert "empty" in str(exc.value).lower()
+        assert jobs.all() == [], "no job for a batch that cannot run"
+
+    @pytest.mark.asyncio
+    async def test_all_urls_unsupported_raises_and_creates_no_job(self, settings, jobs):
+        with pytest.raises(UnsupportedURL):
+            service(settings, jobs).start(["https://abc.xyz/a", "https://abc.xyz/b"])
+        assert jobs.all() == []
+
+    @pytest.mark.asyncio
+    async def test_one_source_failing_leaves_the_others_completed(self, settings, jobs):
+        ok = {"blocked": False, "error": None,
+              "data": {"listings": [_listing("111")], "pages_crawled": 1}}
+        blocked = {"blocked": True, "error": None, "data": {"listings": [], "pages_crawled": 1}}
+        svc = service(settings, jobs,
+                      sweep=self._by_url({SERP: ok, SERP2: blocked}))
+        job = svc.start([SERP, SERP2])
+        await _drain(svc)
+
+        result = svc.result(job.id)
+        # One good source is enough to complete, with the good source's listings.
+        assert result.status == "completed"
+        assert [l.listing_id for l in result.listings] == ["111"]
+        # The failure is surfaced, not swallowed.
+        assert "1 of 2 source(s) failed" in result.error
+        assert "1 source(s) failed" in result.summary
+
+    @pytest.mark.asyncio
+    async def test_all_sources_failing_fails_the_job(self, settings, jobs):
+        boom = {"blocked": False, "error": "kaboom", "data": {"listings": [], "pages_crawled": 0}}
+        blocked = {"blocked": True, "error": None, "data": {"listings": [], "pages_crawled": 1}}
+        svc = service(settings, jobs, sweep=self._by_url({SERP: boom, BROKER: blocked}))
+        job = svc.start([SERP, BROKER])
+        await _drain(svc)
+
+        result = svc.result(job.id)
+        assert result.status == "failed"
+        assert result.listings == []
+        assert "2 of 2 source(s) failed" in result.error
+        # The block among the failures still earns the retry advice.
+        assert "try again" in result.error.lower()
+
+    @pytest.mark.asyncio
+    async def test_listings_are_merged_and_deduped_across_urls(self, settings, jobs):
+        # The same listing_id appears on two different swept URLs — it must land
+        # once. pages_crawled sums across the sources.
+        a = {"blocked": False, "error": None,
+             "data": {"listings": [_listing("dup"), _listing("only-a")], "pages_crawled": 2}}
+        b = {"blocked": False, "error": None,
+             "data": {"listings": [_listing("dup"), _listing("only-b")], "pages_crawled": 3}}
+        svc = service(settings, jobs, sweep=self._by_url({SERP: a, SERP2: b}))
+        job = svc.start([SERP, SERP2])
+        await _drain(svc)
+
+        result = svc.result(job.id)
+        ids = sorted(l.listing_id for l in result.listings)
+        assert ids == ["dup", "only-a", "only-b"], "the shared listing is not doubled"
+        assert result.pages_crawled == 5, "pages sum across sources"
+        assert "2 of 2 source(s) swept" in result.summary
+
+    @pytest.mark.asyncio
+    async def test_sync_upserts_the_merged_set_once(self, settings, jobs):
+        settings.update(notion_api_token="ntn_x", notion_db_id="db-1")
+        store = FakeStore()
+        a = {"blocked": False, "error": None,
+             "data": {"listings": [_listing("dup"), _listing("a")], "pages_crawled": 1}}
+        b = {"blocked": False, "error": None,
+             "data": {"listings": [_listing("dup"), _listing("b")], "pages_crawled": 1}}
+        svc = service(settings, jobs, store=lambda s: store,
+                      sweep=self._by_url({SERP: a, SERP2: b}))
+        svc.start([SERP, SERP2], sync=True)
+        await _drain(svc)
+
+        # ONE upsert, of the deduped union — not one per URL.
+        assert len(store.upserts) == 1, "the merged set is upserted once, not per source"
+        db_id, listings = store.upserts[0]
+        assert db_id == "db-1"
+        assert sorted(l.listing_id for l in listings) == ["a", "b", "dup"]
+
+    @pytest.mark.asyncio
+    async def test_an_unsupported_url_among_valid_ones_is_a_recorded_failure(self, settings, jobs):
+        ok = {"blocked": False, "error": None,
+              "data": {"listings": [_listing("kept")], "pages_crawled": 1}}
+        svc = service(settings, jobs, sweep=self._by_url({SERP: ok}))
+        # The middle URL is not a supported listings page.
+        job = svc.start([SERP, "https://abc.xyz/nope"])
+        await _drain(svc)
+
+        result = svc.result(job.id)
+        assert result.status == "completed"
+        assert [l.listing_id for l in result.listings] == ["kept"]
+        assert "1 of 2 source(s) failed" in result.error
+
+
+class TestFanOutRespectsCapacity:
+    """A single job with many URLs must never launch more browsers at once than
+    the task budget — the same ceiling the single-sweep path enforced."""
+
+    @pytest.mark.asyncio
+    async def test_one_job_with_many_urls_stays_within_task_budget(
+        self, settings, jobs, monkeypatch, tmp_path,
+    ):
+        settings.update(max_instances=4, interactive_reserve=1)
+        assert settings.load().task_budget == 3
+
+        release = asyncio.Event()
+        concurrent = 0
+        peak = 0
+
+        async def retry(instances, *, profile, on_launch=None, **kw):
+            nonlocal concurrent, peak
+            concurrent += 1
+            peak = max(peak, concurrent)
+            try:
+                await release.wait()
+            finally:
+                concurrent -= 1
+            return {"blocked": False, "error": None,
+                    "data": {"listings": [_listing(profile)], "pages_crawled": 1}}
+
+        monkeypatch.setattr("app.services.scrape.scrape_with_retry", retry)
+        profiles = ProfileStore(tmp_path / "profiles")
+        pool = TaskProfilePool(profiles, settings)
+        svc = ScrapeService(instances=object(), jobs=jobs, settings=settings,
+                            store_factory=FakeStore, task_profiles=pool)
+
+        # Eight URLs in ONE job. All valid SERPs (distinct regions).
+        urls = [f"https://www.bizbuysell.com/x{n}-businesses-for-sale/" for n in range(8)]
+        job = svc.start(urls)
+
+        # Let the admitted sources reach the parked launch and settle.
+        for _ in range(200):
+            await asyncio.sleep(0.005)
+            if concurrent >= 3:
+                break
+        await asyncio.sleep(0.05)  # any wrongly-admitted extra would show up here
+
+        assert peak <= 3, f"launched {peak} browsers at once, budget is 3"
+        # The pool never mints more than the budget, even for eight URLs.
+        pooled = [p.name for p in profiles.all() if p.name.startswith("task-")]
+        assert len(pooled) <= 3, f"minted {pooled}, expected at most 3"
+
+        release.set()
+        await _drain(svc)
+        result = svc.result(job.id)
+        assert result.status == "completed"
+        assert result.pages_crawled == 8, "all eight sources ran (serialised past the budget)"
+        final = sorted(p.name for p in profiles.all() if p.name.startswith("task-"))
+        assert final == ["task-1", "task-2", "task-3"], "eight URLs, three profiles"
 
 
 class TestTaskProfiles:
@@ -263,7 +436,7 @@ class TestTaskProfiles:
                     "data": {"listings": list(CARDS), "pages_crawled": 1}}
 
         svc, pool, profiles = self._pooled(settings, jobs, monkeypatch, tmp_path, retry)
-        job = svc.start(SERP)
+        job = svc.start([SERP])
         await _drain(svc)
 
         assert captured["profile"] == "task-1", "launched on a pooled identity"
@@ -271,7 +444,8 @@ class TestTaskProfiles:
         names = [p.name for p in profiles.all()]
         assert "task-1" in names
         assert not any(n.startswith("serp-") for n in names), "no per-URL profile minted"
-        assert pool.leased_by(job.id) == [], "lease returned after a clean sweep"
+        # Leases are keyed per source (job.id:index); a clean sweep returns them.
+        assert pool.leased_by(f"{job.id}:0") == [], "lease returned after a clean sweep"
 
     @pytest.mark.asyncio
     async def test_a_crashed_sweep_releases_its_lease(
@@ -283,11 +457,11 @@ class TestTaskProfiles:
             raise RuntimeError("launch exploded")
 
         svc, pool, _ = self._pooled(settings, jobs, monkeypatch, tmp_path, retry)
-        job = svc.start(SERP)
+        job = svc.start([SERP])
         await _drain(svc)
 
         assert svc.result(job.id).status == "failed"
-        assert pool.leased_by(job.id) == [], "lease freed despite the crash"
+        assert pool.leased_by(f"{job.id}:0") == [], "lease freed despite the crash"
         assert pool.acquire("next") == "task-1", "the freed profile is reused, not leaked"
 
     @pytest.mark.asyncio
@@ -315,7 +489,7 @@ class TestTaskProfiles:
 
         svc, pool, profiles = self._pooled(settings, jobs, monkeypatch, tmp_path, retry)
         for _ in range(10):
-            svc.start(SERP)
+            svc.start([SERP])
 
         # Let the admitted sweeps reach the (blocked) launch and settle.
         for _ in range(200):
@@ -374,9 +548,9 @@ class TestWaitingSummary:
                     "data": {"listings": list(CARDS), "pages_crawled": 1}}
 
         svc = self._pooled(settings, jobs, monkeypatch, tmp_path, retry)
-        job1 = svc.start(SERP)
+        job1 = svc.start([SERP])
         await launched.wait()          # job1 is past the gate and scraping
-        job2 = svc.start(SERP)         # job2 must queue at the gate
+        job2 = svc.start([SERP])         # job2 must queue at the gate
         await asyncio.sleep(0.05)      # let job2 set its summary and block
 
         assert svc.result(job1.id).summary == _SCRAPING_SUMMARY, "running sweep: scraping"
@@ -387,8 +561,8 @@ class TestWaitingSummary:
         await _drain(svc)
         # Once it actually runs and completes, the waiting text is gone.
         assert svc.result(job2.id).status == "completed"
-        assert svc.result(job2.id).summary.startswith("Found")
-        assert svc.result(job1.id).summary.startswith("Found")
+        assert "source(s) swept" in svc.result(job2.id).summary
+        assert "source(s) swept" in svc.result(job1.id).summary
 
 
 class TestCollecting:
@@ -401,13 +575,13 @@ class TestCollecting:
         started = asyncio.Event()
         release = asyncio.Event()
 
-        async def slow(job, source):
+        async def slow(job, i, url, source, prog):
             started.set()
             await release.wait()
-            return await _ok(job)
+            return await _ok(job, i, url, source, prog)
 
         svc = service(settings, jobs, sweep=slow)
-        job = svc.start(SERP)
+        job = svc.start([SERP])
         await started.wait()
 
         result = await asyncio.wait_for(asyncio.to_thread(svc.result, job.id), timeout=1)

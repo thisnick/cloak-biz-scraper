@@ -271,7 +271,7 @@
         <div class="card" style="padding:14px 0 6px">
           <div class="tablewrap">
             <table class="hist">
-              <thead><tr><th>Task</th><th>Started</th><th>Ran for</th><th>Result</th></tr></thead>
+              <thead><tr><th>Task</th><th>Started</th><th>Ran for</th><th>Result</th><th></th></tr></thead>
               <tbody>
                 {% for j in history_jobs %}
                   {% set r = job_result(j) %}
@@ -280,9 +280,10 @@
                     <td class="mono">{{ ago(j.created_at) }}</td>
                     <td class="mono">{{ dur(j.updated_at - j.created_at) }}</td>
                     <td>{% if r[0]=='ok' %}<span class="res">{{ r[1] }}</span>{% else %}<span class="statepill {{ r[0] }}"><span class="dot {{ r[0] }}"></span>{{ r[1] }}</span>{% endif %}</td>
+                    <td class="mono"><a href="/runs/{{ j.id }}/results" target="_blank" rel="noopener">View</a></td>
                   </tr>
                 {% else %}
-                  <tr><td colspan="4" class="mono" style="color:var(--muted)">No finished tasks yet.</td></tr>
+                  <tr><td colspan="5" class="mono" style="color:var(--muted)">No finished tasks yet.</td></tr>
                 {% endfor %}
               </tbody>
             </table>

@@ -134,32 +134,40 @@ def build(app) -> FastMCP:
 
     @mcp.tool()
     async def scrape_listings(
-        url: str, max_pages: int = 1, sync: bool = False, db_id: str | None = None
+        urls: list[str], max_pages: int = 1, sync: bool = False, db_id: str | None = None
     ) -> ScrapeResult:
-        """Start sweeping a listings page for business listings.
+        """Start sweeping one or more listings pages for business listings.
 
         Returns immediately with status="working" and a job_id — the listings are
         NOT in this response. Call get_scrape_listing_results with the job_id to
-        collect them.
+        collect them. All the URLs fan out into ONE job, so there is one job_id to
+        collect and the results come back merged and de-duplicated.
 
-        url: a page that lists many businesses, not a single listing (BizBuySell
-            only for now) — either a SEARCH-RESULTS (SERP) page, or a broker's
-            profile page (bizbuysell.com/business-broker/…), whose for-sale
-            listings are swept. The URL decides how it is read, so for a search use
-            one with the filters already applied. If you don't have such a URL,
-            either ask the user for it, OR get one yourself: create_instance a
-            browser, use agent_browser to run the search on the site (navigate,
+        urls: a NON-EMPTY list of pages that each list many businesses, not single
+            listings (BizBuySell only for now). Each entry is either a
+            SEARCH-RESULTS (SERP) page, or a broker's profile page
+            (bizbuysell.com/business-broker/…), whose for-sale listings are swept.
+            Each URL decides how it is read, so for a search use one with the
+            filters already applied. Pass several to sweep several searches or
+            brokers at once (e.g. the same search across a few regions). If a URL
+            isn't a supported listings page it is reported as that source's
+            failure and the others still run; the call only errors outright if the
+            list is empty or none of the URLs are readable. If you don't have such
+            a URL, either ask the user for it, OR get one yourself: create_instance
+            a browser, use agent_browser to run the search on the site (navigate,
             fill the search box, apply filters), read the resulting address bar
             (agent_browser get url), and pass that here.
-        max_pages: how many pages of results to walk. A broker profile pages its
-            for-sale tab too, so raise this to sweep a broker with many listings.
+        max_pages: how many pages of results to walk PER URL (shared across all of
+            them). A broker profile pages its for-sale tab too, so raise this to
+            sweep a broker with many listings.
         sync: false (default) just reads the listings back — no Notion involved.
             true also saves new ones to your Notion database, skipping those
-            already there. (The Notion layer is opt-in: sync=true here, plus
+            already there; the merged set from all URLs is de-duplicated and
+            upserted once. (The Notion layer is opt-in: sync=true here, plus
             archive_page to file a page's full content into a Notion page.)
         db_id: override the configured Notion database. Only used when sync=true.
         """
-        job = app.state.scrape.start(url, max_pages=max_pages, sync=sync, db_id=db_id)
+        job = app.state.scrape.start(urls, max_pages=max_pages, sync=sync, db_id=db_id)
         return ScrapeResult.of(job)
 
     @mcp.tool()

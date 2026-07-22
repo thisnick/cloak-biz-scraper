@@ -139,7 +139,7 @@ any behavioural change.
 and REST return identical payloads:
 
 ```
-scrape_listings(url, max_pages=1, sync=false, db_id=null) -> ScrapeResult   # async: returns a job_id
+scrape_listings(urls[], max_pages=1, sync=false, db_id=null) -> ScrapeResult  # async: one job_id for all URLs
 get_scrape_listing_results(job_id)                        -> ScrapeResult
 archive_page(url, notion_page_id)                         -> ArchiveResult   # blocks ~20s
 create_instance(profile?, country?, region?, geoip?)      -> InstanceView    # includes a CDP URL

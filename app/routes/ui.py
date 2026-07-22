@@ -25,6 +25,7 @@ from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Resp
 from fastapi.templating import Jinja2Templates
 
 from ..config import CONFIG
+from ..models import ScrapeResult
 from ..services import sessions
 from ..services.ratelimit import client_key
 from ..services.settings import Settings
@@ -382,9 +383,31 @@ async def get_run(request: Request, job_id: str) -> dict[str, Any]:
         if root.is_dir() else []
     return {
         "job_id": job.id, "status": job.status, "source": job.source,
-        "url": job.url, "pages_crawled": job.pages_crawled, "error": job.error,
+        "urls": job.urls, "pages_crawled": job.pages_crawled, "error": job.error,
         "listings": len(job.listings), "evidence": files,
     }
+
+
+@router.get("/runs/{job_id}/results")
+async def get_run_results(request: Request, job_id: str) -> ScrapeResult:
+    """The full result of one sweep, listings and all — what /runs/{job_id} only
+    counts.
+
+    Backs the Tasks-history "View" link, which opens this in a new tab as raw
+    JSON. It returns the very payload `get_scrape_listing_results` / `ScrapeResult`
+    exposes, built by the one `ScrapeResult.of` the tools use, so the dashboard
+    and an agent can never see a different answer for the same job.
+
+    Same gate and id handling as the other /runs routes: the session cookie
+    (`_require`) is the owner check on this public URL, and `jobs.get` returns
+    None for a bad-shaped id — so a `job_id` like `../settings` is a 404, never a
+    filesystem read.
+    """
+    _require(request)
+    job = request.app.state.jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="no such run")
+    return ScrapeResult.of(job)
 
 
 @router.get("/runs/{job_id}/evidence/{name:path}")
@@ -506,7 +529,7 @@ async def ui_run_sweep(
     # codes unchanged.
     try:
         request.app.state.scrape.start(
-            url.strip(), max_pages=max_pages, sync=sync, db_id=db_id.strip() or None
+            [url.strip()], max_pages=max_pages, sync=sync, db_id=db_id.strip() or None
         )
     except UnsupportedURL as exc:
         return _render(request, Result("tasks", False, str(exc)), status=422)

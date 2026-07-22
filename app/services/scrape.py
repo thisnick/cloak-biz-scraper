@@ -104,17 +104,43 @@ class ScrapeService:
         machine must be kept awake."""
         return len(self._running)
 
-    def start(self, url: str, *, max_pages: int = 1, sync: bool = False,
+    def start(self, urls: list[str], *, max_pages: int = 1, sync: bool = False,
               db_id: str | None = None) -> Job:
         """Validate, write the job down, and return without waiting for it.
 
         Everything that can be known to be wrong before the browser starts is
         decided here, so the caller gets a real error instead of a job id that
-        fails a minute later: an unreadable URL, or a sync with nowhere to sync
-        to. A job record is only created once the sweep is genuinely going to run.
+        fails a minute later: an empty list, no readable URL at all, or a sync
+        with nowhere to sync to. A job record is only created once the sweep is
+        genuinely going to run.
+
+        `urls` fan out concurrently into ONE job. A single URL that isn't a
+        supported listings page is not fatal — it is recorded as that source's
+        failure and the rest still run — so `start` only refuses the batch when
+        *nothing* in it is readable (there would be no sweep to run).
         """
-        source = sources.for_url(url)  # raises UnsupportedURL, naming what works
+        if not urls:
+            raise ValueError(
+                "scrape_listings needs at least one URL in 'urls', but the list was empty. "
+                "Pass one or more search-results (SERP) or broker-profile URLs to sweep."
+            )
         max_pages = max(1, min(int(max_pages), _MAX_PAGES_CEILING))
+
+        # Resolve each URL's adapter up front, keeping None for the unreadable
+        # ones so they can be reported per-source rather than sinking the batch.
+        targets: list[tuple[str, object | None]] = []
+        first_unsupported: sources.UnsupportedURL | None = None
+        for url in urls:
+            try:
+                targets.append((url, sources.for_url(url)))
+            except sources.UnsupportedURL as exc:
+                first_unsupported = first_unsupported or exc
+                targets.append((url, None))
+        if all(source is None for _, source in targets):
+            # Not one URL is a page we can read: there is no sweep to start, so
+            # fail loudly with the message that names what IS supported rather
+            # than mint a job that can only fail.
+            raise first_unsupported
 
         target_db = ""
         if sync:
@@ -128,14 +154,17 @@ class ScrapeService:
                     "read the listings back without saving them."
                 )
 
-        # The instruction names the job id, and the id is minted by create(), so
-        # the summary is filled in by the same write rather than a second one.
+        # The representative source for the batch (each Listing still records its
+        # own). The instruction names the job id, and the id is minted by
+        # create(), so the summary is filled in by the same write rather than a
+        # second one.
+        source_name = next(s.name for _, s in targets if s is not None)
         job = self._jobs.create(
-            source=source.name, url=url, max_pages=max_pages, sync=sync, db_id=target_db,
+            source=source_name, urls=urls, max_pages=max_pages, sync=sync, db_id=target_db,
             status="working", summary=_collect_message,
         )
 
-        task = asyncio.create_task(self._run(job, source))
+        task = asyncio.create_task(self._run(job, targets))
         self._running.add(task)
         task.add_done_callback(self._running.discard)
         return job
@@ -162,72 +191,122 @@ class ScrapeService:
             self._past_gate -= 1
             self._gate.notify_all()
 
-    async def _run(self, job: Job, source) -> None:
-        # Make the wait visible before blocking on it. Everything from here to
-        # the moment a browser is in hand is a queue: first the admission gate
-        # (task_budget), then the instance-manager slot wait inside launch. The
-        # status is still "working", but the summary now says *why* nothing has
-        # happened yet — a full pool, not a stuck sweep. Saved so a poll sees it.
-        job.summary = _WAITING_SUMMARY
-        self._jobs.save(job)
-        # Admission first: a sweep leases its profile only once it is past the
-        # gate, capping minted profiles at task_budget under any concurrency.
-        await self._enter_gate()
-        try:
-            res = await self._sweep(job, source)
-            listings: list[Listing] = res.get("data", {}).get("listings", [])
-            job.pages_crawled = res.get("data", {}).get("pages_crawled", 0)
-            job.listings = listings
+    async def _run(self, job: Job, targets: list[tuple[str, object | None]]) -> None:
+        # Fan the URLs out concurrently, but never past the pool's task budget.
+        # Two bounds hold at once: a per-job Semaphore(task_budget) — the ported
+        # run_targets pattern — caps how many of THIS job's sources are in flight,
+        # and the shared admission gate (also task_budget) caps concurrent task
+        # browsers across EVERY job. Each source enters the gate and leases its
+        # own task profile independently, so the profile pool still mints at most
+        # task_budget identities no matter how many URLs or jobs pile up.
+        total = len(targets)
+        prog = _RunProgress(self._jobs, job, total)
+        # Make the wait visible before blocking on it: until a browser is in hand
+        # the job is queued (the gate, then the slot wait inside launch), and the
+        # summary says so — a full pool, not a stuck sweep. Status stays "working".
+        prog.render()
+        parallel = max(1, self._settings.load().task_budget)
+        sem = asyncio.Semaphore(parallel)
 
-            if res.get("blocked"):
+        async def worker(i: int, url: str, source) -> dict:
+            async with sem:
+                return await self._sweep_url(job, i, url, source, prog)
+
+        try:
+            outcomes = await asyncio.gather(
+                *(worker(i, url, source) for i, (url, source) in enumerate(targets))
+            )
+            listings, pages, ok, failures = self._merge(targets, outcomes)
+            job.listings = listings
+            job.pages_crawled = pages
+            if ok == 0:
+                # Every source failed — only now is the whole job a failure.
                 job.status = "failed"
-                job.error = (
-                    f"{urlparse(job.url).hostname} served an anti-bot page instead of "
-                    f"results on every attempt, each from a different exit IP. This "
-                    f"usually clears on its own — try again in a few minutes."
-                )
-                job.summary = "Blocked by the site."
-            elif res.get("error"):
-                job.status = "failed"
-                job.error = res["error"]
-                job.summary = "Sweep failed."
+                job.error = self._failure_text(failures, total)
+                job.summary = f"All {total} source(s) failed."
             else:
                 job.status = "completed"
                 if job.sync:
+                    # Dedupe+upsert the MERGED set ONCE, not per source.
                     job.synced = await self._sync(job, listings)
-                job.summary = self._summarize(job)
+                if failures:
+                    job.error = self._failure_text(failures, total)
+                job.summary = self._summarize(job, ok, total, failures)
         except Exception as exc:  # noqa: BLE001 — the job must record its own failure
             logger.exception("sweep %s failed", job.id)
             job.status = "failed"
             job.error = str(exc)
             job.summary = "Sweep failed."
         finally:
-            # Return the task profile on every path — success, block, error, or
-            # cancel — so a crashed sweep never leaks a lease and pins a profile
-            # as busy forever. Released even if the launch itself failed, since
-            # acquire happens before scrape_with_retry inside _sweep. Idempotent,
-            # so a sweep that never acquired (stubbed _sweep) is a safe no-op.
-            if self._task_profiles is not None:
-                self._task_profiles.release(job.id)
             self._jobs.save(job)
-            logger.info("job %s -> %s (%d listings)", job.id, job.status, len(job.listings))
-            # Leave the gate last, and shielded, so the slot is returned even if
-            # this sweep is cancelled during shutdown — the job is already saved,
-            # so a queued sweep can take the freed slot.
-            await asyncio.shield(self._leave_gate())
-
-    def _summarize(self, job: Job) -> str:
-        pages = f"{job.pages_crawled} page{'s' if job.pages_crawled != 1 else ''}"
-        head = f"Found {len(job.listings)} listing(s) across {pages}."
-        if job.synced is None:
-            return f"{head} Nothing was saved (sync=false)."
-        out = f"{head} Saved {job.synced.new} new, {job.synced.existing} already known."
-        if job.synced.skipped:
-            out += (
-                f" These columns could not be filled: {', '.join(job.synced.skipped)}"
-                f" — see Settings for why."
+            logger.info(
+                "job %s -> %s (%d listings across %d source(s))",
+                job.id, job.status, len(job.listings), total,
             )
-        return out
+
+    def _merge(self, targets, outcomes) -> tuple[list[Listing], int, int, list[tuple[str, str]]]:
+        """Fold every source's outcome into one deduped result.
+
+        Returns (merged listings, total pages crawled, count of sources that
+        succeeded, list of (url, reason) for the ones that failed). Dedupe uses
+        the same identity the rest of the system does — listing_id, then
+        normalized_url — so the same listing surfacing on two SERP pages, or on
+        two of the swept URLs, is counted once.
+        """
+        listings: list[Listing] = []
+        seen: set[str] = set()
+        pages = 0
+        ok = 0
+        failures: list[tuple[str, str]] = []
+        for (url, _source), res in zip(targets, outcomes):
+            data = res.get("data") or {}
+            pages += data.get("pages_crawled", 0) or 0
+            if res.get("blocked"):
+                failures.append((url, "blocked"))
+                continue
+            if res.get("error"):
+                failures.append((url, res["error"]))
+                continue
+            ok += 1
+            for listing in data.get("listings", []):
+                key = listing.listing_id or listing.normalized_url or listing.url
+                if key and key in seen:
+                    continue
+                if key:
+                    seen.add(key)
+                listings.append(listing)
+        return listings, pages, ok, failures
+
+    def _failure_text(self, failures: list[tuple[str, str]], total: int) -> str:
+        bits = []
+        for url, reason in failures:
+            host = urlparse(url).hostname or url
+            bits.append(f"{host} ({'blocked by the site' if reason == 'blocked' else reason})")
+        text = f"{len(failures)} of {total} source(s) failed: " + "; ".join(bits) + "."
+        if any(reason == "blocked" for _, reason in failures):
+            text += (
+                " A blocked source served an anti-bot page instead of results, each attempt "
+                "from a different exit IP. This usually clears on its own — try again in a "
+                "few minutes."
+            )
+        return text
+
+    def _summarize(self, job: Job, ok: int, total: int, failures: list[tuple[str, str]]) -> str:
+        pages = f"{job.pages_crawled} page{'s' if job.pages_crawled != 1 else ''}"
+        parts = [f"{ok} of {total} source(s) swept · {len(job.listings)} listing(s) across {pages}"]
+        if job.synced is None:
+            parts.append("Nothing was saved (sync=false)")
+        else:
+            seg = f"Saved {job.synced.new} new, {job.synced.existing} already known"
+            if job.synced.skipped:
+                seg += (
+                    f"; these columns could not be filled: {', '.join(job.synced.skipped)}"
+                    f" — see Settings for why"
+                )
+            parts.append(seg)
+        if failures:
+            parts.append(f"{len(failures)} source(s) failed")
+        return " · ".join(parts)
 
     async def _sync(self, job: Job, listings: list[Listing]) -> SyncResult:
         settings = self._settings.load()
@@ -245,45 +324,92 @@ class ScrapeService:
             skipped=result.skipped_names,
         )
 
-    async def _sweep(self, job: Job, source) -> dict:
-        evidence = CONFIG.evidence_dir / job.id
-        # Lease a pooled task-N identity for this sweep. Bounded and reused across
-        # sweeps, so profiles no longer accumulate one-per-URL on the volume. The
-        # lease is returned in _run's finally, so acquiring here (before any launch)
-        # means even a launch failure releases it. Two concurrent sweeps can never
-        # get the same profile — the pool is the sole lease authority — so they
-        # cannot collide on Chromium's singleton lock.
-        profile = self._task_profiles.acquire(job.id)
+    def _evidence_dir(self, job: Job, i: int) -> Path:
+        """Where source `i`'s screenshots and snapshots land.
+
+        Namespaced per source under the job's own directory so two URLs swept
+        into one job never overwrite each other's captures. The job-level
+        directory (CONFIG.evidence_dir / job.id) still holds all of them, so the
+        /runs listing and ScrapeResult.evidence_dir are unchanged.
+        """
+        return CONFIG.evidence_dir / job.id / f"source-{i + 1:02d}"
+
+    async def _sweep_url(self, job: Job, i: int, url: str, source, prog: "_RunProgress") -> dict:
+        """Sweep one URL. Never raises: a single source failing is recorded and
+        returned so the batch (see _run's gather) survives it.
+
+        The gate is entered here and left in `finally`, so each concurrent source
+        holds exactly one admission slot for its lifetime — the same capacity
+        ceiling the single-sweep path had, applied per source.
+        """
+        if source is None:
+            # An unreadable URL never reaches the pool or the gate; it is simply
+            # this source's failure.
+            prog.mark_done(i)
+            return {
+                "url": url, "blocked": False,
+                "error": f"not a supported listings page: {url}",
+                "data": {"listings": [], "pages_crawled": 0},
+            }
+        # Admission first: a source leases its profile only once it is past the
+        # gate, capping minted profiles at task_budget under any concurrency.
+        await self._enter_gate()
+        try:
+            res = await self._sweep(job, i, url, source, prog)
+        except Exception as exc:  # noqa: BLE001 — one source failing must not kill the batch
+            logger.warning("source %s in job %s failed: %s", url, job.id, exc)
+            res = {"blocked": False, "error": str(exc),
+                   "data": {"listings": [], "pages_crawled": 0}}
+        finally:
+            prog.mark_done(i)
+            # Leave the gate last, and shielded, so the slot is returned even if
+            # this source is cancelled during shutdown — a queued source can then
+            # take the freed slot.
+            await asyncio.shield(self._leave_gate())
+        res["url"] = url
+        return res
+
+    async def _sweep(self, job: Job, i: int, url: str, source, prog: "_RunProgress") -> dict:
+        evidence = self._evidence_dir(job, i)
+        # Lease a pooled task-N identity for this source, keyed per source so one
+        # source releasing its lease never frees another's. Bounded and reused
+        # across sweeps, so profiles no longer accumulate one-per-URL on the
+        # volume. The lease is returned in the finally, so acquiring here (before
+        # any launch) means even a launch failure releases it. Two concurrent
+        # sources can never get the same profile — the pool is the sole lease
+        # authority — so they cannot collide on Chromium's singleton lock.
+        lease_key = f"{job.id}:{i}"
+        profile = self._task_profiles.acquire(lease_key)
 
         def on_launch(_inst) -> None:
-            # The slot wait is over — a browser is in hand and scraping is about
-            # to start. Flip the queued summary to a working one, but only while
-            # it still reads "waiting" so a retry's relaunch never clobbers a
-            # later, more specific summary. Save so the next poll reflects it.
-            if job.summary == _WAITING_SUMMARY:
-                job.summary = _SCRAPING_SUMMARY
-                self._jobs.save(job)
+            # The slot wait is over for this source — a browser is in hand and
+            # scraping is about to start. Advance the aggregate progress summary.
+            prog.mark_sweeping(i)
 
-        return await scrape_with_retry(
-            self._instances,
-            profile=profile,
-            owner=f"job:{job.id}",
-            wait_ms=_WAIT_MS,
-            attempts=_ATTEMPTS,
-            warmup_url=getattr(source, "warmup_url", None),
-            scrape_once=lambda inst, page: self._sweep_once(inst, page, job, source, evidence),
-            on_launch=on_launch,
-        )
+        try:
+            return await scrape_with_retry(
+                self._instances,
+                profile=profile,
+                owner=f"job:{job.id}",
+                wait_ms=_WAIT_MS,
+                attempts=_ATTEMPTS,
+                warmup_url=getattr(source, "warmup_url", None),
+                scrape_once=lambda inst, page: self._sweep_once(inst, page, job, url, source, evidence),
+                on_launch=on_launch,
+            )
+        finally:
+            if self._task_profiles is not None:
+                self._task_profiles.release(lease_key)
 
-    async def _sweep_once(self, inst, page, job: Job, source, evidence: Path) -> dict:
+    async def _sweep_once(self, inst, page, job: Job, url: str, source, evidence: Path) -> dict:
         listings: list[Listing] = []
         seen: set[str] = set()
         pages_done = 0
 
         for n in range(1, job.max_pages + 1):
             inst.touch()
-            url = source.page_url(job.url, n)
-            await page.goto(url, wait_until="domcontentloaded", timeout=120_000)
+            target = source.page_url(url, n)
+            await page.goto(target, wait_until="domcontentloaded", timeout=120_000)
             await page.wait_for_timeout(_WAIT_MS)
             await gesture(page)
 
@@ -291,7 +417,7 @@ class ScrapeService:
             pages_done += 1
             if result.blocked or text_contains_blocker(result.title):
                 await capture(page, evidence / f"page-{n:02d}-blocked",
-                              {"url": url, "reason": "blocked", "proxy_ip": inst.proxy_ip})
+                              {"url": target, "reason": "blocked", "proxy_ip": inst.proxy_ip})
                 return {"blocked": True, "error": None,
                         "data": {"listings": listings, "pages_crawled": pages_done}}
 
@@ -310,10 +436,55 @@ class ScrapeService:
                 break
 
         await capture(page, evidence / "final",
-                      {"url": job.url, "reason": "success", "found": len(listings),
+                      {"url": url, "reason": "success", "found": len(listings),
                        "pages_crawled": pages_done, "proxy_ip": inst.proxy_ip})
         return {"blocked": False, "error": None,
                 "data": {"listings": listings, "pages_crawled": pages_done}}
+
+
+class _RunProgress:
+    """The aggregate job's live summary while its sources fan out.
+
+    A multi-URL job's status stays "working" until every source is done, but the
+    summary should say *what* is happening: queued behind a full pool, or sweeping
+    N sources with M finished. It is recomputed from counters on each source's
+    transition (all in the one event loop, so no lock is needed) and only while
+    the job is still working — the final summary is _run's to write.
+
+    For a single-source job the text collapses to the exact strings the
+    single-sweep path shipped (`_WAITING_SUMMARY` / `_SCRAPING_SUMMARY`), so that
+    UX is unchanged.
+    """
+
+    def __init__(self, jobs: JobStore, job: Job, total: int) -> None:
+        self._jobs = jobs
+        self._job = job
+        self._total = total
+        self._sweeping: set[int] = set()
+        self._done: set[int] = set()
+
+    def render(self) -> None:
+        if self._job.status != "working":
+            return
+        sweeping, done, total = len(self._sweeping), len(self._done), self._total
+        if not sweeping and not done:
+            summary = _WAITING_SUMMARY
+        elif total == 1:
+            summary = _SCRAPING_SUMMARY
+        else:
+            summary = f"Sweeping {total} sources… ({done} of {total} done)"
+        self._job.summary = summary
+        self._jobs.save(self._job)
+
+    def mark_sweeping(self, i: int) -> None:
+        if i not in self._sweeping and i not in self._done:
+            self._sweeping.add(i)
+            self.render()
+
+    def mark_done(self, i: int) -> None:
+        self._sweeping.discard(i)
+        self._done.add(i)
+        self.render()
 
 
 def _default_store(settings) -> ListingStore:

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .config import CONFIG
 
@@ -58,12 +58,19 @@ class SyncResult(BaseModel):
 
 
 class Job(BaseModel):
-    """A sweep, as persisted to the volume. See services/jobs.py."""
+    """A sweep, as persisted to the volume. See services/jobs.py.
+
+    A sweep now spans one *or more* source URLs (a multi-URL fan-out that lands
+    in one job), so the target is `urls`, a list. `source` is the representative
+    adapter name for the batch — every URL in v1 is BizBuySell, and each Listing
+    still carries its own `source`, so nothing downstream depends on this being
+    a single value.
+    """
 
     id: str
     status: str = "working"  # working | completed | failed
     source: str = ""
-    url: str = ""
+    urls: list[str] = Field(default_factory=list)
     max_pages: int = 1
     sync: bool = False
     db_id: str = ""
@@ -77,6 +84,21 @@ class Job(BaseModel):
     boot_id: str = ""
     created_at: float = 0.0
     updated_at: float = 0.0
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_single_url(cls, data):
+        """Read a legacy single `url` into `urls`.
+
+        Jobs written before the multi-URL change carry a scalar `url` on the
+        volume, and some callers still pass `url=`. Fold either into the list so
+        an old job loads without losing its target and there is one field to read
+        from here on. A present `urls` always wins.
+        """
+        if isinstance(data, dict) and "urls" not in data and "url" in data:
+            single = data.get("url")
+            data = {**data, "urls": [single] if single else []}
+        return data
 
 
 class ScrapeResult(BaseModel):

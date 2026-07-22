@@ -980,6 +980,74 @@ class TestRunEvidenceIsReachableButNotPublic:
         assert auth.get("/runs/not-a-real-job-id").status_code == 404
 
 
+class TestRunResultsEndpoint:
+    """`/runs/{job_id}/results` renders the full sweep result — the actual
+    listings, not the count `/runs/{job_id}` exposes — behind the same cookie
+    gate, so the Tasks-history "View" link can open it as raw JSON.
+    """
+
+    def _job_with_listings(self):
+        from app.models import Listing
+
+        return app.state.jobs.create(
+            urls=["https://www.bizbuysell.com/x-businesses-for-sale/"],
+            source="bizbuysell_serp", status="completed", pages_crawled=2,
+            summary="1 of 1 source(s) swept · 1 listing(s) across 2 pages · Nothing was saved (sync=false).",
+            listings=[Listing(listing_id="2453593", url="https://x/1", normalized_url="x/1",
+                              title="Remodeling Contractor", asking_price="$965,000",
+                              source="bizbuysell_serp")],
+        )
+
+    def test_it_returns_the_actual_listings_not_a_count(self, auth):
+        job = self._job_with_listings()
+        r = auth.get(f"/runs/{job.id}/results")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["job_id"] == job.id
+        assert body["status"] == "completed"
+        # The whole point: the listings themselves, with their fields — /runs/{id}
+        # returns only len(listings).
+        assert isinstance(body["listings"], list) and len(body["listings"]) == 1
+        assert body["listings"][0]["listing_id"] == "2453593"
+        assert body["listings"][0]["asking_price"] == "$965,000"
+
+    def test_it_matches_the_scraperesult_shape(self, auth):
+        """It is the same ScrapeResult the tools return, built by ScrapeResult.of,
+        so the same keys are present."""
+        job = self._job_with_listings()
+        body = auth.get(f"/runs/{job.id}/results").json()
+        assert set(body) >= {
+            "job_id", "status", "source", "summary", "pages_crawled",
+            "error", "synced", "listings", "evidence_dir",
+        }
+        assert body["evidence_dir"].endswith(job.id)
+
+    def test_an_unknown_job_is_404(self, auth):
+        assert auth.get("/runs/deadbeef0000/results").status_code == 404
+
+    def test_a_traversal_id_never_reaches_the_filesystem(self, auth):
+        # jobs.get returns None for a non-alnum id, so "../settings" is a 404, not
+        # a read off the volume.
+        assert auth.get("/runs/../settings/results").status_code == 404
+        assert auth.get("/runs/not-a-real-job/results").status_code == 404
+
+    def test_signed_out_gets_nothing(self, client):
+        """The cookie gate: a real job's results are not served to a logged-out
+        caller (redirected to login), and no listing data leaks. The job is
+        written directly (no HTTP), so the `client` here is genuinely signed out."""
+        job = self._job_with_listings()
+        r = client.get(f"/runs/{job.id}/results", follow_redirects=False)
+        assert r.status_code != 200
+        assert b"2453593" not in r.content
+
+    def test_the_view_link_is_in_the_tasks_history(self, auth):
+        """The dashboard offers the link, opening in a new tab."""
+        job = self._job_with_listings()
+        page = auth.get("/").text
+        assert f'href="/runs/{job.id}/results"' in page
+        assert 'target="_blank"' in page and 'rel="noopener"' in page
+
+
 class TestSessionsControls:
     """The full-control actions on the dashboard: new instance, run sweep, close.
 

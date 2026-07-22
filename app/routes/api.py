@@ -55,7 +55,7 @@ router = APIRouter(prefix="/api")
 
 
 class ScrapeRequest(BaseModel):
-    url: str
+    urls: list[str]
     max_pages: int = 1
     sync: bool = False
     db_id: str | None = None
@@ -95,12 +95,17 @@ def _subject(request: Request) -> str:
 
 @router.post("/scrape", response_model=ScrapeResult)
 async def scrape_listings(request: Request, body: ScrapeRequest) -> ScrapeResult:
-    """Start a sweep. Returns immediately; collect with GET /api/scrape/{job_id}."""
+    """Start a sweep over one or more URLs. Returns immediately; collect the
+    merged result with GET /api/scrape/{job_id}."""
     try:
         job = request.app.state.scrape.start(
-            body.url, max_pages=body.max_pages, sync=body.sync, db_id=body.db_id
+            body.urls, max_pages=body.max_pages, sync=body.sync, db_id=body.db_id
         )
     except UnsupportedURL as exc:
+        # UnsupportedURL is a ValueError subclass, so it must be caught before the
+        # generic ValueError (empty list) below.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except NotionNotConfigured as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
