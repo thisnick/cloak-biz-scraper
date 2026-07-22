@@ -90,17 +90,27 @@ _WARM_TIMEOUT = 8.0
 # element) carries a different message, is not matched here, and is surfaced on
 # the first attempt. A truly dead instance keeps matching, so it fails fast after
 # the bound with its own clear message rather than hanging.
+#
+# Every marker is a fixed prefix the agent-browser CLI itself emits, NOT a bare
+# phrase that could ride in on echoed caller input. That distinction matters
+# because the match is against combined stdout+stderr, which includes the CLI's
+# echo of the selector/URL: a bare "connection refused" / "econnrefused" would
+# match a REAL, permanent command error whose text merely contains those words —
+# e.g. `click "text=Connection refused"` -> "Element not found: text=Connection
+# refused" (a mutating verb, re-executed on every retry), or a navigate to a URL
+# containing "econnrefused" that fails DNS. The real Unix/Docker daemon-socket
+# refusal is "Failed to connect: Connection refused (os error 111)", already
+# caught by the "failed to connect:" prefix — so no transient coverage is lost.
 _TRANSIENT_MARKERS = (
     "failed to connect via cdp",   # the daemon's connectOverCDP raced the browser
     "cdp connection failed",       # the CLI's fallback text for the same
     "make sure the app is running with --remote-debugging-port",
     "daemon failed to start",      # daemon socket not ready within the CLI's own poll
     "failed to start daemon",
-    "failed to connect:",          # client -> daemon socket (ECONNREFUSED / ENOENT)
+    "failed to connect:",          # client -> daemon socket, e.g. "Connection refused
+                                   #   (os error 111)" or "No such file or directory"
     "failed to send:",             # daemon died mid-handshake
     "failed to read:",
-    "econnrefused",
-    "connection refused",
 )
 _RETRY_ATTEMPTS = 3            # 1 initial try + 2 retries
 _RETRY_BACKOFF = (0.3, 0.7)   # seconds to wait before retry 2 and retry 3

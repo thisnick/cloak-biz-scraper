@@ -443,6 +443,61 @@ class TestFirstCallRetry:
         assert "did not respond" in out.output
         assert len(runs) == 1, "a timeout must fail fast, not retry"
 
+    @pytest.mark.asyncio
+    async def test_a_real_error_whose_text_contains_connection_refused_is_not_retried(self, monkeypatch):
+        """The markers must be CLI-emitted prefixes, not bare phrases that ride in
+        on echoed caller input. A missing element whose selector literally says
+        'Connection refused' is a genuine, permanent error — and `click` mutates,
+        so a wrong retry would re-execute the action. It must run exactly once."""
+        import asyncio
+        spy, calls = _fake_exec_sequence([
+            (1, b"", b"Element not found: text=Connection refused"),
+        ])
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", spy)
+        svc = AgentBrowserService(_FakeInstances(_FakeInst()))
+
+        out = await svc.drive("i1", 'click "text=Connection refused"', subject=OWNER)
+
+        assert out.ok is False
+        assert "Element not found" in out.output
+        assert len(calls) == 1, "a real error echoing 'Connection refused' was retried"
+
+    @pytest.mark.asyncio
+    async def test_a_dns_failure_on_a_url_containing_econnrefused_is_not_retried(self, monkeypatch):
+        """A permanent DNS failure whose echoed URL contains 'econnrefused' must
+        not be mistaken for the socket-level ECONNREFUSED transient."""
+        import asyncio
+        spy, calls = _fake_exec_sequence([
+            (1, b"", b"net::ERR_NAME_NOT_RESOLVED at https://econnrefused.example.com/"),
+        ])
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", spy)
+        svc = AgentBrowserService(_FakeInstances(_FakeInst()))
+
+        out = await svc.drive("i1", "navigate https://econnrefused.example.com/", subject=OWNER)
+
+        assert out.ok is False
+        assert "ERR_NAME_NOT_RESOLVED" in out.output
+        assert len(calls) == 1, "a real DNS error echoing 'econnrefused' was retried"
+
+    @pytest.mark.asyncio
+    async def test_the_real_daemon_socket_refusal_is_still_retried(self, monkeypatch):
+        """The genuine Unix/Docker socket refusal — 'Failed to connect: Connection
+        refused (os error 111)' — must STILL be caught, via the 'failed to
+        connect:' prefix, after dropping the two bare markers."""
+        import asyncio
+        spy, calls = _fake_exec_sequence([
+            (1, b"", b"\xe2\x9c\x97 Failed to connect: Connection refused (os error 111)"),
+            (0, b"https://example.com", b""),
+        ])
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", spy)
+        svc = AgentBrowserService(_FakeInstances(_FakeInst()))
+
+        out = await svc.drive("i1", "get url", subject=OWNER)
+
+        assert out.ok is True
+        assert out.output == "https://example.com"
+        assert len(calls) == 2, "the real socket-refusal transient was not retried"
+
 
 class TestWarmOnCreate:
     """create_instance warms the daemon so the first command doesn't race it."""
