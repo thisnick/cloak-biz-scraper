@@ -24,10 +24,13 @@ from .crypto import Cipher
 
 logger = logging.getLogger("cloakbiz.settings")
 
-# Above this we warn and still obey. The ceiling here is cost, not memory —
-# Railway's Hobby plan allows 48 GB per service, so a pool of 12 fits fine and
-# simply bills more. A cap we invented would be us guessing at someone else's
-# budget; a warning tells them what they are choosing and lets them choose it.
+# Fallback threshold, used only when the container's real memory ceiling cannot
+# be read (see capacity.py / pool_warning): above this we warn and still obey.
+# The ceiling here is cost, not memory — Railway's Hobby plan allows 48 GB per
+# service, so a pool of 12 fits fine and simply bills more. A cap we invented
+# would be us guessing at someone else's budget; a warning tells them what they
+# are choosing and lets them choose it. When the memory limit *is* readable,
+# pool_warning ignores this and warns against the detected safe count instead.
 POOL_WARN_ABOVE = 8
 
 
@@ -130,7 +133,39 @@ class Settings(BaseModel):
         return max(1, self.max_instances - self.interactive_reserve)
 
     def pool_warning(self) -> str | None:
-        """Advice for an unusually large pool, or None. Never a refusal."""
+        """Advice for a pool larger than the container can run, or None.
+
+        The warning is measured, not a magic number: it reads the container's
+        real memory ceiling and warns only when ``max_instances`` exceeds what
+        that ceiling can actually run (see services/capacity.py). It stays a
+        WARNING, never a refusal — the estimate is heuristic and the user may
+        know their container better than we do — but it is specific enough to
+        act on. When the ceiling cannot be read (e.g. off a Linux container) it
+        falls back to the old cost-only threshold rather than guessing.
+        """
+        from .capacity import PER_BROWSER_GB, detect_capacity
+
+        cap = detect_capacity()
+        safe = cap.recommended_max_browsers()
+        if safe is None:
+            return self._legacy_pool_warning()
+        if self.max_instances <= safe:
+            return None
+        gb = cap.memory_limit_gb
+        return (
+            f"max_instances is {self.max_instances}, but this container is sized for "
+            f"about {safe} browser(s) — roughly {gb:.1f} GB of memory, budgeting "
+            f"~{PER_BROWSER_GB:.0f} GB per browser. Each browser is a full CloakBrowser "
+            f"plus its own virtual display, so running more than the memory allows fails "
+            f"two ways: under load the renderers run out of memory and pages crash "
+            f"mid-sweep (\"Page crashed\"), and a launch past the process/thread ceiling "
+            f"fails at the OS with \"Resource temporarily unavailable\" (pthread_create / "
+            f"EAGAIN). Either lower max_instances to about {safe}, or give the container "
+            f"more memory. (This is guidance, not a cap — the setting is obeyed as typed.)"
+        )
+
+    def _legacy_pool_warning(self) -> str | None:
+        """The pre-capacity cost-only warning, used when limits are unreadable."""
         if self.max_instances <= POOL_WARN_ABOVE:
             return None
         return (

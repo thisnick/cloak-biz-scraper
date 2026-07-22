@@ -143,6 +143,49 @@ class TestPoolBudget:
         assert Settings(max_instances=4, interactive_reserve=0).task_budget == 4
 
 
+class TestPoolWarning:
+    """The warning is measured against the container's detected memory, not a
+    magic number. capacity.detect_capacity is patched so these are deterministic
+    off a container."""
+
+    def _detect(self, monkeypatch, bytes_):
+        import app.services.capacity as capacity
+
+        monkeypatch.setattr(
+            capacity, "detect_capacity",
+            lambda **kw: capacity.Capacity(memory_limit_bytes=bytes_),
+        )
+
+    def test_silent_when_pool_fits_detected_capacity(self, monkeypatch):
+        self._detect(monkeypatch, 8 * 1024 ** 3)  # ~8 safe
+        assert Settings(max_instances=4).pool_warning() is None
+        assert Settings(max_instances=8).pool_warning() is None
+
+    def test_default_is_quiet_on_the_reference_container(self, monkeypatch):
+        # A 4 GB box recommends 4; the shipped default (max=4) must not nag.
+        self._detect(monkeypatch, 4 * 1024 ** 3)
+        assert Settings().pool_warning() is None
+
+    def test_warns_when_pool_exceeds_detected_capacity(self, monkeypatch):
+        self._detect(monkeypatch, 4 * 1024 ** 3)  # safe ~4
+        warning = Settings(max_instances=8, interactive_reserve=1).pool_warning()
+        assert warning is not None
+        # Specific and actionable: names the detected memory and the safe count,
+        # both failure modes, and both fixes.
+        assert "8" in warning and "4" in warning
+        assert "Page crashed" in warning
+        assert "Resource temporarily unavailable" in warning or "pthread" in warning
+        assert "lower max_instances" in warning
+        assert "more memory" in warning
+
+    def test_falls_back_to_cost_threshold_when_limits_unreadable(self, monkeypatch):
+        self._detect(monkeypatch, None)  # nothing detected
+        # Old behaviour: warns only above the cost threshold, and obeys either way.
+        assert Settings(max_instances=6).pool_warning() is None
+        legacy = Settings(max_instances=12).pool_warning()
+        assert legacy is not None and "browsers is a lot" in legacy
+
+
 class TestProxyConfigured:
     def test_false_when_empty(self):
         assert not Settings().proxy_configured()

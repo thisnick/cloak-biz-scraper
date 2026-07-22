@@ -16,7 +16,12 @@ import pytest
 from app.models import Listing
 from app.services.jobs import JobStore
 from app.services.profiles import ProfileStore
-from app.services.scrape import NotionNotConfigured, ScrapeService
+from app.services.scrape import (
+    _SCRAPING_SUMMARY,
+    _WAITING_SUMMARY,
+    NotionNotConfigured,
+    ScrapeService,
+)
 from app.services.settings import SettingsService
 from app.services.task_profiles import TaskProfilePool
 from app.sources import UnsupportedURL
@@ -328,6 +333,62 @@ class TestTaskProfiles:
         await _drain(svc)
         final = sorted(p.name for p in profiles.all() if p.name.startswith("task-"))
         assert final == ["task-1", "task-2", "task-3"], "ten sweeps, three profiles"
+
+
+class TestWaitingSummary:
+    """A sweep blocked behind a full pool must say so. The status stays
+    'working' (consumers unchanged), but the summary distinguishes 'queued' from
+    'scraping' — otherwise a full pool looks identical to a stuck sweep."""
+
+    def _pooled(self, settings, jobs, monkeypatch, tmp_path, retry):
+        monkeypatch.setattr("app.services.scrape.scrape_with_retry", retry)
+        profiles = ProfileStore(tmp_path / "profiles")
+        pool = TaskProfilePool(profiles, settings)
+        svc = ScrapeService(instances=object(), jobs=jobs, settings=settings,
+                            store_factory=FakeStore, task_profiles=pool)
+        return svc
+
+    @pytest.mark.asyncio
+    async def test_queued_sweep_shows_waiting_and_running_sweep_shows_scraping(
+        self, settings, jobs, monkeypatch, tmp_path,
+    ):
+        # task_budget = 1: only one sweep past the gate at a time, so a second
+        # start() queues behind it.
+        settings.update(max_instances=2, interactive_reserve=1)
+        assert settings.load().task_budget == 1
+
+        release = asyncio.Event()
+        launched = asyncio.Event()
+
+        class _Inst:
+            id = "inst"
+            proxy_ip = None
+
+        async def retry(instances, *, profile, on_launch=None, **kw):
+            # A browser is in hand — clear the "waiting" summary, then park so the
+            # gate stays occupied while we inspect the queued sweep.
+            on_launch(_Inst())
+            launched.set()
+            await release.wait()
+            return {"blocked": False, "error": None,
+                    "data": {"listings": list(CARDS), "pages_crawled": 1}}
+
+        svc = self._pooled(settings, jobs, monkeypatch, tmp_path, retry)
+        job1 = svc.start(SERP)
+        await launched.wait()          # job1 is past the gate and scraping
+        job2 = svc.start(SERP)         # job2 must queue at the gate
+        await asyncio.sleep(0.05)      # let job2 set its summary and block
+
+        assert svc.result(job1.id).summary == _SCRAPING_SUMMARY, "running sweep: scraping"
+        assert svc.result(job2.id).summary == _WAITING_SUMMARY, "queued sweep: waiting"
+        assert svc.result(job2.id).status == "working", "still working, just queued"
+
+        release.set()
+        await _drain(svc)
+        # Once it actually runs and completes, the waiting text is gone.
+        assert svc.result(job2.id).status == "completed"
+        assert svc.result(job2.id).summary.startswith("Found")
+        assert svc.result(job1.id).summary.startswith("Found")
 
 
 class TestCollecting:

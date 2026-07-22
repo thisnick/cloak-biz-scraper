@@ -90,7 +90,13 @@ def server_info(settings, instances) -> ServerInfo:
     booleans, statuses, versions, and counts — never proxy_password,
     cloakbrowser_license_key, or notion_api_token.
     """
+    from .capacity import detect_capacity
+
     counts = instances.counts()
+    # Read the container's real ceiling so an agent/UI can see the safe pool
+    # size next to the configured one. None off a Linux container — omitted, not
+    # faked. No secret: a byte count and a browser count only.
+    recommended_max = detect_capacity().recommended_max_browsers()
 
     proxy_configured = settings.proxy_configured()
     return ServerInfo(
@@ -108,6 +114,7 @@ def server_info(settings, instances) -> ServerInfo:
             max=counts["max"],
             reserved=counts["reserve"],
             in_use=counts["total"],
+            recommended_max=recommended_max,
         ),
         notion=NotionInfo(connected=settings.notion_configured()),
     )

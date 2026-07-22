@@ -292,6 +292,13 @@ class PoolInfo(BaseModel):
     max: int = Field(description="Most browsers that may run at once.")
     reserved: int = Field(description="Slots kept for interactive (agent/human) use.")
     in_use: int = Field(description="Browsers running right now.")
+    recommended_max: int | None = Field(
+        default=None,
+        description="Most browsers this container's detected memory can safely run, or "
+                    "null when the limit could not be read. If 'max' exceeds this, launches "
+                    "may fail under load ('Page crashed') or at the OS ('Resource "
+                    "temporarily unavailable').",
+    )
 
 
 class NotionInfo(BaseModel):

@@ -37,6 +37,15 @@ _WAIT_MS = 12_000
 _ATTEMPTS = 3
 _MAX_PAGES_CEILING = 20
 
+# The summary shown while a sweep is admitted but BLOCKED waiting for capacity —
+# either at the admission gate (task_budget) or at the instance-manager slot
+# wait inside launch. The status stays "working" (so get_scrape_listing_results
+# consumers are unaffected), but the summary distinguishes "queued behind a full
+# pool" from "actively scraping", which is otherwise an opaque wait. Cleared the
+# moment the browser is obtained (see _sweep's on_launch).
+_WAITING_SUMMARY = "Waiting for a free browser slot…"
+_SCRAPING_SUMMARY = "Sweeping the search results…"
+
 
 class NotionNotConfigured(RuntimeError):
     """sync=true was asked for without a database to sync into."""
@@ -154,6 +163,13 @@ class ScrapeService:
             self._gate.notify_all()
 
     async def _run(self, job: Job, source) -> None:
+        # Make the wait visible before blocking on it. Everything from here to
+        # the moment a browser is in hand is a queue: first the admission gate
+        # (task_budget), then the instance-manager slot wait inside launch. The
+        # status is still "working", but the summary now says *why* nothing has
+        # happened yet — a full pool, not a stuck sweep. Saved so a poll sees it.
+        job.summary = _WAITING_SUMMARY
+        self._jobs.save(job)
         # Admission first: a sweep leases its profile only once it is past the
         # gate, capping minted profiles at task_budget under any concurrency.
         await self._enter_gate()
@@ -238,6 +254,16 @@ class ScrapeService:
         # get the same profile — the pool is the sole lease authority — so they
         # cannot collide on Chromium's singleton lock.
         profile = self._task_profiles.acquire(job.id)
+
+        def on_launch(_inst) -> None:
+            # The slot wait is over — a browser is in hand and scraping is about
+            # to start. Flip the queued summary to a working one, but only while
+            # it still reads "waiting" so a retry's relaunch never clobbers a
+            # later, more specific summary. Save so the next poll reflects it.
+            if job.summary == _WAITING_SUMMARY:
+                job.summary = _SCRAPING_SUMMARY
+                self._jobs.save(job)
+
         return await scrape_with_retry(
             self._instances,
             profile=profile,
@@ -246,6 +272,7 @@ class ScrapeService:
             attempts=_ATTEMPTS,
             warmup_url=getattr(source, "warmup_url", None),
             scrape_once=lambda inst, page: self._sweep_once(inst, page, job, source, evidence),
+            on_launch=on_launch,
         )
 
     async def _sweep_once(self, inst, page, job: Job, source, evidence: Path) -> dict:
