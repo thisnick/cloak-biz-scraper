@@ -78,7 +78,7 @@ https://your-server.up.railway.app/mcp
 Your assistant registers itself and sends you to your own login page; paste `APP_SECRET`,
 approve, and the tools appear.
 
-**ChatGPT** — **Settings → Integrations → Plugins** → the **MCPs** tab → **Add Server** →
+**ChatGPT (work)** — **Settings → Integrations → Plugins** → the **MCPs** tab → **Add Server** →
 give it a name, choose **Streamable HTTP**, paste the link → **Save** → click the
 **Authenticate** button that appears and enter your `APP_SECRET`.
 
