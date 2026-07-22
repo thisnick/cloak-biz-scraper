@@ -37,7 +37,7 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Awaitable, Callable, Literal
 
 from ..config import CONFIG
 from . import geo
@@ -185,6 +185,20 @@ class InstanceManager:
         # the only honest source for public-vs-Pro labelling.
         self._last_binary_path: str | None = None
         self._last_binary_selection: tuple[str, str] | None = None
+        # Optional post-registration warm-up for an interactive browser's driver
+        # (see set_launch_warm_hook). Kept as a hook so instances.py has no
+        # dependency on the agent-browser service; None means "not wired", which
+        # is what the pool does on its own without the app assembling it.
+        self._launch_warm_hook: Callable[[int], Awaitable[None]] | None = None
+
+    def set_launch_warm_hook(
+        self, hook: Callable[[int], Awaitable[None]] | None,
+    ) -> None:
+        """Register a coroutine ``fn(cdp_port)`` to warm an interactive browser's
+        driver right after it registers, so the caller's first agent_browser
+        command doesn't race the agent-browser daemon's cold start. Fired
+        fire-and-forget and best-effort — see AgentBrowserService.warm."""
+        self._launch_warm_hook = hook
 
     @staticmethod
     def _binary_selection(settings) -> tuple[str, str]:
@@ -397,6 +411,13 @@ class InstanceManager:
                 if not isinstance(exc, asyncio.CancelledError):
                     await asyncio.shield(cleanup)
             raise
+        # The browser is up and registered. Warm its agent-browser daemon in the
+        # background so the caller's first command meets a warm daemon rather than
+        # racing its cold start. Interactive only: a sweep's browser drives itself
+        # and refuses external driving anyway. Fire-and-forget and tracked, so it
+        # never delays this response and is drained at shutdown.
+        if origin == "interactive" and self._launch_warm_hook is not None:
+            self._track_cleanup(self._launch_warm_hook(inst.cdp_port))
         logger.info("launched %s origin=%s owner=%s (display=:%d cdp=%d ip=%s) [%d/%d]",
                     inst.id, origin, owner, inst.display, inst.cdp_port, inst.proxy_ip,
                     len(self.running), self._settings.load().max_instances)

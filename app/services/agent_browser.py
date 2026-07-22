@@ -74,6 +74,46 @@ _VERB_FLAGS = {
 
 _RUN_TIMEOUT = 45.0
 _SHOT_TIMEOUT = 20.0
+_WARM_TIMEOUT = 8.0
+
+# First-call readiness race. The `agent-browser` CLI cold-starts a detached
+# per-session daemon (a node process) on its first invocation, and that daemon
+# makes its OWN fresh CDP attach (`connectOverCDP`) to the browser. Right after
+# create_instance the browser's CDP port is already listening — but the daemon
+# may still be coming up, or its first attach can be refused for a beat. The CLI
+# then exits non-zero with one of a small, specific set of "can't reach the
+# daemon / can't attach CDP" messages; a second invocation a moment later meets a
+# warm daemon and succeeds. We retry ONLY that class, a bounded number of times.
+#
+# Every marker below is about REACHING the daemon or ATTACHING CDP — never about
+# the page. A genuine command failure (a real navigation error, a missing
+# element) carries a different message, is not matched here, and is surfaced on
+# the first attempt. A truly dead instance keeps matching, so it fails fast after
+# the bound with its own clear message rather than hanging.
+_TRANSIENT_MARKERS = (
+    "failed to connect via cdp",   # the daemon's connectOverCDP raced the browser
+    "cdp connection failed",       # the CLI's fallback text for the same
+    "make sure the app is running with --remote-debugging-port",
+    "daemon failed to start",      # daemon socket not ready within the CLI's own poll
+    "failed to start daemon",
+    "failed to connect:",          # client -> daemon socket (ECONNREFUSED / ENOENT)
+    "failed to send:",             # daemon died mid-handshake
+    "failed to read:",
+    "econnrefused",
+    "connection refused",
+)
+_RETRY_ATTEMPTS = 3            # 1 initial try + 2 retries
+_RETRY_BACKOFF = (0.3, 0.7)   # seconds to wait before retry 2 and retry 3
+
+
+def _is_transient_failure(rc: int, out: str, err: str) -> bool:
+    """A non-zero result whose output is the daemon/CDP readiness race, not a
+    genuine command failure. Scoped by an explicit marker list so only the
+    first-call race retries; everything else surfaces immediately."""
+    if rc == 0:
+        return False
+    blob = f"{out}\n{err}".lower()
+    return any(marker in blob for marker in _TRANSIENT_MARKERS)
 
 
 def _binary() -> str:
@@ -151,6 +191,16 @@ class AgentBrowserService:
 
     def __init__(self, instances) -> None:
         self._instances = instances
+        # Warm the per-port agent-browser daemon the moment a browser launches,
+        # so the caller's FIRST command meets a warm daemon instead of racing its
+        # cold start. Registered as an optional hook the instance pool fires
+        # post-registration for interactive launches; the pool owns the
+        # fire-and-forget scheduling and shutdown draining, so instances.py keeps
+        # no dependency on this service. getattr keeps test doubles that lack the
+        # setter working unchanged.
+        register = getattr(instances, "set_launch_warm_hook", None)
+        if callable(register):
+            register(self.warm)
 
     def _cdp_port(self, instance_id: str, subject: str | None) -> int:
         inst = self._instances.get(instance_id)
@@ -186,6 +236,39 @@ class AgentBrowserService:
             raise TimeoutError(f"the browser did not respond within {int(timeout)}s") from None
         return proc.returncode, out.decode(errors="replace"), err.decode(errors="replace")
 
+    async def _run_resilient(self, port: int, argv: list[str], *,
+                             timeout: float) -> tuple[int, str, str]:
+        """`_run`, retrying ONLY the first-call daemon/CDP readiness race.
+
+        The retry is scoped to `_is_transient_failure` — a cold agent-browser
+        daemon or its initial CDP attach being refused for a beat right after
+        create_instance. A real command error is returned on the first attempt,
+        and a timeout is left to propagate to the caller (never retried), so a
+        genuinely broken action or a dead instance still fails fast. The bound is
+        small, so even a permanently unreachable daemon returns promptly."""
+        rc, out, err = await self._run(port, argv, timeout=timeout)
+        for attempt in range(1, _RETRY_ATTEMPTS):
+            if not _is_transient_failure(rc, out, err):
+                break
+            logger.info("agent_browser %r transient (rc=%s), retry %d/%d",
+                        argv[0], rc, attempt, _RETRY_ATTEMPTS - 1)
+            await asyncio.sleep(_RETRY_BACKOFF[attempt - 1])
+            rc, out, err = await self._run(port, argv, timeout=timeout)
+        return rc, out, err
+
+    async def warm(self, port: int) -> None:
+        """Best-effort: spawn/attach the agent-browser daemon for `port` so the
+        caller's first real command doesn't pay the cold-start race.
+
+        Runs one cheap, side-effect-free action (`get url`) — enough to bring the
+        daemon up and make its initial CDP attach — and swallows everything. A
+        warm that fails changes nothing the caller sees; the in-`drive` retry is
+        the real guarantee. Short-bounded so it never adds meaningful latency."""
+        try:
+            await self._run(port, ["get", "url"], timeout=_WARM_TIMEOUT)
+        except Exception as exc:  # noqa: BLE001 - warming must never surface
+            logger.debug("agent_browser warm on cdp=%s did not complete: %r", port, exc)
+
     async def _screenshot(self, port: int, flags: list[str]) -> bytes | None:
         """A PNG of the current page, written to a path THIS service picks (never
         the caller's) and read back. `flags` is the already-whitelisted display
@@ -193,8 +276,8 @@ class AgentBrowserService:
         with tempfile.TemporaryDirectory(prefix="ab-shot-") as d:
             path = pathlib.Path(d) / "shot.png"
             try:
-                rc, _out, _err = await self._run(port, ["screenshot", *flags, str(path)],
-                                                 timeout=_SHOT_TIMEOUT)
+                rc, _out, _err = await self._run_resilient(
+                    port, ["screenshot", *flags, str(path)], timeout=_SHOT_TIMEOUT)
             except TimeoutError:
                 return None
             if rc == 0 and path.exists():
@@ -227,7 +310,7 @@ class AgentBrowserService:
         # A browser that hangs is a failed *action* the caller can read and retry,
         # not an error about the request — so it comes back ok=False, not raised.
         try:
-            rc, out, err = await self._run(port, argv, timeout=_RUN_TIMEOUT)
+            rc, out, err = await self._run_resilient(port, argv, timeout=_RUN_TIMEOUT)
         except TimeoutError as exc:
             logger.warning("agent_browser %s %r timed out", instance_id, argv[0])
             return DriveOutcome(instance_id, command, False, str(exc), None)

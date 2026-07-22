@@ -91,6 +91,39 @@ async def test_tasks_cannot_consume_the_interactive_reserve(manager):
     assert inst.origin == "interactive"
 
 
+async def test_interactive_launch_schedules_the_warm_hook_but_never_awaits_it(manager):
+    warmed = []
+    release = asyncio.Event()
+
+    async def warm(port):
+        await release.wait()
+        warmed.append(port)
+
+    manager.set_launch_warm_hook(warm)
+    inst = await _launch(manager, "interactive", wait=False)
+
+    # launch returned before the warm did any work: it is fire-and-forget.
+    assert warmed == []
+    assert inst.id in manager.running
+
+    release.set()
+    await manager._wait_for_cleanup()  # drains the scheduled warm task
+    assert warmed == [inst.cdp_port], "the warm hook was not fired with the new port"
+
+
+async def test_a_sweeps_browser_is_not_warmed(manager):
+    warmed = []
+
+    async def warm(port):
+        warmed.append(port)
+
+    manager.set_launch_warm_hook(warm)
+    await _launch(manager, "task", wait=False)
+    await manager._wait_for_cleanup()
+
+    assert warmed == [], "a sweep drives itself and must not be warmed"
+
+
 async def test_interactive_is_bounded_only_by_max(manager):
     for _ in range(4):
         await _launch(manager, "interactive", wait=False)

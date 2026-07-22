@@ -316,6 +316,183 @@ class TestDrivingIsGuarded:
             await svc.drive("nope", "rm -rf /", subject=OWNER)
 
 
+# ── the first-call readiness race: warm on create + a scoped internal retry ───
+def _fake_exec_sequence(results):
+    """A create_subprocess_exec spy that yields queued (rc, stdout, stderr) in
+    order. Returns (spy, calls) where calls records (program, args) per run."""
+    calls = []
+    seq = iter(results)
+
+    async def spy(program, *args, **kwargs):
+        calls.append((program, args))
+        rc, out, err = next(seq)
+
+        class _P:
+            returncode = rc
+
+            async def communicate(self):
+                return (out, err)
+
+            def kill(self):
+                pass
+
+            async def wait(self):
+                return 0
+
+        return _P()
+
+    return spy, calls
+
+
+# The exact stderr the agent-browser CLI prints when its daemon's first CDP
+# attach loses the race — the signature we retry on (browser.ts / main.rs).
+_CDP_RACE_STDERR = (
+    b"\xe2\x9c\x97 Failed to connect via CDP on port 9999. "
+    b"Make sure the app is running with --remote-debugging-port=9999"
+)
+
+
+class TestFirstCallRetry:
+    """The first agent_browser call right after create_instance can lose the
+    agent-browser daemon/CDP cold-start race. That transient failure is retried
+    internally so the caller never sees it; a genuine command error is not."""
+
+    @pytest.fixture(autouse=True)
+    def _no_backoff(self, monkeypatch):
+        import app.services.agent_browser as ab
+        monkeypatch.setattr(ab, "_RETRY_BACKOFF", (0.0, 0.0))
+
+    @pytest.mark.asyncio
+    async def test_a_transient_first_call_is_retried_until_success(self, monkeypatch):
+        import asyncio
+        spy, calls = _fake_exec_sequence([
+            (1, b"", _CDP_RACE_STDERR),          # cold daemon loses the race
+            (0, b"https://example.com", b""),    # warm daemon, a beat later
+        ])
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", spy)
+        svc = AgentBrowserService(_FakeInstances(_FakeInst(cdp_port=9999)))
+
+        out = await svc.drive("i1", "get url", subject=OWNER)
+
+        assert out.ok is True
+        assert out.output == "https://example.com"
+        assert "Failed to connect via CDP" not in out.output, "the caller saw the race"
+        assert len(calls) == 2, "the transient first call was not retried"
+
+    @pytest.mark.asyncio
+    async def test_a_genuine_command_error_is_surfaced_not_retried(self, monkeypatch):
+        import asyncio
+        # A real navigation failure: non-zero, but NOT a daemon/CDP race message.
+        spy, calls = _fake_exec_sequence([
+            (1, b"", b"net::ERR_NAME_NOT_RESOLVED at https://nope.invalid"),
+        ])
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", spy)
+        svc = AgentBrowserService(_FakeInstances(_FakeInst()))
+
+        out = await svc.drive("i1", "navigate https://nope.invalid", subject=OWNER)
+
+        assert out.ok is False
+        assert "ERR_NAME_NOT_RESOLVED" in out.output
+        assert len(calls) == 1, "a real command error must not be retried"
+
+    @pytest.mark.asyncio
+    async def test_a_dead_instance_fails_fast_after_a_bounded_number_of_retries(self, monkeypatch):
+        import asyncio
+        import app.services.agent_browser as ab
+        # Every attempt is the transient signature — a daemon that can never
+        # attach. It must stop after the bound and surface its own message.
+        spy, calls = _fake_exec_sequence([(1, b"", _CDP_RACE_STDERR)] * 20)
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", spy)
+        svc = AgentBrowserService(_FakeInstances(_FakeInst(cdp_port=9999)))
+
+        out = await svc.drive("i1", "get url", subject=OWNER)
+
+        assert out.ok is False
+        assert "Failed to connect via CDP" in out.output
+        assert len(calls) == ab._RETRY_ATTEMPTS, "retries were not bounded"
+
+    @pytest.mark.asyncio
+    async def test_a_timeout_is_not_retried(self, monkeypatch):
+        import asyncio
+        runs = []
+
+        async def slow_exec(program, *args, **kwargs):
+            runs.append(args)
+
+            class _P:
+                returncode = None
+
+                async def communicate(self):
+                    await asyncio.sleep(10)  # forced past the wait_for timeout
+
+                def kill(self):
+                    pass
+
+                async def wait(self):
+                    return 0
+
+            return _P()
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", slow_exec)
+        monkeypatch.setattr("app.services.agent_browser._RUN_TIMEOUT", 0.05)
+        svc = AgentBrowserService(_FakeInstances(_FakeInst()))
+
+        out = await svc.drive("i1", "get url", subject=OWNER)
+
+        assert out.ok is False
+        assert "did not respond" in out.output
+        assert len(runs) == 1, "a timeout must fail fast, not retry"
+
+
+class TestWarmOnCreate:
+    """create_instance warms the daemon so the first command doesn't race it."""
+
+    @pytest.mark.asyncio
+    async def test_warm_runs_one_cheap_read_only_command(self, monkeypatch):
+        import asyncio
+        spy, calls = _fake_exec_sequence([(0, b"about:blank", b"")])
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", spy)
+        svc = AgentBrowserService(_FakeInstances(_FakeInst(cdp_port=5555)))
+
+        await svc.warm(5555)
+
+        assert len(calls) == 1
+        program, args = calls[0]
+        assert program == "agent-browser"
+        assert args[:3] == ("--cdp", "5555", "get") and "url" in args
+
+    @pytest.mark.asyncio
+    async def test_warm_swallows_every_failure(self, monkeypatch):
+        import asyncio
+
+        async def boom(*a, **k):
+            raise FileNotFoundError("agent-browser not installed")
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", boom)
+        svc = AgentBrowserService(_FakeInstances(_FakeInst()))
+
+        await svc.warm(1234)  # must not raise
+
+    def test_the_service_registers_its_warm_hook_when_the_pool_supports_it(self):
+        class _Pool:
+            def __init__(self):
+                self.hook = None
+
+            def get(self, iid):
+                return None
+
+            def set_launch_warm_hook(self, fn):
+                self.hook = fn
+
+        pool = _Pool()
+        svc = AgentBrowserService(pool)
+        assert pool.hook == svc.warm
+
+    def test_a_pool_without_the_hook_setter_is_fine(self):
+        # The unit-test double has no setter; construction must not blow up.
+        AgentBrowserService(_FakeInstances(_FakeInst()))
+
+
 # ── the REST mirror + its auth ────────────────────────────────────────────────
 class TestRestEndpoint:
     @pytest.fixture
