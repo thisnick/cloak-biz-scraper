@@ -82,6 +82,11 @@ approve, and the tools appear.
 give it a name, choose **Streamable HTTP**, paste the link → **Save** → click the
 **Authenticate** button that appears and enter your `APP_SECRET`.
 
+**ChatGPT (classic / web)** — **Settings → Plugins** → open the **Developer Mode** setting
+and turn it on → back in **Plugins**, click **Browse all plugins** → top-right **add a
+custom app** → add an **MCP server**, paste the link, choose **OAuth**, **Scan Tools**,
+then sign in with your `APP_SECRET`.
+
 **Claude** — **Settings → Connectors** → **Add custom connector** → paste the link (no
 client ID or secret — it uses dynamic registration) → **Connect** → sign in with your
 `APP_SECRET`. Team/Enterprise owners add it first under **Organization settings →
