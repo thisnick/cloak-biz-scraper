@@ -1,5 +1,7 @@
 # cloak-biz-scraper
 
+[![CI](https://github.com/thisnick/cloak-biz-scraper/actions/workflows/ci.yml/badge.svg)](https://github.com/thisnick/cloak-biz-scraper/actions/workflows/ci.yml)
+
 A **cloaked cloud browser your AI assistant can drive** — patched Chromium that slips
 past anti-bot detection, running behind your own residential proxy. On top of it are
 built-in tasks that scrape BizBuySell search results and archive listings into your
