@@ -55,7 +55,7 @@ def _rich_job():
                     title="Remodeling Contractor", location="San Francisco, CA",
                     asking_price="$965,000", revenue="", cashflow="$210,000",
                     ebitda="", excerpt="20+ years.", source="bizbuysell_serp",
-                    page_id="notion-page-2453593"),
+                    synced_row_id="notion-page-2453593"),
             Listing(listing_id="2461001", url="https://x/2", normalized_url="x/2",
                     title="Coffee Roaster", location="Oakland, CA",
                     asking_price="Not Disclosed", revenue="$1,200,000", cashflow="",

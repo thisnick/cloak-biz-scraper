@@ -278,7 +278,8 @@ class TestUpsertNew:
         )
         result = await NotionStore(TOKEN).upsert_new(DB, [listing()])
         assert result.new == 1
-        assert [l.page_id for l in result.new_listings] == ["created-page-77"]
+        # In Notion the created row IS a page, so its id lands on synced_row_id.
+        assert [l.synced_row_id for l in result.new_listings] == ["created-page-77"]
 
     @respx.mock
     @pytest.mark.asyncio
@@ -296,7 +297,7 @@ class TestUpsertNew:
         )
         assert (result.new, result.existing) == (1, 1)
         assert [l.listing_id for l in result.new_listings] == ["9999"]
-        assert result.new_listings[0].page_id == "new-99"
+        assert result.new_listings[0].synced_row_id == "new-99"
 
     @respx.mock
     @pytest.mark.asyncio

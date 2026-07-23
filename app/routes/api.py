@@ -99,9 +99,10 @@ async def scrape_listings(request: Request, body: ScrapeRequest) -> ScrapeResult
     merged result with GET /api/scrape/{job_id}.
 
     With sync=false the collected `listings` hold every listing found, each
-    page_id empty. With sync=true they hold only the listings newly added to
-    Notion, each carrying the page_id of its new row (ready for archive_page);
-    rows already present are omitted but counted in synced.existing."""
+    synced_row_id empty. With sync=true they hold only the listings newly added to
+    Notion, each carrying the synced_row_id of its new row (ready for
+    archive_page); rows already present are omitted but counted in
+    synced.existing."""
     try:
         job = request.app.state.scrape.start(
             body.urls, max_pages=body.max_pages, sync=body.sync, db_id=body.db_id
@@ -120,9 +121,9 @@ async def scrape_listings(request: Request, body: ScrapeRequest) -> ScrapeResult
 @router.get("/scrape/{job_id}", response_model=ScrapeResult)
 async def get_scrape_listing_results(request: Request, job_id: str) -> ScrapeResult:
     """Collect a sweep. Never blocks. When completed, `listings` holds every
-    listing found for a sync=false sweep (page_id empty), or only the newly-added
-    ones each with their Notion page_id for a sync=true sweep (already-known rows
-    omitted but counted in synced.existing)."""
+    listing found for a sync=false sweep (synced_row_id empty), or only the
+    newly-added ones each with their Notion synced_row_id for a sync=true sweep
+    (already-known rows omitted but counted in synced.existing)."""
     result = request.app.state.scrape.result(job_id)
     if result is None:
         raise HTTPException(

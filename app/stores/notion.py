@@ -905,7 +905,7 @@ class NotionStore:
             new += 1
             # The POST response's `id` is the created page — carry it back on a
             # copy of the listing so nothing mutates the caller's object.
-            new_listings.append(listing.model_copy(update={"page_id": created.get("id", "")}))
+            new_listings.append(listing.model_copy(update={"synced_row_id": created.get("id", "")}))
             # Within one sweep the same listing can appear twice (paging overlap);
             # without this the second copy would be inserted again.
             if listing.listing_id:
