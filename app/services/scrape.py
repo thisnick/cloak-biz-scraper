@@ -249,12 +249,16 @@ class ScrapeService:
                 job.summary = f"All {total} source(s) failed."
             else:
                 job.status = "completed"
+                found = len(listings)
                 if job.sync:
-                    # Dedupe+upsert the MERGED set ONCE, not per source.
-                    job.synced = await self._sync(job, listings)
+                    # Dedupe+upsert the MERGED set ONCE, not per source. Under
+                    # sync the caller keeps only the NEWLY-inserted rows, each
+                    # carrying its store page id — the already-known ones stay in
+                    # `synced.existing` but drop out of `listings`.
+                    job.synced, job.listings = await self._sync(job, listings)
                 if failures:
                     job.error = self._failure_text(failures, total)
-                job.summary = self._summarize(job, ok, total, failures)
+                job.summary = self._summarize(job, ok, total, failures, found)
         except Exception as exc:  # noqa: BLE001 — the job must record its own failure
             logger.exception("sweep %s failed", job.id)
             job.status = "failed"
@@ -314,9 +318,15 @@ class ScrapeService:
             )
         return text
 
-    def _summarize(self, job: Job, ok: int, total: int, failures: list[tuple[str, str]]) -> str:
+    def _summarize(
+        self, job: Job, ok: int, total: int, failures: list[tuple[str, str]], found: int
+    ) -> str:
+        # `found` is how many DISTINCT listings the sweep saw, passed explicitly
+        # because under sync `job.listings` has already been narrowed to just the
+        # newly-inserted rows — the crawl breadth line should still report the
+        # whole find, not only the new ones.
         pages = f"{job.pages_crawled} page{'s' if job.pages_crawled != 1 else ''}"
-        parts = [f"{ok} of {total} source(s) swept · {len(job.listings)} listing(s) across {pages}"]
+        parts = [f"{ok} of {total} source(s) swept · {found} listing(s) across {pages}"]
         if job.synced is None:
             parts.append("Nothing was saved (sync=false)")
         else:
@@ -331,7 +341,14 @@ class ScrapeService:
             parts.append(f"{len(failures)} source(s) failed")
         return " · ".join(parts)
 
-    async def _sync(self, job: Job, listings: list[Listing]) -> SyncResult:
+    async def _sync(self, job: Job, listings: list[Listing]) -> tuple[SyncResult, list[Listing]]:
+        """Upsert the merged set and report the counts alongside the NEW rows.
+
+        Returns the aggregate `SyncResult` and the newly-inserted listings, each
+        carrying the store page id it was written to. The caller swaps these in
+        for `job.listings`, so an agent collecting a synced sweep gets exactly the
+        rows this sweep added, ready to hand to `archive_page`.
+        """
         settings = self._settings.load()
         store: ListingStore = self._store_factory(settings)
         # The map belongs to the configured database. If the sweep targets a
@@ -342,10 +359,11 @@ class ScrapeService:
         if job.db_id != settings.notion_db_id:
             column_map = None
         result = await store.upsert_new(job.db_id, listings, column_map=column_map)
-        return SyncResult(
+        synced = SyncResult(
             new=result.new, existing=result.existing, db_id=result.db_id,
             skipped=result.skipped_names,
         )
+        return synced, result.new_listings
 
     def _evidence_dir(self, job: Job, i: int) -> Path:
         """Where source `i`'s screenshots and snapshots land.

@@ -126,12 +126,20 @@ class UpsertResult:
     a sync that works and rows that are quietly missing their prices; without
     this they would have to notice the empty column themselves and guess why.
     It is the difference between degrading and degrading *silently*.
+
+    `new_listings` is the listings actually INSERTED this sweep — the `new` count
+    made concrete — each carrying the store row id it was written to on its
+    `page_id` field. Already-present listings are counted in `existing` but never
+    appear here, so a caller can hand these straight on to whatever files the row
+    (see the sweep service) without re-reading the store. What a row id IS stays
+    the store's business: this protocol only knows it lands on `Listing.page_id`.
     """
 
     new: int = 0
     existing: int = 0
     db_id: str = ""
     skipped: list[PropIssue] = field(default_factory=list)
+    new_listings: list[Listing] = field(default_factory=list)
 
     @property
     def skipped_names(self) -> list[str]:

@@ -143,6 +143,13 @@ def build(app) -> FastMCP:
         collect them. All the URLs fan out into ONE job, so there is one job_id to
         collect and the results come back merged and de-duplicated.
 
+        What the collected `listings` hold depends on `sync`. With sync=false you
+        get EVERY listing found, and each `page_id` is empty. With sync=true you
+        get only the listings this sweep NEWLY added to Notion, each carrying the
+        `page_id` of the row it was written to — hand that straight to
+        archive_page(notion_page_id=…). Listings already in the database are left
+        out of `listings` but still counted in `synced.existing`.
+
         urls: a NON-EMPTY list of pages that each list many businesses, not single
             listings (BizBuySell only for now). Each entry is either a
             SEARCH-RESULTS (SERP) page, or a broker's profile page
@@ -160,11 +167,15 @@ def build(app) -> FastMCP:
         max_pages: how many pages of results to walk PER URL (shared across all of
             them). A broker profile pages its for-sale tab too, so raise this to
             sweep a broker with many listings.
-        sync: false (default) just reads the listings back — no Notion involved.
-            true also saves new ones to your Notion database, skipping those
-            already there; the merged set from all URLs is de-duplicated and
-            upserted once. (The Notion layer is opt-in: sync=true here, plus
-            archive_page to file a page's full content into a Notion page.)
+        sync: false (default) just reads the listings back — no Notion involved,
+            and the collected result holds ALL listings found with an empty
+            page_id on each. true also saves new ones to your Notion database,
+            skipping those already there; the merged set from all URLs is
+            de-duplicated and upserted once, and the collected result then holds
+            ONLY the newly-added listings, each with the page_id of its new Notion
+            row (ready for archive_page). (The Notion layer is opt-in: sync=true
+            here, plus archive_page to file a page's full content into a Notion
+            page.)
         db_id: override the configured Notion database. Only used when sync=true.
         """
         job = app.state.scrape.start(urls, max_pages=max_pages, sync=sync, db_id=db_id)
@@ -175,8 +186,13 @@ def build(app) -> FastMCP:
         """Collect the results of a sweep started by scrape_listings.
 
         Never blocks. If status is "working" the sweep is still running: wait a
-        few seconds and call again. "completed" means listings holds everything
-        found; "failed" means error says why.
+        few seconds and call again. "failed" means error says why. "completed"
+        means `listings` is ready — but WHAT it holds depends on how the sweep was
+        started: a sync=false sweep returns every listing found (each page_id
+        empty); a sync=true sweep returns only the ones it newly added to Notion,
+        each carrying the page_id of its new row (pass it to archive_page). Rows
+        already in the database are omitted from `listings` but counted in
+        `synced.existing`.
         """
         result = app.state.scrape.result(job_id)
         if result is None:

@@ -42,6 +42,13 @@ class Listing(BaseModel):
     ebitda: str = ""
     excerpt: str = ""
     source: str = ""
+    page_id: str = Field(
+        default="",
+        description="The Notion page id of the row this listing was written to — pass it "
+        "straight to archive_page(notion_page_id=…). Empty unless this sweep ran with "
+        "sync=true and actually inserted this listing; it is empty for sync=false and for "
+        "listings that were already in the database.",
+    )
 
 
 class SyncResult(BaseModel):
@@ -107,6 +114,13 @@ class ScrapeResult(BaseModel):
     While status is "working" the sweep is still running and `listings` is
     empty — collect it with get_scrape_listing_results. `synced` is null when
     sync was false, which means nothing was saved rather than nothing was found.
+
+    What `listings` holds once completed depends on how the sweep was started.
+    sync=false: every listing found, each with an empty `page_id`. sync=true:
+    only the listings this sweep newly added to the store, each carrying the
+    `page_id` of the row it was written to (hand straight to archive_page).
+    Already-stored listings are left out of `listings` but counted in
+    `synced.existing`.
     """
 
     # Both tools return this one shape so an agent never has to learn two:

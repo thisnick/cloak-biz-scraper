@@ -49,19 +49,36 @@ CARDS = [_listing("2485121")]
 
 class FakeStore:
     """Records what it was asked to do. Its existence in a test is the point:
-    if sync=false ever constructs one, `built` proves it."""
+    if sync=false ever constructs one, `built` proves it.
+
+    Models the real store's new/existing split so the sweep's sync semantics can
+    be exercised: any listing whose id is in `existing_ids` is counted as already
+    present and left OUT of `new_listings`; every other one comes back inserted,
+    stamped with a `page-<id>` page id — the neutral row id the real Notion store
+    reads off the /pages response.
+    """
 
     built = 0
 
-    def __init__(self, settings=None):
+    def __init__(self, settings=None, existing_ids=None):
         FakeStore.built += 1
         self.upserts: list[tuple[str, list[Listing]]] = []
         self.column_maps: list = []
+        self._existing = set(existing_ids or ())
 
     async def upsert_new(self, db_id, listings, column_map=None):
         self.upserts.append((db_id, listings))
         self.column_maps.append(column_map)
-        return UpsertResult(new=len(listings), existing=0, db_id=db_id)
+        new_listings: list[Listing] = []
+        existing = 0
+        for listing in listings:
+            if listing.listing_id in self._existing:
+                existing += 1
+                continue
+            new_listings.append(listing.model_copy(update={"page_id": f"page-{listing.listing_id}"}))
+        return UpsertResult(
+            new=len(new_listings), existing=existing, db_id=db_id, new_listings=new_listings,
+        )
 
 
 @pytest.fixture
@@ -210,6 +227,91 @@ class TestSyncTrue:
         await _drain(svc)
 
         assert store.column_maps[0] is None
+
+
+def _sweep_returning(listings):
+    """A `_sweep` stub that yields a fixed set of listings from a single URL."""
+    async def sweep(job, i, url, source, prog):
+        return {"blocked": False, "error": None,
+                "data": {"listings": list(listings), "pages_crawled": 1}}
+    return sweep
+
+
+class TestSyncReturnsNewWithPageIds:
+    """sync=true narrows the collected `listings` to just the rows this sweep
+    inserted, each stamped with the store page id — so an agent can archive_page
+    the fresh rows straight off the result. Already-known rows stay counted in
+    `synced.existing` but drop out of `listings`. sync=false is unchanged."""
+
+    @pytest.mark.asyncio
+    async def test_sync_true_returns_only_new_listings_each_with_a_page_id(self, settings, jobs):
+        settings.update(notion_api_token="ntn_x", notion_db_id="db-1")
+        store = FakeStore(existing_ids={"known"})
+        found = [_listing("known"), _listing("fresh-a"), _listing("fresh-b")]
+        svc = service(settings, jobs, store=lambda s: store, sweep=_sweep_returning(found))
+        job = svc.start([SERP], sync=True)
+        await _drain(svc)
+
+        result = svc.result(job.id)
+        assert sorted(l.listing_id for l in result.listings) == ["fresh-a", "fresh-b"], (
+            "only the newly-inserted rows are returned; the known one is omitted"
+        )
+        assert all(l.page_id for l in result.listings), "each new listing carries a page id"
+        assert {l.page_id for l in result.listings} == {"page-fresh-a", "page-fresh-b"}
+        assert result.synced.new == 2
+        assert result.synced.existing == 1, "the known row is counted, not returned"
+
+    @pytest.mark.asyncio
+    async def test_sync_false_returns_all_found_with_empty_page_id(self, settings, jobs):
+        found = [_listing("a"), _listing("b")]
+        svc = service(settings, jobs, sweep=_sweep_returning(found))
+        job = svc.start([SERP], sync=False)
+        await _drain(svc)
+
+        result = svc.result(job.id)
+        assert sorted(l.listing_id for l in result.listings) == ["a", "b"], "all found"
+        assert all(l.page_id == "" for l in result.listings), "no store, so no page id"
+        assert result.synced is None
+        assert FakeStore.built == 0, "sync=false still builds no store"
+
+    @pytest.mark.asyncio
+    async def test_a_resweep_with_nothing_new_returns_empty_listings(self, settings, jobs):
+        settings.update(notion_api_token="ntn_x", notion_db_id="db-1")
+        store = FakeStore(existing_ids={"a", "b"})
+        found = [_listing("a"), _listing("b")]
+        svc = service(settings, jobs, store=lambda s: store, sweep=_sweep_returning(found))
+        job = svc.start([SERP], sync=True)
+        await _drain(svc)
+
+        result = svc.result(job.id)
+        assert result.listings == [], "nothing new to hand back"
+        assert result.synced.new == 0
+        assert result.synced.existing == 2
+        # The crawl-breadth line still reports the whole find, not the zero new.
+        assert "2 listing(s)" in result.summary
+
+    @pytest.mark.asyncio
+    async def test_multi_url_sync_returns_the_merged_new_set_with_ids(self, settings, jobs):
+        settings.update(notion_api_token="ntn_x", notion_db_id="db-1")
+        store = FakeStore()
+
+        async def by_url(job, i, url, source, prog):
+            data = {
+                SERP: [_listing("dup"), _listing("only-a")],
+                SERP2: [_listing("dup"), _listing("only-b")],
+            }[url]
+            return {"blocked": False, "error": None,
+                    "data": {"listings": list(data), "pages_crawled": 1}}
+
+        svc = service(settings, jobs, store=lambda s: store, sweep=by_url)
+        job = svc.start([SERP, SERP2], sync=True)
+        await _drain(svc)
+
+        result = svc.result(job.id)
+        ids = sorted(l.listing_id for l in result.listings)
+        assert ids == ["dup", "only-a", "only-b"], "the deduped merged new set is returned"
+        assert all(l.page_id for l in result.listings), "each merged new row carries a page id"
+        assert result.synced.new == 3
 
 
 class TestFailure:

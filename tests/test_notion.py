@@ -267,6 +267,39 @@ class TestUpsertNew:
 
     @respx.mock
     @pytest.mark.asyncio
+    async def test_new_listings_carry_the_created_page_id(self):
+        # The id in the /pages POST response is the created page — the whole point
+        # of returning new_listings is that an agent can archive_page it without
+        # re-querying Notion, so the id must survive out of upsert.
+        mock_db(FULL_SCHEMA)
+        mock_query([])
+        respx.post(f"{API}/pages").mock(
+            return_value=httpx.Response(200, json={"id": "created-page-77"})
+        )
+        result = await NotionStore(TOKEN).upsert_new(DB, [listing()])
+        assert result.new == 1
+        assert [l.page_id for l in result.new_listings] == ["created-page-77"]
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_only_the_inserted_rows_come_back_as_new_listings(self):
+        # One already-present row, one genuinely new: only the new one is returned,
+        # carrying its fresh page id. The known one is counted, never surfaced.
+        mock_db(FULL_SCHEMA)
+        mock_query([row("p1", "2485121", "bizbuysell.com/business-opportunity/foo/2485121")])
+        respx.post(f"{API}/pages").mock(return_value=httpx.Response(200, json={"id": "new-99"}))
+        respx.patch(url__startswith=f"{API}/pages/").mock(
+            return_value=httpx.Response(200, json={"id": "p1"})
+        )
+        result = await NotionStore(TOKEN).upsert_new(
+            DB, [listing(), listing(listing_id="9999", normalized_url="bizbuysell.com/new")]
+        )
+        assert (result.new, result.existing) == (1, 1)
+        assert [l.listing_id for l in result.new_listings] == ["9999"]
+        assert result.new_listings[0].page_id == "new-99"
+
+    @respx.mock
+    @pytest.mark.asyncio
     async def test_deduplicates_within_one_sweep(self):
         # Paged SERPs overlap; the same card can arrive twice in one call.
         mock_db(FULL_SCHEMA)

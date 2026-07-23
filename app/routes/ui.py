@@ -124,6 +124,11 @@ def _job_result(job) -> tuple[str, str]:
     out because it is the failure a user can act on (rotate/retry), distinct from
     an ordinary stop."""
     if job.status == "completed":
+        # Under sync, `job.listings` is narrowed to just the newly-inserted rows,
+        # so its length is the new count, not the whole find — say so explicitly
+        # rather than let a re-sweep that added nothing read as "0 listings".
+        if job.synced is not None:
+            return "ok", f"{job.synced.new} new, {job.synced.existing} known"
         return "ok", f"{len(job.listings)} listings"
     if job.status == "failed":
         if job.error and "block" in job.error.lower():

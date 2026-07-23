@@ -872,6 +872,9 @@ class NotionStore:
         by_url = {r.normalized_url: r for r in rows if r.normalized_url}
 
         new = existing = 0
+        # The listings actually inserted, each stamped with the page id Notion
+        # minted for it, so the caller can file the fresh rows without re-querying.
+        new_listings: list[Listing] = []
         touch_col, touch_payload = self._touch_property(column_map, actual)
         can_touch = touch_payload is not None
 
@@ -894,12 +897,15 @@ class NotionStore:
                 if column_map
                 else self._properties_for(listing, actual, insert=True)
             )
-            await self._client.request(
+            created = await self._client.request(
                 "POST",
                 "/pages",
                 json={"parent": {"database_id": db_id}, "properties": props},
             )
             new += 1
+            # The POST response's `id` is the created page — carry it back on a
+            # copy of the listing so nothing mutates the caller's object.
+            new_listings.append(listing.model_copy(update={"page_id": created.get("id", "")}))
             # Within one sweep the same listing can appear twice (paging overlap);
             # without this the second copy would be inserted again.
             if listing.listing_id:
@@ -915,4 +921,7 @@ class NotionStore:
             "upsert into %s: %d new, %d existing, skipped %s",
             db_id, new, existing, [i.name for i in skipped] or "nothing",
         )
-        return UpsertResult(new=new, existing=existing, db_id=db_id, skipped=skipped)
+        return UpsertResult(
+            new=new, existing=existing, db_id=db_id, skipped=skipped,
+            new_listings=new_listings,
+        )
