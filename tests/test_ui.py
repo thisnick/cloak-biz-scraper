@@ -7,6 +7,7 @@ since Railway is HTTPS).
 """
 from __future__ import annotations
 
+import inspect
 import pathlib
 
 import httpx
@@ -17,6 +18,7 @@ from fastapi.testclient import TestClient
 from app.config import CONFIG
 from app.main import app
 from app.services import sessions
+from app.services.scrape import ScrapeService
 from app.services.secret import SecretService
 from app.services.settings import SettingsService
 from app.stores.notion import API
@@ -1125,7 +1127,12 @@ class TestSessionsControls:
             calls["launch"] += 1
             return object()
 
-        def fake_start(url, **kw):
+        def fake_start(*args, **kwargs):
+            # Bind against the REAL ScrapeService.start signature (self stubbed)
+            # so a call the real method would reject — e.g. a removed kwarg like
+            # db_id — raises here too, instead of a `**kw` catch-all swallowing
+            # it and hiding a route/service signature drift behind a green test.
+            inspect.signature(ScrapeService.start).bind(None, *args, **kwargs)
             calls["start"] += 1
             return object()
 
@@ -1159,6 +1166,25 @@ class TestSessionsControls:
         r = auth.post("/sessions/instances/abc123/close", follow_redirects=False)
         assert r.status_code == 303
         assert calls["stop"] == 1
+
+    def test_run_sweep_drives_the_real_start_without_500(self, auth, monkeypatch):
+        """The route calls the REAL ScrapeService.start (not a stub), so a
+        signature drift between the route and start() — like the removed db_id
+        kwarg that made this route 500 — is caught end to end. Only the per-source
+        browser work (_sweep) is neutered; start()'s validation, job creation and
+        the real call binding all run."""
+        async def fake_sweep(job, i, url, source, prog):
+            return {"blocked": False, "error": None,
+                    "data": {"listings": [], "pages_crawled": 1}}
+
+        monkeypatch.setattr(app.state.scrape, "_sweep", fake_sweep)
+        r = auth.post(
+            "/sessions/sweep",
+            data={"url": "https://www.bizbuysell.com/california/sacramento-area-businesses-for-sale/"},
+            follow_redirects=False,
+        )
+        assert r.status_code == 303, r.text
+        assert r.headers["location"] == "/?view=tasks"
 
     # ── the PRG target must be a real 200 page, not a 404 ──
     def test_a_successful_action_lands_on_the_dashboard_not_a_404(self, auth, monkeypatch):

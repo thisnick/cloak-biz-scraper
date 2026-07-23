@@ -524,7 +524,6 @@ async def ui_run_sweep(
     url: str = Form(""),
     max_pages: int = Form(1),
     sync: bool = Form(False),
-    db_id: str = Form(""),
 ) -> Response:
     _require(request)
     _require_same_origin(request)
@@ -536,7 +535,7 @@ async def ui_run_sweep(
     # codes unchanged.
     try:
         request.app.state.scrape.start(
-            [url.strip()], max_pages=max_pages, sync=sync, db_id=db_id.strip() or None
+            [url.strip()], max_pages=max_pages, sync=sync
         )
     except UnsupportedURL as exc:
         return _render(request, Result("tasks", False, str(exc)), status=422)
