@@ -58,7 +58,6 @@ class ScrapeRequest(BaseModel):
     urls: list[str]
     max_pages: int = 1
     sync: bool = False
-    db_id: str | None = None
 
 
 class ArchiveRequest(BaseModel):
@@ -105,7 +104,7 @@ async def scrape_listings(request: Request, body: ScrapeRequest) -> ScrapeResult
     synced.existing."""
     try:
         job = request.app.state.scrape.start(
-            body.urls, max_pages=body.max_pages, sync=body.sync, db_id=body.db_id
+            body.urls, max_pages=body.max_pages, sync=body.sync
         )
     except UnsupportedURL as exc:
         # UnsupportedURL is a ValueError subclass, so it must be caught before the

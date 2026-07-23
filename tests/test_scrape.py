@@ -182,15 +182,32 @@ class TestSyncTrue:
         assert result.synced.db_id == "db-configured"
 
     @pytest.mark.asyncio
-    async def test_db_id_overrides_the_configured_database(self, settings, jobs):
+    async def test_the_configured_database_cannot_be_overridden_per_call(self, settings, jobs):
+        """There is no db_id override any more: a sweep always syncs to the
+        database configured under Settings, so passing one is rejected outright
+        rather than quietly aiming the sweep somewhere else."""
         settings.update(notion_api_token="ntn_x", notion_db_id="db-configured")
         store = FakeStore()
         svc = service(settings, jobs, store=lambda s: store)
 
-        svc.start([SERP], sync=True, db_id="db-override")
-        await _drain(svc)
+        with pytest.raises(TypeError):
+            svc.start([SERP], sync=True, db_id="db-override")
 
-        assert store.upserts[0][0] == "db-override"
+        job = svc.start([SERP], sync=True)
+        await _drain(svc)
+        assert store.upserts[0][0] == "db-configured", "sync always targets the configured db"
+        assert svc.result(job.id).synced.db_id == "db-configured"
+
+    def test_the_rest_request_exposes_no_db_id_field(self):
+        """The REST façade dropped the override too: db_id is not a request field,
+        and a stray one in the body is ignored rather than steering the sweep."""
+        from app.routes.api import ScrapeRequest
+
+        assert "db_id" not in ScrapeRequest.model_fields
+        req = ScrapeRequest.model_validate(
+            {"urls": [SERP], "sync": True, "db_id": "db-override"}
+        )
+        assert not hasattr(req, "db_id")
 
     @pytest.mark.asyncio
     async def test_the_scraper_hands_the_store_verbatim_money(self, settings, jobs):
@@ -215,20 +232,6 @@ class TestSyncTrue:
 
         assert store.column_maps[0] == cmap
 
-    @pytest.mark.asyncio
-    async def test_a_different_db_id_falls_back_to_identity_no_map(self, settings, jobs):
-        """The stored map belongs to the configured database. A sweep aimed at a
-        different one must not be judged against columns it never named."""
-        settings.update(
-            notion_api_token="ntn_x", notion_db_id="db-configured",
-            notion_column_map={"listing_title": "Deal"},
-        )
-        store = FakeStore()
-        svc = service(settings, jobs, store=lambda s: store)
-        svc.start([SERP], sync=True, db_id="db-other")
-        await _drain(svc)
-
-        assert store.column_maps[0] is None
 
 
 def _sweep_returning(listings):
@@ -314,6 +317,65 @@ class TestSyncReturnsNewWithRowIds:
         assert ids == ["dup", "only-a", "only-b"], "the deduped merged new set is returned"
         assert all(l.synced_row_id for l in result.listings), "each merged new row carries a row id"
         assert result.synced.new == 3
+
+
+class _RaisingStore:
+    """A store whose upsert blows up, to drive the sync-failure path. Building it
+    still counts as a store construction so tests can assert it was reached."""
+
+    def __init__(self, message):
+        self._message = message
+
+    async def upsert_new(self, db_id, listings, column_map=None):
+        raise RuntimeError(self._message)
+
+
+class TestSyncFailure:
+    """The scrape succeeds but the Notion write fails. The owner's rule: this is a
+    clean failure, NOT a success — drop the scraped-but-unsaved listings, say the
+    save failed and nothing was saved, and carry the underlying store error."""
+
+    @pytest.mark.asyncio
+    async def test_a_save_failure_fails_the_job_and_drops_the_listings(self, settings, jobs):
+        settings.update(notion_api_token="ntn_x", notion_db_id="db-1")
+        store = _RaisingStore("the id is wrong or it has not been shared with your integration")
+        svc = service(settings, jobs, store=lambda s: store)
+
+        job = svc.start([SERP], sync=True)
+        await _drain(svc)
+
+        result = svc.result(job.id)
+        assert result.status == "failed"
+        assert result.listings == [], "scraped-but-unsaved listings are not handed back"
+        assert result.synced is None
+        # Says the scrape worked, saving failed, nothing was saved...
+        assert "Scraped 1 listing(s)" in result.error
+        assert "saving to your Notion database failed" in result.error
+        assert "nothing was saved" in result.error
+        # ...and carries the underlying store error verbatim.
+        assert "it has not been shared with your integration" in result.error
+        # The one-line summary carries the same story.
+        assert "saving to Notion failed" in result.summary
+        assert "nothing saved" in result.summary
+
+    @pytest.mark.asyncio
+    async def test_a_scrape_failure_does_not_read_as_a_save_failure(self, settings, jobs):
+        """A source that actually failed is a scrape failure — it must not borrow
+        the sync-failure wording, which would wrongly claim the scrape succeeded."""
+        settings.update(notion_api_token="ntn_x", notion_db_id="db-1")
+        blocked = {"blocked": True, "error": None, "data": {"listings": [], "pages_crawled": 1}}
+
+        async def sweep(job, i, url, source, prog):
+            return blocked
+
+        svc = service(settings, jobs, sweep=sweep)
+        job = svc.start([SERP], sync=True)
+        await _drain(svc)
+
+        result = svc.result(job.id)
+        assert result.status == "failed"
+        assert "saving to your Notion database failed" not in result.error
+        assert "saving to Notion failed" not in result.summary
 
 
 class TestFailure:

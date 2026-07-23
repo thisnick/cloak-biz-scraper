@@ -134,7 +134,7 @@ def build(app) -> FastMCP:
 
     @mcp.tool()
     async def scrape_listings(
-        urls: list[str], max_pages: int = 1, sync: bool = False, db_id: str | None = None
+        urls: list[str], max_pages: int = 1, sync: bool = False
     ) -> ScrapeResult:
         """Start sweeping one or more listings pages for business listings.
 
@@ -175,10 +175,10 @@ def build(app) -> FastMCP:
             ONLY the newly-added listings, each with the synced_row_id of its new
             Notion row (ready for archive_page). (The Notion layer is opt-in:
             sync=true here, plus archive_page to file a page's full content into a
-            Notion page.)
-        db_id: override the configured Notion database. Only used when sync=true.
+            Notion page.) Sync always targets the Notion database configured under
+            Settings — there is no per-call database override.
         """
-        job = app.state.scrape.start(urls, max_pages=max_pages, sync=sync, db_id=db_id)
+        job = app.state.scrape.start(urls, max_pages=max_pages, sync=sync)
         return ScrapeResult.of(job)
 
     @mcp.tool()

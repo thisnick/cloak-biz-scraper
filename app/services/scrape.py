@@ -127,8 +127,7 @@ class ScrapeService:
         machine must be kept awake."""
         return len(self._running)
 
-    def start(self, urls: list[str], *, max_pages: int = 1, sync: bool = False,
-              db_id: str | None = None) -> Job:
+    def start(self, urls: list[str], *, max_pages: int = 1, sync: bool = False) -> Job:
         """Validate, write the job down, and return without waiting for it.
 
         Everything that can be known to be wrong before the browser starts is
@@ -168,13 +167,13 @@ class ScrapeService:
         target_db = ""
         if sync:
             settings = self._settings.load()
-            target_db = (db_id or settings.notion_db_id or "").strip()
+            target_db = (settings.notion_db_id or "").strip()
             if not settings.notion_api_token or not target_db:
                 raise NotionNotConfigured(
                     "sync=true asks for the listings to be saved, but no Notion database is "
                     "set up. Either add your Notion token and pick a database under "
-                    "Settings, pass db_id explicitly, or call this with sync=false to just "
-                    "read the listings back without saving them."
+                    "Settings, or call this with sync=false to just read the listings back "
+                    "without saving them."
                 )
 
         # The representative source for the batch (each Listing still records its
@@ -255,7 +254,29 @@ class ScrapeService:
                     # sync the caller keeps only the NEWLY-inserted rows, each
                     # carrying its store page id — the already-known ones stay in
                     # `synced.existing` but drop out of `listings`.
-                    job.synced, job.listings = await self._sync(job, listings)
+                    try:
+                        job.synced, job.listings = await self._sync(job, listings)
+                    except Exception as exc:  # noqa: BLE001 — a save failure is the job's own
+                        # The scrape SUCCEEDED; only the Notion write broke. This is
+                        # distinct from a scrape failure (where sources failed) and
+                        # must read that way. Drop the scraped listings on purpose:
+                        # handing back scraped-but-unsaved rows looks like success
+                        # and is worse than a clean failure. The message says the
+                        # scrape worked, saving failed, nothing was saved — and
+                        # carries the underlying store error verbatim.
+                        logger.exception("saving sweep %s to Notion failed", job.id)
+                        job.status = "failed"
+                        job.listings = []
+                        job.synced = None
+                        job.error = (
+                            f"Scraped {found} listing(s) from {ok} source(s), but saving to "
+                            f"your Notion database failed — nothing was saved. {exc}"
+                        )
+                        job.summary = (
+                            f"Scraped {found} listing(s), but saving to Notion failed — "
+                            f"nothing saved."
+                        )
+                        return
                 if failures:
                     job.error = self._failure_text(failures, total)
                 job.summary = self._summarize(job, ok, total, failures, found)
@@ -351,13 +372,10 @@ class ScrapeService:
         """
         settings = self._settings.load()
         store: ListingStore = self._store_factory(settings)
-        # The map belongs to the configured database. If the sweep targets a
-        # different db_id (an agent passing one explicitly), the map does not
-        # apply to it — fall back to identity mapping, which is safe for any
-        # correctly-named database.
+        # The sweep always targets the configured database (job.db_id is set to
+        # settings.notion_db_id at start), so the configured column map always
+        # applies.
         column_map = settings.notion_column_map or None
-        if job.db_id != settings.notion_db_id:
-            column_map = None
         result = await store.upsert_new(job.db_id, listings, column_map=column_map)
         synced = SyncResult(
             new=result.new, existing=result.existing, db_id=result.db_id,
