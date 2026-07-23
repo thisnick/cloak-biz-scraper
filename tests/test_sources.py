@@ -302,6 +302,19 @@ class TestBrokerMapping:
         assert listing.source == "bizbuysell_broker"
 
     @pytest.mark.asyncio
+    async def test_broker_tiles_carry_no_profit_figures(self):
+        """Documented, not a bug: a broker-profile tile shows only title,
+        location, asking price, and description — cash flow, EBITDA, and revenue
+        are not on the tile (verified live on real broker profiles), so the
+        adapter never invents them. Locks that they stay empty rather than
+        picking up some neighbouring number."""
+        page = _FakePage([{"title": "Krea", "blocked": False, "cards": [self.ONE]}])
+        listing = (await BizBuySellBroker().cards(page)).listings[0]
+        assert listing.cashflow == ""
+        assert listing.ebitda == ""
+        assert listing.revenue == ""
+
+    @pytest.mark.asyncio
     async def test_the_listing_id_is_recovered_from_the_url_when_absent(self):
         card = dict(self.ONE)
         card["listing_id"] = None
@@ -338,6 +351,7 @@ class TestBrokerMapping:
 
 
 _FIXTURE = Path(__file__).parent / "fixtures" / "broker_profile.html"
+_SERP_FIXTURE = Path(__file__).parent / "fixtures" / "serp_results.html"
 
 
 def _chromium_available() -> bool:
@@ -425,3 +439,102 @@ class TestBrokerExtraction:
         result = await self._cards()
         assert result.blocked is False
         assert result.title.startswith("Krea Business")
+
+
+@needs_chromium
+class TestSerpExtraction:
+    """JS_CARDS against a saved search-results page, in a real browser.
+
+    The cash-flow/EBITDA routing lives in the in-page JS, so a Python-level
+    mapping test cannot see it — the only honest test runs the real extractor
+    against the real markup. The fixture's `.cash-flow` elements are copied from
+    live California SERP cards (label text and all), so what these assert is what
+    the site ships. Every case here FAILS against the pre-fix code, where the
+    EBITDA figure was filed as cash flow (one number under two names), and PASSES
+    after routing by the element's own label.
+    """
+
+    async def _by_id(self):
+        from playwright.async_api import async_playwright
+
+        html = _SERP_FIXTURE.read_text()
+        async with async_playwright() as p:
+            browser = await p.chromium.launch()
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+                result = await BizBuySellSerp().cards(page)
+            finally:
+                await browser.close()
+        return {x.listing_id: x for x in result.listings}
+
+    @pytest.mark.asyncio
+    async def test_an_ebitda_card_is_ebitda_with_no_phantom_cash_flow(self):
+        """The bug, pinned: an "EBITDA: $X" figure is EBITDA, and cash flow —
+        which the card never stated — stays empty."""
+        card = (await self._by_id())["2474658"]
+        assert card.ebitda == "$664,984"
+        assert card.cashflow == ""
+
+    @pytest.mark.asyncio
+    async def test_a_cash_flow_card_is_cash_flow_with_no_phantom_ebitda(self):
+        card = (await self._by_id())["2531780"]
+        assert card.cashflow == "$122,000"
+        assert card.ebitda == ""
+
+    @pytest.mark.asyncio
+    async def test_an_sde_figure_routes_to_cash_flow(self):
+        """SDE is a cash-flow label; it is cash flow, not EBITDA."""
+        card = (await self._by_id())["2530911"]
+        assert card.cashflow == "$88,000"
+        assert card.ebitda == ""
+
+    @pytest.mark.asyncio
+    async def test_no_figure_ever_lands_in_two_fields(self):
+        """The core invariant across the whole page: the one profit figure a card
+        states occupies exactly one of cash flow / EBITDA, never both."""
+        for card in (await self._by_id()).values():
+            assert not (card.cashflow and card.ebitda), card.listing_id
+
+    @pytest.mark.asyncio
+    async def test_revenue_is_absent_on_ordinary_cards(self):
+        """SERP cards do not show revenue, so it stays empty — not back-filled
+        from the asking price or the profit figure."""
+        by_id = await self._by_id()
+        assert by_id["2474658"].revenue == ""
+        assert by_id["2531780"].revenue == ""
+        assert by_id["2530924"].revenue == ""
+
+    @pytest.mark.asyncio
+    async def test_the_franchise_revenue_line_still_extracts(self):
+        """The rare franchise tile states revenue as a trailing line; the
+        existing Revenue: regex still lifts it, alongside a real cash flow and no
+        EBITDA."""
+        card = (await self._by_id())["2484641"]
+        assert card.revenue == "$1,000,000"
+        assert card.cashflow == "$300,000"
+        assert card.ebitda == ""
+
+    @pytest.mark.asyncio
+    async def test_an_asking_only_card_leaves_every_profit_field_empty(self):
+        card = (await self._by_id())["2530924"]
+        assert card.asking_price == "$195,000"
+        assert card.cashflow == ""
+        assert card.ebitda == ""
+        assert card.revenue == ""
+
+    @pytest.mark.asyncio
+    async def test_a_clean_page_is_not_reported_as_blocked(self):
+        from playwright.async_api import async_playwright
+
+        html = _SERP_FIXTURE.read_text()
+        async with async_playwright() as p:
+            browser = await p.chromium.launch()
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+                result = await BizBuySellSerp().cards(page)
+            finally:
+                await browser.close()
+        assert result.blocked is False
+        assert len(result.listings) == 5

@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Businesses For Sale in California - BizBuySell</title>
+  <!-- A BizBuySell search-results page. Each tile is an anchor wrapping the
+       listing, and the ONE profit figure the seller gave sits in a .cash-flow
+       element whose own text names its kind — "Cash Flow: $X", "SDE: $X", or
+       "EBITDA: $X". The markup below is copied from live California SERP cards
+       (the class list `cash-flow show-on-mobile ng-star-inserted`, the
+       "EBITDA: $664,984" and "Cash Flow: $122,000" figures, and the ids are all
+       real), so the routing test asserts against the structure the site ships,
+       not a remembered guess. Revenue is not shown on SERP cards except for the
+       rare franchise tile, which carries it as a trailing "Revenue:" line. -->
+</head>
+<body>
+  <div class="listings">
+    <!-- EBITDA card: the figure is labeled EBITDA, so it is EBITDA, and cash
+         flow is genuinely absent. -->
+    <a href="https://www.bizbuysell.com/business-opportunity/rockin-jump-sky-zone-family-trampoline-park/2474658/">
+      <span class="title">Rockin' Jump / Sky Zone Family Trampoline Park</span>
+      <span class="location">Contra Costa County, CA</span>
+      <p class="asking-price">$2,000,000</p>
+      <p class="cash-flow show-on-mobile ng-star-inserted">EBITDA: $664,984</p>
+    </a>
+
+    <!-- Cash Flow card: the ordinary case. -->
+    <a href="https://www.bizbuysell.com/business-opportunity/pizza-to-go-owner-finance/2531780/">
+      <span class="title">Pizza To Go — Owner Finance, Low Rent</span>
+      <span class="location">Fresno County, CA</span>
+      <p class="asking-price">$279,000</p>
+      <p class="cash-flow show-on-mobile ng-star-inserted">Cash Flow: $122,000</p>
+    </a>
+
+    <!-- SDE card: SDE is a cash-flow label, so it routes to cash flow, not
+         EBITDA. -->
+    <a href="https://www.bizbuysell.com/business-opportunity/profitable-massage-and-wellness-spa/2530911/">
+      <span class="title">Profitable Massage &amp; Wellness Spa</span>
+      <span class="location">Rancho Cucamonga, CA</span>
+      <p class="asking-price">$249,000</p>
+      <p class="cash-flow show-on-mobile ng-star-inserted">SDE: $88,000</p>
+    </a>
+
+    <!-- Franchise card: the rare tile that also states revenue, as a trailing
+         line. Cash flow and revenue coexist; EBITDA stays empty. -->
+    <a href="https://www.bizbuysell.com/business-opportunity/auto-repair-franchise-6-bays/2484641/">
+      <span class="title">Auto Repair Franchise — 6 Bays, SF Valley</span>
+      <span class="location">Los Angeles County, CA</span>
+      <p class="asking-price">$1,200,000</p>
+      <p class="cash-flow show-on-mobile ng-star-inserted">Cash Flow: $300,000</p>
+      <p class="revenue">Revenue: $1,000,000</p>
+    </a>
+
+    <!-- Asking-price-only card: no profit figure and no revenue at all. -->
+    <a href="https://www.bizbuysell.com/business-opportunity/coin-laundromat-absentee-run/2530924/">
+      <span class="title">Coin Laundromat — Absentee Run</span>
+      <span class="location">San Diego County, CA</span>
+      <p class="asking-price">$195,000</p>
+    </a>
+  </div>
+</body>
+</html>

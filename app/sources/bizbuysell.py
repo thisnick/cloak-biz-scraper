@@ -87,9 +87,19 @@ JS_CARDS = r"""
     const raw = clean(a.innerText || a.textContent);
     const asking = value(text(a, 'p.asking-price:not(.hide-on-desktop)') || text(a, 'p.asking-price'))
                 || after(raw, /Asking(?: Price)?:\s*[^\n]+/i);
-    const cashflow = value(text(a, '.cash-flow') || text(a, '.cash-flow-on-mobile'))
-                  || after(raw, /Cash Flow:\s*[^\n]+/i);
-    const ebitda = after(raw, /EBITDA:\s*[^\n]+/i);
+    // A card shows ONE profit figure in a .cash-flow element, and the element's
+    // own text says which kind it is — "Cash Flow: $X", "SDE: $X", or
+    // "EBITDA: $X". Route by that inline label so a figure lands in exactly one
+    // field: an EBITDA amount is EBITDA, never a phantom cash flow. (value()
+    // strips the label, so the branch has to read it off the element first.)
+    const cashEl = text(a, '.cash-flow') || text(a, '.cash-flow-on-mobile');
+    let cashflow = null, ebitda = null;
+    if (cashEl && /^\s*ebitda\b/i.test(cashEl)) ebitda = value(cashEl);
+    else if (cashEl) cashflow = value(cashEl);
+    // Labeled fallbacks from the card's raw text, each kept to its own label so
+    // the fallback cannot cross-fill either.
+    cashflow = cashflow || after(raw, /(?:Cash Flow|SDE):\s*[^\n]+/i);
+    ebitda = ebitda || after(raw, /EBITDA:\s*[^\n]+/i);
     const revenue = after(raw, /(?:Gross )?Revenue:\s*[^\n]+/i);
     cards.push({
       listing_id: listingId(href, a.id),
@@ -155,11 +165,6 @@ class BizBuySellSerp:
             url = canonical_url(c.get("url") or "")
             if not url:
                 continue
-            cashflow = c.get("cashflow") or ""
-            # The .cash-flow element sometimes holds the EBITDA figure instead;
-            # recording it as cash flow would file one number under two names.
-            if cashflow.lower().startswith("ebitda"):
-                cashflow = ""
             listings.append(
                 Listing(
                     listing_id=c.get("listing_id") or listing_id_from(url) or "",
@@ -169,7 +174,7 @@ class BizBuySellSerp:
                     location=c.get("location") or "",
                     asking_price=c.get("asking_price") or "",
                     revenue=c.get("revenue") or "",
-                    cashflow=cashflow,
+                    cashflow=c.get("cashflow") or "",
                     ebitda=c.get("ebitda") or "",
                     excerpt=c.get("excerpt") or "",
                     source=self.name,
