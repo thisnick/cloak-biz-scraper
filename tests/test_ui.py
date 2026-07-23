@@ -36,6 +36,25 @@ def shown(response) -> str:
     return html.unescape(response.text)
 
 
+def _pin_capacity(monkeypatch, bytes_):
+    """Pin the container's DETECTED memory ceiling so pool_warning() is
+    deterministic instead of inheriting the host's.
+
+    pool_warning() is resource-aware: it reads the real cgroup/proc limit and
+    only falls back to the legacy cost-threshold ("… is a lot") when that limit
+    is UNREADABLE. That makes any un-pinned assertion host-dependent — it passes
+    on a developer's macOS (no cgroup, limit=None, legacy path) but flips on a
+    Linux CI runner (cgroup readable, resource-aware path). Patch detect_capacity
+    at its module so the test owns the regime: `bytes_=None` = unreadable (legacy
+    path), a byte count = a readable ceiling (resource-aware path)."""
+    import app.services.capacity as capacity
+
+    monkeypatch.setattr(
+        capacity, "detect_capacity",
+        lambda **kw: capacity.Capacity(memory_limit_bytes=bytes_),
+    )
+
+
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     """A signed-out client on a private volume."""
@@ -293,11 +312,43 @@ class TestSaving:
         for retired in ("Serverless", "0.5–1 GB", "$10/GB per month", "costs pennies"):
             assert retired not in page
 
-    def test_pool_warns_above_eight_but_obeys(self, auth):
+    def test_pool_warns_above_eight_but_obeys(self, auth, monkeypatch):
+        # Regime (a): memory ceiling UNREADABLE (as on a host without cgroups/
+        # proc), so the legacy cost-threshold warning is the one that fires. Pin
+        # it so this holds on any CI host, not only where the limit happens to be
+        # unreadable — before pinning, a Linux runner (~16 GB readable) put 12
+        # under the safe count and dropped the warning entirely.
+        _pin_capacity(monkeypatch, None)
         response = auth.post("/settings/pool", data={"max_instances": "12", "interactive_reserve": "1"})
         assert response.status_code == 200
         assert app.state.settings.load().max_instances == 12, "guidance, not a cap"
         assert "is a lot" in response.text
+
+    def test_pool_warns_when_it_exceeds_detected_memory(self, auth, monkeypatch):
+        # Regime (b): the one that turned CI red. On a Linux runner the cgroup IS
+        # readable, so the resource-aware path runs. Pin a small ceiling (4 GB ->
+        # safe 4) and post a pool above it: it must warn with the measured
+        # guidance (naming the safe count and a failure mode) and still obey.
+        _pin_capacity(monkeypatch, 4 * 1024 ** 3)
+        response = auth.post("/settings/pool", data={"max_instances": "12", "interactive_reserve": "1"})
+        assert response.status_code == 200
+        assert app.state.settings.load().max_instances == 12, "guidance, not a cap"
+        page = shown(response)
+        assert "sized for about 4 browser(s)" in page
+        assert "Page crashed" in page
+        assert "is a lot" not in page, "resource-aware warning, not the legacy cost one"
+
+    def test_pool_is_silent_within_detected_memory(self, auth, monkeypatch):
+        # The other half of regime (b), and exactly what the CI host was doing to
+        # the legacy assertion: at or under the detected safe count there is no
+        # nag, whichever warning path is live.
+        _pin_capacity(monkeypatch, 4 * 1024 ** 3)  # safe 4
+        response = auth.post("/settings/pool", data={"max_instances": "4", "interactive_reserve": "1"})
+        assert response.status_code == 200
+        assert app.state.settings.load().max_instances == 4
+        page = shown(response)
+        assert "is a lot" not in page
+        assert "sized for" not in page
 
     def test_impossible_reserve_is_refused_readably(self, auth):
         response = auth.post("/settings/pool", data={"max_instances": "2", "interactive_reserve": "2"})
