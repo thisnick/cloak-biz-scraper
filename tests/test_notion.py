@@ -46,6 +46,7 @@ FULL_SCHEMA = {
     "Revenue": prop("number", "r1"),
     "SDE / Cash Flow": prop("number", "c1"),
     "EBITDA": prop("number", "e1"),
+    "Excerpt": prop("rich_text", "ex"),
     "Status": prop("select", "st"),
     "First Seen At": prop("date", "f1"),
     "Last Synced At": prop("date", "ls"),
@@ -437,6 +438,36 @@ class TestUpsertNew:
 
     @respx.mock
     @pytest.mark.asyncio
+    async def test_the_extracted_excerpt_lands_when_a_column_holds_it(self):
+        import json
+
+        # Both adapters extract the card's snippet onto Listing.excerpt; when the
+        # database has an Excerpt column, the sweep saves it there.
+        mock_db(FULL_SCHEMA)
+        mock_query([])
+        route = respx.post(f"{API}/pages").mock(return_value=httpx.Response(200, json={"id": "n"}))
+        await NotionStore(TOKEN).upsert_new(DB, [listing(excerpt="Turnkey cafe, owner retiring.")])
+        sent = json.loads(route.calls[0].request.read())["properties"]
+        assert sent["Excerpt"] == {
+            "rich_text": [{"type": "text", "text": {"content": "Turnkey cafe, owner retiring."}}]
+        }
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_excerpt_is_skipped_when_the_database_has_no_column_for_it(self):
+        import json
+
+        # The snippet is always extracted, but a database without an Excerpt column
+        # simply does not receive it — no 400, no invented column.
+        mock_db(MINIMAL_SCHEMA)
+        mock_query([])
+        route = respx.post(f"{API}/pages").mock(return_value=httpx.Response(200, json={"id": "n"}))
+        await NotionStore(TOKEN).upsert_new(DB, [listing(excerpt="A profitable bakery.")])
+        sent = json.loads(route.calls[0].request.read())["properties"]
+        assert "Excerpt" not in sent
+
+    @respx.mock
+    @pytest.mark.asyncio
     async def test_new_rows_get_status_and_first_seen(self):
         import json
 
@@ -741,6 +772,25 @@ class TestMappedWrites:
         assert set(sent) == {"Deal", "Link", "Canonical", "Ref", "Ask"}
         assert sent["Deal"] == {"title": [{"type": "text", "text": {"content": "A Business"}}]}
         assert sent["Ask"] == {"number": 1258000.0}
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_excerpt_lands_in_the_mapped_column(self):
+        import json
+
+        # The snippet both adapters extract is saved only when the user maps it —
+        # here onto their differently-named "Notes" text column.
+        mock_db(RENAMED)
+        mock_query([])
+        route = respx.post(f"{API}/pages").mock(return_value=httpx.Response(200, json={"id": "n"}))
+        m = {**RENAMED_MAP, "excerpt": "Notes"}
+        await NotionStore(TOKEN).upsert_new(
+            DB, [listing(excerpt="Owner retiring; strong lease.")], column_map=m
+        )
+        sent = json.loads(route.calls[0].request.read())["properties"]
+        assert sent["Notes"] == {
+            "rich_text": [{"type": "text", "text": {"content": "Owner retiring; strong lease."}}]
+        }
 
     @respx.mock
     @pytest.mark.asyncio
