@@ -227,6 +227,12 @@ KNOWN_PROPS: tuple[NotionProp, ...] = (
         source="ebitda", render=_money, consequence=_MONEY_CONSEQUENCE,
     ),
     NotionProp(
+        "excerpt", "Excerpt", "rich_text", False, {"rich_text": {}}, source="excerpt",
+        render=lambda v: {"rich_text": _text_chunk(v)} if v else None,
+        consequence="The card's own summary text — extracted on every sweep but only "
+                    "saved when this is mapped to a column. Everything else still syncs.",
+    ),
+    NotionProp(
         "status", "Status", "select", False,
         {"select": {"options": [
             {"name": "New", "color": "blue"},
