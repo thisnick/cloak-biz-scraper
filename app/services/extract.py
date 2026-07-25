@@ -57,6 +57,15 @@ RECIPES: dict[str, dict] = {
         ],
         "extra_selectors": [".inform_revenue"],
     },
+    # asking/cash-flow/gross-income/year-established rows, and the "Represented
+    # by" block whose last line is the WC reference number. Both sit in the
+    # sidebar row Readability discards. `.sb-table` is the theme's own name for
+    # the single-business facts table and is the stable one. `.wysiwyg:not(.cfx)`
+    # is weaker — it is defined against the body copy, which the theme marks
+    # `.wysiwyg.cfx`, so a second unadorned `.wysiwyg` anywhere on the page would
+    # be picked up too. Kept as two independent selectors rather than one
+    # `:has()` row selector so that if either rots the other still lands.
+    "websiteclosers.com": {"extra_selectors": [".sb-table", ".wysiwyg:not(.cfx)"]},
     # facts rows (Duda template ids — fragile; body alone is fine if they rot)
     "sfbay.fcbb.com": {
         "extra_selectors": [

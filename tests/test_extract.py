@@ -9,11 +9,14 @@ memory would defeat the point: the whole reason these exist is that what martian
 from __future__ import annotations
 
 import shutil
+from pathlib import Path
 
 import pytest
 
 from app.services import extract
-from app.services.extract import _MD2BLOCKS, _md_to_blocks_sync, prelude, recipe_for
+from app.services.extract import (
+    _MD2BLOCKS, _md_to_blocks_sync, prelude, recipe_for, recipe_for_url,
+)
 
 martian = pytest.mark.skipif(
     not (_MD2BLOCKS.exists() and shutil.which("node")),
@@ -81,6 +84,118 @@ class TestRecipes:
 
     def test_an_unknown_host_gets_no_recipe_rather_than_an_error(self):
         assert recipe_for("example.com") == {}
+
+    def test_a_websiteclosers_listing_resolves_with_and_without_www(self):
+        """The financials and the WC reference live in the sidebar; a listing URL
+        has to reach the recipe for either to survive."""
+        want = [".sb-table", ".wysiwyg:not(.cfx)"]
+        assert recipe_for_url(_WC_URL)["extra_selectors"] == want
+        assert recipe_for_url(_WC_URL.replace("//www.", "//")) == recipe_for_url(_WC_URL)
+
+
+_WC_FIXTURE = Path(__file__).parent / "fixtures" / "websiteclosers_listing.html"
+_WC_URL = (
+    "https://www.websiteclosers.com/businesses/sba-pre-qualified-ai-powered-medical-"
+    "device-company-patented-systems-8-year-med-tech-firm-fda-class-i-device-110k-"
+    "average-deal-size-22-granted-patent-claims/119217/"
+)
+
+
+def _chromium_available() -> bool:
+    """Whether a Playwright chromium is installed — asked without launching one."""
+    try:
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as p:
+            path = p.chromium.executable_path
+        return bool(path) and Path(path).exists()
+    except Exception:
+        return False
+
+
+needs_chromium = pytest.mark.skipif(
+    not _chromium_available(), reason="the real JS extractor needs a Playwright chromium"
+)
+
+
+@needs_chromium
+class TestWebsiteClosersKeepsTheFinancialsAndTheReference:
+    """The recipe against the real markup, in a real browser.
+
+    A matched pair, like the martian tests above: the first case runs the same
+    extractor with no extra selectors — which is exactly what an unrecognised
+    host gets — and shows the page's only financials going missing. The rest run
+    the host's own recipe and show them landing. Asserting this from remembered
+    structure would defeat the point; the fixture is sliced from listing 119217's
+    live DOM and the figures are that listing's own.
+    """
+
+    async def _extract(self, extra_selectors=None):
+        from playwright.async_api import async_playwright
+
+        html = _WC_FIXTURE.read_text()
+        async with async_playwright() as p:
+            browser = await p.chromium.launch()
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+                # extra_selectors=None means "use the host's recipe"; [] is the
+                # pre-recipe behaviour, reproduced rather than described.
+                return await extract.extract(
+                    page, url=_WC_URL, extra_selectors=extra_selectors
+                )
+            finally:
+                await browser.close()
+
+    @pytest.mark.asyncio
+    async def test_readability_alone_drops_every_figure_on_the_page(self):
+        """The bug. Readability keeps the body copy and discards the sidebar, so
+        an archive of this page states no price, no cash flow, and no broker
+        reference at all."""
+        res = await self._extract(extra_selectors=[])
+        md = res["markdown"]
+        assert res["usedPath"] == "readability", "not the path the live page takes"
+        assert "robotic hair restoration systems" in md, "body copy should survive"
+        for gone in ("Asking Price", "$ 4,900,000", "Cash Flow", "$ 1,371,348",
+                     "Gross Income", "$ 1,958,786", "Year Established",
+                     "Represented by", "WC 4068"):
+            assert gone not in md, f"{gone} unexpectedly survived without the recipe"
+
+    @pytest.mark.asyncio
+    async def test_the_recipe_puts_the_four_figures_back(self):
+        md = (await self._extract())["markdown"]
+        for label, figure in (("Asking Price", "$ 4,900,000"),
+                              ("Cash Flow", "$ 1,371,348"),
+                              ("Gross Income", "$ 1,958,786"),
+                              ("Year Established", "2018")):
+            assert label in md, f"{label} row lost"
+            assert figure in md, f"{label} figure lost"
+
+    @pytest.mark.asyncio
+    async def test_the_recipe_keeps_who_represents_the_listing_and_its_reference(self):
+        """The last line of that block is the WC number, which is how a listing
+        is referred to in conversation with the broker."""
+        md = (await self._extract())["markdown"]
+        assert "This Med-Tech Company is Represented by:" in md
+        assert "WebsiteClosers.com" in md
+        assert "Tech Business Brokers" in md
+        assert "WC 4068" in md
+
+    @pytest.mark.asyncio
+    async def test_the_body_copy_is_not_pulled_in_twice(self):
+        """`.wysiwyg:not(.cfx)` is the represented-by block precisely because the
+        body copy carries `.cfx`. Drop the `:not(...)` and the whole description
+        is appended a second time — this is the case that would catch it."""
+        md = (await self._extract())["markdown"]
+        assert md.count("robotic hair restoration systems") == 1
+
+    @pytest.mark.asyncio
+    async def test_the_extras_arrive_as_their_own_sections(self):
+        """Appended below the body behind dividers, not spliced into it."""
+        res = await self._extract()
+        body, *extras = res["markdown"].split("\n\n---\n\n")
+        assert len(extras) == 2, "one section per extra selector"
+        assert "Asking Price" not in body
 
 
 @martian
