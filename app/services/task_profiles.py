@@ -3,15 +3,23 @@
 The problem this fixes: a sweep used to launch on ``serp-<url-path>`` — a fresh
 durable profile per unique URL path, minted at launch time and never cleaned up.
 Scrape a hundred different searches and you have a hundred profiles on the volume
-forever, each with its own cookie jar warming up from cold every time.
+forever, each with its own cookie jar warming up from cold every time. Archiving
+had the identical bug in its own namespace (``archive-<host+path>``) and draws
+from this pool now too, so *every* task-origin browser is a pooled identity.
 
-Instead, sweeps draw from a small, bounded set of pooled identities — ``task-1``,
-``task-2``, … — leased for the life of one sweep and returned when it ends, then
-handed to the next sweep warm. The pool self-limits without any garbage
-collection: the instance pool already caps concurrent tasks at ``task_budget``
-(max_instances − interactive_reserve), so at most that many leases are ever held
-at once, so the pool never mints more than ``task_budget`` profiles. A released
-profile is reused, not deleted — its cookies and warmth are the point.
+Instead, tasks draw from a small, bounded set of pooled identities — ``task-1``,
+``task-2``, … — leased for the life of one sweep or archive and returned when it
+ends, then handed to the next one warm. The pool self-limits without any garbage
+collection: each consumer admits at most ``task_budget`` concurrent tasks
+(max_instances − interactive_reserve) before leasing, so the number of leases held
+at once is bounded, and the pool only ever mints as many profiles as are held at
+once. A released profile is reused, not deleted — its cookies and warmth are the
+point.
+
+The bound is per consumer, so a volume where sweeps and archives both saturate
+can reach two budgets' worth of ``task-N`` names. That is a ceiling on minting,
+not a leak: they are reused from then on, and the instance pool still caps how
+many run at once.
 
 Leases are in-memory: they record which profile is *busy right now*, nothing
 more. A process restart resets them all to free, which is correct — nothing is

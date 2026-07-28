@@ -66,6 +66,25 @@ class Settings(BaseModel):
     proxy_last_check_ok: bool | None = None
     proxy_last_check_summary: str = ""
 
+    # The last browser binary that actually resolved, remembered across restarts
+    # for exactly the reason above.
+    #
+    # The binary itself is durable — it is unpacked into the cache dir on the
+    # volume — but the knowledge of which one resolved used to live only in
+    # InstanceManager's memory, so every redeploy or wake-from-sleep downgraded a
+    # verified Pro install back to the "Pro key saved" chip until the user
+    # re-verified or a browser happened to launch. Nothing had changed but the
+    # process.
+    #
+    # No secret: the key is stored as a sha256 digest, only to detect that the
+    # saved key changed since the path was resolved. The path is what a later
+    # boot re-checks against the volume (a purged cache must not keep reporting
+    # Pro), and it is the same string already shown as the cache dir in the UI.
+    binary_last_path: str = ""
+    binary_last_key_hash: str = ""
+    binary_last_version_pin: str = ""
+    binary_last_resolved_at: float = 0.0
+
     # Notion. The database is chosen or created explicitly in the UI and its id
     # stored here — never discovered, never created on the fly (decision #5).
     notion_api_token: str = ""

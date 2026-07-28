@@ -47,6 +47,7 @@ from .license import LicenseNotPro, resolve_browser_binary
 from .profiles import ProfileInUse, ProfileStore
 from .proxy import ProxyParts, build_proxy_url
 from .settings import SettingsService
+from .task_profiles import TaskProfilePool
 
 logger = logging.getLogger("cloakbiz.instances")
 
@@ -182,9 +183,19 @@ class InstanceManager:
         # Status only; never stores the key. The fingerprint lets server_info
         # reject a stale result after the user changes keys without disclosing
         # either value. The path is what was actually resolved, and therefore
-        # the only honest source for public-vs-Pro labelling.
+        # the only honest source for public-vs-Pro labelling. Mirrored into the
+        # settings store (binary_last_*) so a restart does not downgrade a
+        # verified Pro install to "Pro key saved" — see binary_path_for.
         self._last_binary_path: str | None = None
         self._last_binary_selection: tuple[str, str] | None = None
+        # One task-profile pool per manager, created on first use so a test that
+        # swaps ``profiles`` after construction still gets a pool over the store
+        # it installed. Built here rather than by each consumer because the pool
+        # is the sole lease authority: two pools would each believe task-1 was
+        # free and hand it to a sweep and an archive at once, and the two
+        # browsers would collide on Chromium's singleton lock in one
+        # user-data-dir. Sweeps and archives therefore share this one.
+        self._task_profiles: TaskProfilePool | None = None
         # Optional post-registration warm-up for an interactive browser's driver
         # (see set_launch_warm_hook). Kept as a hook so instances.py has no
         # dependency on the agent-browser service; None means "not wired", which
@@ -200,27 +211,86 @@ class InstanceManager:
         fire-and-forget and best-effort — see AgentBrowserService.warm."""
         self._launch_warm_hook = hook
 
+    @property
+    def task_profiles(self) -> TaskProfilePool:
+        """The pool of reusable ``task-N`` identities every task origin draws from."""
+        if self._task_profiles is None:
+            self._task_profiles = TaskProfilePool(self.profiles, self._settings)
+        return self._task_profiles
+
     @staticmethod
     def _binary_selection(settings) -> tuple[str, str]:
         key_hash = hashlib.sha256(settings.cloakbrowser_license_key.encode()).hexdigest()
         return key_hash, settings.cloakbrowser_version
 
     def note_binary(self, path: str, settings=None) -> None:
-        """Remember a successfully resolved artifact for secret-free status."""
+        """Remember a successfully resolved artifact for secret-free status.
+
+        Written through to the settings store so the status survives the process
+        that observed it. Skipped when the store already says this, so an ordinary
+        launch does not rewrite the encrypted settings file every time.
+        """
         settings = settings or self._settings.load()
+        selection = self._binary_selection(settings)
         self._last_binary_path = path
-        self._last_binary_selection = self._binary_selection(settings)
+        self._last_binary_selection = selection
+        if self._stored_selection(settings) == selection and settings.binary_last_path == path:
+            return
+        self._persist_binary(path, selection)
 
     def forget_binary(self) -> None:
         """Drop status after a verification failure for the same saved key."""
         self._last_binary_path = None
         self._last_binary_selection = None
+        if self._stored_binary_present():
+            self._persist_binary("", ("", ""))
 
     def binary_path_for(self, settings) -> str | None:
-        """Return the resolved path only while it matches current settings."""
-        if self._last_binary_selection != self._binary_selection(settings):
+        """Return the resolved path only while it matches current settings.
+
+        Falls back to the store when this process has not resolved a binary
+        itself — a restart must not turn a verified Pro install back into
+        ``pro-unverified`` when neither the key nor the artifact changed. The
+        stored path is re-checked against the volume rather than trusted: a
+        purged or rebuilt cache is exactly the case where claiming Pro would be
+        a lie, and it costs one stat on a page render.
+        """
+        selection = self._binary_selection(settings)
+        if self._last_binary_selection == selection:
+            return self._last_binary_path
+        if self._stored_selection(settings) != selection:
             return None
-        return self._last_binary_path
+        stored = settings.binary_last_path
+        if not stored or not Path(stored).exists():
+            return None
+        # Adopt it as this process's own, so the stat happens once per boot.
+        self._last_binary_path = stored
+        self._last_binary_selection = selection
+        return stored
+
+    @staticmethod
+    def _stored_selection(settings) -> tuple[str, str]:
+        return settings.binary_last_key_hash, settings.binary_last_version_pin
+
+    def _stored_binary_present(self) -> bool:
+        try:
+            return bool(self._settings.load().binary_last_path)
+        except Exception:  # noqa: BLE001 — status is never worth failing over
+            return False
+
+    def _persist_binary(self, path: str, selection: tuple[str, str]) -> None:
+        """Mirror the status to the volume. Never fatal: a browser that launched
+        stays launched even if we cannot write down which build it was."""
+        key_hash, version_pin = selection
+        try:
+            self._settings.update(
+                binary_last_path=path,
+                binary_last_key_hash=key_hash,
+                binary_last_version_pin=version_pin,
+                binary_last_resolved_at=time.time() if path else 0.0,
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("could not persist the resolved browser build", exc_info=True)
 
     # ── capacity accounting (call under self._cond) ──────────────────────────
     def _reserve_profile(self, name: str) -> None:
