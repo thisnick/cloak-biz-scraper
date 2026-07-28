@@ -126,9 +126,11 @@ def browser_info(settings, instances) -> BrowserInfo:
     `cloakbrowser.binary_info()` prefers any cached Pro binary, even when the
     current settings deliberately select the public build, so it cannot answer
     this question on a volume that has used both modes. The manager remembers
-    the exact path returned for the current key fingerprint + pin; `is_pro(path)`
-    is then the ground truth. Before a keyed build resolves, status stays
-    `pro-unverified` rather than claiming that the key worked.
+    the exact path returned for the current key fingerprint + pin — in memory,
+    and on the volume so a restart does not un-verify a working install —
+    and `is_pro(path)` is then the ground truth. Before a keyed build resolves
+    (or after its cached binary goes away), status stays `pro-unverified` rather
+    than claiming that the key worked.
     """
     from .license import _version_from_path, is_pro
 

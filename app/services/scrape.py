@@ -100,12 +100,13 @@ class ScrapeService:
         self._store_factory = store_factory or _default_store
         # A bounded pool of reusable task-N browser identities, replacing the old
         # per-URL serp-<path> profiles that accumulated on the volume forever.
-        # Injectable for tests; built from the instance manager's ProfileStore in
-        # normal use. None only when there is no instance manager (unit tests that
-        # stub _sweep) — release() below is guarded for that case.
+        # Injectable for tests; otherwise the instance manager's own pool — the
+        # single lease authority, shared with archives, never a second one built
+        # here. None only when there is no instance manager (unit tests that stub
+        # _sweep) — release() below is guarded for that case.
         self._task_profiles = task_profiles
         if self._task_profiles is None and instances is not None:
-            self._task_profiles = TaskProfilePool(instances.profiles, settings)
+            self._task_profiles = instances.task_profiles
         self._running: set[asyncio.Task] = set()
         # Admission gate: at most task_budget sweeps run past this point at once.
         # The instance pool's cap only bites INSIDE launch, but start() spawns an
