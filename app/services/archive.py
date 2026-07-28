@@ -5,6 +5,11 @@ append — roughly 40–60s. That sits inside Claude.ai's wall but right on top 
 Claude Code's 60s default, which is a documentation problem rather than a design
 one (`MCP_TOOL_TIMEOUT`).
 
+It runs on a leased ``task-N`` identity from the shared pool, exactly as a sweep
+does — see services/task_profiles.py. It used to launch on ``archive-<host+path>``,
+a durable profile minted per URL and never cleaned up, so the profile list grew by
+one for every distinct page anyone ever archived.
+
 **The Notion write scope is deliberately tiny**: this appends blocks to a page
 the caller already named, and does nothing else. No page is created, no property
 is set, no parent is chosen. The caller decided where this goes; we only fill it
@@ -13,7 +18,9 @@ append a header announcing content that is not there.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import uuid
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -23,6 +30,7 @@ from .blocker import text_contains_blocker
 from .browsing import capture, gesture, scrape_with_retry, slug
 from .extract import extract, md_to_blocks, prelude
 from .settings import SettingsService
+from .task_profiles import TaskProfilePool
 
 logger = logging.getLogger("cloakbiz.archive")
 
@@ -34,10 +42,43 @@ _BLOCKS_PER_REQUEST = 100
 
 
 class ArchiveService:
-    def __init__(self, instances, settings: SettingsService, appender=None) -> None:
+    def __init__(self, instances, settings: SettingsService, appender=None,
+                 task_profiles: TaskProfilePool | None = None) -> None:
         self._instances = instances
         self._settings = settings
         self._append = appender or _notion_append
+        # The instance manager's pool, shared with sweeps. Archiving used to mint
+        # a durable ``archive-<host+path>`` profile per URL, which is the same
+        # unbounded accumulation task_profiles.py was written to end for sweeps:
+        # a hundred archived pages left a hundred cookie jars on the volume
+        # forever, each cold on first use. Injectable for tests.
+        self._task_profiles = task_profiles
+        if self._task_profiles is None and instances is not None:
+            self._task_profiles = instances.task_profiles
+        # Admission gate, for the same reason ScrapeService has one: a profile is
+        # leased BEFORE the launch that waits for a pool slot, so without a bound
+        # here the number of leases held at once — and therefore the number of
+        # task-N profiles ever minted — would track how many archive calls happen
+        # to overlap rather than the pool budget. Excess archives queue here; they
+        # would have queued on the instance slot a moment later anyway. Re-read
+        # from settings on each wake so the Pool setting applies without a
+        # restart. Sweeps are bounded separately by their own gate, so a volume
+        # where both saturate at once can hold up to two budgets' worth of leases;
+        # that is the ceiling on minting, and every one of them is reused after.
+        self._gate = asyncio.Condition()
+        self._past_gate = 0
+
+    async def _enter_gate(self) -> None:
+        async with self._gate:
+            await self._gate.wait_for(
+                lambda: self._past_gate < self._settings.load().task_budget
+            )
+            self._past_gate += 1
+
+    async def _leave_gate(self) -> None:
+        async with self._gate:
+            self._past_gate -= 1
+            self._gate.notify_all()
 
     async def archive(self, url: str, notion_page_id: str,
                       heading: str = _DEFAULT_HEADING) -> ArchiveResult:
@@ -53,16 +94,34 @@ class ArchiveService:
 
         parsed = urlparse(url)
         host = parsed.hostname or "unknown"
-        # Per-URL, not per-host: two archives of the same site running at once
-        # would otherwise share a user-data-dir and collide on the singleton lock.
+        # Still per-URL for evidence, which is a record of one page.
         key = slug((host + parsed.path) or host)
         evidence = CONFIG.evidence_dir / "archive" / key
 
-        res = await scrape_with_retry(
-            self._instances, profile=f"archive-{key}", owner=f"archive:{key}",
-            wait_ms=_WAIT_MS, attempts=_ATTEMPTS,
-            scrape_once=lambda inst, page: self._extract_once(inst, page, url, evidence),
-        )
+        # Lease a pooled task-N identity. The lease key is per CALL, not per URL:
+        # what has to stay distinct is two archives running at once, and two
+        # archives of the SAME url are exactly the case the old per-URL profile
+        # name could not keep apart — they shared a user-data-dir and collided on
+        # Chromium's singleton lock. The pool is the sole lease authority, so
+        # distinct leases mean distinct profiles. Acquired before any launch and
+        # released in the finally, so a launch failure returns it too.
+        lease_key = f"archive:{key}:{uuid.uuid4().hex[:8]}"
+        await self._enter_gate()
+        try:
+            profile = self._task_profiles.acquire(lease_key)
+            try:
+                res = await scrape_with_retry(
+                    self._instances, profile=profile, owner=f"archive:{key}",
+                    wait_ms=_WAIT_MS, attempts=_ATTEMPTS,
+                    scrape_once=lambda inst, page: self._extract_once(inst, page, url, evidence),
+                )
+            finally:
+                self._task_profiles.release(lease_key)
+        finally:
+            # Shielded for the same reason the sweep gate is: a caller that
+            # disconnects mid-archive must not leave the gate counter permanently
+            # short, or later archives queue behind a slot nobody holds.
+            await asyncio.shield(self._leave_gate())
 
         data = res.get("data") or {}
         result = ArchiveResult(
