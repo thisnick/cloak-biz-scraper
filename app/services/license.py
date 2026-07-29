@@ -174,6 +174,48 @@ async def verify(license_key: str, version_pin: str = "") -> LicenseReport:
     )
 
 
+async def establish(instances, settings) -> LicenseReport | None:
+    """Make the running build known at boot. Returns None when it already was.
+
+    Persisting the status (settings.binary_last_*) keeps an answer someone
+    already obtained; it cannot invent one. The only two things that ever
+    recorded a build were the Settings "Verify" button and a successful launch,
+    so a server that has done neither *since the status was introduced* reports
+    `pro-unverified` forever — a saved key, a Pro binary sitting on the volume,
+    and nothing that ever looked. That is the state every existing deployment
+    upgraded into, and the state a fresh one boots into.
+
+    So the boot establishes it, which is what this module was written for
+    ("Early matters", above) and what nothing ever called it to do. The cost is
+    bounded to once per volume in the normal case: when the stored path still
+    resolves we return without touching the network, so the licensing server is
+    contacted on the first boot after a deploy and then not again — which
+    matters when the platform sleeps the container aggressively.
+
+    A failure here never clears what is already known. `verify` fails closed on a
+    licensing outage by design, and an outage is precisely when erasing a good
+    stored status would strand a paying user on the public build. Clearing stays
+    the Verify button's job, where a person asked and gets told.
+    """
+    current = settings.load()
+    if instances.binary_path_for(current):
+        logger.info("browser build already known from the volume; not re-resolving")
+        return None
+
+    report = await verify(current.cloakbrowser_license_key, current.cloakbrowser_version)
+    if report.ok and report.binary_path:
+        instances.note_binary(report.binary_path, settings.load())
+        logger.info(
+            "browser build resolved at startup: %s %s",
+            "pro" if report.pro else "public", report.version,
+        )
+    else:
+        # Warn, never fail: the server runs fine, it just cannot yet say which
+        # build it would launch. The next verify or launch settles it.
+        logger.warning("could not resolve the browser build at startup: %s", report.message)
+    return report
+
+
 def _version_from_path(path: str) -> str:
     """Pull the resolved version out of the cached binary's path.
 

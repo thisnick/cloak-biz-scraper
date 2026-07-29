@@ -6,6 +6,8 @@ from __future__ import annotations
 import os
 import tempfile
 
+import pytest
+
 # Forced, not setdefault. setdefault lets an ambient DATA_DIR win, so running the
 # suite anywhere one is already set — inside the container, most obviously — points
 # the tests at a REAL volume: they then read live settings, and
@@ -29,6 +31,29 @@ for _leak in (
     "MCP_ALLOWED_ORIGINS",
 ):
     os.environ.pop(_leak, None)
+
+
+@pytest.fixture(autouse=True)
+def no_startup_binary_resolve(monkeypatch, request):
+    """Keep the lifespan's build resolution out of the suite.
+
+    Booting the app now settles which browser it runs, which means contacting
+    the licensing server and downloading ~150 MB of Chromium into DATA_DIR — in
+    every test that opens a TestClient. The suite is hermetic by contract, so the
+    startup hop is stubbed here, at the one place it is wired in (app.main), and
+    nowhere near services.license: the tests that exercise the resolution itself
+    call it directly, with the package faked.
+
+    A test that wants the real wiring marks itself `real_startup_resolve` and
+    stubs the licence call instead.
+    """
+    if "real_startup_resolve" in request.keywords:
+        return
+
+    async def skip(app) -> None:
+        return None
+
+    monkeypatch.setattr("app.main._establish_build", skip)
 
 
 def isolate_auth(app, tmp_path):

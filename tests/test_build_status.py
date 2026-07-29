@@ -17,9 +17,17 @@ from pathlib import Path
 
 import pytest
 
+from app.services import license as license_service
 from app.services.instances import InstanceManager
 from app.services.settings import Settings, SettingsService
 from app.services.views import browser_info
+
+
+class _Info:
+    """What cloakbrowser's validate_license returns."""
+
+    def __init__(self, valid: bool, plan: str = "team") -> None:
+        self.valid, self.plan = valid, plan
 
 
 def _store(tmp_path) -> SettingsService:
@@ -175,6 +183,178 @@ class TestWhatGetsWrittenDown:
         store.update = boom  # type: ignore[method-assign]
         manager.note_binary(pro, settings)
         assert manager.binary_path_for(settings) == pro, "memory still answers"
+
+
+class TestTheBootEstablishesIt:
+    """Persisting a status keeps an answer; it cannot invent one.
+
+    Only the Verify button and a successful launch ever recorded a build, so a
+    server that has done neither reports `pro-unverified` indefinitely — with a
+    saved key and a Pro binary sitting on the volume. That is the state every
+    existing deployment upgraded into, and it is why the status looked unchanged
+    after the store started remembering it.
+    """
+
+    @pytest.fixture
+    def package(self, monkeypatch, tmp_path):
+        """Stand in for the cloakbrowser package, resolving a real file."""
+
+        class Fake:
+            info: object = _Info(True)
+            path: str = _binary(tmp_path)
+            validate_calls: list = []
+            ensure_calls: list = []
+
+            def validate_license(self, key):
+                self.validate_calls.append(key)
+                return self.info
+
+            def ensure_binary(self, license_key=None, browser_version=None):
+                self.ensure_calls.append((license_key, browser_version))
+                return self.path
+
+        fake = Fake()
+        import cloakbrowser.browser
+        import cloakbrowser.license
+
+        monkeypatch.setattr(cloakbrowser.license, "validate_license", fake.validate_license)
+        monkeypatch.setattr(cloakbrowser.browser, "ensure_binary", fake.ensure_binary)
+        return fake
+
+    @pytest.mark.asyncio
+    async def test_a_server_that_never_verified_still_learns_its_build(
+        self, tmp_path, package,
+    ):
+        store = _store(tmp_path)
+        store.update(cloakbrowser_license_key="a-real-key")
+        manager = InstanceManager(store)
+        assert browser_info(store.load(), manager).build == "pro-unverified"
+
+        await license_service.establish(manager, store)
+
+        assert browser_info(store.load(), manager).build == "pro"
+        assert store.load().binary_last_path == package.path, "and written down"
+
+    @pytest.mark.asyncio
+    async def test_what_it_established_survives_the_next_restart(self, tmp_path, package):
+        store = _store(tmp_path)
+        store.update(cloakbrowser_license_key="a-real-key")
+        await license_service.establish(InstanceManager(store), store)
+
+        assert browser_info(store.load(), InstanceManager(store)).build == "pro"
+
+    @pytest.mark.asyncio
+    async def test_a_later_boot_does_not_touch_the_licensing_server(
+        self, tmp_path, package,
+    ):
+        """The reason this is cheap enough to do on every boot: once the volume
+        has the answer, waking the container costs no round-trip at all."""
+        store = _store(tmp_path)
+        store.update(cloakbrowser_license_key="a-real-key")
+        await license_service.establish(InstanceManager(store), store)
+        assert package.validate_calls == ["a-real-key"], "first boot resolves"
+
+        assert await license_service.establish(InstanceManager(store), store) is None
+        assert package.validate_calls == ["a-real-key"], "later boots read the volume"
+
+    @pytest.mark.asyncio
+    async def test_a_licensing_outage_never_erases_a_known_build(self, tmp_path, package):
+        # verify() fails closed on an outage, which is exactly when erasing a
+        # good status would strand a paying user on the public build.
+        store = _store(tmp_path)
+        settings = store.update(cloakbrowser_license_key="a-real-key")
+        manager = InstanceManager(store)
+        manager.note_binary(package.path, settings)
+
+        package.info = None  # licensing server unreachable
+        assert await license_service.establish(manager, store) is None
+        assert browser_info(store.load(), manager).build == "pro"
+
+    @pytest.mark.asyncio
+    async def test_a_rejected_key_at_boot_is_reported_not_recorded(self, tmp_path, package):
+        store = _store(tmp_path)
+        store.update(cloakbrowser_license_key="totally-bogus-key-123")
+        manager = InstanceManager(store)
+        package.info = _Info(False, "unknown")  # licensing rejects it
+
+        report = await license_service.establish(manager, store)
+
+        assert report is not None and not report.ok
+        assert "rejected this licence key" in report.message
+        assert store.load().binary_last_path == "", "a refused key records nothing"
+        assert browser_info(store.load(), manager).build == "pro-unverified"
+
+    @pytest.mark.asyncio
+    async def test_a_public_server_learns_its_version_too(self, tmp_path, package):
+        store = _store(tmp_path)
+        package.path = _binary(tmp_path, "chromium-146.0.7680.177.3")
+
+        await license_service.establish(InstanceManager(store), store)
+
+        info = browser_info(store.load(), InstanceManager(store))
+        assert info.build == "public" and info.version == "146.0.7680.177.3"
+        assert package.validate_calls == [], "a blank key never contacts licensing"
+
+    @pytest.mark.asyncio
+    async def test_a_stored_path_that_no_longer_exists_is_re_resolved(
+        self, tmp_path, package,
+    ):
+        """Self-healing: the volume said Pro, the cache no longer has it, so the
+        boot resolves again rather than reporting a binary that is gone."""
+        store = _store(tmp_path)
+        settings = store.update(cloakbrowser_license_key="a-real-key")
+        manager = InstanceManager(store)
+        manager.note_binary(str(tmp_path / ".cloakbrowser" / "chromium-1.2.3.4-pro" / "chrome"),
+                            settings)
+
+        report = await license_service.establish(InstanceManager(store), store)
+
+        assert report is not None and report.ok
+        assert store.load().binary_last_path == package.path
+        assert browser_info(store.load(), InstanceManager(store)).version == "148.0.7778.215.5"
+
+    @pytest.mark.asyncio
+    async def test_a_broken_settings_store_does_not_take_down_the_boot(
+        self, tmp_path, package,
+    ):
+        store = _store(tmp_path)
+        store.update(cloakbrowser_license_key="a-real-key")
+        manager = InstanceManager(store)
+
+        def boom(**changes):
+            raise OSError("read-only volume")
+
+        store.update = boom  # type: ignore[method-assign]
+        report = await license_service.establish(manager, store)
+
+        assert report is not None and report.ok, "the build still resolved"
+        assert manager.binary_path_for(store.load()) == package.path, "memory still answers"
+
+
+class TestTheLifespanWiring:
+    """The gap was never the logic — it was that nothing called it."""
+
+    @pytest.mark.real_startup_resolve
+    def test_booting_the_app_establishes_the_build(self, monkeypatch):
+        from fastapi.testclient import TestClient
+
+        from app.main import app
+
+        called: list[tuple] = []
+
+        async def record(instances, settings) -> None:
+            called.append((instances, settings))
+
+        # The marker keeps conftest's stub out of the way; the licence call
+        # itself is still faked, so no network and no download.
+        monkeypatch.setattr("app.services.license.establish", record)
+
+        with TestClient(app) as client:
+            client.get("/healthz")
+
+        assert called, "the lifespan never asked which build it runs"
+        instances, settings = called[0]
+        assert instances is app.state.instances and settings is app.state.settings
 
 
 class TestUnchangedBehaviour:

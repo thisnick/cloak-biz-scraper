@@ -59,6 +59,18 @@ async def _reap_loop(instances: InstanceManager) -> None:
             logger.exception("reap failed")
 
 
+async def _establish_build(app: FastAPI) -> None:
+    """Record the running build at startup. Never fatal, on any path."""
+    from .services import license as license_service
+
+    try:
+        await license_service.establish(app.state.instances, app.state.settings)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 — a status is never worth a crash loop
+        logger.exception("could not establish the browser build at startup")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     cache = bootstrap_binary_cache()
@@ -145,6 +157,11 @@ async def lifespan(app: FastAPI):
 
     reaper = asyncio.create_task(_reap_loop(app.state.instances))
     pulse = asyncio.create_task(heartbeat.loop(lambda: app.state.scrape.in_flight))
+    # Settle which build this server actually runs, in the background: it may
+    # download ~150 MB the first time, and readiness must not wait for a package
+    # download or a licensing round-trip. Once recorded on the volume, later boots
+    # answer from there and this returns immediately without any network at all.
+    warm = asyncio.create_task(_establish_build(app))
     # The manager owns the task group every MCP request runs inside.
     async with app.state.mcp_manager.run():
         try:
@@ -154,6 +171,12 @@ async def lifespan(app: FastAPI):
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
+            # Cancelled but deliberately not awaited: it may be parked in a
+            # package download on a worker thread, which cancellation cannot
+            # interrupt, and shutdown must not block on it. Nothing downstream
+            # depends on its result — the status it would have written is
+            # rebuilt by the next boot.
+            warm.cancel()
             await app.state.instances.cleanup_all()
 
 
