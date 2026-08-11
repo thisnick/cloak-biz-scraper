@@ -1789,6 +1789,44 @@ class TestProfileEndpoints:
         assert "Each profile keeps its own exit country and region" in body
         assert "apply only to profiles created afterward" in body
 
+    def test_row_actions_are_named_icon_buttons_that_keep_their_description(self, auth, profiles):
+        """The row actions are icon-only buttons. Each MUST carry a non-empty
+        aria-label — a nameless icon button is unusable to a screen reader or by
+        keyboard — and MUST keep its explanation in the hover title, which is
+        where the description went when the text labels were dropped."""
+        import re
+
+        self._proxied()
+        self._mk(profiles, "research")  # idle, non-Default → shows all four actions
+        body = auth.get("/?view=settings").text
+
+        # Every icon button anywhere on the page (row actions AND the topbar
+        # hamburger/collapse) has an accessible name.
+        for tag in re.findall(r'<button class="iconbtn[^"]*"[^>]*>', body):
+            name = re.search(r'aria-label="([^"]+)"', tag)
+            assert name and name.group(1).strip(), f"icon button without a name: {tag}"
+
+        # The four actions are present as icon buttons and their description
+        # survived the move into the hover title.
+        for label, needle in (
+            ("Edit", "change this profile"),
+            ("New proxy session", "does not change a browser that is already open"),
+            ("Clear", "erase cookies, logins and cache"),
+            ("Delete", "remove this profile and its saved data"),
+        ):
+            tag = re.search(
+                rf'<button class="iconbtn[^"]*"[^>]*aria-label="{re.escape(label)}"[^>]*>', body
+            )
+            assert tag, f"no icon button for {label!r}"
+            assert 'title="' in tag.group(0) and needle in tag.group(0), (
+                f"{label} lost its hover description"
+            )
+
+        # Delete stays the destructive one; the old text labels are gone.
+        assert re.search(r'<button class="iconbtn danger"[^>]*aria-label="Delete"', body)
+        for gone in (">Edit</button>", ">New proxy session</button>", ">Clear</button>", ">Delete</button>"):
+            assert gone not in body
+
     def test_a_hostile_profile_name_cannot_break_out_of_the_edit_dialog(self, auth, profiles):
         """Names are user input — create_profile is an MCP tool — and the dialog
         puts one in a heading, a hidden value, and a text input's value."""
