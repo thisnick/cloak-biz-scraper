@@ -628,7 +628,7 @@
                       <td class="mono">{{ 'Connected ' + ago(app.authorized_at) if app.authorized_at else '—' }}</td>
                       <td>
                         <div class="btnrow" style="justify-content:flex-end;margin:0">
-                          <form method="post" action="/settings/connections/disconnect" onsubmit="return confirm('Disconnect “{{ app.client_name }}”? It loses access within an hour and must be re-authorized to reconnect.');"><input type="hidden" name="client_id" value="{{ app.client_id }}"><button class="btn danger" type="submit">Disconnect</button></form>
+                          <form method="post" action="/settings/connections/disconnect" onsubmit='return confirm("Disconnect “" + {{ app.client_name|tojson }} + "”? It loses access within an hour and must be re-authorized to reconnect.");'><input type="hidden" name="client_id" value="{{ app.client_id }}"><button class="btn danger" type="submit">Disconnect</button></form>
                         </div>
                       </td>
                     </tr>
@@ -680,10 +680,11 @@
             <div class="acc-body">
               <p class="lead-help">A profile is a saved browser identity — its cookies, logins, and location. Everything uses your Default profile unless you pick another, so you stay signed in across sessions.</p>
               {% if s.proxy_configured() %}<p class="lead-help">New proxy session keeps the profile's cookies and logins, but asks the proxy for a fresh exit address the next time that profile opens. It does not change a browser that is already open.</p>{% endif %}
+              <p class="lead-help">Clear is the opposite: it erases a profile's cookies, logins, and cache — signing it out of everything — but keeps the profile, its name, and its location. It works on Default too, which is the only way to start that one over, since Default cannot be deleted.</p>
               {{ banner('profiles') }}
               <div class="tablewrap">
                 <table class="hist">
-                  <thead><tr><th>Profile</th><th>Exit</th><th></th></tr></thead>
+                  <thead><tr><th>Profile</th><th>Exit</th><th>Saved data</th><th></th></tr></thead>
                   <tbody>
                     {% for p in profiles %}
                     <tr>
@@ -698,11 +699,23 @@
                         {% if p.name.startswith('task-') and _suf.isascii() and _suf.isdigit() and _suf == _suf|int|string and _suf|int >= 1 %} <span class="chip" title="Reusable identity for sweeps — created and reused automatically">auto</span>{% endif %}
                         {% if p.name in profiles_in_use %} <span class="chip warn">open now</span>{% endif %}</td>
                       <td class="mono">{% if s.proxy_configured() %}{{ p.country }}{% if p.region %} · {{ p.region }}{% endif %}{% else %}Direct (no proxy){% endif %}</td>
+                      {# Filled in after the page paints — measuring is a walk of
+                         thousands of files and no render may wait on it. #}
+                      <td><span class="mono" data-size-for="{{ p.name }}">—</span><span class="hint" data-size-age="{{ p.name }}" style="display:block;margin:2px 0 0;font-size:12px"></span></td>
                       <td>
                         <div class="btnrow" style="justify-content:flex-end;margin:0">
                           {% if s.proxy_configured() %}<form method="post" action="/settings/profiles/rotate"><input type="hidden" name="name" value="{{ p.name }}"><button class="btn" type="submit" title="Fresh proxy session on the next launch; keeps cookies and logins">New proxy session</button></form>{% endif %}
+                          {% if p.name not in profiles_in_use %}
+                          {# The name goes in as |tojson, never interpolated into the JS
+                             string: profile names are created by agents too (create_profile
+                             is an MCP tool), and Jinja's attribute escaping turns a quote
+                             into &#39;, which the parser hands back to the script intact.
+                             Hence the single-quoted attribute — tojson emits double quotes,
+                             and escapes ' and " inside the value so neither can end it. #}
+                          <form method="post" action="/settings/profiles/clear" onsubmit='return confirm("Clear the “" + {{ p.name|tojson }} + "” profile? Its cookies, logins, and cache are erased. The profile itself, its location, and its exit address stay. This cannot be undone.");'><input type="hidden" name="name" value="{{ p.name }}"><button class="btn" type="submit" title="Erase this profile's cookies, logins, and cache; keeps the profile and its exit address">Clear</button></form>
+                          {% endif %}
                           {% if p.name != default_profile and p.name not in profiles_in_use %}
-                          <form method="post" action="/settings/profiles/delete" onsubmit="return confirm('Delete the “{{ p.name }}” profile and its saved cookies/logins? This cannot be undone.');"><input type="hidden" name="name" value="{{ p.name }}"><button class="btn danger" type="submit">Delete</button></form>
+                          <form method="post" action="/settings/profiles/delete" onsubmit='return confirm("Delete the “" + {{ p.name|tojson }} + "” profile and its saved cookies/logins? This cannot be undone.");'><input type="hidden" name="name" value="{{ p.name }}"><button class="btn danger" type="submit">Delete</button></form>
                           {% endif %}
                         </div>
                       </td>
@@ -711,6 +724,9 @@
                   </tbody>
                 </table>
               </div>
+              {# Hidden until the script runs: with no JavaScript there are no
+                 sizes to re-measure, and a dead button is worse than none. #}
+              <div class="btnrow" style="margin-top:10px"><button class="btn" type="button" id="sizes-remeasure" hidden>Re-measure</button></div>
 
               <div class="subh">Add a profile</div>
               <form method="post" action="/settings/profiles/create">
@@ -801,6 +817,64 @@
       b.textContent='Getting browser — about ten seconds…';
       var w=document.getElementById('licence-wait');if(w)w.hidden=false;
     });
+    // Profile sizes. Measuring one is a walk of a whole Chromium profile
+    // directory, so the server never does it during a render — the page paints
+    // first and asks afterwards. Every failure here is silent on purpose: this
+    // page also holds the licence, proxy, and Notion settings, and it has to
+    // stay completely usable whether or not a size ever arrives.
+    (function(){
+      var cells=document.querySelectorAll('[data-size-for]');
+      if(!cells.length)return;
+      var ages=document.querySelectorAll('[data-size-age]');
+      var btn=document.getElementById('sizes-remeasure');
+      function human(n){
+        if(n<1024)return n+' B';
+        var units=['KB','MB','GB','TB'],i=-1;
+        do{n/=1024;i++;}while(n>=1024&&i<units.length-1);
+        return (n>=10?Math.round(n):Math.round(n*10)/10)+' '+units[i];
+      }
+      function ago(sec){
+        sec=Math.max(0,Math.round(sec));
+        if(sec<60)return 'measured just now';
+        if(sec<3600)return 'measured '+Math.round(sec/60)+'m ago';
+        if(sec<86400)return 'measured '+Math.round(sec/3600)+'h ago';
+        return 'measured '+Math.round(sec/86400)+'d ago';
+      }
+      function paint(rows){
+        var by={};
+        rows.forEach(function(r){by[r.name]=r;});
+        cells.forEach(function(c){
+          var r=by[c.getAttribute('data-size-for')];
+          if(!r)return;
+          // textContent, never innerHTML: a profile name is user input.
+          c.textContent=human(r.bytes)+' · '+r.files.toLocaleString()+
+            ' file'+(r.files===1?'':'s');
+        });
+        ages.forEach(function(a){
+          var r=by[a.getAttribute('data-size-age')];
+          a.textContent=r?ago(r.age_sec):'';
+        });
+      }
+      var busy=false;
+      function load(refresh){
+        if(busy)return;
+        busy=true;
+        if(btn){btn.disabled=true;btn.classList.add('loading');}
+        function done(){
+          busy=false;
+          if(btn){btn.disabled=false;btn.classList.remove('loading');}
+        }
+        fetch('/settings/profiles/sizes'+(refresh?'?refresh=true':''),
+              {credentials:'same-origin',headers:{'Accept':'application/json'}})
+          .then(function(r){return r.ok?r.json():Promise.reject(r.status);})
+          .then(function(d){paint((d&&d.profiles)||[]);done();})
+          .catch(function(){done();});  // leave the placeholders exactly as they are
+      }
+      if(btn){btn.hidden=false;btn.addEventListener('click',function(){load(true);});}
+      // After paint, not during it.
+      if(document.readyState==='complete')setTimeout(function(){load(false);},0);
+      else window.addEventListener('load',function(){load(false);});
+    })();
     // New-browser dialog: pick a profile (or type a new one) before opening.
     var nbo=document.getElementById('nb-open'), nbd=document.getElementById('nb-dialog');
     if(nbo&&nbd&&nbd.showModal){

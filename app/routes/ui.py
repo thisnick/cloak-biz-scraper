@@ -925,6 +925,59 @@ async def profile_rotate(request: Request, name: str = Form("")) -> Response:
     return _settings_redirect()
 
 
+@router.post("/settings/profiles/clear")
+async def profile_clear(request: Request, name: str = Form("")) -> Response:
+    _require(request)
+    _require_same_origin(request)
+    from ..services.profiles import ProfileError
+
+    # POST, never GET: this destroys cookies and logins, and the session cookie
+    # is SameSite=lax — which a cross-site top-level GET would still carry.
+    # Unlike delete, this is offered on Default too: it is the only way to reset
+    # the one profile that cannot be deleted.
+    try:
+        await request.app.state.profile_service.clear_profile(name)
+    except ProfileError as exc:
+        return _render(
+            request, Result("profiles", False, str(exc)), status=_profile_error_status(exc)
+        )
+    return _settings_redirect()
+
+
+@router.get("/settings/profiles/sizes")
+async def profile_sizes(request: Request, refresh: bool = False) -> dict[str, Any]:
+    """How much disk each profile's saved data is using.
+
+    Its own endpoint, fetched by the page after it paints, because measuring is
+    a walk of thousands of small files and the settings page — which also holds
+    the licence, proxy, and Notion configuration — must never wait on it. GET is
+    right: it changes nothing. `refresh` re-walks instead of serving the cache.
+
+    `age_sec` is computed here rather than left to the browser: "measured 4m
+    ago" must not depend on the viewer's clock agreeing with the server's.
+    """
+    _require(request)
+    try:
+        sizes = await request.app.state.profile_service.sizes.snapshot(refresh=refresh)
+    except OSError:
+        # The walk already skips individual unreadable files; this is the volume
+        # itself failing. A settings page with no sizes is fine — one that
+        # cannot report the licence state because a directory listing failed is
+        # not. Narrow on purpose: a bug here should still surface as a 500.
+        logger.exception("could not measure profile sizes")
+        sizes = []
+    now = time.time()
+    return {
+        "profiles": [
+            {
+                "name": s.name, "bytes": s.bytes, "files": s.files,
+                "measured_at": s.measured_at, "age_sec": max(0.0, now - s.measured_at),
+            }
+            for s in sizes
+        ]
+    }
+
+
 @router.post("/settings/profiles/delete")
 async def profile_delete(request: Request, name: str = Form("")) -> Response:
     _require(request)

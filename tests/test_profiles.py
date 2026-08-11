@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import shutil
 
 import pytest
 
@@ -161,6 +162,131 @@ class TestDelete:
 
         with pytest.raises(ProfileError, match="outside the profiles root"):
             s.delete("corrupt")
+
+        assert canary.read_text() == "safe"
+        assert escape.is_symlink()
+        assert "corrupt" in {p.name for p in store(tmp_path).all()}
+
+
+class TestClear:
+    """Clear wipes a profile's storage and keeps the profile — the way out for
+    Default, which delete refuses. It shares delete's containment guard, so the
+    hostile-path cases are repeated here against the real filesystem."""
+
+    def test_clear_wipes_the_jar_but_keeps_the_profile(self, tmp_path):
+        s = store(tmp_path)
+        p = _make(s, "research", country="GB", region="london")
+        _cookie(p).write_text("session=abc123")
+        (pathlib.Path(p.user_data_dir) / "Cache").mkdir()
+        (pathlib.Path(p.user_data_dir) / "Cache" / "data").write_text("x" * 100)
+
+        assert s.clear("research") is True
+
+        kept = {x.name: x for x in s.all()}["research"]
+        assert kept.name == "research" and kept.country == "GB" and kept.region == "london"
+        assert kept.user_data_dir == p.user_data_dir           # same dir, still stored
+        assert kept.session_token == p.session_token           # same exit IP
+        assert kept.fingerprint_seed == p.fingerprint_seed     # same identity
+        directory = pathlib.Path(kept.user_data_dir)
+        assert directory.is_dir() and list(directory.iterdir()) == []  # present, empty
+        assert not _cookie(p).exists()                          # signed out
+
+    def test_cleared_profile_survives_a_reload(self, tmp_path):
+        s = store(tmp_path)
+        _cookie(_make(s, "research")).write_text("session=abc123")
+        s.clear("research")
+        assert "research" in {p.name for p in store(tmp_path).all()}
+
+    def test_the_default_profile_can_be_cleared(self, tmp_path):
+        """The whole point: Default cannot be deleted, so without this its
+        cookies could never be reset."""
+        s = store(tmp_path)
+        d = s.ensure_default(default_country="US", default_region="california")
+        _cookie(d).write_text("session=abc123")
+
+        assert s.clear(DEFAULT_PROFILE) is True
+
+        assert DEFAULT_PROFILE in {p.name for p in s.all()}
+        assert not _cookie(d).exists()
+        assert pathlib.Path(d.user_data_dir).is_dir()
+
+    def test_clearing_a_missing_profile_is_false_not_error(self, tmp_path):
+        assert store(tmp_path).clear("nope") is False
+
+    def test_clear_recreates_a_user_data_dir_that_went_missing(self, tmp_path):
+        s = store(tmp_path)
+        p = _make(s, "research")
+        shutil.rmtree(p.user_data_dir)
+        assert s.clear("research") is True
+        assert pathlib.Path(p.user_data_dir).is_dir()
+
+    def test_clear_replaces_a_user_data_dir_that_is_not_a_directory(self, tmp_path):
+        s = store(tmp_path)
+        p = _make(s, "research")
+        shutil.rmtree(p.user_data_dir)
+        pathlib.Path(p.user_data_dir).write_text("not a cookie jar")
+        assert s.clear("research") is True
+        assert pathlib.Path(p.user_data_dir).is_dir()
+
+    def test_clear_does_not_follow_a_symlink_out_of_the_jar(self, tmp_path):
+        """A link inside the profile is unlinked, never walked through: the
+        directory it points at keeps its contents."""
+        s = store(tmp_path)
+        p = _make(s, "research")
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "keep-me").write_text("safe")
+        (pathlib.Path(p.user_data_dir) / "link").symlink_to(outside, target_is_directory=True)
+
+        assert s.clear("research") is True
+
+        assert (outside / "keep-me").read_text() == "safe"
+        assert outside.is_dir()
+        assert list(pathlib.Path(p.user_data_dir).iterdir()) == []
+
+    def test_corrupt_sibling_path_is_refused_and_removes_nothing(self, tmp_path):
+        s = store(tmp_path)
+        _make(s, "corrupt")
+        sibling = tmp_path / "outside"
+        sibling.mkdir()
+        canary = sibling / "keep-me"
+        canary.write_text("safe")
+        s = _reopen_with_user_data_dir(tmp_path, "corrupt", sibling)
+
+        with pytest.raises(ProfileError, match="outside the profiles root"):
+            s.clear("corrupt")
+
+        assert sibling.is_dir() and canary.read_text() == "safe"
+        assert "corrupt" in {p.name for p in store(tmp_path).all()}
+
+    def test_corrupt_root_path_is_refused_without_emptying_the_root(self, tmp_path):
+        s = store(tmp_path)
+        _make(s, "corrupt")
+        root = tmp_path / "profiles"
+        canary = root / "keep-me"
+        canary.write_text("safe")
+        s = _reopen_with_user_data_dir(tmp_path, "corrupt", root)
+
+        with pytest.raises(ProfileError, match="is the profiles root"):
+            s.clear("corrupt")
+
+        assert canary.read_text() == "safe"
+        assert (root / "profiles.json").is_file()
+        assert "corrupt" in {p.name for p in store(tmp_path).all()}
+
+    def test_symlink_escape_is_resolved_and_refused(self, tmp_path):
+        s = store(tmp_path)
+        _make(s, "corrupt")
+        sibling = tmp_path / "outside"
+        sibling.mkdir()
+        canary = sibling / "keep-me"
+        canary.write_text("safe")
+        escape = tmp_path / "profiles" / "escape"
+        escape.symlink_to(sibling, target_is_directory=True)
+        s = _reopen_with_user_data_dir(tmp_path, "corrupt", escape)
+
+        with pytest.raises(ProfileError, match="outside the profiles root"):
+            s.clear("corrupt")
 
         assert canary.read_text() == "safe"
         assert escape.is_symlink()

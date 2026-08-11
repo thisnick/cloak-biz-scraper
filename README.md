@@ -24,7 +24,9 @@ https://github.com/user-attachments/assets/8bc957ef-130d-4516-a356-9efdcedeb60d
   session is never starved by a batch job.
 - **Profiles** — durable browser identities; each keeps its own cookies, logins, and
   settings across relaunches. Rename, delete, or rotate a profile's exit IP without
-  losing its cookies.
+  losing its cookies — or clear one to sign it out of everything and start over,
+  including the Default profile, which cannot be deleted. Settings shows what each
+  profile is using on disk.
 - **Built-in listing tasks** — sweep a BizBuySell search page into structured
   listings, dedupe into a Notion database, and archive full pages.
 - **Connect your own driver over CDP** — every instance hands back a CDP URL you can

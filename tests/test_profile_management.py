@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import pathlib
 import time
 
 import pytest
@@ -175,6 +176,89 @@ async def test_opening_and_open_profile_block_rename_and_delete(managed, monkeyp
     await manager.stop(instance.id)
     renamed = await service.update_profile("busy", new_name="renamed")
     assert renamed.name == "renamed"
+
+
+async def test_clear_keeps_the_identity_and_works_on_default(managed):
+    """Clear is the only way out for Default, which delete refuses outright."""
+    manager, service, _ = managed
+    default = manager.profiles.get(DEFAULT_PROFILE)
+    (pathlib.Path(default.user_data_dir) / "Cookies").write_text("session=abc123")
+
+    view = await service.clear_profile(DEFAULT_PROFILE)
+
+    assert view.name == DEFAULT_PROFILE and view.is_default and view.in_use is False
+    kept = manager.profiles.get(DEFAULT_PROFILE)
+    assert kept is not None
+    assert kept.session_token == default.session_token          # same exit IP
+    assert kept.fingerprint_seed == default.fingerprint_seed    # same identity
+    assert kept.country == default.country and kept.region == default.region
+    assert not (pathlib.Path(kept.user_data_dir) / "Cookies").exists()
+    assert pathlib.Path(kept.user_data_dir).is_dir()
+
+
+async def test_clear_is_explicit_about_a_missing_profile(managed):
+    _, service, _ = managed
+    with pytest.raises(ProfileNotFound, match="no profile"):
+        await service.clear_profile("missing")
+
+
+async def test_clear_drops_the_cached_size(managed):
+    """A wiped profile's cached size is a lie until it is measured again."""
+    manager, service, _ = managed
+    directory = pathlib.Path(manager.profiles.get(DEFAULT_PROFILE).user_data_dir)
+    (directory / "Cookies").write_text("x" * 40)
+    assert (await service.sizes.snapshot())[0].bytes == 40
+
+    await service.clear_profile(DEFAULT_PROFILE)
+
+    assert service.sizes.cached(DEFAULT_PROFILE) is None
+    assert (await service.sizes.snapshot())[0].bytes == 0
+
+
+async def test_delete_drops_the_cached_size(managed):
+    manager, service, _ = managed
+    await service.create_profile("research")
+    (pathlib.Path(manager.profiles.get("research").user_data_dir) / "f").write_text("x" * 12)
+    assert {r.name: r.bytes for r in await service.sizes.snapshot()}["research"] == 12
+
+    await service.delete_profile("research")
+
+    assert service.sizes.cached("research") is None
+    assert "research" not in {r.name for r in await service.sizes.snapshot()}
+
+
+async def test_an_open_profile_cannot_be_cleared(managed, monkeypatch):
+    """Emptying the directory a live Chromium is writing to corrupts it, so the
+    same lifecycle guard delete takes applies here."""
+    manager, service, _ = managed
+    await service.create_profile("busy")
+    directory = pathlib.Path(manager.profiles.get("busy").user_data_dir)
+    (directory / "Cookies").write_text("session=abc123")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def opening(req, origin, owner, subject=None):
+        entered.set()
+        await release.wait()
+        return _instance(req.profile)
+
+    monkeypatch.setattr(manager, "_do_launch", opening)
+    launch = asyncio.create_task(
+        manager.launch(InstanceCreate(profile="busy"), origin="interactive")
+    )
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    with pytest.raises(ProfileInUse, match="opening"):
+        await service.clear_profile("busy")
+
+    release.set()
+    instance = await asyncio.wait_for(launch, timeout=1)
+    with pytest.raises(ProfileInUse, match="open"):
+        await service.clear_profile("busy")
+    assert (directory / "Cookies").read_text() == "session=abc123"  # nothing was wiped
+
+    await manager.stop(instance.id)
+    await service.clear_profile("busy")  # idle again
+    assert not (directory / "Cookies").exists()
 
 
 async def test_rename_also_guards_an_opening_destination(managed, monkeypatch):

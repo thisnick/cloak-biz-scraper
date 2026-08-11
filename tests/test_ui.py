@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import inspect
 import pathlib
+import shutil
 
 import httpx
 import pytest
@@ -1536,6 +1537,83 @@ class TestProfileEndpoints:
         r = auth.post("/settings/profiles/delete", data={"name": "busy"}, follow_redirects=False)
         assert r.status_code == 409 and "busy" in self._names(profiles)
 
+    def _jar(self, profile) -> pathlib.Path:
+        return pathlib.Path(profile.user_data_dir) / "Cookies"
+
+    def test_clear_wipes_the_saved_data_but_keeps_the_profile(self, auth, profiles):
+        p = self._mk(profiles, "research")
+        self._jar(p).write_text("session=abc123")
+        r = auth.post("/settings/profiles/clear", data={"name": "research"},
+                      follow_redirects=False)
+        assert r.status_code == 303 and r.headers["location"] == "/?view=settings"
+        kept = {x.name: x for x in profiles.all()}["research"]
+        assert kept.user_data_dir == p.user_data_dir and kept.session_token == p.session_token
+        assert not self._jar(p).exists()
+        assert pathlib.Path(kept.user_data_dir).is_dir()
+
+    def test_clear_works_on_the_default_profile(self, auth, profiles):
+        """The gap this closes: Default cannot be deleted, so before Clear its
+        cookies could never be reset from the UI."""
+        d = profiles.ensure_default(default_country="US", default_region="california")
+        self._jar(d).write_text("session=abc123")
+        r = auth.post("/settings/profiles/clear", data={"name": "Default"},
+                      follow_redirects=False)
+        assert r.status_code == 303
+        assert "Default" in self._names(profiles)
+        assert not self._jar(d).exists()
+
+    def test_clear_is_blocked_while_a_browser_is_open(self, auth, profiles, monkeypatch):
+        p = self._mk(profiles, "busy")
+        self._jar(p).write_text("session=abc123")
+        self._running(monkeypatch, "busy")
+        r = auth.post("/settings/profiles/clear", data={"name": "busy"},
+                      follow_redirects=False)
+        assert r.status_code == 409
+        assert self._jar(p).read_text() == "session=abc123"  # nothing was wiped
+
+    def test_clear_of_a_missing_profile_is_a_404(self, auth, profiles):
+        r = auth.post("/settings/profiles/clear", data={"name": "missing"},
+                      follow_redirects=False)
+        assert r.status_code == 404
+
+    def test_clear_rejects_a_get(self, auth, profiles):
+        self._mk(profiles, "research")
+        assert auth.get("/settings/profiles/clear",
+                        follow_redirects=False).status_code == 405
+
+    def test_signed_out_cannot_clear(self, client, profiles):
+        p = self._mk(profiles, "research")
+        self._jar(p).write_text("session=abc123")
+        r = client.post("/settings/profiles/clear", data={"name": "research"},
+                        follow_redirects=False)
+        assert r.status_code == 303 and r.headers["location"] == "/login"
+        assert self._jar(p).read_text() == "session=abc123"
+
+    def test_the_page_offers_clear_for_every_profile_including_default(self, auth, profiles):
+        profiles.ensure_default(default_country="US", default_region="california")
+        self._mk(profiles, "research")
+        body = shown(auth.get("/?view=settings"))
+        assert body.count('action="/settings/profiles/clear"') == 2   # Default included
+        assert body.count('action="/settings/profiles/delete"') == 1  # still not Default
+        assert "Clear the “" in body                                  # confirm dialog
+
+    def test_a_profile_name_cannot_break_out_of_the_confirm_dialog(self, auth, profiles):
+        """A profile name is untrusted input even here: create_profile is an MCP
+        tool, so an agent reading a hostile page can choose the name that lands
+        in the owner's own settings page."""
+        import html as _html
+        import re
+
+        self._mk(profiles, "x');alert(1);//")
+        raw = auth.get("/?view=settings").text
+        # The script the browser actually runs: attribute entities are decoded
+        # before the JS is parsed, which is exactly where attribute escaping on
+        # its own stops helping.
+        scripts = [_html.unescape(m) for m in re.findall(r"onsubmit='([^']*)'", raw)]
+        assert scripts, "no confirm dialogs rendered — the assertion below proves nothing"
+        assert not [s for s in scripts if "');alert(1);//" in s]
+        assert [s for s in scripts if "\\u0027);alert(1);//" in s]  # inert, inside a string
+
     def test_rotate_changes_the_session_token(self, auth, profiles):
         app.state.settings.update(
             proxy_user="u", proxy_password="p", proxy_host="proxy.example", proxy_port="1000",
@@ -1578,6 +1656,7 @@ class TestProfileEndpoints:
         for path, data in (
             ("/settings/profiles/create", {"name": "z"}),
             ("/settings/profiles/rename", {"name": "p", "new_name": "q"}),
+            ("/settings/profiles/clear", {"name": "p"}),
             ("/settings/profiles/delete", {"name": "p"}),
             ("/settings/profiles/rotate", {"name": "p"}),
             ("/settings/profiles/geo", {"name": "p", "country": "GB"}),
@@ -1593,6 +1672,108 @@ class TestProfileEndpoints:
 
     def test_get_is_rejected(self, auth):
         assert auth.get("/settings/profiles/create", follow_redirects=False).status_code == 405
+
+
+class TestProfileSizesEndpoint:
+    """Disk usage is fetched by the page after it paints — never measured
+    during a render, and never able to stop the settings page rendering."""
+
+    @pytest.fixture
+    def profiles(self, monkeypatch, tmp_path):
+        from app.services.profiles import ProfileStore
+        ps = ProfileStore(tmp_path / "prof")
+        monkeypatch.setattr(app.state.instances, "profiles", ps)
+        monkeypatch.setattr(app.state.instances, "running", {})
+        return ps
+
+    def _mk(self, ps, name, *, size: int = 0):
+        p = ps.get_or_create(name, default_country="US", default_region="california")
+        if size:
+            (pathlib.Path(p.user_data_dir) / "Cookies").write_bytes(b"x" * size)
+        return p
+
+    def _rows(self, response) -> dict:
+        return {r["name"]: r for r in response.json()["profiles"]}
+
+    def test_reports_bytes_files_and_freshness_per_profile(self, auth, profiles):
+        self._mk(profiles, "research", size=40)
+        self._mk(profiles, "empty")
+        rows = self._rows(auth.get("/settings/profiles/sizes"))
+        assert rows["research"]["bytes"] == 40 and rows["research"]["files"] == 1
+        assert rows["empty"] == {
+            "name": "empty", "bytes": 0, "files": 0,
+            "measured_at": rows["empty"]["measured_at"], "age_sec": rows["empty"]["age_sec"],
+        }
+        assert rows["research"]["age_sec"] >= 0
+
+    def test_the_settings_page_render_never_walks_a_profile(self, auth, profiles, monkeypatch):
+        """The owner's hard constraint: a warm Chromium profile is thousands of
+        files, and no page render may wait on counting them."""
+        from app.services import profile_sizes
+
+        self._mk(profiles, "research", size=40)
+        walks = []
+        monkeypatch.setattr(
+            profile_sizes, "measure_dir", lambda p: walks.append(p) or (0, 0)
+        )
+        assert auth.get("/?view=settings").status_code == 200
+        assert walks == []
+        # …and the row is there waiting to be filled in.
+        assert 'data-size-for="research"' in auth.get("/?view=settings").text
+
+    def test_a_second_visit_serves_the_cache_and_refresh_re_walks(self, auth, profiles):
+        p = self._mk(profiles, "research", size=40)
+        first = self._rows(auth.get("/settings/profiles/sizes"))["research"]
+        (pathlib.Path(p.user_data_dir) / "Cookies").write_bytes(b"x" * 400)
+
+        cached = self._rows(auth.get("/settings/profiles/sizes"))["research"]
+        assert cached["bytes"] == 40 and cached["measured_at"] == first["measured_at"]
+
+        fresh = self._rows(auth.get("/settings/profiles/sizes?refresh=true"))["research"]
+        assert fresh["bytes"] == 400
+
+    def test_clearing_a_profile_invalidates_its_cached_size(self, auth, profiles):
+        self._mk(profiles, "research", size=40)
+        assert self._rows(auth.get("/settings/profiles/sizes"))["research"]["bytes"] == 40
+        assert auth.post("/settings/profiles/clear", data={"name": "research"},
+                         follow_redirects=False).status_code == 303
+        assert self._rows(auth.get("/settings/profiles/sizes"))["research"]["bytes"] == 0
+
+    def test_deleting_a_profile_drops_it_from_the_sizes(self, auth, profiles):
+        self._mk(profiles, "gone", size=40)
+        assert "gone" in self._rows(auth.get("/settings/profiles/sizes"))
+        auth.post("/settings/profiles/delete", data={"name": "gone"})
+        assert "gone" not in self._rows(auth.get("/settings/profiles/sizes"))
+
+    def test_a_missing_user_data_dir_reports_zero_rather_than_failing(self, auth, profiles):
+        p = self._mk(profiles, "research", size=40)
+        shutil.rmtree(p.user_data_dir)
+        rows = self._rows(auth.get("/settings/profiles/sizes"))
+        assert rows["research"]["bytes"] == 0 and rows["research"]["files"] == 0
+
+    def test_signed_out_is_not_served(self, client, profiles):
+        self._mk(profiles, "research", size=40)
+        r = client.get("/settings/profiles/sizes", follow_redirects=False)
+        assert r.status_code == 303 and r.headers["location"] == "/login"
+        assert "research" not in r.text
+
+    def test_the_settings_page_still_renders_when_measuring_is_broken(self, auth, profiles,
+                                                                      monkeypatch):
+        """The page carries the licence, proxy, and Notion config. A sizing
+        failure degrades to a page with no sizes, never to no page."""
+        from app.services import profile_sizes
+
+        self._mk(profiles, "research", size=40)
+        monkeypatch.setattr(
+            profile_sizes, "measure_dir",
+            lambda p: (_ for _ in ()).throw(OSError("disk is having a day")),
+        )
+        page = auth.get("/?view=settings")
+        assert page.status_code == 200 and "Profiles" in page.text
+        # The endpoint answers with no sizes rather than an error the page has
+        # to handle; the placeholders simply stay.
+        sizes = auth.get("/settings/profiles/sizes")
+        assert sizes.status_code == 200 and sizes.json() == {"profiles": []}
 
 
 class TestNewBrowserProfile:

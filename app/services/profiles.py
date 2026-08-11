@@ -11,6 +11,7 @@ profiles dir so a later instance reattaches warm after the container restarts.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import secrets
@@ -22,6 +23,7 @@ from typing import TYPE_CHECKING, Callable
 
 from ..models import ProfileDeleteResult, ProfileView
 from . import proxy
+from .profile_sizes import ProfileSizes
 
 if TYPE_CHECKING:
     from .instances import InstanceManager
@@ -221,6 +223,70 @@ class ProfileStore:
         """Update a profile's proxy exit country/region. Takes effect next launch."""
         return self.update(name, country=country, region=region)
 
+    def _removable_dir(self, name: str, stored: str, *, action: str) -> Path:
+        """Canonicalize a stored user_data_dir before anything is removed.
+
+        The one containment guard behind every destructive operation, shared so
+        delete and clear cannot drift apart. A stored path is untrusted input —
+        profiles.json is a file on a volume — so it is resolved (following any
+        symlink) and must land on a STRICT descendant of the profiles root. The
+        caller removes the Path returned here, never the stored string.
+        """
+        try:
+            root = self.root.resolve()
+            target = Path(stored).resolve()
+            target.relative_to(root)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ProfileError(
+                f"refusing to {action} {name!r}: its data directory is outside "
+                "the profiles root"
+            ) from exc
+        if target == root:
+            raise ProfileError(
+                f"refusing to {action} {name!r}: its data directory is the "
+                "profiles root"
+            )
+        return target
+
+    def clear(self, name: str) -> bool:
+        """DESTROY a profile's browser storage but KEEP the profile.
+
+        The third of three orthogonal actions: rotate_session gives a new exit
+        IP and keeps cookies, delete removes everything, and this wipes cookies,
+        logins, local storage, and cache while the identity — name, geo, sticky
+        session token, fingerprint seed, and the same user_data_dir — survives.
+        Unlike delete it is allowed on the DEFAULT profile: it is the only way
+        to reset the one profile that cannot be deleted.
+
+        The directory is emptied and left in place. The application service owns
+        the in-use guard — emptying a directory a live Chromium is writing to
+        corrupts it. Returns False if there was no such profile.
+        """
+        with self._lock:
+            p = self._cache.get(name)
+            if p is None:
+                return False
+            target = self._removable_dir(name, p.user_data_dir, action="clear")
+            # Under the lock: the record stays in the index the whole time, so
+            # nothing may reattach or re-mint this name half-way through a wipe.
+            if not target.is_dir():
+                # Missing, a stray file, or a broken link — none of them a cookie
+                # jar. Leave the empty directory the profile expects, not a 500.
+                target.unlink(missing_ok=True)
+            target.mkdir(parents=True, exist_ok=True)
+            for entry in target.iterdir():
+                try:
+                    # is_dir() follows symlinks, so a link to a directory would
+                    # be rmtree'd — through the link, outside the root. Links go
+                    # first and are only ever unlinked.
+                    if entry.is_symlink() or not entry.is_dir():
+                        entry.unlink()
+                    else:
+                        shutil.rmtree(entry, ignore_errors=True)
+                except OSError:
+                    continue  # best effort, exactly like rmtree(ignore_errors=True)
+            return True
+
     def delete(self, name: str) -> bool:
         """Remove a profile and DESTROY its cookie jar (rmtree its user_data_dir).
 
@@ -234,20 +300,7 @@ class ProfileStore:
             p = self._cache.get(name)
             if p is None:
                 return False
-            try:
-                root = self.root.resolve()
-                target = Path(p.user_data_dir).resolve()
-                target.relative_to(root)
-            except (OSError, RuntimeError, ValueError) as exc:
-                raise ProfileError(
-                    f"refusing to delete {name!r}: its data directory is outside "
-                    "the profiles root"
-                ) from exc
-            if target == root:
-                raise ProfileError(
-                    f"refusing to delete {name!r}: its data directory is the "
-                    "profiles root"
-                )
+            target = self._removable_dir(name, p.user_data_dir, action="delete")
             self._cache.pop(name)
             self._flush()
         # rmtree after dropping the cache entry (and outside the lock): the profile
@@ -291,6 +344,10 @@ class ProfileService:
     ) -> None:
         self._instances = instances
         self._get_settings = settings if callable(settings) else lambda: settings
+        # Disk usage is a directory walk, so it is never taken during a render:
+        # the page asks for it separately and this caches the answer. Reached
+        # through a callable because the store is swapped at runtime.
+        self.sizes = ProfileSizes(lambda: self._instances.profiles)
 
     def _view(self, profile: Profile, *, in_use: bool) -> ProfileView:
         return ProfileView(
@@ -398,8 +455,33 @@ class ProfileService:
                 profile, in_use=profile.name in self._instances.profile_names_in_use()
             )
 
+    async def clear_profile(self, name: str) -> ProfileView:
+        """Wipe a profile's saved browser data, keeping the profile itself.
+
+        Allowed on the Default profile, which cannot be deleted — before this
+        there was no way to reset the identity everything uses by default.
+        Requires the profile to be idle for the same reason a delete does: the
+        directory being emptied is the one an open browser is writing to.
+
+        The wipe itself is an rmtree of thousands of files, so it goes to a
+        worker thread; the lifecycle guard is held across it, so nothing can
+        launch on the profile mid-wipe.
+        """
+        async with self._instances.profile_guard(name, require_idle=True):
+            store = self._instances.profiles
+            if not await asyncio.to_thread(store.clear, name):
+                raise ProfileNotFound(f"there is no profile named {name!r}")
+            self.sizes.invalidate(name)
+            profile = store.get(name)
+            # clear() keeps the record and profile_guard holds the same
+            # lifecycle lock deletion takes, so it must still be there.
+            if profile is None:  # pragma: no cover - defensive invariant
+                raise ProfileNotFound(f"there is no profile named {name!r}")
+            return self._view(profile, in_use=False)
+
     async def delete_profile(self, name: str) -> ProfileDeleteResult:
         async with self._instances.profile_guard(name, require_idle=True):
             if not self._instances.profiles.delete(name):
                 raise ProfileNotFound(f"there is no profile named {name!r}")
+            self.sizes.invalidate(name)
             return ProfileDeleteResult(name=name)
