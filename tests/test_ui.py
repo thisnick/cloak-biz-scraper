@@ -295,9 +295,7 @@ class TestSaving:
         assert 'href="https://developers.notion.com/docs/create-a-notion-integration"' in page
         assert "How to share a page →" in page
         assert (
-            "A profile is a saved browser identity — its cookies, logins, and location. "
-            "Everything uses your Default profile unless you pick another, so you stay "
-            "signed in across sessions."
+            "A saved browser identity — cookies, logins, and its own exit location."
         ) in page
 
     def test_capacity_copy_explains_the_controls_without_cost_copy(self, auth):
@@ -1788,8 +1786,8 @@ class TestProfileEndpoints:
         only the default for new profiles. The page has to say so."""
         self._proxied()
         body = shown(auth.get("/?view=settings"))
-        assert "Each profile carries its own exit country and region" in body
-        assert "leaves existing profiles exactly where they are" in body
+        assert "Each profile keeps its own exit country and region" in body
+        assert "apply only to profiles created afterward" in body
 
     def test_a_hostile_profile_name_cannot_break_out_of_the_edit_dialog(self, auth, profiles):
         """Names are user input — create_profile is an MCP tool — and the dialog
@@ -2049,9 +2047,10 @@ class TestNewBrowserProfile:
         )
 
         page = auth.get("/").text
+        # The explanation now lives in the icon button's hover tooltip.
         assert "New proxy session" in page
-        assert "keeps the profile's cookies and logins" in page
-        assert "It does not change a browser that is already open" in page
+        assert "keeps cookies and logins" in page
+        assert "does not change a browser that is already open" in page
 
 
 class TestConnectedAppsUi:

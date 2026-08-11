@@ -678,10 +678,8 @@
               </div>
             </button>
             <div class="acc-body">
-              <p class="lead-help">A profile is a saved browser identity — its cookies, logins, and location. Everything uses your Default profile unless you pick another, so you stay signed in across sessions.</p>
-              {% if s.proxy_configured() %}<p class="lead-help">New proxy session keeps the profile's cookies and logins, but asks the proxy for a fresh exit address the next time that profile opens. It does not change a browser that is already open.</p>{% endif %}
-              <p class="lead-help">Clear is the opposite: it erases a profile's cookies, logins, and cache — signing it out of everything — but keeps the profile, its name, and its location. It works on Default too, which is the only way to start that one over, since Default cannot be deleted.</p>
-              {% if s.proxy_configured() %}<p class="lead-help">Each profile carries its own exit country and region, and that is where its browser actually comes out. The country and region under Proxy are only the defaults handed to profiles as they are created — changing them there leaves existing profiles exactly where they are.</p>{% endif %}
+              <p class="lead-help">A saved browser identity — cookies, logins, and its own exit location. Everything uses <b>Default</b> unless you pick another. Hover a button to see what it does.</p>
+              {% if s.proxy_configured() %}<p class="lead-help">Each profile keeps its own exit country and region; the Proxy defaults apply only to profiles created afterward.</p>{% endif %}
               {{ banner('profiles') }}
               <div class="tablewrap">
                 <table class="hist">
@@ -711,8 +709,8 @@
                       <td><span class="mono" data-size-for="{{ p.name }}">—</span><span class="hint" data-size-age="{{ p.name }}" style="display:block;margin:2px 0 0;font-size:12px"></span></td>
                       <td>
                         <div class="btnrow" style="justify-content:flex-end;margin:0">
-                          {% if can_edit %}<button class="btn" type="button" data-dlg-open="pedit-{{ loop.index }}" title="Change this profile's name and exit location">Edit</button>{% endif %}
-                          {% if s.proxy_configured() %}<form method="post" action="/settings/profiles/rotate"><input type="hidden" name="name" value="{{ p.name }}"><button class="btn" type="submit" title="Fresh proxy session on the next launch; keeps cookies and logins">New proxy session</button></form>{% endif %}
+                          {% if can_edit %}<button class="iconbtn" type="button" data-dlg-open="pedit-{{ loop.index }}" aria-label="Edit" title="Edit — change this profile's name and exit location"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h4L18.5 9.5a2 2 0 0 0-3-3L5 17z"/><path d="M13.5 6.5l3 3"/></svg></button>{% endif %}
+                          {% if s.proxy_configured() %}<form method="post" action="/settings/profiles/rotate"><input type="hidden" name="name" value="{{ p.name }}"><button class="iconbtn" type="submit" aria-label="New proxy session" title="New proxy session — a fresh exit IP the next time this profile launches; keeps cookies and logins, and does not change a browser that is already open"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 1 0-.9 4.5"/><path d="M20 4v6h-6"/></svg></button></form>{% endif %}
                           {% if p.name not in profiles_in_use %}
                           {# The name goes in as |tojson, never interpolated into the JS
                              string: profile names are created by agents too (create_profile
@@ -720,10 +718,10 @@
                              into &#39;, which the parser hands back to the script intact.
                              Hence the single-quoted attribute — tojson emits double quotes,
                              and escapes ' and " inside the value so neither can end it. #}
-                          <form method="post" action="/settings/profiles/clear" onsubmit='return confirm("Clear the “" + {{ p.name|tojson }} + "” profile? Its cookies, logins, and cache are erased. The profile itself, its location, and its exit address stay. This cannot be undone.");'><input type="hidden" name="name" value="{{ p.name }}"><button class="btn" type="submit" title="Erase this profile's cookies, logins, and cache; keeps the profile and its exit address">Clear</button></form>
+                          <form method="post" action="/settings/profiles/clear" onsubmit='return confirm("Clear the “" + {{ p.name|tojson }} + "” profile? Its cookies, logins, and cache are erased. The profile itself, its location, and its exit address stay. This cannot be undone.");'><input type="hidden" name="name" value="{{ p.name }}"><button class="iconbtn" type="submit" aria-label="Clear" title="Clear — erase cookies, logins and cache; keeps the profile and its exit address"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 20h11"/><path d="M14.5 5.5l4 4a2 2 0 0 1 0 2.8L12 19H7l-3-3a2 2 0 0 1 0-2.8l7.5-7.5a2 2 0 0 1 2.8 0z"/><path d="M9 9l6 6"/></svg></button></form>
                           {% endif %}
                           {% if p.name != default_profile and p.name not in profiles_in_use %}
-                          <form method="post" action="/settings/profiles/delete" onsubmit='return confirm("Delete the “" + {{ p.name|tojson }} + "” profile and its saved cookies/logins? This cannot be undone.");'><input type="hidden" name="name" value="{{ p.name }}"><button class="btn danger" type="submit">Delete</button></form>
+                          <form method="post" action="/settings/profiles/delete" onsubmit='return confirm("Delete the “" + {{ p.name|tojson }} + "” profile and its saved cookies/logins? This cannot be undone.");'><input type="hidden" name="name" value="{{ p.name }}"><button class="iconbtn danger" type="submit" aria-label="Delete" title="Delete — remove this profile and its saved data"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16"/><path d="M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/><path d="M6 7l1 13a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-13"/><path d="M10 11v6M14 11v6"/></svg></button></form>
                           {% endif %}
                         </div>
                       </td>
