@@ -357,7 +357,11 @@ class TestControlLandsOnTheRightPane:
 
         page.evaluate("window.__rfbLog = []")
         page.evaluate("document.querySelector('[data-control-for=\"i1\"]').click()")  # take control
-        page.wait_for_timeout(150)
+        # Opening the RFB connection is async; a fixed sleep raced it and flaked
+        # red in CI (log=[]). Wait for the control connection the assert needs.
+        page.wait_for_function(
+            "() => (window.__rfbLog || []).some(e => e.viewOnly === false)", timeout=15000
+        )
 
         log = page.evaluate("""() => (window.__rfbLog || []).map(e => ({
           viewOnly: e.viewOnly,
