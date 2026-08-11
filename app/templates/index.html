@@ -681,12 +681,19 @@
               <p class="lead-help">A profile is a saved browser identity — its cookies, logins, and location. Everything uses your Default profile unless you pick another, so you stay signed in across sessions.</p>
               {% if s.proxy_configured() %}<p class="lead-help">New proxy session keeps the profile's cookies and logins, but asks the proxy for a fresh exit address the next time that profile opens. It does not change a browser that is already open.</p>{% endif %}
               <p class="lead-help">Clear is the opposite: it erases a profile's cookies, logins, and cache — signing it out of everything — but keeps the profile, its name, and its location. It works on Default too, which is the only way to start that one over, since Default cannot be deleted.</p>
+              {% if s.proxy_configured() %}<p class="lead-help">Each profile carries its own exit country and region, and that is where its browser actually comes out. The country and region under Proxy are only the defaults handed to profiles as they are created — changing them there leaves existing profiles exactly where they are.</p>{% endif %}
               {{ banner('profiles') }}
               <div class="tablewrap">
                 <table class="hist">
                   <thead><tr><th>Profile</th><th>Exit</th><th>Saved data</th><th></th></tr></thead>
                   <tbody>
+                    {# Renaming needs the profile idle and needs it not to be Default;
+                       geography needs a proxy. A row whose Edit dialog would be
+                       empty — Default in direct mode — gets no Edit button, and the
+                       dialog itself never offers a field the server would refuse. #}
                     {% for p in profiles %}
+                    {% set can_rename = p.name != default_profile and p.name not in profiles_in_use %}
+                    {% set can_edit = can_rename or s.proxy_configured() %}
                     <tr>
                       <td><b>{{ p.name }}</b>
                         {% if p.name == default_profile %} <span class="chip ok">default</span>{% endif %}
@@ -704,6 +711,7 @@
                       <td><span class="mono" data-size-for="{{ p.name }}">—</span><span class="hint" data-size-age="{{ p.name }}" style="display:block;margin:2px 0 0;font-size:12px"></span></td>
                       <td>
                         <div class="btnrow" style="justify-content:flex-end;margin:0">
+                          {% if can_edit %}<button class="btn" type="button" data-dlg-open="pedit-{{ loop.index }}" title="Change this profile's name and exit location">Edit</button>{% endif %}
                           {% if s.proxy_configured() %}<form method="post" action="/settings/profiles/rotate"><input type="hidden" name="name" value="{{ p.name }}"><button class="btn" type="submit" title="Fresh proxy session on the next launch; keeps cookies and logins">New proxy session</button></form>{% endif %}
                           {% if p.name not in profiles_in_use %}
                           {# The name goes in as |tojson, never interpolated into the JS
@@ -724,40 +732,65 @@
                   </tbody>
                 </table>
               </div>
-              {# Hidden until the script runs: with no JavaScript there are no
-                 sizes to re-measure, and a dead button is worse than none. #}
-              <div class="btnrow" style="margin-top:10px"><button class="btn" type="button" id="sizes-remeasure" hidden>Re-measure</button></div>
+              <div class="btnrow" style="margin-top:10px"><button class="btn primary" type="button" data-dlg-open="pnew-dialog">+ New profile</button></div>
 
-              <div class="subh">Add a profile</div>
-              <form method="post" action="/settings/profiles/create">
-                <div class="grid2">
-                  <div class="field"><label>Name</label><input name="name" placeholder="e.g. research" autocomplete="off"></div>
-                  {% if s.proxy_configured() %}<div class="field"><label>Exit country — optional</label><input name="country" placeholder="US"></div>{% endif %}
-                </div>
-                <div class="btnrow"><button class="btn primary" type="submit">Create profile</button></div>
-              </form>
-
-              {% set renamable = profiles | rejectattr('name', 'equalto', default_profile) | list %}
-              {% if renamable %}
-              <div class="subh">Rename a profile</div>
-              <form method="post" action="/settings/profiles/rename">
-                <div class="grid2">
-                  <div class="field"><label>Profile</label><select name="name">{% for p in renamable %}<option value="{{ p.name }}">{{ p.name }}</option>{% endfor %}</select></div>
-                  <div class="field"><label>New name</label><input name="new_name" placeholder="new name" autocomplete="off"></div>
-                </div>
-                <div class="btnrow"><button class="btn" type="submit">Rename</button></div>
-              </form>
+              {# The per-row Edit dialogs live outside the table: a <dialog> is
+                 valid inside a cell, but .tablewrap scrolls, and nothing that
+                 opens over the page belongs inside a scroll container. Ids come
+                 from the loop index — a profile name is user input (create_profile
+                 is an MCP tool) and would be arbitrary text in an id and a
+                 selector. The loop order matches the rows above exactly. #}
+              {% for p in profiles %}
+              {% set can_rename = p.name != default_profile and p.name not in profiles_in_use %}
+              {% if can_rename or s.proxy_configured() %}
+              <dialog id="pedit-{{ loop.index }}" class="dlg">
+                <form method="post" action="/settings/profiles/edit">
+                  <h3 class="dlg-h">Edit “{{ p.name }}”</h3>
+                  <input type="hidden" name="name" value="{{ p.name }}">
+                  {% if can_rename %}
+                  <div class="field"><label>Name</label><input name="new_name" value="{{ p.name }}" autocomplete="off"></div>
+                  {% else %}
+                  {# Disabled, so the browser never sends it and the server never
+                     sees a rename it is certain to refuse — but still shown, so
+                     the dialog says which profile it is editing and why the name
+                     is fixed. #}
+                  <div class="field"><label>Name</label><input value="{{ p.name }}" disabled>
+                    <div class="help">{% if p.name == default_profile %}Default cannot be renamed.{% else %}A browser is open on this profile — close it to rename it.{% endif %}</div>
+                  </div>
+                  {% endif %}
+                  {% if s.proxy_configured() %}
+                  <div class="grid2">
+                    <div class="field"><label>Exit country</label><input name="country" value="{{ p.country }}" placeholder="US"></div>
+                    <div class="field"><label>Exit region — optional</label><input name="region" value="{{ p.region }}" placeholder="california"></div>
+                  </div>
+                  <div class="field"><div class="help">This profile exits here. It takes effect the next time the profile opens, and does not change a browser that is already running.</div></div>
+                  {% endif %}
+                  <div class="btnrow">
+                    <button class="btn" type="button" data-dlg-cancel>Cancel</button>
+                    <button class="btn primary" type="submit">Save</button>
+                  </div>
+                </form>
+              </dialog>
               {% endif %}
+              {% endfor %}
 
-              {% if s.proxy_configured() %}<div class="subh">Change a profile's exit location</div>
-              <form method="post" action="/settings/profiles/geo">
-                <div class="grid2">
-                  <div class="field"><label>Profile</label><select name="name">{% for p in profiles %}<option value="{{ p.name }}">{{ p.name }}</option>{% endfor %}</select></div>
-                  <div class="field"><label>Country</label><input name="country" placeholder="US"></div>
-                </div>
-                <div class="field"><label>Region — optional</label><input name="region" placeholder="california"></div>
-                <div class="btnrow"><button class="btn" type="submit">Set location</button></div>
-              </form>{% endif %}
+              <dialog id="pnew-dialog" class="dlg">
+                <form method="post" action="/settings/profiles/create">
+                  <h3 class="dlg-h">New profile</h3>
+                  <div class="field"><label>Name</label><input name="name" placeholder="e.g. research" autocomplete="off"></div>
+                  {% if s.proxy_configured() %}
+                  <div class="grid2">
+                    <div class="field"><label>Exit country — optional</label><input name="country" placeholder="US"></div>
+                    <div class="field"><label>Exit region — optional</label><input name="region" placeholder="california"></div>
+                  </div>
+                  <div class="field"><div class="help">Leave these blank to use the country and region from Proxy. Whatever this profile is created with is what it keeps.</div></div>
+                  {% endif %}
+                  <div class="btnrow">
+                    <button class="btn" type="button" data-dlg-cancel>Cancel</button>
+                    <button class="btn primary" type="submit">Create profile</button>
+                  </div>
+                </form>
+              </dialog>
             </div>
           </div>
         </div>
@@ -826,7 +859,6 @@
       var cells=document.querySelectorAll('[data-size-for]');
       if(!cells.length)return;
       var ages=document.querySelectorAll('[data-size-age]');
-      var btn=document.getElementById('sizes-remeasure');
       function human(n){
         if(n<1024)return n+' B';
         var units=['KB','MB','GB','TB'],i=-1;
@@ -855,26 +887,30 @@
           a.textContent=r?ago(r.age_sec):'';
         });
       }
-      var busy=false;
-      function load(refresh){
-        if(busy)return;
-        busy=true;
-        if(btn){btn.disabled=true;btn.classList.add('loading');}
-        function done(){
-          busy=false;
-          if(btn){btn.disabled=false;btn.classList.remove('loading');}
-        }
-        fetch('/settings/profiles/sizes'+(refresh?'?refresh=true':''),
+      function load(){
+        fetch('/settings/profiles/sizes',
               {credentials:'same-origin',headers:{'Accept':'application/json'}})
           .then(function(r){return r.ok?r.json():Promise.reject(r.status);})
-          .then(function(d){paint((d&&d.profiles)||[]);done();})
-          .catch(function(){done();});  // leave the placeholders exactly as they are
+          .then(function(d){paint((d&&d.profiles)||[]);})
+          .catch(function(){});  // leave the placeholders exactly as they are
       }
-      if(btn){btn.hidden=false;btn.addEventListener('click',function(){load(true);});}
       // After paint, not during it.
-      if(document.readyState==='complete')setTimeout(function(){load(false);},0);
-      else window.addEventListener('load',function(){load(false);});
+      if(document.readyState==='complete')setTimeout(load,0);
+      else window.addEventListener('load',load);
     })();
+    // Dialogs opened by a button elsewhere on the page: the button names its
+    // dialog's id, anything inside marked data-dlg-cancel closes it. Used by the
+    // profile Edit rows and + New profile; the new-browser dialog below keeps
+    // its own handler because it also toggles a field.
+    document.querySelectorAll('[data-dlg-open]').forEach(function(b){
+      var d=document.getElementById(b.getAttribute('data-dlg-open'));
+      if(!d||!d.showModal)return;
+      b.addEventListener('click',function(){d.showModal();});
+      d.addEventListener('click',function(e){if(e.target===d)d.close();}); // backdrop
+      d.querySelectorAll('[data-dlg-cancel]').forEach(function(c){
+        c.addEventListener('click',function(){d.close();});
+      });
+    });
     // New-browser dialog: pick a profile (or type a new one) before opening.
     var nbo=document.getElementById('nb-open'), nbd=document.getElementById('nb-dialog');
     if(nbo&&nbd&&nbd.showModal){

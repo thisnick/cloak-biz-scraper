@@ -126,6 +126,9 @@
   .field label{display:block;font-size:12px;font-weight:600;margin-bottom:5px;color:var(--muted)}
   .field input,.field select{width:100%;padding:9px 11px;border:1px solid var(--border);border-radius:var(--r-sm);background:var(--bg);color:var(--text);font:13px var(--mono)}
   .field input:focus,.field select:focus{outline:2px solid var(--accent);outline-offset:1px}
+  /* A box that is shown for context but cannot be edited — the profile name in
+     Default's Edit dialog — has to look uneditable before it is clicked. */
+  .field input:disabled{opacity:.55;cursor:not-allowed}
   .field .help{font-size:11.5px;color:var(--muted);margin-top:5px;line-height:1.4}
   .grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
   @media(max-width:560px){.grid2{grid-template-columns:1fr}}

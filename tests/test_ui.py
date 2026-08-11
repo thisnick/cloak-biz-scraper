@@ -1485,35 +1485,122 @@ class TestProfileEndpoints:
         assert r.status_code == 303 and r.headers["location"] == "/?view=settings"
         assert {p.name: p for p in profiles.all()}["research"].session_token == token
 
-    def test_rename_keeps_the_profile_under_the_new_name(self, auth, profiles):
-        self._mk(profiles, "old")
-        r = auth.post("/settings/profiles/rename", data={"name": "old", "new_name": "new"},
-                      follow_redirects=False)
-        assert r.status_code == 303 and self._names(profiles) == {"new"}
+    def test_create_persists_the_region_the_dialog_offers(self, auth, profiles):
+        """The dialog offers country *and* region; the route has always accepted
+        both. It used to render only country, so a region was uneditable at
+        birth and had to be set again straight afterwards."""
+        r = auth.post(
+            "/settings/profiles/create",
+            data={"name": "research", "country": "GB", "region": "london"},
+            follow_redirects=False,
+        )
+        assert r.status_code == 303
+        made = {p.name: p for p in profiles.all()}["research"]
+        assert (made.country, made.region) == ("GB", "london")
 
-    def test_rename_is_blocked_while_a_browser_is_open(self, auth, profiles, monkeypatch):
+    # ── Edit: one dialog per row, name and location together ──
+
+    def test_edit_renames_and_moves_in_one_post(self, auth, profiles):
+        self._mk(profiles, "old")
+        r = auth.post(
+            "/settings/profiles/edit",
+            data={"name": "old", "new_name": "new", "country": "GB", "region": "london"},
+            follow_redirects=False,
+        )
+        assert r.status_code == 303 and self._names(profiles) == {"new"}
+        moved = {p.name: p for p in profiles.all()}["new"]
+        assert (moved.country, moved.region) == ("GB", "london")
+
+    def test_edit_with_only_the_location_changed_keeps_the_name(self, auth, profiles):
+        self._mk(profiles, "keep")
+        r = auth.post(
+            "/settings/profiles/edit",
+            data={"name": "keep", "new_name": "keep", "country": "GB", "region": ""},
+            follow_redirects=False,
+        )
+        assert r.status_code == 303 and self._names(profiles) == {"keep"}
+        moved = {p.name: p for p in profiles.all()}["keep"]
+        assert (moved.country, moved.region) == ("GB", "")
+
+    def test_edit_that_changes_nothing_is_not_an_error(self, auth, profiles):
+        """Default in direct mode sends only the profile it is editing — no
+        rename (disabled), no geography (no proxy). Pressing Save on an
+        unchanged form is not a failure, so it must not surface as one."""
+        self._mk(profiles, "still")
+        r = auth.post("/settings/profiles/edit", data={"name": "still"},
+                      follow_redirects=False)
+        assert r.status_code == 303 and self._names(profiles) == {"still"}
+
+    def test_edit_is_blocked_while_a_browser_is_open(self, auth, profiles, monkeypatch):
         self._mk(profiles, "busy")
         self._running(monkeypatch, "busy")
-        r = auth.post("/settings/profiles/rename", data={"name": "busy", "new_name": "x"},
+        r = auth.post("/settings/profiles/edit", data={"name": "busy", "new_name": "x"},
                       follow_redirects=False)
         assert r.status_code == 409 and "busy" in self._names(profiles)
 
-    def test_missing_rename_keeps_the_existing_bad_request_status(self, auth, profiles):
+    def test_edit_moves_an_open_profile_without_renaming_it(self, auth, profiles, monkeypatch):
+        """Geography is not identity: it applies on the next launch, so it does
+        not need the browser closed — which is why the dialog keeps offering it
+        when it has withdrawn the name box."""
+        self._mk(profiles, "busy")
+        self._running(monkeypatch, "busy")
+        r = auth.post("/settings/profiles/edit",
+                      data={"name": "busy", "country": "GB", "region": "london"},
+                      follow_redirects=False)
+        assert r.status_code == 303
+        assert {p.name: p for p in profiles.all()}["busy"].country == "GB"
+
+    def test_missing_edit_keeps_the_existing_bad_request_status(self, auth, profiles):
         r = auth.post(
-            "/settings/profiles/rename",
+            "/settings/profiles/edit",
             data={"name": "missing", "new_name": "new"},
             follow_redirects=False,
         )
         assert r.status_code == 400
 
-    def test_default_cannot_be_renamed_by_a_crafted_form(self, auth, profiles):
+    def test_edit_refuses_a_name_that_is_already_taken_and_says_so(self, auth, profiles):
+        self._mk(profiles, "one")
+        self._mk(profiles, "two")
+        r = auth.post("/settings/profiles/edit", data={"name": "one", "new_name": "two"})
+        assert r.status_code == 409
+        assert "already exists" in shown(r)
+        assert self._names(profiles) == {"one", "two"}
+
+    def test_edit_refuses_an_emptied_name_rather_than_ignoring_it(self, auth, profiles):
+        self._mk(profiles, "one")
+        r = auth.post("/settings/profiles/edit", data={"name": "one", "new_name": "  "},
+                      follow_redirects=False)
+        assert r.status_code == 400 and self._names(profiles) == {"one"}
+
+    def test_default_can_be_moved_but_not_renamed_by_a_crafted_form(self, auth, profiles):
         profiles.ensure_default(default_country="US", default_region="california")
         r = auth.post(
-            "/settings/profiles/rename",
+            "/settings/profiles/edit",
+            data={"name": "Default", "country": "GB", "region": "london"},
+            follow_redirects=False,
+        )
+        assert r.status_code == 303
+        assert {p.name: p for p in profiles.all()}["Default"].country == "GB"
+
+        r = auth.post(
+            "/settings/profiles/edit",
             data={"name": "Default", "new_name": "renamed"},
             follow_redirects=False,
         )
         assert r.status_code == 409 and "Default" in self._names(profiles)
+
+    def test_edit_only_sends_arguments_the_real_service_accepts(self):
+        """Bind the real signature. A UI stub that swallows **kwargs would let a
+        renamed service argument reach production as a 500."""
+        from app.services.profiles import ProfileService
+
+        sig = inspect.signature(ProfileService.update_profile)
+        for sent in (
+            {"new_name": "n"},
+            {"country": "GB", "region": "london"},
+            {"new_name": "n", "country": "GB", "region": "london"},
+        ):
+            sig.bind(object(), "p", **sent)
 
     def test_delete_removes_the_profile(self, auth, profiles):
         self._mk(profiles, "gone")
@@ -1614,6 +1701,121 @@ class TestProfileEndpoints:
         assert not [s for s in scripts if "');alert(1);//" in s]
         assert [s for s in scripts if "\\u0027);alert(1);//" in s]  # inert, inside a string
 
+    # ── The rendered section: one dialog per row, none offering the impossible ──
+
+    def _proxied(self):
+        app.state.settings.update(
+            proxy_user="u", proxy_password="p", proxy_host="proxy.example", proxy_port="1000",
+        )
+
+    def _dialogs(self, body: str) -> dict[str, str]:
+        """Each row's Edit dialog, keyed by the profile it edits."""
+        import re
+
+        found = {}
+        for block in re.findall(r'<dialog id="pedit-\d+".*?</dialog>', body, re.S):
+            owner = re.search(r'name="name" value="([^"]*)"', block)
+            assert owner, "an edit dialog does not say which profile it edits"
+            found[owner.group(1)] = block
+        return found
+
+    def test_every_row_gets_an_edit_dialog_with_name_and_location_together(self, auth, profiles):
+        self._proxied()
+        self._mk(profiles, "research")
+        body = shown(auth.get("/?view=settings"))
+        assert 'data-dlg-open="pedit-1"' in body
+        dialog = self._dialogs(body)["research"]
+        assert 'action="/settings/profiles/edit"' in dialog
+        assert 'name="new_name"' in dialog
+        assert 'name="country"' in dialog and 'name="region"' in dialog
+
+    def test_defaults_dialog_offers_its_location_but_no_rename(self, auth, profiles):
+        """Default cannot be renamed — the store raises. So the dialog must not
+        hand the user a box whose only outcome is that refusal."""
+        self._proxied()
+        profiles.ensure_default(default_country="US", default_region="california")
+        dialog = self._dialogs(shown(auth.get("/?view=settings")))["Default"]
+        assert 'name="new_name"' not in dialog
+        assert "Default cannot be renamed." in dialog
+        assert 'name="country"' in dialog and 'name="region"' in dialog
+
+    def test_an_open_profiles_dialog_offers_its_location_but_no_rename(
+        self, auth, profiles, monkeypatch
+    ):
+        self._proxied()
+        self._mk(profiles, "busy")
+        self._running(monkeypatch, "busy")
+        dialog = self._dialogs(shown(auth.get("/?view=settings")))["busy"]
+        assert 'name="new_name"' not in dialog
+        assert "close it to rename it" in dialog
+        assert 'name="country"' in dialog
+
+    def test_default_in_direct_mode_gets_no_edit_button_at_all(self, auth, profiles):
+        """No proxy, no rename: the dialog would be empty, so there is no button
+        to open it."""
+        profiles.ensure_default(default_country="", default_region="")
+        body = shown(auth.get("/?view=settings"))
+        assert self._dialogs(body) == {}
+        assert "data-dlg-open=\"pedit-" not in body
+
+    def test_new_profile_is_a_dialog_that_offers_country_and_region(self, auth, profiles):
+        self._proxied()
+        body = shown(auth.get("/?view=settings"))
+        assert 'data-dlg-open="pnew-dialog"' in body
+        dialog = body.split('<dialog id="pnew-dialog"', 1)[1].split("</dialog>", 1)[0]
+        assert 'action="/settings/profiles/create"' in dialog
+        assert 'name="name"' in dialog
+        assert 'name="country"' in dialog and 'name="region"' in dialog
+
+    def test_the_detached_bottom_forms_are_gone(self, auth, profiles):
+        """Renaming and relocating used to be two forms at the foot of the
+        section, each with its own profile picker, detached from the row they
+        acted on. The row's own dialog replaced both."""
+        self._proxied()
+        self._mk(profiles, "research")
+        body = shown(auth.get("/?view=settings"))
+        assert 'action="/settings/profiles/rename"' not in body
+        assert 'action="/settings/profiles/geo"' not in body
+        assert "Rename a profile" not in body
+        assert "Change a profile's exit location" not in body
+        assert "Add a profile" not in body
+
+    def test_the_section_says_a_profile_keeps_the_location_it_was_created_with(
+        self, auth, profiles
+    ):
+        """The owner read the proxy's country as the one that applies, and it is
+        only the default for new profiles. The page has to say so."""
+        self._proxied()
+        body = shown(auth.get("/?view=settings"))
+        assert "Each profile carries its own exit country and region" in body
+        assert "leaves existing profiles exactly where they are" in body
+
+    def test_a_hostile_profile_name_cannot_break_out_of_the_edit_dialog(self, auth, profiles):
+        """Names are user input — create_profile is an MCP tool — and the dialog
+        puts one in a heading, a hidden value, and a text input's value."""
+        import re
+
+        hostile = '"><img src=x onerror=alert(1)>'
+        self._proxied()
+        self._mk(profiles, hostile)
+        raw = auth.get("/?view=settings").text
+        assert 'id="pedit-1"' in raw, "no edit dialog rendered — the rest proves nothing"
+        assert hostile not in raw           # never lands verbatim
+        assert "<img" not in raw            # …so no tag of its own is ever opened
+        assert 'value="&#34;&gt;&lt;img src=x onerror=alert(1)&gt;"' in raw  # inert, in the box
+        # Ids come from the row's position, never from the name.
+        assert re.findall(r'<dialog id="(pedit-[^"]*)"', raw) == ["pedit-1"]
+
+    def test_the_re_measure_button_is_gone_and_sizes_still_load_themselves(self, auth, profiles):
+        self._mk(profiles, "research")
+        body = shown(auth.get("/?view=settings"))
+        assert "sizes-remeasure" not in body
+        assert "Re-measure" not in body
+        # The automatic after-paint fetch stays exactly as it was.
+        assert 'data-size-for="research"' in body
+        assert "'/settings/profiles/sizes'" in body
+        assert "refresh=true" not in body
+
     def test_rotate_changes_the_session_token(self, auth, profiles):
         app.state.settings.update(
             proxy_user="u", proxy_password="p", proxy_host="proxy.example", proxy_port="1000",
@@ -1636,42 +1838,45 @@ class TestProfileEndpoints:
         assert r.status_code == 409 and "incomplete" in r.text
         assert {p.name: p for p in profiles.all()}["r"].session_token == tok
 
-    def test_geo_updates_the_exit(self, auth, profiles):
-        self._mk(profiles, "g")
-        r = auth.post("/settings/profiles/geo",
-                      data={"name": "g", "country": "GB", "region": "london"}, follow_redirects=False)
-        assert r.status_code == 303
-        assert {p.name: p for p in profiles.all()}["g"].country == "GB"
-
-    def test_missing_geo_keeps_the_existing_bad_request_status(self, auth, profiles):
-        r = auth.post(
-            "/settings/profiles/geo",
-            data={"name": "missing", "country": "GB", "region": "london"},
-            follow_redirects=False,
-        )
-        assert r.status_code == 400
+    def test_the_superseded_rename_and_geo_routes_are_gone(self, auth, profiles):
+        """Edit replaced both, and the two detached bottom forms with them. A
+        route left behind is a second way in that nothing exercises."""
+        self._mk(profiles, "p")
+        for path, data in (
+            ("/settings/profiles/rename", {"name": "p", "new_name": "q"}),
+            ("/settings/profiles/geo", {"name": "p", "country": "GB"}),
+        ):
+            assert auth.post(path, data=data, follow_redirects=False).status_code == 404
 
     def test_all_reject_a_foreign_origin(self, auth, profiles):
         self._mk(profiles, "p")
         for path, data in (
             ("/settings/profiles/create", {"name": "z"}),
-            ("/settings/profiles/rename", {"name": "p", "new_name": "q"}),
+            ("/settings/profiles/edit", {"name": "p", "new_name": "q"}),
             ("/settings/profiles/clear", {"name": "p"}),
             ("/settings/profiles/delete", {"name": "p"}),
             ("/settings/profiles/rotate", {"name": "p"}),
-            ("/settings/profiles/geo", {"name": "p", "country": "GB"}),
         ):
             r = auth.post(path, data=data, headers={"Origin": "https://evil.example"},
                           follow_redirects=False)
             assert r.status_code == 403, f"{path} allowed a cross-origin POST"
+        assert self._names(profiles) == {"p"}
 
     def test_signed_out_cannot_manage_profiles(self, client, profiles):
         r = client.post("/settings/profiles/create", data={"name": "z"}, follow_redirects=False)
         assert r.status_code == 303 and r.headers["location"] == "/login"
         assert "z" not in self._names(profiles)
 
+    def test_signed_out_cannot_edit_a_profile(self, client, profiles):
+        self._mk(profiles, "p")
+        r = client.post("/settings/profiles/edit", data={"name": "p", "new_name": "q"},
+                        follow_redirects=False)
+        assert r.status_code == 303 and r.headers["location"] == "/login"
+        assert self._names(profiles) == {"p"}
+
     def test_get_is_rejected(self, auth):
         assert auth.get("/settings/profiles/create", follow_redirects=False).status_code == 405
+        assert auth.get("/settings/profiles/edit", follow_redirects=False).status_code == 405
 
 
 class TestProfileSizesEndpoint:

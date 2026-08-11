@@ -874,34 +874,41 @@ async def profile_create(
     return _settings_redirect()
 
 
-@router.post("/settings/profiles/rename")
-async def profile_rename(request: Request, name: str = Form(""), new_name: str = Form("")) -> Response:
-    _require(request)
-    _require_same_origin(request)
-    from ..services.profiles import ProfileError
-
-    try:
-        await request.app.state.profile_service.update_profile(name, new_name=new_name)
-    except ProfileError as exc:
-        return _render(
-            request, Result("profiles", False, str(exc)),
-            status=_profile_error_status(exc, missing=400),
-        )
-    return _settings_redirect()
-
-
-@router.post("/settings/profiles/geo")
-async def profile_geo(
-    request: Request, name: str = Form(""), country: str = Form(""), region: str = Form("")
+@router.post("/settings/profiles/edit")
+async def profile_edit(
+    request: Request,
+    name: str = Form(""),
+    new_name: str | None = Form(None),
+    country: str | None = Form(None),
+    region: str | None = Form(None),
 ) -> Response:
+    """Rename and relocate a profile in one submit — the dialog behind each row.
+
+    The dialog sends only the fields it actually offered: Default's name box is
+    disabled because Default cannot be renamed, and the geography boxes exist
+    only when a proxy is configured. So an absent field means "leave this
+    alone", which is deliberately distinct from an empty one — an empty region
+    clears the region, and an emptied name is a mistake worth reporting rather
+    than silently ignoring. A submit that changes nothing is a no-op redirect,
+    not the service's "provide something to update" error: the user pressed
+    Save on an unchanged form, which is not a failure.
+    """
     _require(request)
     _require_same_origin(request)
     from ..services.profiles import ProfileError
 
+    changes: dict[str, str] = {}
+    if new_name is not None and new_name.strip() != name:
+        changes["new_name"] = new_name.strip()
+    if country is not None:
+        changes["country"] = country.strip()
+    if region is not None:
+        changes["region"] = region.strip()
+    if not changes:
+        return _settings_redirect()
+
     try:
-        await request.app.state.profile_service.update_profile(
-            name, country=country.strip(), region=region.strip(),
-        )
+        await request.app.state.profile_service.update_profile(name, **changes)
     except ProfileError as exc:
         return _render(
             request, Result("profiles", False, str(exc)),

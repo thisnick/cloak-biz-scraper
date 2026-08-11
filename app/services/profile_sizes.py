@@ -106,8 +106,8 @@ class ProfileSizes:
         """Every profile's size, walking only what is not already cached.
 
         Repeat visits to the settings page therefore cost nothing. ``refresh``
-        re-measures everything, which is what the page's "Re-measure" control
-        asks for. Two overlapping calls may both walk the same tree; that is
+        re-measures everything, for callers that need a figure they know is
+        current. Two overlapping calls may both walk the same tree; that is
         wasted work, never a wrong answer, and it is not worth an asyncio lock
         whose event-loop affinity would outlive the request that created it.
         """
