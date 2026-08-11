@@ -147,6 +147,11 @@
   .btnrow{display:flex;gap:9px;flex-wrap:wrap;margin-top:14px}
   button.btn,button{font:600 13px var(--sans);padding:9px 13px;border-radius:var(--r-sm);cursor:pointer;border:1px solid var(--border);background:var(--surface);color:var(--text)}
   button.btn:hover,button:hover{border-color:var(--accent)}
+  /* A button the page has just learned has nothing to do — e.g. no old browser
+     versions to remove. Greyed rather than hidden: it disappearing after paint
+     would move the section under the reader's cursor. */
+  button.btn:disabled,button:disabled{opacity:.5;cursor:not-allowed}
+  button.btn:disabled:hover,button:disabled:hover{border-color:var(--border)}
   button.btn.primary,button.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
   button.btn.primary:hover,button.primary:hover{background:var(--accent-strong)}
   button.btn.danger{color:var(--bad);border-color:color-mix(in srgb,var(--bad) 38%,var(--border));background:var(--surface)}

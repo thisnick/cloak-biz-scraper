@@ -101,6 +101,42 @@ def test_prune_keeps_recent_and_drops_old(root):
     assert store.get(recent.id) is not None
 
 
+def test_prune_takes_the_evidence_with_the_record(root, tmp_path):
+    """The leak this closes: pruning the record used to STRAND the screenshots,
+    because /runs/<id>/evidence checks the record before serving a file. So the
+    volume kept files no page could ever reach again."""
+    evidence = tmp_path / "evidence"
+    store = JobStore(root, evidence_root=evidence)
+    old = store.create(url="https://x/old-businesses-for-sale/")
+    old.status = "completed"
+    old.created_at = time.time() - 30 * 86_400
+    store.save(old)
+    recent = store.create(url="https://x/new-businesses-for-sale/")
+    recent.status = "completed"
+    store.save(recent)
+    for job in (old, recent):
+        (evidence / job.id / "source-01").mkdir(parents=True)
+        (evidence / job.id / "source-01" / "page.png").write_bytes(b"x" * 100)
+
+    assert store.prune() == 1
+    assert not (evidence / old.id).exists()
+    assert (evidence / recent.id).is_dir(), "a kept run keeps what it captured"
+
+
+def test_prune_leaves_a_working_job_and_its_evidence_alone(root, tmp_path):
+    evidence = tmp_path / "evidence"
+    store = JobStore(root, evidence_root=evidence)
+    job = store.create(url="https://x/y-businesses-for-sale/")
+    job.created_at = time.time() - 30 * 86_400
+    store.save(job)
+    (evidence / job.id).mkdir(parents=True)
+    (evidence / job.id / "page.png").write_bytes(b"x" * 100)
+
+    assert store.prune() == 0
+    assert store.get(job.id) is not None
+    assert (evidence / job.id / "page.png").exists()
+
+
 def test_prune_never_drops_a_running_job(root):
     """An old timestamp on a working job means a long sweep, not a stale one."""
     store = JobStore(root)

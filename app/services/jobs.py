@@ -16,6 +16,14 @@ saying "working" would have `get_scrape_listing_results` tell an agent to keep
 waiting for a sweep that died — forever, and with no error to explain it. The
 poll must be able to say what happened. This is the honest reading of a status
 we can no longer vouch for.
+
+**Why a record never goes without its evidence.** A sweep's JSON record is a few
+hundred KB; the screenshots and page HTML it captured, under
+`evidence/<job_id>/`, are the actual weight on the volume. Dropping the record
+alone does not merely leave them behind — it strands them, because
+`/runs/<job_id>/evidence/...` is gated on `get(job_id)` succeeding. So the two
+are removed together, here, by the one method both the retention prune and the
+user's "Clear task history" go through.
 """
 from __future__ import annotations
 
@@ -27,7 +35,9 @@ import time
 import uuid
 from pathlib import Path
 
+from ..config import CONFIG
 from ..models import Job
+from . import reclaim
 
 logger = logging.getLogger("cloakbiz.jobs")
 
@@ -42,9 +52,19 @@ _KEEP_MOST_RECENT = 500
 class JobStore:
     """Job records as one JSON file each, under the volume's jobs directory."""
 
-    def __init__(self, root: Path, boot_id: str | None = None) -> None:
+    def __init__(
+        self,
+        root: Path,
+        boot_id: str | None = None,
+        evidence_root: Path | str | None = None,
+    ) -> None:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
+        # Where each job's captures live, one directory per job id. Defaulted
+        # rather than required so no caller can construct a store that silently
+        # loses track of the evidence it is supposed to remove; tests point it
+        # at their own volume.
+        self.evidence_root = Path(evidence_root) if evidence_root else CONFIG.evidence_dir
         # Identifies this process run. Any job claiming to be "working" under a
         # different boot id is being worked on by a process that no longer exists.
         self.boot_id = boot_id or uuid.uuid4().hex[:12]
@@ -134,8 +154,45 @@ class JobStore:
             logger.warning("marked %d interrupted job(s) as failed after restart", interrupted)
         return interrupted
 
+    def evidence_dir(self, job_id: str) -> Path:
+        """Where this job's captures are. Validates the id's shape first, so a
+        job_id arriving from outside can never name a directory of its own."""
+        self._path(job_id)  # raises ValueError for anything that is not an id
+        return self.evidence_root / job_id
+
+    def drop(self, job_id: str) -> bool:
+        """Remove one job's record AND the evidence it captured.
+
+        Refuses a working job: a coroutine in this process is still writing to
+        both, and a sweep that lost its record mid-run would report nothing to
+        the agent waiting on it. Returns whether the record is gone, so a caller
+        can count what it really removed rather than what it tried to.
+        """
+        try:
+            path = self._path(job_id)
+        except ValueError:
+            return False
+        job = self.get(job_id)
+        if job is not None and job.status == "working":
+            return False
+        with self._lock:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                return False
+        # Evidence after the record, deliberately: evidence outliving its record
+        # is dead weight, but a record outliving its evidence is a run the UI
+        # still lists and whose screenshots 404.
+        try:
+            if not reclaim.remove_child(self.evidence_root, self.evidence_dir(job_id)):
+                logger.warning("could not fully remove the evidence for job %s", job_id)
+        except reclaim.Unsafe as exc:
+            logger.warning("left the evidence for job %s alone: %s", job_id, exc)
+        return True
+
     def prune(self) -> int:
-        """Drop jobs that are old and surplus. Never touches a working job."""
+        """Drop jobs that are old and surplus, with their evidence. Never
+        touches a working job."""
         cutoff = time.time() - _KEEP_DAYS * 86_400
         jobs = self.all()
         removed = 0
@@ -143,11 +200,8 @@ class JobStore:
             if job.status == "working":
                 continue
             if job.created_at < cutoff or i >= _KEEP_MOST_RECENT:
-                try:
-                    self._path(job.id).unlink(missing_ok=True)
+                if self.drop(job.id):
                     removed += 1
-                except OSError:
-                    continue
         if removed:
-            logger.info("pruned %d old job(s)", removed)
+            logger.info("pruned %d old job(s) and the evidence they captured", removed)
         return removed

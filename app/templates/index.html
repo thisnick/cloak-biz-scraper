@@ -793,6 +793,51 @@
               </dialog>
             </div>
           </div>
+
+          {# Disk space #}
+          <div class="acc-item {{ 'open' if result and result.section=='storage' }}">
+            <button class="acc-head">
+              <svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg>
+              <span class="h-title">Disk space</span>
+              <div class="h-right">
+                <span class="chip" data-storage="chip">Free up space</span>
+                <svg class="chev" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M9 6l6 6-6 6"/></svg>
+              </div>
+            </button>
+            <div class="acc-body">
+              <p class="lead-help">Two things build up on this server's disk and nothing removes them on its own: a copy of the browser for every version it has downloaded, and the screenshots and pages every task saved. Both are safe to clear — the browser downloads itself again the next time it is needed.</p>
+              {{ banner('storage') }}
+
+              {# Sizes are filled in after the page paints, for the same reason
+                 the profile sizes are: measuring is a walk of the whole volume
+                 and no render may wait on it. #}
+              <div class="field">
+                <label>Browser versions</label>
+                <div class="mono" data-storage="build-inuse">—</div>
+                <div class="help" data-storage="build-note">Checking what's on the disk…</div>
+                {% if s.binary_last_path %}
+                <div class="btnrow">
+                  <form method="post" action="/settings/storage/builds/prune" onsubmit="return confirm('Remove the older browser versions? The one this server is using is kept. This cannot be undone.');">
+                    <button class="btn danger" type="submit" data-storage="build-button">Remove old versions</button>
+                  </form>
+                </div>
+                {% else %}
+                <div class="help">This server has not recorded which browser it is running yet, so nothing can be removed — open <b>Browser licence</b> above, click <b>Save &amp; verify</b>, then come back.</div>
+                {% endif %}
+              </div>
+
+              <div class="field">
+                <label>Task history</label>
+                <div class="mono" data-storage="history">—</div>
+                <div class="help">Every task keeps the pages and screenshots it saw. Clearing removes finished tasks and everything they saved; anything still running is kept.</div>
+                <div class="btnrow">
+                  <form method="post" action="/settings/storage/history/clear" onsubmit="return confirm('Clear the task history? Every finished task and the screenshots it saved are removed. This cannot be undone.');">
+                    <button class="btn danger" type="submit">Clear task history</button>
+                  </form>
+                </div>
+              </div>
+            </div>
+          </div>
         </div>
 
         <div class="cnote">
@@ -850,6 +895,13 @@
       b.textContent='Getting browser — about ten seconds…';
       var w=document.getElementById('licence-wait');if(w)w.hidden=false;
     });
+    // Bytes for a person. Shared by the two after-paint size fetches below.
+    function human(n){
+      if(n<1024)return n+' B';
+      var units=['KB','MB','GB','TB'],i=-1;
+      do{n/=1024;i++;}while(n>=1024&&i<units.length-1);
+      return (n>=10?Math.round(n):Math.round(n*10)/10)+' '+units[i];
+    }
     // Profile sizes. Measuring one is a walk of a whole Chromium profile
     // directory, so the server never does it during a render — the page paints
     // first and asks afterwards. Every failure here is silent on purpose: this
@@ -859,12 +911,6 @@
       var cells=document.querySelectorAll('[data-size-for]');
       if(!cells.length)return;
       var ages=document.querySelectorAll('[data-size-age]');
-      function human(n){
-        if(n<1024)return n+' B';
-        var units=['KB','MB','GB','TB'],i=-1;
-        do{n/=1024;i++;}while(n>=1024&&i<units.length-1);
-        return (n>=10?Math.round(n):Math.round(n*10)/10)+' '+units[i];
-      }
       function ago(sec){
         sec=Math.max(0,Math.round(sec));
         if(sec<60)return 'measured just now';
@@ -895,6 +941,47 @@
           .catch(function(){});  // leave the placeholders exactly as they are
       }
       // After paint, not during it.
+      if(document.readyState==='complete')setTimeout(load,0);
+      else window.addEventListener('load',load);
+    })();
+    // Disk space. Same rule as the profile sizes: the page paints first and
+    // asks afterwards, and a fetch that fails leaves every placeholder exactly
+    // as the server rendered it. The buttons are rendered by the server and the
+    // guards live in the service — this only says what pressing one would free,
+    // and greys one out when there is nothing for it to do.
+    (function(){
+      function at(k){return document.querySelector('[data-storage="'+k+'"]');}
+      if(!at('history'))return;
+      function paintBuilds(b){
+        var used=at('build-inuse'),note=at('build-note'),btn=at('build-button');
+        if(used)used.textContent=b.in_use
+          ?('In use: '+b.in_use.version+(b.in_use.pro?' Pro':'')+' · '+human(b.in_use.bytes))
+          :'In use: not identified';
+        if(note)note.textContent=b.in_use_known
+          ?(b.stale_count
+              ?(b.stale_count+' older version'+(b.stale_count===1?'':'s')+' · '+human(b.stale_bytes)+' to free')
+              :'No older versions are left on the disk.')
+          :b.reason;
+        if(btn&&(!b.in_use_known||!b.stale_count))btn.disabled=true;
+      }
+      function paint(d){
+        var b=d&&d.builds,h=d&&d.history;
+        if(b)paintBuilds(b);
+        if(h){
+          var e=at('history');
+          if(e)e.textContent=h.runs.toLocaleString()+' task'+(h.runs===1?'':'s')+' · '+
+            human(h.bytes)+' saved'+(h.orphans?' · including '+h.orphans+' from tasks already gone':'');
+        }
+        var chip=at('chip');
+        if(chip&&b&&h)chip.textContent=human((b.total_bytes||0)+(h.bytes||0))+' used';
+      }
+      function load(){
+        fetch('/settings/storage',
+              {credentials:'same-origin',headers:{'Accept':'application/json'}})
+          .then(function(r){return r.ok?r.json():Promise.reject(r.status);})
+          .then(paint)
+          .catch(function(){});  // leave the placeholders exactly as they are
+      }
       if(document.readyState==='complete')setTimeout(load,0);
       else window.addEventListener('load',load);
     })();

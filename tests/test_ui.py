@@ -10,6 +10,7 @@ from __future__ import annotations
 import inspect
 import pathlib
 import shutil
+import types
 
 import httpx
 import pytest
@@ -2132,3 +2133,301 @@ class TestConnectedAppsUi:
         info = self._connect(wired)  # confidential client: gets a secret
         assert info.get("client_secret")
         assert info["client_secret"] not in wired.get("/").text
+
+
+class TestStorage:
+    """Disk space: the two things that grow on the volume forever.
+
+    The numbers are shown where the buttons are, so both are tested together —
+    a measurement that fails must still leave a settings page that can configure
+    a licence, and a button must never remove anything the service would refuse
+    to remove.
+    """
+
+    @pytest.fixture
+    def storage(self, monkeypatch, tmp_path):
+        """Point both reclaim services at this test's own volume."""
+        from app.services.binaries import BrowserBuilds
+        from app.services.history import TaskHistory
+        from app.services.jobs import JobStore
+
+        cache = tmp_path / "cloakbrowser-cache"
+        cache.mkdir()
+        jobs = JobStore(tmp_path / "jobs", boot_id="boot-1",
+                        evidence_root=tmp_path / "evidence")
+        monkeypatch.setattr(app.state, "jobs", jobs)
+        monkeypatch.setattr(app.state.instances, "running", {})
+        monkeypatch.setattr(
+            app.state, "browser_builds",
+            BrowserBuilds(cache, lambda: app.state.settings, app.state.instances),
+        )
+        monkeypatch.setattr(app.state, "task_history", TaskHistory(lambda: app.state.jobs))
+        return types.SimpleNamespace(cache=cache, jobs=jobs)
+
+    def _build(self, storage, name, *, size=100, in_use=False):
+        directory = storage.cache / name
+        directory.mkdir(parents=True)
+        (directory / "chrome").write_bytes(b"x" * size)
+        if in_use:
+            app.state.settings.update(binary_last_path=str(directory / "chrome"))
+        return directory
+
+    def _run(self, storage, *, status="completed", size=100):
+        job = storage.jobs.create(source="bizbuysell_serp", url="https://x/y/")
+        job.status = status
+        storage.jobs.save(job)
+        evidence = storage.jobs.evidence_root / job.id / "source-01"
+        evidence.mkdir(parents=True)
+        (evidence / "page.png").write_bytes(b"x" * size)
+        return job
+
+    # ── the measurement endpoint ─────────────────────────────────────────────
+
+    def test_reports_what_the_browser_cache_and_the_history_are_using(self, auth, storage):
+        self._build(storage, "chromium-148.0.7778.215.5-pro", size=700, in_use=True)
+        self._build(storage, "chromium-146.0.7680.177.3", size=300)
+        self._run(storage, size=250)
+
+        body = auth.get("/settings/storage").json()
+
+        assert body["builds"]["in_use"]["version"] == "148.0.7778.215.5"
+        assert body["builds"]["in_use"]["pro"] is True
+        assert body["builds"]["in_use"]["bytes"] == 700
+        assert body["builds"]["stale_count"] == 1 and body["builds"]["stale_bytes"] == 300
+        assert body["builds"]["total_bytes"] == 1000
+        assert body["history"] == {
+            "runs": 1, "bytes": 250, "files": 1, "orphans": 0,
+            "measured_at": body["history"]["measured_at"],
+        }
+
+    def test_with_no_recorded_build_it_still_reports_sizes_and_says_why(self, auth, storage):
+        self._build(storage, "chromium-148.0.7778.215.5-pro", size=700)
+
+        builds = auth.get("/settings/storage").json()["builds"]
+
+        assert builds["in_use_known"] is False and builds["stale_count"] == 0
+        assert builds["total_bytes"] == 700, "a full volume is always explainable"
+        assert "Save & verify" in builds["reason"]
+
+    def test_orphaned_evidence_is_counted(self, auth, storage):
+        (storage.jobs.evidence_root / "deadbeef1234" / "final").mkdir(parents=True)
+        (storage.jobs.evidence_root / "deadbeef1234" / "final" / "p.png").write_bytes(b"x" * 900)
+
+        history = auth.get("/settings/storage").json()["history"]
+
+        assert history["runs"] == 0 and history["orphans"] == 1 and history["bytes"] == 900
+
+    def test_a_second_visit_serves_the_cache_and_refresh_re_walks(self, auth, storage):
+        directory = self._build(storage, "chromium-148.0.7778.215.5-pro", size=100, in_use=True)
+        assert auth.get("/settings/storage").json()["builds"]["total_bytes"] == 100
+
+        (directory / "extra").write_bytes(b"x" * 400)
+
+        assert auth.get("/settings/storage").json()["builds"]["total_bytes"] == 100
+        fresh = auth.get("/settings/storage?refresh=true").json()
+        assert fresh["builds"]["total_bytes"] == 500
+
+    def test_signed_out_is_not_served(self, client, storage):
+        self._build(storage, "chromium-148.0.7778.215.5-pro", in_use=True)
+        r = client.get("/settings/storage", follow_redirects=False)
+        assert r.status_code == 303 and r.headers["location"] == "/login"
+        assert "chromium" not in r.text
+
+    def test_the_page_still_renders_when_measuring_is_broken(self, auth, storage,
+                                                             monkeypatch):
+        """The settings page carries the licence, proxy, and Notion config. A
+        volume that cannot be walked costs a number, never the page."""
+        from app.services import binaries, history as history_module
+
+        self._build(storage, "chromium-148.0.7778.215.5-pro", in_use=True)
+        self._run(storage)
+        boom = lambda p: (_ for _ in ()).throw(OSError("disk is having a day"))
+        monkeypatch.setattr(binaries, "measure_dir", boom)
+        monkeypatch.setattr(history_module, "measure_dir", boom)
+
+        page = auth.get("/?view=settings")
+        assert page.status_code == 200 and "Disk space" in page.text
+
+        body = auth.get("/settings/storage")
+        assert body.status_code == 200
+        assert body.json() == {"builds": None, "history": None}
+
+    def test_the_page_renders_over_a_hostile_volume(self, auth, storage, tmp_path):
+        """Dangling links, an unreadable directory, and missing roots: the page
+        never walks any of it during a render, and the endpoint degrades to
+        zeroes rather than an error."""
+        import os
+        import shutil
+
+        (storage.cache / "chromium-broken").symlink_to(tmp_path / "never-existed",
+                                                       target_is_directory=True)
+        storage.jobs.evidence_root.mkdir(parents=True, exist_ok=True)
+        locked = storage.jobs.evidence_root / "locked"
+        locked.mkdir()
+        (locked / "p.png").write_bytes(b"x" * 10)
+        if os.geteuid() != 0:
+            locked.chmod(0o000)
+        shutil.rmtree(storage.jobs.root)  # the jobs directory itself is gone
+
+        try:
+            assert auth.get("/?view=settings").status_code == 200
+            body = auth.get("/settings/storage")
+            assert body.status_code == 200
+            assert body.json()["builds"]["total_bytes"] == 0
+            assert body.json()["history"]["runs"] == 0
+        finally:
+            locked.chmod(0o700)
+
+    # ── the page ─────────────────────────────────────────────────────────────
+
+    def test_the_section_asks_for_its_sizes_after_it_paints(self, auth, storage):
+        body = auth.get("/?view=settings").text
+        assert "'/settings/storage'" in body
+        assert 'data-storage="build-inuse"' in body and 'data-storage="history"' in body
+        # …and the render itself measured nothing: no size is in the HTML.
+        assert "Checking what's on the disk" in shown(auth.get("/?view=settings"))
+
+    def test_the_remove_button_is_absent_until_a_build_is_recorded(self, auth, storage):
+        page = shown(auth.get("/?view=settings"))
+        assert "Remove old versions" not in page
+        assert "has not recorded which browser it is running" in page
+
+        self._build(storage, "chromium-148.0.7778.215.5-pro", in_use=True)
+
+        page = shown(auth.get("/?view=settings"))
+        assert "Remove old versions" in page
+        assert "/settings/storage/builds/prune" in page
+
+    def test_both_destructive_buttons_confirm_first(self, auth, storage):
+        self._build(storage, "chromium-148.0.7778.215.5-pro", in_use=True)
+        page = shown(auth.get("/?view=settings"))
+        assert "Remove the older browser versions?" in page
+        assert "Clear the task history?" in page
+
+    # ── the actions ──────────────────────────────────────────────────────────
+
+    def test_removing_old_builds_keeps_the_one_in_use(self, auth, storage):
+        keep = self._build(storage, "chromium-148.0.7778.215.5-pro", size=700, in_use=True)
+        old = self._build(storage, "chromium-146.0.7680.177.3", size=300)
+
+        r = auth.post("/settings/storage/builds/prune", follow_redirects=False)
+
+        assert r.status_code == 200, r.text
+        assert "Removed 1 older browser version" in shown(r)
+        assert not old.exists() and keep.is_dir()
+
+    def test_removing_old_builds_refuses_when_none_is_recorded(self, auth, storage):
+        old = self._build(storage, "chromium-146.0.7680.177.3")
+
+        r = auth.post("/settings/storage/builds/prune", follow_redirects=False)
+
+        assert r.status_code == 409
+        assert "Save & verify" in shown(r)
+        assert old.is_dir(), "nothing may be removed when the running build is unknown"
+
+    def test_removing_old_builds_refuses_while_a_browser_is_open(self, auth, storage,
+                                                                 monkeypatch):
+        self._build(storage, "chromium-148.0.7778.215.5-pro", in_use=True)
+        old = self._build(storage, "chromium-146.0.7680.177.3")
+        # Reserved but not yet running: the launch window a scan of `running`
+        # cannot see, and the one a live Chromium's mapped binary sits in.
+        monkeypatch.setattr(app.state.instances, "_profiles_opening", {"Default": 1})
+
+        r = auth.post("/settings/storage/builds/prune", follow_redirects=False)
+
+        assert r.status_code == 409 and "Close every browser" in shown(r)
+        assert old.is_dir()
+
+    def test_clearing_history_removes_finished_runs_and_their_evidence(self, auth, storage):
+        done = self._run(storage, size=300)
+        working = self._run(storage, status="working", size=100)
+
+        r = auth.post("/settings/storage/history/clear", follow_redirects=False)
+
+        assert r.status_code == 200, r.text
+        assert "Cleared 1 run" in shown(r)
+        assert storage.jobs.get(done.id) is None
+        assert not (storage.jobs.evidence_root / done.id).exists()
+        assert storage.jobs.get(working.id) is not None
+        assert (storage.jobs.evidence_root / working.id).is_dir()
+
+    def test_clearing_history_removes_orphaned_evidence(self, auth, storage):
+        orphan = storage.jobs.evidence_root / "deadbeef1234"
+        orphan.mkdir(parents=True)
+        (orphan / "p.png").write_bytes(b"x" * 900)
+
+        r = auth.post("/settings/storage/history/clear", follow_redirects=False)
+
+        assert r.status_code == 200 and "leftover evidence folder" in shown(r)
+        assert not orphan.exists()
+
+    def test_the_routes_call_the_services_they_claim_to(self, auth, storage, monkeypatch):
+        """Bind against the REAL service signatures (self stubbed) so a route
+        that grows an argument the service does not take fails here instead of
+        being swallowed by a **kwargs stub."""
+        from app.services.binaries import BrowserBuilds, RemovedBuilds
+        from app.services.history import ClearedHistory, TaskHistory
+
+        called = []
+
+        async def fake_remove_stale(*args, **kwargs):
+            inspect.signature(BrowserBuilds.remove_stale).bind(None, *args, **kwargs)
+            called.append("builds")
+            return RemovedBuilds(removed=["chromium-146.0.7680.177.3"], bytes=300,
+                                 kept="chromium-148.0.7778.215.5-pro")
+
+        async def fake_clear(*args, **kwargs):
+            inspect.signature(TaskHistory.clear).bind(None, *args, **kwargs)
+            called.append("history")
+            return ClearedHistory(runs=2, orphans=1, bytes=500, kept=1)
+
+        monkeypatch.setattr(app.state.browser_builds, "remove_stale", fake_remove_stale)
+        monkeypatch.setattr(app.state.task_history, "clear", fake_clear)
+
+        prune = shown(auth.post("/settings/storage/builds/prune", follow_redirects=False))
+        clear = shown(auth.post("/settings/storage/history/clear", follow_redirects=False))
+
+        assert called == ["builds", "history"]
+        assert "freed 300 B" in prune and "chromium-148.0.7778.215.5-pro) was kept" in prune
+        assert "Cleared 2 runs" in clear and "1 leftover evidence folder" in clear
+        assert "1 run still working was kept" in clear
+
+    def test_nothing_to_do_is_reported_as_success(self, auth, storage):
+        self._build(storage, "chromium-148.0.7778.215.5-pro", in_use=True)
+        assert "Nothing to remove" in shown(
+            auth.post("/settings/storage/builds/prune", follow_redirects=False))
+        assert "no saved task history" in shown(
+            auth.post("/settings/storage/history/clear", follow_redirects=False))
+
+    # ── the gates ────────────────────────────────────────────────────────────
+
+    def test_both_actions_are_post_only(self, auth, storage):
+        assert auth.get("/settings/storage/builds/prune",
+                        follow_redirects=False).status_code == 405
+        assert auth.get("/settings/storage/history/clear",
+                        follow_redirects=False).status_code == 405
+
+    def test_both_actions_reject_a_foreign_origin(self, auth, storage):
+        keep = self._build(storage, "chromium-148.0.7778.215.5-pro", in_use=True)
+        old = self._build(storage, "chromium-146.0.7680.177.3")
+        job = self._run(storage)
+
+        for path in ("/settings/storage/builds/prune", "/settings/storage/history/clear"):
+            r = auth.post(path, headers={"Origin": "https://evil.example"},
+                          follow_redirects=False)
+            assert r.status_code == 403, f"{path} allowed a cross-origin POST"
+
+        assert old.is_dir() and keep.is_dir()
+        assert storage.jobs.get(job.id) is not None
+
+    def test_signed_out_cannot_reclaim_anything(self, client, storage):
+        old = self._build(storage, "chromium-146.0.7680.177.3")
+        self._build(storage, "chromium-148.0.7778.215.5-pro", in_use=True)
+        job = self._run(storage)
+
+        for path in ("/settings/storage/builds/prune", "/settings/storage/history/clear"):
+            r = client.post(path, follow_redirects=False)
+            assert r.status_code == 303 and r.headers["location"] == "/login"
+
+        assert old.is_dir()
+        assert storage.jobs.get(job.id) is not None

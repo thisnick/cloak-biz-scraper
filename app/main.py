@@ -33,6 +33,8 @@ from .response_security import ResponseSecurity
 from .services import heartbeat
 from .services.agent_browser import AgentBrowserService
 from .services.archive import ArchiveService
+from .services.binaries import BrowserBuilds
+from .services.history import TaskHistory
 from .services.instances import InstanceManager
 from .services.jobs import JobStore
 from .services.oauth import OAuthProvider, OAuthStore
@@ -116,6 +118,15 @@ async def lifespan(app: FastAPI):
             default_country=_s.proxy_country, default_region=_s.proxy_region)
     except Exception:  # noqa: BLE001
         logger.exception("could not ensure the Default profile at startup")
+    # The two things that grow on the volume forever and nothing else removes:
+    # one cached browser directory per CloakBrowser release, and the evidence
+    # every task captures. Both are measured on demand (never during a render)
+    # and reclaimed only when the user asks. Read through app.state so a swapped
+    # settings or job store cannot leave either one pointed at a stale volume.
+    app.state.browser_builds = BrowserBuilds(
+        CONFIG.binary_cache_dir, lambda: app.state.settings, app.state.instances,
+    )
+    app.state.task_history = TaskHistory(lambda: app.state.jobs)
     app.state.scrape = ScrapeService(app.state.instances, jobs, settings_service)
     app.state.archive = ArchiveService(app.state.instances, settings_service)
     app.state.agent_browser = AgentBrowserService(app.state.instances)

@@ -1006,6 +1006,151 @@ async def profile_delete(request: Request, name: str = Form("")) -> Response:
     return _settings_redirect()
 
 
+# ── Disk space: what the volume is actually full of ─────────────────────────
+#
+# Two leaks, one section. The browser cache keeps one directory per CloakBrowser
+# release (747 MB each, and the version is normally unpinned), and every task's
+# screenshots and page copies stay forever. Both are measured the same way the
+# profile sizes are — a walk, in a worker thread, fetched by the page after it
+# paints — because the settings page also carries the licence, proxy, and Notion
+# configuration and must render whatever the volume is doing.
+#
+# The numbers are shown next to the buttons that act on them, so nobody is asked
+# to press "Remove" to find out what removing would free.
+
+
+def _size(num: int) -> str:
+    """Bytes for a person: 747 MB, 1.4 GB. Only ever used in a message."""
+    value = float(num)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            if unit == "B":
+                return f"{int(value)} B"
+            return f"{value:.0f} {unit}" if value >= 10 else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.0f} TB"  # pragma: no cover - unreachable, the loop returns
+
+
+async def _builds_payload(request: Request, refresh: bool) -> dict[str, Any] | None:
+    view = await request.app.state.browser_builds.snapshot(refresh=refresh)
+    in_use = view.in_use
+    return {
+        "cache_dir": view.cache_dir,
+        "in_use_known": view.in_use_known,
+        "reason": view.reason,
+        "in_use": (
+            {"name": in_use.name, "version": in_use.version, "pro": in_use.pro,
+             "bytes": in_use.bytes, "files": in_use.files}
+            if in_use is not None else None
+        ),
+        "stale_count": len(view.stale),
+        "stale_bytes": view.stale_bytes,
+        "total_bytes": view.total_bytes,
+        "builds": [
+            {"name": b.name, "version": b.version, "pro": b.pro,
+             "bytes": b.bytes, "files": b.files, "in_use": b.in_use}
+            for b in view.builds
+        ],
+        "measured_at": view.measured_at,
+    }
+
+
+async def _history_payload(request: Request, refresh: bool) -> dict[str, Any] | None:
+    view = await request.app.state.task_history.snapshot(refresh=refresh)
+    return {
+        "runs": view.runs, "bytes": view.bytes, "files": view.files,
+        "orphans": view.orphans, "measured_at": view.measured_at,
+    }
+
+
+@router.get("/settings/storage")
+async def storage_sizes(request: Request, refresh: bool = False) -> dict[str, Any]:
+    """What the browser cache and the task history are using on the volume.
+
+    One request for both, filled in after the page paints. Each half degrades on
+    its own: a volume that cannot be walked answers `null` for that section and
+    the page simply keeps its placeholder, because a settings page that cannot
+    report the licence state because a directory listing failed is a far worse
+    outcome than one that cannot report a size. Narrow on purpose — a bug in
+    here should still surface as a 500.
+    """
+    _require(request)
+    payload: dict[str, Any] = {}
+    for key, build in (("builds", _builds_payload), ("history", _history_payload)):
+        try:
+            payload[key] = await build(request, refresh)
+        except OSError:
+            logger.exception("could not measure %s", key)
+            payload[key] = None
+    return payload
+
+
+@router.post("/settings/storage/builds/prune", response_class=HTMLResponse)
+async def prune_builds(request: Request) -> Response:
+    """Remove every cached browser build except the one in use.
+
+    POST with both CSRF layers, like every other destructive action here: this
+    is an rmtree of hundreds of megabytes, and the session cookie is SameSite=lax
+    — which a cross-site top-level GET would still carry.
+    """
+    _require(request)
+    _require_same_origin(request)
+    from ..services.binaries import BuildsError
+
+    try:
+        removed = await request.app.state.browser_builds.remove_stale()
+    except BuildsError as exc:
+        # Both refusals — "we cannot tell which build is running" and "a browser
+        # is open" — are states the user can resolve, so each says how.
+        return _render(request, Result("storage", False, str(exc)), status=409)
+    if not removed.removed:
+        return _render(
+            request,
+            Result("storage", True,
+                   "Nothing to remove — the only browser build on the volume is the one "
+                   "this server is using."),
+        )
+    return _render(
+        request,
+        Result("storage", True,
+               f"Removed {len(removed.removed)} older browser "
+               f"version{'' if len(removed.removed) == 1 else 's'} and freed "
+               f"{_size(removed.bytes)}. The build in use ({removed.kept}) was kept."),
+    )
+
+
+@router.post("/settings/storage/history/clear", response_class=HTMLResponse)
+async def clear_history(request: Request) -> Response:
+    """Remove every finished run and the evidence it captured.
+
+    A run that is still working keeps both — the service re-reads each job's
+    status as it removes it, so starting a sweep and clearing history at the
+    same time cannot delete the sweep out from under itself.
+    """
+    _require(request)
+    _require_same_origin(request)
+
+    cleared = await request.app.state.task_history.clear()
+    if not cleared.runs and not cleared.orphans:
+        return _render(
+            request,
+            Result("storage", True, "Nothing to clear — there is no saved task history."),
+        )
+    parts = [f"Cleared {cleared.runs} run{'' if cleared.runs == 1 else 's'}"]
+    if cleared.orphans:
+        parts.append(
+            f"and {cleared.orphans} leftover evidence "
+            f"folder{'' if cleared.orphans == 1 else 's'} from runs already gone"
+        )
+    message = " ".join(parts) + f", freeing {_size(cleared.bytes)}."
+    if cleared.kept:
+        message += (
+            f" {cleared.kept} run{'' if cleared.kept == 1 else 's'} still working "
+            f"{'was' if cleared.kept == 1 else 'were'} kept."
+        )
+    return _render(request, Result("storage", True, message))
+
+
 # ── Notion ──────────────────────────────────────────────────────────────────
 
 
