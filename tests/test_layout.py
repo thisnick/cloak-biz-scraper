@@ -97,6 +97,13 @@ def test_live_view_repairs_wrapped_websocket_states_before_novnc_import():
             body='{"token":"t","path":"/instances/i1/vnc"}'))
         try:
             page.goto(PAGE_URL, wait_until="networkidle")
+            # The rfb.js stub records __wsOpenAtRfbImport when it executes, which
+            # is a dynamic import that can finish AFTER networkidle on a slow
+            # runner — reading it right away raced and flaked in CI. Wait for the
+            # exact value the assertion needs instead of trusting load timing.
+            page.wait_for_function(
+                "() => window.__wsOpenAtRfbImport !== undefined", timeout=15000
+            )
             states = page.evaluate("""() => ({
               connecting: WebSocket.CONNECTING, open: WebSocket.OPEN,
               closing: WebSocket.CLOSING, closed: WebSocket.CLOSED,
