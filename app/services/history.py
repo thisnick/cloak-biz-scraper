@@ -141,9 +141,12 @@ class TaskHistory:
                 runs += 1
                 freed += size
 
-        # The orphans, including every directory whose record was pruned months
-        # ago and the per-URL captures `archive_page` files under `archive/`,
-        # which never had a job record and are unreachable for the same reason.
+        # The orphans: every directory whose record was pruned months ago, plus
+        # the `archive/` tree left by the versions of `archive_page` that filed
+        # captures per URL instead of per task. An archive writes under its own
+        # task id now, so it is removed with its record like any other run — but
+        # what is already on the volume still has no record to reach it, and this
+        # is the only thing that ever takes it away.
         # The live set is re-read HERE, not reused from above: a sweep that
         # started while the loop was running has a record and a directory it is
         # writing to right now, and neither is an orphan.

@@ -21,7 +21,7 @@ from urllib.parse import urlparse
 
 from .. import sources
 from ..config import CONFIG
-from ..models import Job, Listing, ScrapeResult, SyncResult
+from ..models import Listing, ScrapeResult, SweepTask, SyncResult
 from ..stores.base import ListingStore
 from .blocker import text_contains_blocker
 from .browsing import capture, gesture, scrape_with_retry
@@ -51,16 +51,25 @@ class NotionNotConfigured(RuntimeError):
     """sync=true was asked for without a database to sync into."""
 
 
+class NotASweep(ValueError):
+    """A sweep's id was expected and a task of another kind was given.
+
+    Ids are minted from one sequence for every kind of task, so an archive's id
+    looks exactly like a sweep's and an agent holding the wrong one gets a
+    sentence saying so — rather than a ScrapeResult with an empty `listings`,
+    which reads as "the sweep found nothing".
+    """
+
+
 # ── The task-label interface ─────────────────────────────────────────────────
 #
-# Every task type provides a `describe(job) -> str` that names one of its jobs
+# Every task type provides a `describe(job) -> str` that names one of its tasks
 # for the dashboard, COLOCATED with that task. The common interface is just this
-# signature — there is no central dispatcher to edit. Today the listing sweep is
-# the only task, so `describe` below is the only implementation; a future task
-# type adds its own `describe` next to ITS definition and wires that in where the
-# job is displayed. The UI asks the task for the label; it never builds one from
-# site or task strings itself.
-def describe(job: Job) -> str:
+# signature. `archive_page` is the second implementation (services/archive.py),
+# and adding it needed no edit here: routes/ui.py picks one by `kind`. The UI
+# asks the task for the label; it never builds one from site or task strings
+# itself.
+def describe(job: SweepTask) -> str:
     """Name a listing-sweep job: verb · source label · count.
 
     The source label comes from the adapter that owns the job's `source` id
@@ -128,7 +137,7 @@ class ScrapeService:
         machine must be kept awake."""
         return len(self._running)
 
-    def start(self, urls: list[str], *, max_pages: int = 1, sync: bool = False) -> Job:
+    def start(self, urls: list[str], *, max_pages: int = 1, sync: bool = False) -> SweepTask:
         """Validate, write the job down, and return without waiting for it.
 
         Everything that can be known to be wrong before the browser starts is
@@ -193,9 +202,22 @@ class ScrapeService:
         return job
 
     def result(self, job_id: str) -> ScrapeResult | None:
-        """The job as it stands. Never blocks, never waits, never launches anything."""
+        """The sweep as it stands. Never blocks, never waits, never launches anything.
+
+        None means no such record. A record of another kind raises NotASweep:
+        every task shares one id space, so this is a reachable mistake, and the
+        one answer it must never give is an empty-looking sweep.
+        """
         job = self._jobs.get(job_id)
-        return ScrapeResult.of(job) if job else None
+        if job is None:
+            return None
+        if not isinstance(job, SweepTask):
+            raise NotASweep(
+                f"job_id={job_id!r} is an {job.kind} task, not a listings sweep, so there "
+                f"are no listings to collect. Its result is on the Tasks page; "
+                f"get_scrape_listing_results only collects ids returned by scrape_listings."
+            )
+        return ScrapeResult.of(job)
 
     async def _enter_gate(self) -> None:
         """Block until fewer than task_budget sweeps are past the gate, then admit.
@@ -214,7 +236,7 @@ class ScrapeService:
             self._past_gate -= 1
             self._gate.notify_all()
 
-    async def _run(self, job: Job, targets: list[tuple[str, object | None]]) -> None:
+    async def _run(self, job: SweepTask, targets: list[tuple[str, object | None]]) -> None:
         # Fan the URLs out concurrently, but never past the pool's task budget.
         # Two bounds hold at once: a per-job Semaphore(task_budget) — the ported
         # run_targets pattern — caps how many of THIS job's sources are in flight,
@@ -341,7 +363,7 @@ class ScrapeService:
         return text
 
     def _summarize(
-        self, job: Job, ok: int, total: int, failures: list[tuple[str, str]], found: int
+        self, job: SweepTask, ok: int, total: int, failures: list[tuple[str, str]], found: int
     ) -> str:
         # `found` is how many DISTINCT listings the sweep saw, passed explicitly
         # because under sync `job.listings` has already been narrowed to just the
@@ -363,7 +385,7 @@ class ScrapeService:
             parts.append(f"{len(failures)} source(s) failed")
         return " · ".join(parts)
 
-    async def _sync(self, job: Job, listings: list[Listing]) -> tuple[SyncResult, list[Listing]]:
+    async def _sync(self, job: SweepTask, listings: list[Listing]) -> tuple[SyncResult, list[Listing]]:
         """Upsert the merged set and report the counts alongside the NEW rows.
 
         Returns the aggregate `SyncResult` and the newly-inserted listings, each
@@ -384,7 +406,7 @@ class ScrapeService:
         )
         return synced, result.new_listings
 
-    def _evidence_dir(self, job: Job, i: int) -> Path:
+    def _evidence_dir(self, job: SweepTask, i: int) -> Path:
         """Where source `i`'s screenshots and snapshots land.
 
         Namespaced per source under the job's own directory so two URLs swept
@@ -394,7 +416,7 @@ class ScrapeService:
         """
         return CONFIG.evidence_dir / job.id / f"source-{i + 1:02d}"
 
-    async def _sweep_url(self, job: Job, i: int, url: str, source, prog: "_RunProgress") -> dict:
+    async def _sweep_url(self, job: SweepTask, i: int, url: str, source, prog: "_RunProgress") -> dict:
         """Sweep one URL. Never raises: a single source failing is recorded and
         returned so the batch (see _run's gather) survives it.
 
@@ -429,7 +451,7 @@ class ScrapeService:
         res["url"] = url
         return res
 
-    async def _sweep(self, job: Job, i: int, url: str, source, prog: "_RunProgress") -> dict:
+    async def _sweep(self, job: SweepTask, i: int, url: str, source, prog: "_RunProgress") -> dict:
         evidence = self._evidence_dir(job, i)
         # Lease a pooled task-N identity for this source, keyed per source so one
         # source releasing its lease never frees another's. Bounded and reused
@@ -461,7 +483,7 @@ class ScrapeService:
             if self._task_profiles is not None:
                 self._task_profiles.release(lease_key)
 
-    async def _sweep_once(self, inst, page, job: Job, url: str, source, evidence: Path) -> dict:
+    async def _sweep_once(self, inst, page, job: SweepTask, url: str, source, evidence: Path) -> dict:
         listings: list[Listing] = []
         seen: set[str] = set()
         pages_done = 0
@@ -516,7 +538,7 @@ class _RunProgress:
     UX is unchanged.
     """
 
-    def __init__(self, jobs: JobStore, job: Job, total: int) -> None:
+    def __init__(self, jobs: JobStore, job: SweepTask, total: int) -> None:
         self._jobs = jobs
         self._job = job
         self._total = total

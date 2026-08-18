@@ -5,6 +5,11 @@ append — roughly 40–60s. That sits inside Claude.ai's wall but right on top 
 Claude Code's 60s default, which is a documentation problem rather than a design
 one (`MCP_TOOL_TIMEOUT`).
 
+It records itself as a task (models.ArchiveTask, on the volume via the job
+store) for the same reason it is one: a leased identity, the same admission
+gate, a browser open for a minute. Before that record existed the Tasks tab
+showed nothing at all while an archive ran, which read as an idle server.
+
 It runs on a leased ``task-N`` identity from the shared pool, exactly as a sweep
 does — see services/task_profiles.py. It used to launch on ``archive-<host+path>``,
 a durable profile minted per URL and never cleaned up, so the profile list grew by
@@ -25,10 +30,11 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from ..config import CONFIG
-from ..models import ArchiveResult
+from ..models import ArchiveResult, ArchiveTask
 from .blocker import text_contains_blocker
 from .browsing import capture, gesture, scrape_with_retry, slug
 from .extract import extract, md_to_blocks, prelude
+from .jobs import JobStore
 from .settings import SettingsService
 from .task_profiles import TaskProfilePool
 
@@ -41,11 +47,35 @@ _DEFAULT_HEADING = "Source Content"
 _BLOCKS_PER_REQUEST = 100
 
 
+def describe(task: ArchiveTask) -> str:
+    """Name an archive task for the dashboard — the counterpart of
+    `scrape.describe`, colocated with the task it names (see the note there).
+
+    The title once the page has been read, the host until then: while it is
+    running there is nothing else to say, and afterwards the title is what the
+    person recognises the row by. Truncated, because a listing page's <title>
+    can be a paragraph.
+    """
+    subject = task.title.strip()
+    if not subject:
+        target = task.urls[0] if task.urls else ""
+        subject = urlparse(target).hostname or target or "a page"
+    if len(subject) > 60:
+        subject = subject[:59].rstrip() + "…"
+    return f"Archive · {subject}"
+
+
 class ArchiveService:
-    def __init__(self, instances, settings: SettingsService, appender=None,
-                 task_profiles: TaskProfilePool | None = None) -> None:
+    def __init__(self, instances, settings: SettingsService, jobs: JobStore,
+                 appender=None, task_profiles: TaskProfilePool | None = None) -> None:
         self._instances = instances
         self._settings = settings
+        # An archive is a task in every sense the dashboard means — a pooled
+        # identity, the same admission gate, about a minute of browser — and it
+        # was missing from the Tasks tab only because it wrote no record. Not
+        # optional: a store that could be absent would make "did it show up?"
+        # depend on how the service happened to be built.
+        self._jobs = jobs
         self._append = appender or _notion_append
         # The instance manager's pool, shared with sweeps. Archiving used to mint
         # a durable ``archive-<host+path>`` profile per URL, which is the same
@@ -94,10 +124,64 @@ class ArchiveService:
 
         parsed = urlparse(url)
         host = parsed.hostname or "unknown"
-        # Still per-URL for evidence, which is a record of one page.
         key = slug((host + parsed.path) or host)
-        evidence = CONFIG.evidence_dir / "archive" / key
 
+        # Write the task down BEFORE the browser starts, so the minute it spends
+        # running is a minute it is visible under "Running now" rather than a
+        # minute of nothing happening. The record is also what makes the capture
+        # below reachable: evidence goes under the task id, exactly like a
+        # sweep's, so /runs/<id>/evidence serves it and dropping the record takes
+        # it along. (It used to go under `archive/<url slug>`, which no page
+        # could reach and only "Clear task history" could ever remove.)
+        task = self._jobs.create(
+            kind="archive", status="working", urls=[url], notion_page_id=notion_page_id,
+            summary=f"Archiving {host}…",
+        )
+        evidence = CONFIG.evidence_dir / task.id
+        task.evidence_dir = str(evidence)
+        self._jobs.save(task)
+
+        try:
+            result = await self._archive(url, notion_page_id, heading, host, key, evidence)
+        except BaseException as exc:  # noqa: BLE001 — the task must record its own end
+            # Including CancelledError: a caller that disconnects mid-archive
+            # leaves a task nothing is advancing, and a record stuck on "working"
+            # is the exact lie `adopt` exists to stop telling.
+            self._record_crash(task, exc)
+            raise
+        self._record(task, result)
+        return result
+
+    def _record(self, task: ArchiveTask, result: ArchiveResult) -> None:
+        """Close the task out with what the archive actually did.
+
+        The status and the wording come straight off the ArchiveResult — the
+        blocked page, the empty extraction and the refused Notion write each
+        already say what happened, and re-phrasing them here is how the Tasks row
+        and the tool's answer start disagreeing about the same run.
+        """
+        task.status = "completed" if result.ok else "failed"
+        task.title = result.title
+        task.blocks_appended = result.blocks_appended
+        task.used_path = result.used_path
+        task.evidence_dir = result.evidence_dir or task.evidence_dir
+        task.error = result.error
+        task.summary = result.summary
+        self._jobs.save(task)
+
+    def _record_crash(self, task: ArchiveTask, exc: BaseException) -> None:
+        cancelled = isinstance(exc, asyncio.CancelledError)
+        task.status = "failed"
+        task.error = (
+            "The caller went away before this finished, so it was stopped. Nothing was "
+            "written to the Notion page."
+            if cancelled else str(exc) or exc.__class__.__name__
+        )
+        task.summary = "Archive stopped early." if cancelled else "Archive failed."
+        self._jobs.save(task)
+
+    async def _archive(self, url: str, notion_page_id: str, heading: str,
+                       host: str, key: str, evidence: Path) -> ArchiveResult:
         # Lease a pooled task-N identity. The lease key is per CALL, not per URL:
         # what has to stay distinct is two archives running at once, and two
         # archives of the SAME url are exactly the case the old per-URL profile

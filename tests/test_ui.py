@@ -1108,6 +1108,132 @@ class TestRunResultsEndpoint:
         assert "<b>Sweep</b>" not in page, "the generic label is gone"
 
 
+class TestArchiveTasksInTheDashboard:
+    """`archive_page` records a task, so the Tasks tab has to be able to render
+    one — and every reader of a task had been written when a task was only ever
+    a sweep. Each of these renders an archive through a path that used to reach
+    for `listings` or `pages_crawled` and would now raise on a record that has
+    never had them.
+    """
+
+    URL = "https://www.bizbuysell.com/Business-Opportunity/a-laundromat/2274905/"
+
+    @pytest.fixture(autouse=True)
+    def _leave_the_store_as_it_was_found(self):
+        """app.state.jobs is one real store shared by the whole suite, and this
+        class writes a *working* task into it. Left behind, that is a task every
+        later render shows as running — a fixture nobody asked for. So remove
+        exactly what this test added (finishing it first, since `drop` rightly
+        refuses a working record)."""
+        before = {j.id for j in app.state.jobs.all()}
+        yield
+        for job in app.state.jobs.all():
+            if job.id in before:
+                continue
+            if job.status == "working":
+                job.status = "completed"
+                app.state.jobs.save(job)
+            app.state.jobs.drop(job.id)
+
+    def _archive(self, **fields):
+        return app.state.jobs.create(
+            kind="archive", url=self.URL, notion_page_id="page-77", **fields
+        )
+
+    def _finished(self):
+        return self._archive(
+            status="completed", title="A Laundromat", blocks_appended=12,
+            used_path="readability",
+            summary="Archived 'A Laundromat' into Notion (12 blocks).",
+        )
+
+    def test_a_finished_archive_is_a_row_in_the_history(self, auth):
+        self._finished()
+        page = shown(auth.get("/"))
+        assert "Archive · A Laundromat" in page, "the archive's own label"
+        assert "12 blocks appended" in page, "an archive's result is blocks, not listings"
+
+    def test_a_running_archive_is_under_running_now(self, auth):
+        self._archive(summary="Archiving www.bizbuysell.com…")
+        page = shown(auth.get("/"))
+        # The row that used to read "page 0 / 1" off fields an archive has never
+        # had; it names the page being read instead.
+        assert "Archive · www.bizbuysell.com" in page
+        assert self.URL in page
+        assert "Nothing running right now" not in page
+
+    def test_a_blocked_archive_reads_as_blocked(self, auth):
+        self._archive(
+            status="failed", summary="Blocked by the site; nothing written.",
+            error="bizbuysell.com served an anti-bot page instead of the listing.",
+        )
+        assert "Blocked" in shown(auth.get("/"))
+
+    def test_a_notion_refusal_is_not_dressed_up_as_a_block(self):
+        """The two failures must not wear each other's badge. "Notion accepted 3
+        block(s) and then refused the rest" contains the word "block" — under the
+        sweep's test it would have sent the user off to rotate an exit IP over a
+        problem in their Notion page. Asserted on the classifier itself, because
+        on the page the two rows differ by one badge among many."""
+        from app.routes.ui import _job_result
+
+        refused = self._archive(
+            status="failed", summary="Read the page, but could not write it to Notion.",
+            error="Notion accepted 3 block(s) and then refused the rest.",
+        )
+        assert _job_result(refused) == ("asleep", "Stopped")
+
+    def test_runs_lists_an_archive_without_pretending_it_has_listings(self, auth):
+        task = self._finished()
+        rows = {r["job_id"]: r for r in auth.get("/runs").json()}
+        row = rows[task.id]
+        assert row["kind"] == "archive"
+        assert row["blocks_appended"] == 12 and row["notion_page_id"] == "page-77"
+        # `"listings": 0` on an archive would read as a sweep that found nothing.
+        assert "listings" not in row and "pages_crawled" not in row
+
+    def test_one_run_reports_what_the_archive_did(self, auth):
+        task = self._finished()
+        body = auth.get(f"/runs/{task.id}").json()
+        assert body["kind"] == "archive" and body["status"] == "completed"
+        assert body["urls"] == [self.URL]
+        assert body["title"] == "A Laundromat" and body["used_path"] == "readability"
+        assert "listings" not in body
+
+    def test_the_view_link_returns_the_archive_record_itself(self, auth):
+        """Every history row offers "View"; an archive has no ScrapeResult, so it
+        hands back its own record rather than a sweep-shaped answer."""
+        task = self._finished()
+        page = auth.get("/").text
+        assert f'href="/runs/{task.id}/results"' in page
+
+        body = auth.get(f"/runs/{task.id}/results").json()
+        assert body["kind"] == "archive"
+        assert body["notion_page_id"] == "page-77" and body["blocks_appended"] == 12
+        assert "listings" not in body
+
+    def test_the_app_files_archives_into_the_one_task_list(self, auth):
+        """Wiring, not behaviour: the dashboard reads `app.state.jobs`, so an
+        archive service holding any OTHER store would run, record diligently, and
+        show up nowhere. One store is the whole feature."""
+        assert app.state.archive._jobs is app.state.jobs
+
+    def test_a_sweep_still_renders_exactly_as_it_did(self, auth):
+        """The other half: narrowing the readers must not have changed the sweep."""
+        from app.models import Listing
+
+        job = app.state.jobs.create(
+            url="https://www.bizbuysell.com/x-businesses-for-sale/", source="bizbuysell_serp",
+            status="completed", pages_crawled=2,
+            listings=[Listing(listing_id="1", title="A Business")],
+        )
+        page = shown(auth.get("/"))
+        assert "Listing sweep · BizBuySell" in page
+        assert "1 listings" in page
+        row = {r["job_id"]: r for r in auth.get("/runs").json()}[job.id]
+        assert row["kind"] == "sweep" and row["listings"] == 1 and row["pages_crawled"] == 2
+
+
 class TestSessionsControls:
     """The full-control actions on the dashboard: new instance, run sweep, close.
 

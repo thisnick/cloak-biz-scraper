@@ -13,12 +13,13 @@ import asyncio
 
 import pytest
 
-from app.models import Job, Listing
+from app.models import Listing, SweepTask
 from app.services.jobs import JobStore
 from app.services.profiles import ProfileStore
 from app.services.scrape import (
     _SCRAPING_SUMMARY,
     _WAITING_SUMMARY,
+    NotASweep,
     NotionNotConfigured,
     ScrapeService,
     describe,
@@ -524,23 +525,23 @@ class TestJobLabel:
     name via the source registry, not a string baked into the template."""
 
     def test_multi_source_names_the_source_and_count(self):
-        job = Job(id="a", source="bizbuysell_serp", urls=[SERP, SERP2, BROKER])
+        job = SweepTask(id="a", source="bizbuysell_serp", urls=[SERP, SERP2, BROKER])
         assert describe(job) == "Listing sweep · BizBuySell · 3 sources"
 
     def test_single_source_drops_the_count(self):
-        job = Job(id="b", source="bizbuysell_serp", urls=[SERP])
+        job = SweepTask(id="b", source="bizbuysell_serp", urls=[SERP])
         # No "1 sources" noise for a single-URL sweep.
         assert describe(job) == "Listing sweep · BizBuySell"
         assert "sources" not in describe(job)
 
     def test_broker_source_uses_its_own_label(self):
-        job = Job(id="c", source="bizbuysell_broker", urls=[BROKER])
+        job = SweepTask(id="c", source="bizbuysell_broker", urls=[BROKER])
         assert describe(job) == "Listing sweep · BizBuySell broker"
 
     def test_unknown_source_falls_back_to_the_raw_id(self):
         """An old job whose source was retired must still render, not break — the
         registry returns the raw id when no adapter owns it."""
-        job = Job(id="d", source="craigslist_biz", urls=[SERP, SERP2])
+        job = SweepTask(id="d", source="craigslist_biz", urls=[SERP, SERP2])
         assert describe(job) == "Listing sweep · craigslist_biz · 2 sources"
 
 
@@ -761,6 +762,19 @@ class TestWaitingSummary:
 class TestCollecting:
     def test_an_unknown_job_is_none(self, settings, jobs):
         assert service(settings, jobs).result("nosuchjob") is None
+
+    def test_collecting_an_archive_says_so_instead_of_faking_a_sweep(self, settings, jobs):
+        """Every kind of task is minted from one id space, so an agent holding an
+        archive's id is a reachable mistake — and the one answer it must never
+        get is a ScrapeResult with an empty `listings`, which reads as a sweep
+        that found nothing."""
+        task = jobs.create(kind="archive", url="https://example.com/x", notion_page_id="page-1")
+
+        with pytest.raises(NotASweep) as exc:
+            service(settings, jobs).result(task.id)
+
+        assert "archive task" in str(exc.value)
+        assert "scrape_listings" in str(exc.value), "say which ids this does take"
 
     @pytest.mark.asyncio
     async def test_collecting_never_waits_for_the_sweep(self, settings, jobs):

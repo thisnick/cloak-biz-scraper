@@ -149,7 +149,7 @@
           {% for j in running_jobs %}
           <div class="card trun">
             <span class="statepill live"><span class="dot live"></span>Running</span>
-            <div class="g"><b>{{ job_label(j) }}</b><div class="where">page {{ j.pages_crawled }} / {{ j.max_pages }} · started {{ ago(j.created_at) }}</div></div>
+            <div class="g"><b>{{ job_label(j) }}</b><div class="where">{{ job_where(j) }} · started {{ ago(j.created_at) }}</div></div>
             <div class="el">{{ dur(now - j.created_at) }}</div>
           </div>
           {% endfor %}
@@ -259,7 +259,7 @@
           {% for j in running_jobs %}
           <div class="card trun">
             <span class="statepill live"><span class="dot live"></span>Running</span>
-            <div class="g"><b>{{ job_label(j) }}</b><div class="where">page {{ j.pages_crawled }} / {{ j.max_pages }}</div></div>
+            <div class="g"><b>{{ job_label(j) }}</b><div class="where">{{ job_where(j) }}</div></div>
             <div class="el">{{ dur(now - j.created_at) }}</div>
           </div>
           {% endfor %}

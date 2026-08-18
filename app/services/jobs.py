@@ -1,4 +1,12 @@
-"""Sweep jobs, on the volume.
+"""Tasks, on the volume.
+
+**Why "job" is still the word on the outside.** A record used to be a sweep and
+nothing else; it is now a discriminated union on `kind` (models.Task), because
+an archive runs the same browser, through the same capacity gate, for about as
+long — and was invisible in the dashboard purely because nobody wrote it down.
+The *stored* shape generalised; the vocabulary an agent depends on did not.
+`job_id` is the id `get_scrape_listing_results` is polled with, so the store,
+`app.state.jobs`, and every façade keep saying `job_id`.
 
 **Why the volume and not a dict.** Railway sleeps a service after ten minutes
 with no *outbound* traffic, and wakes it on *inbound*. A sweep pins the machine
@@ -35,8 +43,10 @@ import time
 import uuid
 from pathlib import Path
 
+from pydantic import TypeAdapter
+
 from ..config import CONFIG
-from ..models import Job
+from ..models import Task
 from . import reclaim
 
 logger = logging.getLogger("cloakbiz.jobs")
@@ -47,6 +57,35 @@ logger = logging.getLogger("cloakbiz.jobs")
 # agent polling for a result that existed an hour ago.
 _KEEP_DAYS = 14
 _KEEP_MOST_RECENT = 500
+
+# The one validator for a stored record. Built once: a TypeAdapter compiles the
+# union's discriminator, and rebuilding it per file would pay that on every read
+# of every job in `all()`.
+_TASK = TypeAdapter(Task)
+
+# What a record with no `kind` is. Every job written before tasks became a union
+# was a sweep — the model's own docstring said so — so this is not a guess, it
+# is the fact those files were written under. Applied on the way in (see
+# `_parse`) rather than by a migration pass, for the same reason the legacy
+# scalar `url` is folded in a validator: nothing rewrites the volume, and a
+# record must load correctly however old it is.
+_DEFAULT_KIND = "sweep"
+
+# What a task left "working" by a dead process is told to say (see `adopt`),
+# per kind: (error, summary).
+_INTERRUPTED = {
+    "sweep": (
+        "This sweep was interrupted — the server stopped or restarted while it was "
+        "running, so it never finished. Nothing was saved. Start it again.",
+        "Sweep interrupted by a restart.",
+    ),
+    "archive": (
+        "This archive was interrupted — the server stopped or restarted while it was "
+        "running, so it never finished. Nothing was written to the Notion page. "
+        "Start it again.",
+        "Archive interrupted by a restart.",
+    ),
+}
 
 
 class JobStore:
@@ -78,27 +117,32 @@ class JobStore:
             raise ValueError(f"not a job id: {job_id!r}")
         return self.root / f"{job_id}.json"
 
-    def create(self, *, summary=None, **fields) -> Job:
-        """Write a new job down.
+    def create(self, *, summary=None, **fields) -> Task:
+        """Write a new task down, of whatever `kind` the caller asked for.
+
+        The kind selects the model: `kind="archive"` builds an ArchiveTask,
+        anything unstated is a sweep — the only kind that existed when this was
+        written and the one every caller that omits it means.
 
         `summary` may be a callable taking the new id: the message that tells a
         model how to collect this sweep has to name the job, and the id is minted
         here — so this lets the caller fill it in within the same write rather
         than saving once and immediately saving again.
         """
-        job = Job(
-            id=uuid.uuid4().hex[:12],
-            boot_id=self.boot_id,
-            created_at=time.time(),
-            updated_at=time.time(),
+        fields.setdefault("kind", _DEFAULT_KIND)
+        job = _TASK.validate_python({
+            "id": uuid.uuid4().hex[:12],
+            "boot_id": self.boot_id,
+            "created_at": time.time(),
+            "updated_at": time.time(),
             **fields,
-        )
+        })
         if summary is not None:
             job.summary = summary(job.id) if callable(summary) else summary
         self.save(job)
         return job
 
-    def save(self, job: Job) -> Job:
+    def save(self, job: Task) -> Task:
         job.updated_at = time.time()
         with self._lock:
             path = self._path(job.id)
@@ -109,7 +153,22 @@ class JobStore:
             os.replace(tmp, path)
         return job
 
-    def get(self, job_id: str) -> Job | None:
+    @staticmethod
+    def _parse(text: str) -> Task:
+        """One stored record, as the kind it actually is.
+
+        Parsed to a dict first so a record written before tasks had kinds can be
+        told what it is: those files hold a sweep and nothing else, so the
+        discriminator is defaulted rather than left missing — without it the
+        union would refuse every job already on the volume, and a user's history
+        would vanish on deploy.
+        """
+        data = json.loads(text)
+        if isinstance(data, dict):
+            data.setdefault("kind", _DEFAULT_KIND)
+        return _TASK.validate_python(data)
+
+    def get(self, job_id: str) -> Task | None:
         try:
             path = self._path(job_id)
         except ValueError:
@@ -117,37 +176,38 @@ class JobStore:
         if not path.exists():
             return None
         try:
-            return Job.model_validate_json(path.read_text())
+            return self._parse(path.read_text())
         except Exception as exc:  # noqa: BLE001
             logger.warning("job %s is unreadable: %s", job_id, exc)
             return None
 
-    def all(self) -> list[Job]:
-        jobs: list[Job] = []
+    def all(self) -> list[Task]:
+        jobs: list[Task] = []
         for path in self.root.glob("*.json"):
             try:
-                jobs.append(Job.model_validate_json(path.read_text()))
+                jobs.append(self._parse(path.read_text()))
             except Exception:  # noqa: BLE001 — one bad file must not hide the rest
                 continue
         return sorted(jobs, key=lambda j: j.created_at, reverse=True)
 
     def adopt(self) -> int:
-        """Fail every job left 'working' by a process that is no longer running.
+        """Fail every task left 'working' by a process that is no longer running.
 
         Called once at startup, before anything can poll. Returns how many were
         interrupted, which is worth logging: it is the only signal that the
         container died mid-sweep rather than between sweeps.
+
+        The wording follows the kind, because "nothing was saved" means a
+        different thing for each: a sweep saved no listings, an archive wrote no
+        blocks to the page it was pointed at — and someone reading this is about
+        to go and look at that page.
         """
         interrupted = 0
         for job in self.all():
             if job.status != "working" or job.boot_id == self.boot_id:
                 continue
             job.status = "failed"
-            job.error = (
-                "This sweep was interrupted — the server stopped or restarted while it was "
-                "running, so it never finished. Nothing was saved. Start it again."
-            )
-            job.summary = "Sweep interrupted by a restart."
+            job.error, job.summary = _INTERRUPTED[job.kind]
             self.save(job)
             interrupted += 1
         if interrupted:

@@ -120,10 +120,18 @@ def _dur(seconds: float) -> str:
 
 
 def _job_result(job) -> tuple[str, str]:
-    """(css-state, label) for a finished job's Result cell. 'blocked' is called
+    """(css-state, label) for a finished task's Result cell. 'blocked' is called
     out because it is the failure a user can act on (rotate/retry), distinct from
-    an ordinary stop."""
+    an ordinary stop.
+
+    What "the result" IS depends on the kind of task — listings for a sweep,
+    blocks appended for an archive — so each is asked its own question rather
+    than one row template reaching for fields the other has never had.
+    """
     if job.status == "completed":
+        if job.kind == "archive":
+            n = job.blocks_appended
+            return "ok", f"{n} block{'' if n == 1 else 's'} appended"
         # Under sync, `job.listings` is narrowed to just the newly-inserted rows,
         # so its length is the new count, not the whole find — say so explicitly
         # rather than let a re-sweep that added nothing read as "0 listings".
@@ -131,16 +139,52 @@ def _job_result(job) -> tuple[str, str]:
             return "ok", f"{job.synced.new} new, {job.synced.existing} known"
         return "ok", f"{len(job.listings)} listings"
     if job.status == "failed":
-        if job.error and "block" in job.error.lower():
+        if _blocked(job):
             return "bad", "Blocked"
         return "asleep", "Stopped"
     return "live", "Running"
 
 
+def _blocked(job) -> bool:
+    """Whether this task failed because the site served an anti-bot page.
+
+    Matched per kind, not by one substring across both: an archive's Notion
+    failure says "Notion accepted 3 block(s) and then refused the rest", which
+    the sweep's "block" test would have labelled Blocked — sending the user to
+    rotate an exit IP over a problem in their Notion page.
+    """
+    error = (job.error or "").lower()
+    if not error:
+        return False
+    return "anti-bot" in error if job.kind == "archive" else "block" in error
+
+
+def _job_where(job) -> str:
+    """The one line under a running task's name: what it is doing right now.
+
+    A sweep counts pages; an archive has a single page to read, so it names it.
+    """
+    if job.kind == "archive":
+        return job.urls[0] if job.urls else ""
+    return f"page {job.pages_crawled} / {job.max_pages}"
+
+
+def _job_label(job) -> str:
+    """The dashboard's name for one task, asked of the task itself.
+
+    Each kind's label lives with that kind (`scrape.describe`, `archive.describe`
+    — see the note in services/scrape.py); this is only the switch, so adding a
+    task type never means editing a template.
+    """
+    from ..services.archive import describe as describe_archive
+    from ..services.scrape import describe as describe_sweep
+
+    return describe_archive(job) if job.kind == "archive" else describe_sweep(job)
+
+
 def _render(request: Request, result: Result | None = None, status: int = 200,
             active: str | None = None, notion_mapping: Any = None) -> Response:
     settings: Settings = request.app.state.settings.load()
-    from ..services.scrape import describe as job_label
     from ..services.urls import public_base
     from ..services.views import browser_info, instance_view
 
@@ -189,7 +233,8 @@ def _render(request: Request, result: Result | None = None, status: int = 200,
             "ago": _ago,
             "dur": _dur,
             "job_result": _job_result,
-            "job_label": job_label,
+            "job_label": _job_label,
+            "job_where": _job_where,
             "now": time.time(),
         },
         status_code=status,
@@ -361,6 +406,24 @@ def _evidence_root(job_id: str) -> Path:
     return (CONFIG.evidence_dir / job_id).resolve()
 
 
+def _run_detail(job) -> dict[str, Any]:
+    """The half of a run's JSON that only its own kind can answer.
+
+    A sweep reports what it crawled and found; an archive reports where it wrote
+    and how much. Neither is given the other's keys — an archive with
+    `"listings": 0` would read as a sweep that found nothing.
+    """
+    if job.kind == "archive":
+        return {
+            "notion_page_id": job.notion_page_id, "title": job.title,
+            "blocks_appended": job.blocks_appended, "used_path": job.used_path,
+        }
+    return {
+        "source": job.source, "pages_crawled": job.pages_crawled,
+        "listings": len(job.listings),
+    }
+
+
 @router.get("/runs")
 async def list_runs(request: Request, limit: int = 100) -> list[dict[str, Any]]:
     _require(request)
@@ -368,10 +431,10 @@ async def list_runs(request: Request, limit: int = 100) -> list[dict[str, Any]]:
     jobs.sort(key=lambda j: j.created_at, reverse=True)
     return [
         {
-            "job_id": j.id, "status": j.status, "source": j.source,
-            "created_at": j.created_at, "pages_crawled": j.pages_crawled,
-            "listings": len(j.listings), "error": j.error,
+            "job_id": j.id, "kind": j.kind, "status": j.status,
+            "created_at": j.created_at, "error": j.error,
             "evidence": _evidence_root(j.id).is_dir(),
+            **_run_detail(j),
         }
         for j in jobs[:limit]
     ]
@@ -389,21 +452,23 @@ async def get_run(request: Request, job_id: str) -> dict[str, Any]:
     files = sorted(str(p.relative_to(root)) for p in root.rglob("*") if p.is_file()) \
         if root.is_dir() else []
     return {
-        "job_id": job.id, "status": job.status, "source": job.source,
-        "urls": job.urls, "pages_crawled": job.pages_crawled, "error": job.error,
-        "listings": len(job.listings), "evidence": files,
+        "job_id": job.id, "kind": job.kind, "status": job.status,
+        "urls": job.urls, "error": job.error, "evidence": files,
+        **_run_detail(job),
     }
 
 
-@router.get("/runs/{job_id}/results")
-async def get_run_results(request: Request, job_id: str) -> ScrapeResult:
-    """The full result of one sweep, listings and all — what /runs/{job_id} only
-    counts.
+@router.get("/runs/{job_id}/results", response_model=None)
+async def get_run_results(request: Request, job_id: str) -> ScrapeResult | Any:
+    """The full result of one task — what /runs/{job_id} only counts.
 
     Backs the Tasks-history "View" link, which opens this in a new tab as raw
-    JSON. It returns the very payload `get_scrape_listing_results` / `ScrapeResult`
-    exposes, built by the one `ScrapeResult.of` the tools use, so the dashboard
-    and an agent can never see a different answer for the same job.
+    JSON, and every row in that table has one — so it answers for whatever kind
+    the row is. For a sweep it returns the very payload
+    `get_scrape_listing_results` / `ScrapeResult` exposes, built by the one
+    `ScrapeResult.of` the tools use, so the dashboard and an agent can never see
+    a different answer for the same job. An archive has no ScrapeResult to
+    return: it hands back its own record, which is the whole of what it did.
 
     Same gate and id handling as the other /runs routes: the session cookie
     (`_require`) is the owner check on this public URL, and `jobs.get` returns
@@ -414,6 +479,8 @@ async def get_run_results(request: Request, job_id: str) -> ScrapeResult:
     job = request.app.state.jobs.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="no such run")
+    if job.kind != "sweep":
+        return job
     return ScrapeResult.of(job)
 
 

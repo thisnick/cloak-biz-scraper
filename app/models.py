@@ -1,7 +1,7 @@
 """Request/response models shared by the service layer and its façades."""
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -64,29 +64,25 @@ class SyncResult(BaseModel):
     )
 
 
-class Job(BaseModel):
-    """A sweep, as persisted to the volume. See services/jobs.py.
+class TaskBase(BaseModel):
+    """What every stored task has, whatever kind of work it did.
 
-    A sweep now spans one *or more* source URLs (a multi-URL fan-out that lands
-    in one job), so the target is `urls`, a list. `source` is the representative
-    adapter name for the batch — every URL in v1 is BizBuySell, and each Listing
-    still carries its own `source`, so nothing downstream depends on this being
-    a single value.
+    A task is one unit of browser work this server ran and wrote to the volume
+    (see services/jobs.py). Only the fields here are common: an id, how it went,
+    what it operated on, and where its captures landed. Everything a *particular*
+    kind of task knows — a sweep's listings, an archive's Notion page — belongs
+    on that kind, so no reader of one is tempted to reach for the other's fields.
     """
 
     id: str
     status: str = "working"  # working | completed | failed
-    source: str = ""
+    # What this task operates on. A sweep fans out over several URLs into one
+    # record; an archive reads exactly one. The list is the common shape.
     urls: list[str] = Field(default_factory=list)
-    max_pages: int = 1
-    sync: bool = False
-    db_id: str = ""
     summary: str = ""
-    pages_crawled: int = 0
     error: str | None = None
-    synced: SyncResult | None = None
-    listings: list[Listing] = Field(default_factory=list)
-    # Which process run started this. A "working" job from an older boot is one
+    evidence_dir: str = ""
+    # Which process run started this. A "working" task from an older boot is one
     # nobody is working on — see JobStore.adopt.
     boot_id: str = ""
     created_at: float = 0.0
@@ -106,6 +102,49 @@ class Job(BaseModel):
             single = data.get("url")
             data = {**data, "urls": [single] if single else []}
         return data
+
+
+class SweepTask(TaskBase):
+    """A listings sweep, as persisted to the volume.
+
+    A sweep spans one *or more* source URLs (a multi-URL fan-out that lands in
+    one record), so the target is `urls`, a list. `source` is the representative
+    adapter name for the batch — every URL in v1 is BizBuySell, and each Listing
+    still carries its own `source`, so nothing downstream depends on this being
+    a single value.
+    """
+
+    kind: Literal["sweep"] = "sweep"
+    source: str = ""
+    max_pages: int = 1
+    sync: bool = False
+    db_id: str = ""
+    pages_crawled: int = 0
+    listings: list[Listing] = Field(default_factory=list)
+    synced: SyncResult | None = None
+
+
+class ArchiveTask(TaskBase):
+    """One `archive_page` run, as persisted to the volume.
+
+    It leases a pooled task identity through the same capacity gate a sweep
+    does and takes about as long, so it is a task in exactly the sense the
+    dashboard means — it was invisible there only because nothing wrote it down.
+    """
+
+    kind: Literal["archive"] = "archive"
+    # Where the content was appended. A sweep's destination is a database
+    # (`db_id`); an archive's is one page, and they are not the same thing.
+    notion_page_id: str = ""
+    title: str = ""
+    blocks_appended: int = 0
+    used_path: str = ""
+
+
+# The stored task, discriminated by `kind`. Reading a record goes through this
+# (see services/jobs.py) so the loader returns the concrete kind rather than a
+# union of every field any task might have.
+Task = Annotated[SweepTask | ArchiveTask, Field(discriminator="kind")]
 
 
 class ScrapeResult(BaseModel):
@@ -144,7 +183,7 @@ class ScrapeResult(BaseModel):
     evidence_dir: str = ""
 
     @classmethod
-    def of(cls, job: Job) -> "ScrapeResult":
+    def of(cls, job: SweepTask) -> "ScrapeResult":
         return cls(
             job_id=job.id,
             status=job.status,

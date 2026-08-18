@@ -128,7 +128,9 @@ async def lifespan(app: FastAPI):
     )
     app.state.task_history = TaskHistory(lambda: app.state.jobs)
     app.state.scrape = ScrapeService(app.state.instances, jobs, settings_service)
-    app.state.archive = ArchiveService(app.state.instances, settings_service)
+    # The same job store the sweeps use: one Tasks list, one retention policy,
+    # one place a run's evidence is reachable from.
+    app.state.archive = ArchiveService(app.state.instances, settings_service, jobs)
     app.state.agent_browser = AgentBrowserService(app.state.instances)
     logger.info(
         "ready: secret=%s license=%s proxy=%s notion=%s pool max=%d reserve=%d "

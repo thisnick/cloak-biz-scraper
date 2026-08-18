@@ -158,3 +158,41 @@ class TestServerInfoParity:
             f"  only in MCP : {set(mcp) - set(rest)}"
         )
         assert _sha(rest) == _sha(mcp)
+
+
+class TestAnArchiveIdIsNotASweep:
+    """The mistake one id space makes reachable, and how both façades answer it.
+
+    `archive_page` now records a task, and its id looks exactly like a sweep's —
+    so an agent will eventually poll one with `get_scrape_listing_results`. The
+    answer must be a sentence saying it is the wrong kind of id, in both façades:
+    a ScrapeResult with an empty `listings` would read as a sweep that found
+    nothing, which is a wrong answer rather than a refused question.
+    """
+
+    def _archive_task(self):
+        return app.state.jobs.create(
+            kind="archive", url="https://www.bizbuysell.com/Business-Opportunity/x/1/",
+            notion_page_id="page-1", status="completed", title="A Laundromat",
+            blocks_appended=12, summary="Archived 'A Laundromat' into Notion (12 blocks).",
+        )
+
+    def test_rest_refuses_it_as_a_conflict_not_a_missing_run(self, client):
+        task = self._archive_task()
+        r = client.get(f"/api/scrape/{task.id}")
+        # 409, not 404: the record exists, it just cannot answer this question.
+        assert r.status_code == 409, r.text
+        detail = r.json()["detail"]
+        assert "archive task" in detail and "scrape_listings" in detail
+
+    def test_mcp_refuses_it_with_the_same_sentence(self, client):
+        task = self._archive_task()
+        r = client.post("/mcp", headers=HEADERS, json={
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "get_scrape_listing_results", "arguments": {"job_id": task.id}},
+        })
+        assert r.status_code == 200, r.text
+        result = r.json()["result"]
+        assert result["isError"] is True, result
+        text = " ".join(c.get("text", "") for c in result["content"])
+        assert "archive task" in text and "scrape_listings" in text

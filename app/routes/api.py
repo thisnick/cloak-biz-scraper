@@ -42,7 +42,7 @@ from ..services.geo import GeoUnresolved, ProxyUnreachable
 from ..services.instances import BrowserUnavailable, CapExceeded
 from ..services.license import LicenseNotPro
 from ..services.proxy import ProxyNotConfigured
-from ..services.scrape import NotionNotConfigured
+from ..services.scrape import NotASweep, NotionNotConfigured
 from ..services.tokens import OWNER
 from ..services.urls import public_base
 from ..services.views import instance_view
@@ -123,7 +123,12 @@ async def get_scrape_listing_results(request: Request, job_id: str) -> ScrapeRes
     listing found for a sync=false sweep (synced_row_id empty), or only the
     newly-added ones each with their Notion synced_row_id for a sync=true sweep
     (already-known rows omitted but counted in synced.existing)."""
-    result = request.app.state.scrape.result(job_id)
+    try:
+        result = request.app.state.scrape.result(job_id)
+    except NotASweep as exc:
+        # A real id, of a task that is not a sweep. 409 rather than 404: the
+        # record exists, it just cannot answer this question.
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     if result is None:
         raise HTTPException(
             status_code=404,
