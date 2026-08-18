@@ -172,10 +172,14 @@ class TestClear:
         assert (store.evidence_root / late.id).is_dir(), "a live sweep lost its evidence"
         assert cleared.orphans == 0
 
-    async def test_the_page_archives_are_cleared_too(self, history, store):
-        """`archive_page` files its captures under `evidence/archive/<url>`,
-        which never had a job record and no route can reach — the same dead
-        weight as an orphan, and cleared as one."""
+    async def test_the_legacy_page_archive_pile_is_cleared_too(self, history, store):
+        """`archive_page` used to file its captures under `evidence/archive/<url>`
+        — no job record, no route that could reach them. It writes under its own
+        task id now, so new archives are removed with their record like any other
+        run; but a volume that has been up since before that change still holds
+        the old tree, and this sweep is the only thing that will ever take it
+        away. "archive" is not a live record id, so it is an orphan, and orphans
+        go."""
         archive = store.evidence_root / "archive" / "example.com-a-listing" / "final"
         archive.mkdir(parents=True)
         (archive / "page.png").write_bytes(b"x" * 400)
