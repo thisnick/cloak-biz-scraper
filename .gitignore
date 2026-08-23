@@ -7,6 +7,9 @@
 data/
 .dek
 
+# Agent scratch: reviewer worktrees live here and are their own checkouts.
+.claude/worktrees/
+
 # Local handoff/working notes — internal ops detail, keep out of the public repo
 HANDOFF.md
 

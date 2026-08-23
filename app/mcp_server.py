@@ -379,6 +379,7 @@ def build(app) -> FastMCP:
             click @e3             click an element by its ref
             fill @e3 "some text"  type into a field
             press Enter           press a key
+            upload @e3 <path>     attach an uploaded file to a file input
             get url               also: get title, get text @e3
             back / forward / reload
             screenshot            see the page as an image (add --full for the whole scroll height)
@@ -386,6 +387,13 @@ def build(app) -> FastMCP:
         Calls return text by default — the snapshot refs or the read text you act
         on. Ask for `screenshot` only when you actually need to SEE the page; it
         returns an image and costs far more, so don't screenshot after every step.
+
+        `upload` attaches a file the page asks for. The <path> is only ever one that
+        create_upload_url's flow gave you — call it, POST the file to the URL it
+        returns, and use the path from that response. A path you wrote yourself is
+        refused, and so is one whose file has expired; both say what to do instead.
+        Works on file inputs; a button that opens the operating system's file picker
+        is not supported.
 
         One action per call. Quote arguments that contain spaces. Only the
         listed read/interact verbs are accepted; anything else is refused. Only

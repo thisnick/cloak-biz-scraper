@@ -8,6 +8,8 @@ if the metacharacters were ever handed to a shell, the canary would be created.
 """
 from __future__ import annotations
 
+import pathlib
+
 import pytest
 from conftest import isolate_auth, mint_access
 from fastapi.testclient import TestClient
@@ -594,3 +596,399 @@ class TestRestEndpoint:
         self._stub(monkeypatch)
         r = client.post("/api/instances/i1/agent-browser", json={"command": "snapshot"})
         assert r.status_code == 401
+
+
+# ── `upload`: the one verb that reads the container's disk ────────────────────
+
+JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 60
+PNG = b"\x89PNG\r\n\x1a\n" + b"\x01" * 60
+PDF = b"%PDF-1.4\n" + b"\x02" * 60
+
+
+async def _one(data: bytes):
+    yield data
+
+
+async def _staging(root, *payloads, subject=OWNER):
+    """A REAL staging store holding real files.
+
+    Deliberately not a stub. The whole question this verb raises is *which paths
+    the store will vouch for*, and a stub would only test our idea of that — the
+    interesting failures are exactly where the two drift.
+    """
+    from app.services.uploads import UploadService
+
+    store = UploadService(root)
+    ticket = await store.mint(subject=subject, secret=SECRET)
+    staged = [
+        await store.stage(ticket.handle, subject=subject, filename=name, stream=_one(data))
+        for name, data in payloads
+    ]
+    return store, ticket, staged
+
+
+def _staging_sync(root, *payloads, subject=OWNER):
+    """`_staging` for the synchronous REST tests, which have no loop of their own."""
+    import asyncio
+
+    return asyncio.run(_staging(root, *payloads, subject=subject))
+
+
+def _expire(store, handle):
+    """Age a ticket without waiting two hours: the manifest is what every gate
+    reads, so moving its clock is the honest way to simulate one."""
+    import json
+
+    path = store.root / handle / ".ticket.json"
+    manifest = json.loads(path.read_text())
+    manifest["expires"] = 1.0
+    path.write_text(json.dumps(manifest))
+
+
+class TestUploadIsParsedLikeEveryOtherVerb:
+    """`upload` gets no entry in _VERB_FLAGS and is not in _FLAGS_ONLY, so the
+    parser's existing loop already refuses every option-looking token for it.
+    Nothing in parse_command moved to make that true — these tests are what
+    prove the claim rather than assuming it."""
+
+    def test_the_verb_is_accepted_with_a_selector_and_a_path(self):
+        assert parse_command("upload @e3 /data/uploads/upl_00112233445566aa/photo.jpg") == [
+            "upload", "@e3", "/data/uploads/upl_00112233445566aa/photo.jpg"
+        ]
+
+    def test_several_files_are_just_more_positionals(self):
+        """The CLI verb is variadic, so multi-photo needs no convention of ours."""
+        assert parse_command("upload @e3 /a/one.jpg /a/two.png") == [
+            "upload", "@e3", "/a/one.jpg", "/a/two.png"
+        ]
+
+    @pytest.mark.parametrize("payload", [
+        "upload @e3 --cdp 9999 /a/x.jpg",
+        "upload --cdp 9999 @e3 /a/x.jpg",
+        "upload @e3 /a/x.jpg --cdp=9999",
+        "upload @e3 --proxy http://evil /a/x.jpg",
+        "upload @e3 --executable-path /bin/sh /a/x.jpg",
+        "upload @e3 --user-data-dir /data/profiles /a/x.jpg",
+        "upload -i @e3 /a/x.jpg",
+    ])
+    def test_no_option_looking_token_is_allowed_for_it(self, payload):
+        with pytest.raises(AgentBrowserError, match="not allowed"):
+            parse_command(payload)
+
+    def test_a_quoted_path_with_spaces_survives_as_one_token(self):
+        assert parse_command("upload @e3 '/data/uploads/upl_x/my photo.jpg'") == [
+            "upload", "@e3", "/data/uploads/upl_x/my photo.jpg"
+        ]
+
+    def test_the_parser_still_refuses_everything_it_did_before(self):
+        """Adding a verb must not widen the list by accident."""
+        for bad in ("rm -rf /", "state save x", "mcp", "command.run echo", "install",
+                    "uploads @e3 /a/x.jpg", "Upload @e3 /a/x.jpg"):
+            with pytest.raises(AgentBrowserError):
+                parse_command(bad)
+
+
+@pytest.mark.asyncio
+class TestUploadResolvesThroughTheStore:
+    async def test_a_staged_path_reaches_the_browser(self, tmp_path, monkeypatch):
+        import asyncio
+
+        store, ticket, staged = await _staging(tmp_path / "uploads", ("photo.jpg", JPEG))
+        spy, calls = _fake_exec_sequence([(0, b"attached 1 file", b"")])
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", spy)
+        svc = AgentBrowserService(_FakeInstances(_FakeInst(cdp_port=4242)), store)
+
+        out = await svc.drive("i1", f"upload @e3 {staged[0].path}", subject=OWNER)
+
+        assert out.ok and out.output == "attached 1 file"
+        program, args = calls[0]
+        assert program == "agent-browser"
+        assert args[:4] == ("--cdp", "4242", "upload", "@e3")
+        assert args[4:] == (str(pathlib.Path(staged[0].path).resolve()),)
+
+    async def test_the_subprocess_gets_the_path_the_store_returned_not_the_callers_string(
+        self, tmp_path, monkeypatch
+    ):
+        """The single most important assertion in this unit.
+
+        The uploads root is reached through a symlink, so the path the caller
+        writes and the path the store vouches for are DIFFERENT STRINGS for the
+        same file. A service that validated the caller's string and then re-used
+        it would pass every other test here and fail this one — which is exactly
+        the bug `reclaim.removable_child`'s docstring warns about.
+        """
+        import asyncio
+
+        real = tmp_path / "real"
+        real.mkdir()
+        link = tmp_path / "link"
+        link.symlink_to(real)
+
+        store, ticket, staged = await _staging(link / "uploads", ("photo.jpg", JPEG))
+        caller_path = f"{link}/uploads/{ticket.handle}/photo.jpg"
+        assert "/link/" in caller_path, "the caller's string really does go via the link"
+
+        spy, calls = _fake_exec_sequence([(0, b"ok", b"")])
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", spy)
+        svc = AgentBrowserService(_FakeInstances(_FakeInst()), store)
+
+        await svc.drive("i1", f"upload @e3 {caller_path}", subject=OWNER)
+
+        passed = calls[0][1][4]
+        assert "/link/" not in passed, f"the caller's own string reached argv: {passed}"
+        assert passed.startswith(str(real.resolve()))
+        assert pathlib.Path(passed).read_bytes() == JPEG
+
+    async def test_a_noisy_but_valid_path_comes_back_canonical(self, tmp_path, monkeypatch):
+        import asyncio
+
+        store, ticket, staged = await _staging(tmp_path / "uploads", ("photo.jpg", JPEG))
+        noisy = f"{store.root / ticket.handle}/./photo.jpg"
+        spy, calls = _fake_exec_sequence([(0, b"ok", b"")])
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", spy)
+        svc = AgentBrowserService(_FakeInstances(_FakeInst()), store)
+
+        await svc.drive("i1", f"upload @e3 {noisy}", subject=OWNER)
+
+        assert "/./" not in calls[0][1][4]
+
+    async def test_every_file_in_a_variadic_upload_is_resolved_in_order(
+        self, tmp_path, monkeypatch
+    ):
+        import asyncio
+
+        store, ticket, staged = await _staging(
+            tmp_path / "uploads",
+            ("a.jpg", JPEG), ("b.png", PNG), ("c.pdf", PDF),
+        )
+        spy, calls = _fake_exec_sequence([(0, b"attached 3 files", b"")])
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", spy)
+        svc = AgentBrowserService(_FakeInstances(_FakeInst()), store)
+
+        out = await svc.drive(
+            "i1", "upload @e7 " + " ".join(s.path for s in staged), subject=OWNER
+        )
+
+        assert out.ok
+        args = calls[0][1]
+        assert args[3] == "@e7", "the selector is passed through, like every other verb"
+        assert list(args[4:]) == [str(pathlib.Path(s.path).resolve()) for s in staged]
+
+    async def test_the_selector_is_never_treated_as_a_path(self, tmp_path, monkeypatch):
+        """`@e3` is a page ref. If it were run through the store it would be
+        refused, and the verb would be unusable."""
+        import asyncio
+
+        store, ticket, staged = await _staging(tmp_path / "uploads", ("photo.jpg", JPEG))
+        spy, calls = _fake_exec_sequence([(0, b"ok", b"")])
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", spy)
+        svc = AgentBrowserService(_FakeInstances(_FakeInst()), store)
+
+        await svc.drive("i1", f"upload @e3 {staged[0].path}", subject=OWNER)
+
+        assert calls[0][1][3] == "@e3"
+
+
+@pytest.mark.asyncio
+class TestUploadRefusals:
+    @pytest.fixture
+    def spy(self, monkeypatch):
+        """A subprocess spy that records every run. The assertion that matters
+        for a refusal is that this list stays EMPTY — a refusal after the browser
+        already read the file would be no refusal at all."""
+        import asyncio
+
+        spy, calls = _fake_exec_sequence([(0, b"ok", b"")] * 5)
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", spy)
+        return calls
+
+    @pytest.mark.parametrize("attack", [
+        "/data/.dek",
+        "/etc/passwd",
+        "/data/settings.json",
+        "../../.dek",
+    ])
+    async def test_a_path_the_store_never_wrote_is_refused_before_any_subprocess(
+        self, tmp_path, spy, attack
+    ):
+        store, ticket, staged = await _staging(tmp_path / "uploads", ("photo.jpg", JPEG))
+        svc = AgentBrowserService(_FakeInstances(_FakeInst()), store)
+
+        with pytest.raises(AgentBrowserError) as refused:
+            await svc.drive("i1", f"upload @e3 {attack}", subject=OWNER)
+
+        assert "is not an uploaded file" in str(refused.value)
+        assert "create_upload_url" in str(refused.value)
+        assert spy == [], "the browser was asked to read it anyway"
+
+    async def test_the_dek_two_directories_up_from_a_real_ticket_is_refused(
+        self, tmp_path, spy
+    ):
+        store, ticket, staged = await _staging(tmp_path / "uploads", ("photo.jpg", JPEG))
+        dek = tmp_path / ".dek"
+        dek.write_bytes(b"the key that decrypts settings.json")
+        svc = AgentBrowserService(_FakeInstances(_FakeInst()), store)
+
+        for attack in (str(dek), f"{store.root / ticket.handle}/../../.dek"):
+            with pytest.raises(AgentBrowserError, match="not an uploaded file"):
+                await svc.drive("i1", f"upload @e3 {attack}", subject=OWNER)
+        assert spy == []
+
+    async def test_one_bad_path_among_good_ones_refuses_the_whole_command(
+        self, tmp_path, spy
+    ):
+        """Never a partial upload: a caller who slipped one path in must not get
+        the others attached and a warning."""
+        store, ticket, staged = await _staging(tmp_path / "uploads", ("photo.jpg", JPEG))
+        svc = AgentBrowserService(_FakeInstances(_FakeInst()), store)
+
+        with pytest.raises(AgentBrowserError):
+            await svc.drive(
+                "i1", f"upload @e3 {staged[0].path} /data/.dek", subject=OWNER
+            )
+        assert spy == []
+
+    async def test_an_expired_file_says_to_upload_it_again_and_says_it_differently(
+        self, tmp_path, spy
+    ):
+        """This refusal replaces a status API, so it has to be unmistakable —
+        and it must not read like "you made that path up"."""
+        store, ticket, staged = await _staging(tmp_path / "uploads", ("photo.jpg", JPEG))
+        svc = AgentBrowserService(_FakeInstances(_FakeInst()), store)
+        _expire(store, ticket.handle)
+
+        with pytest.raises(AgentBrowserError) as expired:
+            await svc.drive("i1", f"upload @e3 {staged[0].path}", subject=OWNER)
+
+        message = str(expired.value)
+        assert "expired" in message and "upload it again" in message
+        assert "is not an uploaded file" not in message
+        assert pathlib.Path(staged[0].path).is_file(), "the bytes are still there"
+        assert spy == []
+
+    async def test_another_subjects_staged_file_is_refused(self, tmp_path, spy):
+        store, ticket, staged = await _staging(tmp_path / "uploads", ("photo.jpg", JPEG))
+        svc = AgentBrowserService(_FakeInstances(_FakeInst(subject="somebody-else")), store)
+
+        with pytest.raises(AgentBrowserError, match="not an uploaded file"):
+            await svc.drive("i1", f"upload @e3 {staged[0].path}", subject="somebody-else")
+        assert spy == []
+
+    @pytest.mark.parametrize("command", ["upload", "upload @e3"])
+    async def test_a_selector_and_at_least_one_path_are_required(
+        self, tmp_path, spy, command
+    ):
+        store, _t, _s = await _staging(tmp_path / "uploads", ("photo.jpg", JPEG))
+        svc = AgentBrowserService(_FakeInstances(_FakeInst()), store)
+
+        with pytest.raises(AgentBrowserError, match="selector and at least one"):
+            await svc.drive("i1", command, subject=OWNER)
+        assert spy == []
+
+    async def test_a_service_with_no_staging_store_says_so(self, spy):
+        svc = AgentBrowserService(_FakeInstances(_FakeInst()))
+        with pytest.raises(AgentBrowserError, match="cannot stage uploads"):
+            await svc.drive("i1", "upload @e3 /data/uploads/upl_x/a.jpg", subject=OWNER)
+        assert spy == []
+
+    async def test_an_undrivable_instance_is_refused_before_the_paths_are_read(
+        self, tmp_path, spy
+    ):
+        """Order matters: a sweep's browser is refused on its own grounds, and a
+        caller learns nothing about which files exist from trying."""
+        store, ticket, staged = await _staging(tmp_path / "uploads", ("photo.jpg", JPEG))
+        svc = AgentBrowserService(_FakeInstances(_FakeInst(origin="task")), store)
+
+        with pytest.raises(InstanceNotDrivable):
+            await svc.drive("i1", f"upload @e3 {staged[0].path}", subject=OWNER)
+        assert spy == []
+
+
+class TestUploadOverRest:
+    """The REST twin takes `command` as an opaque string, so it needed no change
+    — proven by running a real upload through it rather than by reading it."""
+
+    @pytest.fixture
+    def client(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("APP_SECRET", SECRET)
+        with TestClient(app, base_url="https://testserver") as c:
+            isolate_auth(app, tmp_path)
+            yield c
+
+    def test_an_upload_command_goes_through_untouched(self, client, monkeypatch, tmp_path):
+        import asyncio
+
+        store, ticket, staged = _staging_sync(tmp_path / "uploads", ("photo.jpg", JPEG))
+        spy, calls = _fake_exec_sequence([(0, b"attached 1 file", b"")])
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", spy)
+        monkeypatch.setattr(
+            app.state, "agent_browser",
+            AgentBrowserService(_FakeInstances(_FakeInst(cdp_port=5150)), store),
+        )
+
+        r = client.post(
+            "/api/instances/i1/agent-browser",
+            json={"command": f"upload @e3 {staged[0].path}"},
+            headers={"Authorization": f"Bearer {mint_access(app)}"},
+        )
+
+        assert r.status_code == 200, r.text
+        assert r.json()["output"] == "attached 1 file"
+        assert calls[0][1][:4] == ("--cdp", "5150", "upload", "@e3")
+        assert calls[0][1][4] == str(pathlib.Path(staged[0].path).resolve())
+
+    def test_a_path_the_store_never_wrote_is_a_400_that_says_what_to_do(
+        self, client, monkeypatch, tmp_path
+    ):
+        store, _t, _s = _staging_sync(tmp_path / "uploads", ("photo.jpg", JPEG))
+        monkeypatch.setattr(
+            app.state, "agent_browser",
+            AgentBrowserService(_FakeInstances(_FakeInst()), store),
+        )
+
+        r = client.post(
+            "/api/instances/i1/agent-browser",
+            json={"command": "upload @e3 /data/.dek"},
+            headers={"Authorization": f"Bearer {mint_access(app)}"},
+        )
+
+        assert r.status_code == 400
+        assert "not an uploaded file" in r.json()["detail"]
+        assert "create_upload_url" in r.json()["detail"]
+
+
+class TestTheToolDescriptionMatchesWhatIsEnforced:
+    """A tool description that overstates what the server accepts is a bug with
+    a very long feedback loop — the model believes it for the whole session."""
+
+    def _doc(self) -> str:
+        import inspect
+
+        from app import mcp_server
+        source = inspect.getsource(mcp_server)
+        start = source.index("async def agent_browser(")
+        return source[start:source.index('"""', source.index('"""', start) + 3)]
+
+    def test_the_verb_block_lists_upload_with_a_path(self):
+        assert "upload @e3 <path>     attach an uploaded file to a file input" in self._doc()
+
+    def test_it_tells_the_model_where_the_path_must_come_from(self):
+        doc = self._doc()
+        assert "create_upload_url" in doc
+        assert "A path you wrote yourself is" in doc and "refused" in doc
+
+    def test_it_admits_the_case_it_cannot_serve(self):
+        """setInputFiles binds to an <input type=file>; a native chooser needs
+        Playwright's filechooser event, which the CLI has no fallback for. A
+        model that does not know will loop on a page it cannot serve."""
+        assert "file picker" in self._doc()
+
+    def test_every_verb_the_description_advertises_is_actually_allowed(self):
+        from app.services.agent_browser import ALLOWED_VERBS
+
+        doc = self._doc()
+        advertised = {"navigate", "snapshot", "read", "click", "fill", "press",
+                      "upload", "get", "back", "forward", "reload", "screenshot"}
+        for verb in advertised:
+            assert verb in doc, f"{verb} is enforced but not described"
+            assert verb in ALLOWED_VERBS, f"{verb} is described but not allowed"

@@ -144,7 +144,9 @@ async def lifespan(app: FastAPI):
     # The same job store the sweeps use: one Tasks list, one retention policy,
     # one place a run's evidence is reachable from.
     app.state.archive = ArchiveService(app.state.instances, settings_service, jobs)
-    app.state.agent_browser = AgentBrowserService(app.state.instances)
+    # The staging store goes in here too: `upload` is the one verb that reads
+    # the container's disk, and this is what decides which files exist to read.
+    app.state.agent_browser = AgentBrowserService(app.state.instances, app.state.uploads)
     logger.info(
         "ready: secret=%s license=%s proxy=%s notion=%s pool max=%d reserve=%d "
         "jobs=%d interrupted=%d oauth_clients=%d",

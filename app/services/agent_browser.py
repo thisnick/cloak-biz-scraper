@@ -16,6 +16,18 @@ disk or launches/escapes a browser — `screenshot` (to a caller path), `state`,
 resulting page is taken by *this* service to a path *it* controls and returned,
 so the caller never needs a file-writing verb.
 
+**One verb now READS the disk, and it is worth saying why that changed.**
+`upload` was excluded by exactly the sentence above: it takes caller-named paths
+and `setInputFiles` reads whatever it is pointed at, so `upload @e3 /data/.dek`
+would post the key that decrypts the licence, proxy and Notion credentials to
+whatever site the browser is sitting on. What makes it admissible is that the
+caller no longer names the file. Every path is run through
+`services/uploads.resolve_for`, which returns only files this server itself
+wrote into a live, subject-owned staging ticket — and the argv handed to
+`create_subprocess_exec` is built from what THAT returned, never from the
+caller's string re-used after a boolean check. The verb still writes nothing;
+it reads one directory the server filled itself.
+
 Driving is the same privilege as the CDP endpoint (`create_instance` already
 hands out a `cdp_url`), so it carries the same guards: a sweep's browser is
 refused (it is mid-navigation on its own schedule), and the instance must belong
@@ -32,6 +44,7 @@ import tempfile
 from dataclasses import dataclass
 
 from .tokens import OWNER
+from .uploads import Expired, NotStaged
 
 logger = logging.getLogger("cloakbiz.agent_browser")
 
@@ -39,11 +52,14 @@ logger = logging.getLogger("cloakbiz.agent_browser")
 # agent-browser's raw `screenshot <path>` takes a caller path — the file-write
 # surface — so it never reaches the passthrough. The verb captures to a path this
 # service picks; the caller only chooses viewport vs full page.
+# `upload` is here and SERVICE-HANDLED too (see drive): its paths are replaced
+# with the ones services/uploads.resolve_for vouched for before any argv is
+# built, so a caller-named path never reaches agent-browser.
 ALLOWED_VERBS = frozenset({
     "navigate", "open", "back", "forward", "reload",
     "snapshot", "read", "get",
     "click", "dblclick", "hover", "fill", "type", "press", "select", "scroll", "wait",
-    "screenshot",
+    "screenshot", "upload",
 })
 
 # Verbs that take NO positional arguments — only their whitelisted flags.
@@ -199,8 +215,13 @@ class DriveOutcome:
 class AgentBrowserService:
     """Runs allow-listed `agent-browser` actions against a pool instance's CDP."""
 
-    def __init__(self, instances) -> None:
+    def __init__(self, instances, uploads=None) -> None:
         self._instances = instances
+        # The staging store behind the `upload` verb. Optional so a test double
+        # or an embedder that never stages files can build the service without
+        # one — `upload` then refuses with a message that says so, rather than
+        # the service failing to construct for a verb nobody is using.
+        self._uploads = uploads
         # Warm the per-port agent-browser daemon the moment a browser launches,
         # so the caller's FIRST command meets a warm daemon instead of racing its
         # cold start. Registered as an optional hook the instance pool fires
@@ -294,6 +315,37 @@ class AgentBrowserService:
                 return path.read_bytes()
         return None
 
+    def _staged_upload(self, argv: list[str], subject: str | None) -> list[str]:
+        """`["upload", <selector>, *paths]` with the paths replaced by ours.
+
+        The selector is passed through like every other verb's argument — it is
+        a page ref, not a filesystem name. The paths are not passed through at
+        all: they are looked up, and what comes back is what runs.
+
+        `subject or OWNER` mirrors ws_guard's fallback and for the same reason —
+        a caller with no recorded subject falls back to the one resource owner,
+        which is the strictest reading, never to "anybody's tickets".
+        """
+        if self._uploads is None:
+            raise AgentBrowserError(
+                "this server cannot stage uploads, so there is nothing for `upload` to attach"
+            )
+        if len(argv) < 3:
+            raise AgentBrowserError(
+                "upload needs a selector and at least one staged file path, e.g. "
+                "`upload @e3 /data/uploads/upl_.../photo.jpg`"
+            )
+        try:
+            resolved = self._uploads.resolve_for(subject or OWNER, argv[2:])
+        except (NotStaged, Expired) as exc:
+            # One clause, two messages, and the difference is the point: "not an
+            # uploaded file" and "that file has expired" call for different
+            # readings by the model, and the expired one is the only status
+            # check this feature has. The wording belongs to the store, so the
+            # refusal a model reads cannot drift from the rule that produced it.
+            raise AgentBrowserError(str(exc)) from exc
+        return ["upload", argv[1], *(str(path) for path in resolved)]
+
     async def drive(self, instance_id: str, command: str, *,
                     subject: str | None = OWNER) -> DriveOutcome:
         """Run one allow-listed action against the instance.
@@ -309,6 +361,14 @@ class AgentBrowserService:
         # `screenshot` is intercepted, never passed through: the service captures
         # to its own path with only the whitelisted display flags, so agent-browser
         # never receives a caller-chosen path.
+        # `upload` is intercepted for the same reason: agent-browser would take the
+        # caller's paths verbatim into setInputFiles. What goes into argv is what
+        # resolve_for returned from a ticket manifest — reclaim.removable_child's
+        # rule, applied to reads: "callers use the Path returned here, never the
+        # one they passed in."
+        if argv[0] == "upload":
+            argv = self._staged_upload(argv, subject)
+
         if argv[0] == "screenshot":
             flags = argv[1:]  # already validated to whitelisted flags only
             shot = await self._screenshot(port, flags)
