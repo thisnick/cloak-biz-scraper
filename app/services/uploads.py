@@ -75,13 +75,28 @@ MAX_BYTES_PER_FILE = 100 * 1024 * 1024
 MAX_FILES_PER_TICKET = 12
 MAX_BYTES_PER_TICKET = 250 * 1024 * 1024
 
-# The global ceiling, checked when a ticket is minted. These are the first
-# genuinely large files on a volume that also holds profiles, evidence,
-# settings.json and the .dek. Refusing to mint is far kinder than filling the
-# volume and having profile writes start failing — and with no manual release,
-# the TTL and the mint-time sweep are the only things that ever free this space,
-# which makes this check load-bearing rather than belt-and-braces.
+# The global ceiling. These are the first genuinely large files on a volume that
+# also holds profiles, evidence, settings.json and the .dek, so filling it does
+# not degrade an upload — it makes profile writes start failing.
+#
+# **The invariant: the bytes under the uploads root can never exceed this, under
+# any amount of concurrency.** That is a stronger promise than it looks, and the
+# first version of this module did not keep it. Measuring the volume and then
+# granting is not a bound: eight writers that all measure before any of them
+# commits will all be admitted, and the measured peak was 8.00x the per-ticket
+# cap. So admission is a RESERVATION, taken under the same lock that later
+# commits — see `_reserved` and `begin`. A reservation cannot be raced, because
+# the deciding read and the write of the ledger happen without an await between
+# them.
 UPLOADS_BUDGET_BYTES = 1024 * 1024 * 1024
+
+# Bookkeeping is bytes too, and an invariant with an unaccounted term is not an
+# invariant. A ticket's manifest is reserved once at mint (headroom for the
+# whole ticket's life) and each staged file reserves room for the entry it will
+# add. Both are generous: an entry is ~150 bytes of JSON and twelve of them plus
+# the wrapper fit inside the headroom several times over.
+_MANIFEST_SEED_BYTES = 256
+_MANIFEST_ENTRY_BYTES = 512
 
 # Two hours: long enough that the same photos can be posted to several sites in
 # one session, short enough that a forgotten ticket is a rounding error on the
@@ -295,8 +310,14 @@ def human_size(count: int) -> str:
 
 
 def _split_ext(name: str) -> tuple[str, str]:
+    """`("photo", ".jpg")`, or the whole name and no extension.
+
+    An empty stem means there was no extension to find, only a leading dot —
+    `.env` is a name, not an extension — and a non-alphanumeric or very long
+    tail is not one either.
+    """
     stem, dot, ext = name.rpartition(".")
-    if not dot or len(ext) > 8:  # ".tar.gz" is fine; "a.name-with-dots" is not an ext
+    if not dot or not stem or not ext.isalnum() or len(ext) > 8:
         return name, ""
     return stem, f".{ext}"
 
@@ -310,14 +331,25 @@ def safe_name(raw: str, content_type: str) -> str:
     what guarantees a staged file can never be named `.ticket.json` or shadow an
     in-flight `.incoming-*` temp file, so the manifest cannot be overwritten by
     something it is supposed to be describing.
+
+    **The extension is separated BEFORE the stem is cleaned up**, and that
+    ordering is the whole of a bug worth remembering. Doing it the other way
+    round, `写真.jpg` collapses to `_.jpg`, whose leading `_` and `.` are then
+    stripped as junk, and the file arrives called `jpg` with no extension at
+    all. Harmless for containment — nothing escapes either way — but this
+    feature exists to post photos to somebody else's upload form, and half of
+    those validate the extension. A stem that survives nothing is replaced;
+    an extension that was really there is kept.
     """
     basename = re.split(r"[\\/]", raw or "")[-1]
-    cleaned = _UNSAFE_CHARS.sub("_", basename).strip("._-")
-    if not cleaned:
-        return f"upload{_EXTENSION.get(content_type, '')}"
-    stem, ext = _split_ext(cleaned)
-    stem = stem[: max(1, MAX_NAME_LEN - len(ext))]
-    return f"{stem}{ext}"
+    stem, ext = _split_ext(_UNSAFE_CHARS.sub("_", basename))
+    stem = stem.strip("._-")
+    if not stem:
+        stem = "upload"
+        # Nothing usable was given at all, so name it after what it turned out
+        # to be. The type is the sniffed one, never the caller's claim.
+        ext = ext or _EXTENSION.get(content_type, "")
+    return f"{stem[: max(1, MAX_NAME_LEN - len(ext))]}{ext}"
 
 
 def _unique_name(name: str, taken: Iterable[str]) -> str:
@@ -378,6 +410,31 @@ def _write_manifest(ticket_dir: Path, manifest: dict) -> None:
     os.replace(tmp, ticket_dir / MANIFEST_NAME)
 
 
+def _volume_bytes(root: Path) -> int:
+    """Bytes under the uploads root, EXCLUDING in-flight temp files.
+
+    The exclusion is what makes the budget arithmetic exact rather than merely
+    conservative. A partially-written `.incoming-*` file is already covered by
+    its writer's reservation; counting it as well would charge those bytes
+    twice, and the effective budget would shrink and grow with traffic.
+
+    Never raises, for the same reason `measure_dir` does not: a volume that
+    cannot be walked is a reason to refuse an upload, not to crash one.
+    """
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(root, onerror=None, followlinks=False):
+        for filename in filenames:
+            if filename.startswith(_INCOMING_PREFIX):
+                continue
+            try:
+                total += os.stat(
+                    os.path.join(dirpath, filename), follow_symlinks=False
+                ).st_size
+            except OSError:  # it vanished mid-walk
+                continue
+    return total
+
+
 def _expired(manifest: dict, now: float) -> bool:
     return float(manifest.get("expires") or 0) <= now
 
@@ -420,12 +477,20 @@ class StagedWrite:
     """
 
     def __init__(self, service: "UploadService", ticket_dir: Path, *,
-                 filename: str, used_bytes: int) -> None:
+                 filename: str, allowance: int, refusal: UploadsError) -> None:
         self._service = service
         self._ticket_dir = ticket_dir
         self._filename = filename
-        self._used = used_bytes
+        # What `begin` reserved for these bytes, and therefore the most this
+        # write may put on disk — the smallest of the per-file cap, what the
+        # caller declared, the room left in the ticket, and the room left on the
+        # volume. `refusal` is the message belonging to whichever of those it
+        # was, prepared at admission so the streaming path does not have to
+        # re-derive which limit it just hit.
+        self._allowance = allowance
+        self._refusal = refusal
         self._tmp = ticket_dir / f"{_INCOMING_PREFIX}{secrets.token_hex(8)}"
+        self.reservation = self._tmp.name
         self._out = open(self._tmp, "wb")
         self._digest = sha256()
         self._written = 0
@@ -451,17 +516,17 @@ class StagedWrite:
             raise
 
     def _admit(self, data: bytes) -> None:
+        """One slice onto disk, or the refusal that stops it going there.
+
+        A single comparison, because `begin` already worked out which limit
+        binds. That matters for more than tidiness: every byte of every upload
+        passes through here, and the number it is checked against is the number
+        the volume was reserved for — so what lands can never exceed what was
+        promised, whatever the client said or did.
+        """
         self._written += len(data)
-        if self._written > MAX_BYTES_PER_FILE:
-            raise TooLarge(
-                f"that file is over the {human_size(MAX_BYTES_PER_FILE)} limit for a "
-                "single upload"
-            )
-        if self._used + self._written > MAX_BYTES_PER_TICKET:
-            raise TooLarge(
-                f"this upload URL can hold {human_size(MAX_BYTES_PER_TICKET)} in total and "
-                "that file would take it over. Get a fresh upload URL for the rest."
-            )
+        if self._written > self._allowance:
+            raise self._refusal
         self._digest.update(data)
         self._out.write(data)
 
@@ -524,6 +589,10 @@ class StagedWrite:
                 }
                 manifest["files"] = entries + [entry]
                 _write_manifest(self._ticket_dir, manifest)
+                # Released inside the lock, in the same breath as the bytes
+                # becoming committed: for one instant they are counted twice,
+                # never zero times, which is the direction an invariant may err.
+                self._service._release(self.reservation)
         except UploadsError:
             self.abort()
             raise
@@ -534,7 +603,14 @@ class StagedWrite:
         return _record(self._ticket_dir, entry)
 
     def abort(self) -> None:
-        """Close and remove the partial file. Idempotent, and safe after commit."""
+        """Close and remove the partial file, and give the reservation back.
+
+        Idempotent, and safe after commit. Releasing here is what stops a
+        refused or abandoned upload from holding volume budget for the rest of
+        the process's life — an upload that fails must cost nothing, or a run of
+        failures becomes its own outage.
+        """
+        self._service._release(self.reservation)
         if not self._closed:
             self._closed = True
             try:
@@ -560,10 +636,44 @@ class UploadService:
 
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
-        # Guards only the read-modify-write of a manifest, which is small and
-        # never holds across a byte of I/O. Built here rather than per call so
-        # two POSTs to one ticket contend on the same lock.
+        # Guards the three read-decide-write sequences that must not interleave:
+        # minting a ticket, admitting a write, and committing one. All three
+        # read the volume and then change it, and a check that is not holding
+        # this lock is a check eight callers can pass at once.
         self._lock = asyncio.Lock()
+        # The admission ledger: reservation id -> (handle, file bytes, overhead).
+        # Bytes that are SPOKEN FOR but not yet on disk. The two numbers are kept
+        # apart because they answer different questions — the per-ticket cap is
+        # about the caller's files, the volume budget is about everything. A
+        # plain dict, mutated without awaiting, which is atomic under one event
+        # loop; the lock is what makes the surrounding decide-then-reserve atomic.
+        self._reserved: dict[str, tuple[str, int, int]] = {}
+
+    # ── the admission ledger ──
+    def _reserved_total(self) -> int:
+        """Every promised byte, bookkeeping included — the volume's question."""
+        return sum(size + overhead for _h, size, overhead in self._reserved.values())
+
+    def _reserved_for(self, handle: str) -> int:
+        """Promised FILE bytes for one ticket — the per-ticket cap's question."""
+        return sum(size for owner, size, _o in self._reserved.values() if owner == handle)
+
+    def _release(self, reservation: str) -> None:
+        """Give bytes back. Idempotent: commit and abort may both reach here."""
+        self._reserved.pop(reservation, None)
+
+    def _volume_committed_and_reserved(self) -> int:
+        """Everything the budget has to cover: bytes on disk plus bytes promised.
+
+        The walk is done fresh rather than cached. A counter would have to be
+        kept in step with the sweep, with the owner's clear, and with anything
+        else that ever touches this volume — and a counter that drifts high
+        refuses uploads nobody can explain, while one that drifts low is a
+        broken invariant. The volume is capped at a gigabyte across a few dozen
+        files, so the walk is cheap, and paying for it is how this stays true by
+        construction rather than by everyone remembering.
+        """
+        return _volume_bytes(self.root) + self._reserved_total()
 
     # ── minting ──
     async def mint(self, *, subject: str, secret: str | None,
@@ -580,22 +690,41 @@ class UploadService:
             raise UploadsError(
                 "this server has no APP_SECRET set, so it cannot mint an upload URL"
             )
+        # Outside the lock: a sweep only removes tickets that are already
+        # expired, and an expired ticket is one `begin` refuses anyway, so it can
+        # never take a directory a live writer is holding.
         await self.sweep(now=now)
-        used, _files = await asyncio.to_thread(measure_dir, self.root)
-        if used >= UPLOADS_BUDGET_BYTES:
-            raise NoRoom(
-                f"uploaded files are already using {human_size(used)}, which is the "
-                f"{human_size(UPLOADS_BUDGET_BYTES)} this server keeps for them. "
-                "They expire on their own within two hours; to free the space now, open "
-                "Settings \u2192 Disk space and clear uploaded files."
-            )
         now = time.time() if now is None else now
         handle = f"{HANDLE_PREFIX}{secrets.token_hex(8)}"
         ticket_dir = self.root / handle
-        ticket_dir.mkdir(parents=True)
-        _write_manifest(ticket_dir, {
-            "sub": subject, "created": now, "expires": now + TTL_SEC, "files": [],
-        })
+        async with self._lock:
+            # Nothing in here awaits, and that is load-bearing rather than
+            # incidental: without an await, measure-then-create is already
+            # atomic under one event loop, and the lock is what keeps it that
+            # way the day somebody makes the walk `await asyncio.to_thread(...)`
+            # for latency. Verified by mutation — removing the lock alone
+            # changes nothing; removing it AND yielding here hands the same last
+            # free slot to twenty-five callers at once.
+            #
+            # A ticket confers no bytes on its own — `begin` is what admits
+            # those — so this check is the FRIENDLY one: it stops a caller
+            # collecting URLs that will refuse every file, and it names the one
+            # place a person can free space. What it strictly bounds is the
+            # ticket's own bookkeeping, which is why it reserves manifest
+            # headroom and why it is inside the lock: twenty-five concurrent
+            # mints must not each write a manifest against one measurement.
+            used = self._volume_committed_and_reserved()
+            if used + _MANIFEST_SEED_BYTES > UPLOADS_BUDGET_BYTES:
+                raise NoRoom(
+                    f"uploaded files are already using {human_size(used)}, which is the "
+                    f"{human_size(UPLOADS_BUDGET_BYTES)} this server keeps for them. "
+                    "They expire on their own within two hours; to free the space now, open "
+                    "Settings \u2192 Disk space and clear uploaded files."
+                )
+            ticket_dir.mkdir(parents=True)
+            _write_manifest(ticket_dir, {
+                "sub": subject, "created": now, "expires": now + TTL_SEC, "files": [],
+            })
         logger.info("minted upload ticket %s for %s", handle, subject)
         return Ticket(
             handle=handle,
@@ -604,28 +733,82 @@ class UploadService:
         )
 
     # ── writing ──
-    def begin(self, handle: str, *, subject: str, filename: str,
-              now: float | None = None) -> StagedWrite:
-        """Open a write into a live, subject-owned ticket.
+    async def begin(self, handle: str, *, subject: str, filename: str,
+                    declared_bytes: int | None = None,
+                    now: float | None = None) -> StagedWrite:
+        """Admit one write into a live, subject-owned ticket, or refuse it.
 
-        Everything checkable before a byte arrives is checked before a byte
-        arrives: a handle that is not one of ours, a ticket that is gone, one
-        belonging to somebody else, one past its TTL, or one already full. What
-        cannot be known yet — the type and the size — is checked as it streams.
+        **This is where the volume is bounded.** Not by measuring and then
+        granting — eight writers can all measure before any of them commits, and
+        they did: the measured peak was 8.00x the per-ticket cap. Admission
+        takes a RESERVATION for the bytes this write may put on disk, under the
+        lock that later commits, so what the next caller measures already
+        includes what this one is about to write.
+
+        `declared_bytes` is the caller's Content-Length when it has one — curl
+        always sends it, so the reservation is tight in the case that matters.
+        Without one (a chunked body) the reservation is the pessimistic
+        `MAX_BYTES_PER_FILE`, which is what makes a bound hold for a client that
+        did not say. It is a ceiling as well as a promise: a body longer than
+        what it declared is refused at the declared number, or the lie would buy
+        back exactly the slack the reservation removed.
+
+        Everything else checkable before a byte arrives is still checked before
+        a byte arrives — an unknown handle, a ticket that is gone, one belonging
+        to somebody else, one past its TTL, one already full.
         """
         now = time.time() if now is None else now
         ticket_dir = self._ticket_dir(handle)
-        manifest = self._live_manifest(ticket_dir, subject, now)
-        entries = manifest.get("files") or []
-        if len(entries) >= MAX_FILES_PER_TICKET:
-            raise TooMany(
-                f"this upload URL already holds {MAX_FILES_PER_TICKET} files, which is its "
-                "limit. Call create_upload_url for another."
+
+        async with self._lock:
+            manifest = self._live_manifest(ticket_dir, subject, now)
+            entries = manifest.get("files") or []
+            if len(entries) >= MAX_FILES_PER_TICKET:
+                raise TooMany(
+                    f"this upload URL already holds {MAX_FILES_PER_TICKET} files, which is "
+                    "its limit. Call create_upload_url for another."
+                )
+            committed = sum(int(e.get("bytes", 0)) for e in entries)
+
+            # Four limits, each with the sentence that belongs to it. Both room
+            # figures are computed against committed PLUS promised; against
+            # committed alone — which is what this used to do — eight callers
+            # all pass before any of them commits.
+            room_in_ticket = MAX_BYTES_PER_TICKET - committed - self._reserved_for(handle)
+            room_on_volume = (
+                UPLOADS_BUDGET_BYTES
+                - self._volume_committed_and_reserved()
+                - _MANIFEST_ENTRY_BYTES
             )
-        return StagedWrite(
-            self, ticket_dir, filename=filename,
-            used_bytes=sum(int(e.get("bytes", 0)) for e in entries),
-        )
+            limits: list[tuple[int, UploadsError]] = [
+                (MAX_BYTES_PER_FILE, TooLarge(
+                    f"that file is over the {human_size(MAX_BYTES_PER_FILE)} limit for a "
+                    "single upload")),
+                (room_in_ticket, TooLarge(
+                    f"this upload URL can hold {human_size(MAX_BYTES_PER_TICKET)} in total "
+                    "and that file would take it over. Get a fresh upload URL for the rest.")),
+                (room_on_volume, NoRoom(
+                    "there is no room on this server for another upload right now — "
+                    f"uploaded files may use {human_size(UPLOADS_BUDGET_BYTES)} in total. "
+                    "They expire on their own within two hours; to free the space now, open "
+                    "Settings \u2192 Disk space and clear uploaded files.")),
+            ]
+            if declared_bytes is not None:
+                limits.append((max(0, declared_bytes), TooLarge(
+                    "that upload sent more data than its Content-Length declared; send "
+                    "the length you mean to send")))
+            allowance, refusal = min(limits, key=lambda pair: pair[0])
+            # Nothing at all fits: refuse now rather than open a file and a
+            # reservation for a write that cannot take a single byte.
+            if allowance <= 0:
+                raise refusal
+
+            write = StagedWrite(self, ticket_dir, filename=filename,
+                                allowance=allowance, refusal=refusal)
+            self._reserved[write.reservation] = (
+                handle, allowance, _MANIFEST_ENTRY_BYTES
+            )
+        return write
 
     async def stage(self, handle: str, *, subject: str, filename: str,
                     stream: AsyncIterator[bytes], now: float | None = None) -> StagedFile:
@@ -635,7 +818,7 @@ class UploadService:
         the natural shape for a test and for the deferred server-side fetch, and
         both must go through exactly the same caps and sniffing as the route.
         """
-        write = self.begin(handle, subject=subject, filename=filename, now=now)
+        write = await self.begin(handle, subject=subject, filename=filename, now=now)
         try:
             async for chunk in stream:
                 write.feed(chunk)

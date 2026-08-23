@@ -78,6 +78,16 @@ def _manifest(store: UploadService, handle: str) -> dict:
     return json.loads((store.root / handle / ".ticket.json").read_text())
 
 
+def _fill(store: UploadService, handle: str, size: int) -> None:
+    """Put bytes on the volume without going through the store.
+
+    How they got there is not what these tests are about — "the volume already
+    holds this much" is the precondition, and staging cannot produce it any
+    more, because staging is now the thing that refuses to.
+    """
+    (store.root / handle / "filler.bin").write_bytes(b"x" * size)
+
+
 def _rewrite_expiry(store: UploadService, handle: str, expires: float) -> None:
     """Age a ticket without waiting two hours. The manifest is the record every
     gate reads, so moving its clock is the honest way to simulate one."""
@@ -199,6 +209,13 @@ class TestSafeName:
         ("..", "upload.jpg"),
         ("", "upload.jpg"),
         ("caf\u00e9 \u2014 photo.jpg", "caf_photo.jpg"),
+        # The extension has to survive a stem that does not. This feature exists
+        # to post photos to somebody else's upload form, and half of those
+        # validate the extension — a file called `jpg` fails them all.
+        ("\u5199\u771f.jpg", "upload.jpg"),
+        ("\u65e5\u672c\u8a9e.pdf", "upload.pdf"),
+        ("\U0001f389.jpg", "upload.jpg"),
+        ("\u00dcnter.png", "nter.png"),
     ])
     def test_a_filename_becomes_one_harmless_path_component(self, raw, expected):
         assert safe_name(raw, "image/jpeg") == expected
@@ -298,9 +315,13 @@ class TestCaps:
     async def test_minting_past_the_global_budget_is_refused_and_says_where_to_look(
         self, store, monkeypatch
     ):
-        monkeypatch.setattr(uploads_service, "UPLOADS_BUDGET_BYTES", 128)
+        """The budget is now measured in numbers a manifest fits inside: the
+        server's own bookkeeping is charged to the volume too, so a "budget" of
+        128 bytes is smaller than an empty ticket and no longer a coherent
+        value to test with."""
+        monkeypatch.setattr(uploads_service, "UPLOADS_BUDGET_BYTES", 4096)
         ticket = await _mint(store)
-        await _stage(store, ticket.handle, JPEG + b"\x07" * 200)
+        _fill(store, ticket.handle, 4096)
 
         with pytest.raises(NoRoom) as refused:
             await _mint(store)
@@ -309,14 +330,258 @@ class TestCaps:
     async def test_the_budget_counts_only_what_is_still_there(self, store, monkeypatch):
         """Refusing to mint has to be recoverable, and the sweep inside mint is
         what recovers it — otherwise one big expired ticket wedges the feature."""
-        monkeypatch.setattr(uploads_service, "UPLOADS_BUDGET_BYTES", 128)
+        monkeypatch.setattr(uploads_service, "UPLOADS_BUDGET_BYTES", 4096)
         ticket = await _mint(store)
-        await _stage(store, ticket.handle, JPEG + b"\x07" * 200)
+        _fill(store, ticket.handle, 4096)
         _rewrite_expiry(store, ticket.handle, time.time() - 1)
 
         fresh = await _mint(store)  # the sweep inside mint frees the space first
         assert fresh.handle != ticket.handle
         assert not (store.root / ticket.handle).exists()
+
+
+# ── The volume bound ─────────────────────────────────────────────────────────
+
+
+def _disk(root: pathlib.Path) -> int:
+    """Every byte under the root, temp files included. What the volume holds —
+    not what the manifests say it holds, which is a different question and the
+    one that was already right when this was wrong."""
+    import os
+
+    total = 0
+    for dirpath, _dirs, files in os.walk(root):
+        for name in files:
+            try:
+                total += os.stat(os.path.join(dirpath, name)).st_size
+            except OSError:
+                pass
+    return total
+
+
+async def _sample_peak(root, peak, stop):
+    """Watch the volume while writers run. Without this the tests could only see
+    the tidy state afterwards, and the failure being guarded against was a PEAK
+    that no final measurement would ever show."""
+    import asyncio
+
+    while not stop.is_set():
+        peak[0] = max(peak[0], _disk(root))
+        await asyncio.sleep(0)
+    peak[0] = max(peak[0], _disk(root))
+
+
+async def _slow_body(total: int, marker: int):
+    """Bytes in pieces, yielding between them, so writers really interleave.
+    Distinct per writer so the sha256 dedupe cannot quietly collapse them."""
+    import asyncio
+
+    head = JPEG + bytes([marker % 256]) * 8
+    yield head
+    sent = len(head)
+    while sent < total:
+        piece = min(4096, total - sent)
+        yield bytes([marker % 256]) * piece
+        sent += piece
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+class TestTheVolumeIsBounded:
+    """The invariant: the bytes under the uploads root can never exceed
+    UPLOADS_BUDGET_BYTES, under any amount of concurrency.
+
+    The first version of this store measured the volume and then granted, which
+    is not a bound — eight writers all measure before any of them commits. It
+    was measured at 8.00x the per-ticket cap. Admission is a reservation now,
+    and these are the tests that would notice if it stopped being one.
+    """
+
+    async def test_concurrent_writers_cannot_exceed_the_per_ticket_cap(
+        self, store, monkeypatch
+    ):
+        import asyncio
+
+        monkeypatch.setattr(uploads_service, "MAX_BYTES_PER_FILE", 64 * 1024)
+        monkeypatch.setattr(uploads_service, "MAX_BYTES_PER_TICKET", 64 * 1024)
+        monkeypatch.setattr(uploads_service, "UPLOADS_BUDGET_BYTES", 1024 * 1024)
+        ticket = await _mint(store)
+        peak, stop = [0], asyncio.Event()
+        watch = asyncio.create_task(_sample_peak(store.root, peak, stop))
+
+        async def writer(i):
+            try:
+                await store.stage(ticket.handle, subject=SUBJECT, filename=f"f{i}.jpg",
+                                  stream=_slow_body(64 * 1024, i))
+            except uploads_service.UploadsError:
+                pass
+
+        await asyncio.gather(*[writer(i) for i in range(8)])
+        stop.set()
+        await watch
+
+        assert peak[0] <= uploads_service.MAX_BYTES_PER_TICKET + 4096, (
+            f"eight writers put {peak[0]} bytes on a volume whose ticket cap is "
+            f"{uploads_service.MAX_BYTES_PER_TICKET}"
+        )
+
+    async def test_concurrent_writers_across_many_tickets_cannot_exceed_the_budget(
+        self, store, monkeypatch
+    ):
+        """A ticket confers no bytes — so however many are minted, the volume is
+        still bounded. This is the composite case: many tickets, many writers."""
+        import asyncio
+
+        monkeypatch.setattr(uploads_service, "MAX_BYTES_PER_FILE", 32 * 1024)
+        monkeypatch.setattr(uploads_service, "MAX_BYTES_PER_TICKET", 32 * 1024)
+        monkeypatch.setattr(uploads_service, "UPLOADS_BUDGET_BYTES", 128 * 1024)
+        handles = [(await _mint(store)).handle for _ in range(10)]
+        peak, stop = [0], asyncio.Event()
+        watch = asyncio.create_task(_sample_peak(store.root, peak, stop))
+
+        async def writer(i):
+            try:
+                await store.stage(handles[i % len(handles)], subject=SUBJECT,
+                                  filename=f"f{i}.jpg",
+                                  stream=_slow_body(32 * 1024, i))
+            except uploads_service.UploadsError:
+                pass
+
+        await asyncio.gather(*[writer(i) for i in range(20)])
+        stop.set()
+        await watch
+
+        assert peak[0] <= uploads_service.UPLOADS_BUDGET_BYTES, (
+            f"twenty writers across ten tickets put {peak[0]} bytes on a volume "
+            f"budgeted at {uploads_service.UPLOADS_BUDGET_BYTES}"
+        )
+
+    async def test_many_mints_at_once_on_a_full_volume_are_all_refused(
+        self, store, monkeypatch
+    ):
+        """Twenty-five callers measuring the same full volume at the same time
+        used to be twenty-five grants."""
+        import asyncio
+
+        monkeypatch.setattr(uploads_service, "UPLOADS_BUDGET_BYTES", 8192)
+        first = await _mint(store)
+        _fill(store, first.handle, 8192)
+
+        async def ask():
+            try:
+                await _mint(store)
+                return True
+            except NoRoom:
+                return False
+
+        granted = sum(await asyncio.gather(*[ask() for _ in range(25)]))
+        assert granted == 0, f"{granted} of 25 mints were granted on a full volume"
+
+    async def test_the_last_ticket_that_fits_is_granted_to_exactly_one_caller(
+        self, store, monkeypatch
+    ):
+        """The narrow case the lock exists for.
+
+        A volume with room for ONE more ticket's bookkeeping, and twenty-five
+        callers asking at once. Deciding and then creating without holding the
+        lock lets all twenty-five past the same measurement — which is the same
+        shape of bug as the one this whole rework is about, just in bytes small
+        enough to be easy to wave away.
+        """
+        import asyncio
+
+        monkeypatch.setattr(uploads_service, "UPLOADS_BUDGET_BYTES", 1024 * 1024)
+        await _mint(store)
+        one = _disk(store.root)
+        await _mint(store)
+        manifest_bytes = _disk(store.root) - one
+        assert manifest_bytes > 0, "a ticket really does cost bytes"
+
+        # Room for one more manifest, and not for two.
+        monkeypatch.setattr(
+            uploads_service, "UPLOADS_BUDGET_BYTES",
+            _disk(store.root) + uploads_service._MANIFEST_SEED_BYTES + manifest_bytes // 2,
+        )
+
+        async def ask():
+            try:
+                await _mint(store)
+                return True
+            except NoRoom:
+                return False
+
+        granted = sum(await asyncio.gather(*[ask() for _ in range(25)]))
+        assert granted <= 1, f"{granted} callers were handed the last free slot"
+        assert _disk(store.root) <= uploads_service.UPLOADS_BUDGET_BYTES
+
+    async def test_bytes_already_written_are_not_charged_twice(self, store, monkeypatch):
+        """A reservation covers the temp file it is writing, so counting that
+        file as well would charge those bytes twice and the usable budget would
+        shrink and grow with traffic. Two writes that fit must both be admitted
+        even while the first one's bytes are on disk."""
+        monkeypatch.setattr(uploads_service, "MAX_BYTES_PER_FILE", 8192)
+        monkeypatch.setattr(uploads_service, "MAX_BYTES_PER_TICKET", 64 * 1024)
+        ticket = await _mint(store)
+        monkeypatch.setattr(uploads_service, "UPLOADS_BUDGET_BYTES",
+                            _disk(store.root) + 2 * 8192 + 2048)
+
+        first = await store.begin(ticket.handle, subject=SUBJECT, filename="a.jpg",
+                                  declared_bytes=8192)
+        async for chunk in _slow_body(8192, 1):
+            first.feed(chunk)  # on disk, not yet committed
+
+        second = await store.begin(ticket.handle, subject=SUBJECT, filename="b.jpg",
+                                   declared_bytes=8192)
+        async for chunk in _slow_body(8192, 2):
+            second.feed(chunk)
+        assert (await second.commit()).bytes == 8192
+        assert (await first.commit()).bytes == 8192
+        assert _disk(store.root) <= uploads_service.UPLOADS_BUDGET_BYTES
+
+    async def test_a_refused_upload_gives_its_reservation_back(self, store, monkeypatch):
+        """An upload that fails must cost nothing. Otherwise a run of failures
+        is its own outage: the volume looks full and nothing can be freed."""
+        monkeypatch.setattr(uploads_service, "MAX_BYTES_PER_FILE", 4096)
+        ticket = await _mint(store)
+
+        with pytest.raises(UnsupportedType):
+            await _stage(store, ticket.handle, NOT_AN_IMAGE, name="x.jpg")
+        assert store._reserved == {}, "a refused upload is still holding budget"
+
+        staged = await _stage(store, ticket.handle, JPEG, name="ok.jpg")
+        assert pathlib.Path(staged.path).is_file()
+        assert store._reserved == {}, "a committed upload is still holding budget"
+
+    async def test_a_body_longer_than_it_declared_is_cut_off_at_what_it_declared(
+        self, store
+    ):
+        """The reservation is a ceiling as well as a promise. A client that
+        declares a small length and then streams a large body would otherwise
+        buy back exactly the slack the reservation removed."""
+        ticket = await _mint(store)
+        write = await store.begin(ticket.handle, subject=SUBJECT, filename="liar.jpg",
+                                  declared_bytes=100)
+        with pytest.raises(TooLarge, match="Content-Length"):
+            async for chunk in _slow_body(50_000, 1):
+                write.feed(chunk)
+
+        assert sorted(p.name for p in (store.root / ticket.handle).iterdir()) == [
+            ".ticket.json"
+        ]
+        assert store._reserved == {}
+
+    async def test_an_upload_that_would_pass_the_budget_is_refused_not_written(
+        self, store, monkeypatch
+    ):
+        monkeypatch.setattr(uploads_service, "UPLOADS_BUDGET_BYTES", 16 * 1024)
+        ticket = await _mint(store)
+        _fill(store, ticket.handle, 15 * 1024)
+
+        with pytest.raises(NoRoom, match="Disk space"):
+            await _stage(store, ticket.handle, JPEG + b"\x00" * 8192, name="big.jpg")
+
+        assert _disk(store.root) <= uploads_service.UPLOADS_BUDGET_BYTES
+        assert store._reserved == {}
 
 
 # ── resolve_for: the security function ───────────────────────────────────────
@@ -862,6 +1127,45 @@ class TestEndpointBody:
         assert json.loads(
             (app.state.uploads.root / ticket.handle / ".ticket.json").read_text()
         )["files"] == []
+
+    def test_a_body_with_no_content_length_is_still_capped_mid_stream(
+        self, client, monkeypatch
+    ):
+        """The guard for a client that will not say how much it is sending.
+
+        `Content-Length` is a courtesy: a chunked body has none, so the
+        header check cannot fire and the only thing standing between the volume
+        and an endless POST is the counter in the read loop. The refusal text
+        differs between the two guards precisely so this test can prove WHICH
+        one fired — a 413 alone would not distinguish them.
+        """
+        from app.routes import uploads as upload_routes
+
+        monkeypatch.setattr(upload_routes, "_MAX_BODY", 40_000)
+        ticket = _mint_sync(client)
+        head = (b"--abc\r\nContent-Disposition: form-data; name=\"file\"; "
+                b"filename=\"big.jpg\"\r\n\r\n")
+
+        def chunked():
+            yield head + JPEG
+            for _ in range(20):
+                yield b"\x00" * 8192
+            yield b"\r\n--abc--\r\n"
+
+        r = client.post(
+            f"/uploads/{ticket.handle}",
+            headers={"Authorization": f"Bearer {ticket.token}",
+                     "Content-Type": "multipart/form-data; boundary=abc"},
+            content=chunked(),
+        )
+
+        assert r.status_code == 413, r.text
+        assert "declared no length" in r.json()["detail"], (
+            "the header guard fired, not the in-stream one — this test is not "
+            f"exercising what it claims: {r.json()['detail']}"
+        )
+        left = sorted(p.name for p in (app.state.uploads.root / ticket.handle).iterdir())
+        assert left == [".ticket.json"], f"a partial body survived: {left}"
 
     def test_the_thirteenth_file_in_one_post_is_refused(self, client):
         ticket = _mint_sync(client)

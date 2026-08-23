@@ -26,6 +26,15 @@ oversized is ever held anywhere.
 Verify-Origin-when-present, per routes/mcp.py: curl sends no `Origin` and that
 is not the attack, but a page on evil.example driving this endpoint through a
 logged-in user's browser is.
+
+**Any multipart part carrying a filename is a file here, whatever its field name
+is.** The curl this server hands out says `-F file=@...`, and a stricter reading
+would refuse `-F photo=@...` with a message about field names — which is a
+confusing failure for a caller who did exactly the right thing in slightly the
+wrong words. The field name is never used for anything: the stored name comes
+from `filename` through `services.uploads.safe_name`, and the path comes from
+the manifest. A part with no filename is a plain form field and is dropped
+without being buffered.
 """
 from __future__ import annotations
 
@@ -113,10 +122,13 @@ class _Ingest:
     contains is drained immediately afterwards.
     """
 
-    def __init__(self, store, *, handle: str, subject: str) -> None:
+    def __init__(self, store, *, handle: str, subject: str,
+                 declared: int | None = None) -> None:
         self._store = store
         self._handle = handle
         self._subject = subject
+        self._declared = declared
+        self._staged_bytes = 0
         self._events: list[tuple[str, Any]] = []
         self._disposition = b""
         self._field = b""
@@ -185,13 +197,24 @@ class _Ingest:
         events, self._events = self._events, []
         for kind, payload in events:
             if kind == "begin":
-                self._write = self._store.begin(
-                    self._handle, subject=self._subject, filename=payload
+                # Whatever the client said the WHOLE body was, less what this
+                # request has already staged, is an upper bound on the next
+                # part — so the reservation stays tight for the ordinary
+                # one-file curl and honest for a multi-part one.
+                remaining = (
+                    None if self._declared is None
+                    else max(1, self._declared - self._staged_bytes)
+                )
+                self._write = await self._store.begin(
+                    self._handle, subject=self._subject, filename=payload,
+                    declared_bytes=remaining,
                 )
             elif kind == "data" and self._write is not None:
                 self._write.feed(payload)
             elif kind == "end" and self._write is not None:
-                self.staged.append(await self._write.commit())
+                staged = await self._write.commit()
+                self._staged_bytes += staged.bytes
+                self.staged.append(staged)
                 self._write = None
 
     def abort(self) -> None:
@@ -201,7 +224,8 @@ class _Ingest:
             self._write = None
 
 
-async def _consume(request: Request, store, handle: str, subject: str) -> list[StagedFile]:
+async def _consume(request: Request, store, handle: str, subject: str,
+                   declared: int | None) -> list[StagedFile]:
     _, params = parse_options_header(request.headers.get("content-type", ""))
     boundary = params.get(b"boundary")
     if not boundary:
@@ -209,7 +233,7 @@ async def _consume(request: Request, store, handle: str, subject: str) -> list[S
             status_code=400,
             detail="send the file as multipart/form-data, e.g. curl -F file=@photo.jpg",
         )
-    ingest = _Ingest(store, handle=handle, subject=subject)
+    ingest = _Ingest(store, handle=handle, subject=subject, declared=declared)
     parser = MultipartParser(boundary, ingest.callbacks())
     read = 0
     try:
@@ -219,8 +243,9 @@ async def _consume(request: Request, store, handle: str, subject: str) -> list[S
                 # A client that lied about (or omitted) Content-Length. The cap
                 # still binds, it just costs the bytes already on the wire.
                 raise uploads_service.TooLarge(
-                    f"that request is over the {uploads_service.human_size(_MAX_BODY)} one "
-                    "upload URL can take in total"
+                    "that upload sent more than the "
+                    f"{uploads_service.human_size(_MAX_BODY)} one upload URL can take in "
+                    "total (it declared no length)"
                 )
             parser.write(chunk)
             await ingest.drain()
@@ -253,8 +278,9 @@ async def stage_upload(request: Request, handle: str) -> StagedUpload:
         # not have been here.
         raise HTTPException(status_code=401, detail="invalid or expired upload token")
 
-    declared = request.headers.get("content-length")
-    if declared and declared.isdigit() and int(declared) > _MAX_BODY:
+    raw_length = request.headers.get("content-length")
+    declared = int(raw_length) if raw_length and raw_length.isdigit() else None
+    if declared is not None and declared > _MAX_BODY:
         raise HTTPException(
             status_code=413,
             detail=f"that request is over the {uploads_service.human_size(_MAX_BODY)} one "
@@ -262,7 +288,9 @@ async def stage_upload(request: Request, handle: str) -> StagedUpload:
         )
 
     try:
-        staged = await _consume(request, request.app.state.uploads, handle, subject)
+        staged = await _consume(
+            request, request.app.state.uploads, handle, subject, declared
+        )
     except uploads_service.UploadsError as exc:
         raise HTTPException(status_code=_status_for(exc), detail=str(exc)) from exc
     except FormParserError as exc:

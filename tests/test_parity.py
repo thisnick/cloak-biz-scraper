@@ -438,6 +438,74 @@ class TestThePublishedUploadSurface:
         assert not (uploads.root / dead).exists(), "the expired ticket survived a mint"
 
 
+class TestMintingCanBeRefused:
+    """Both refusals a mint can produce, over the door that has to turn them
+    into a status code. Untested when Unit C shipped; the messages are the whole
+    point of surfacing them, so they are worth a test rather than a reading."""
+
+    def test_a_full_volume_is_a_507_that_names_where_to_free_space(
+        self, client, uploads, monkeypatch
+    ):
+        from app.services import uploads as store
+
+        monkeypatch.setattr(store, "UPLOADS_BUDGET_BYTES", 8192)
+        first = _rest_ticket(client)
+        (uploads.root / first["handle"] / "filler.bin").write_bytes(b"x" * 8192)
+
+        r = client.post("/api/uploads")
+        assert r.status_code == 507, r.text
+        detail = r.json()["detail"]
+        assert "Settings" in detail and "Disk space" in detail
+
+    def test_the_tool_refuses_with_the_same_sentence(self, client, uploads, monkeypatch):
+        from app.services import uploads as store
+
+        monkeypatch.setattr(store, "UPLOADS_BUDGET_BYTES", 8192)
+        first = _rest_ticket(client)
+        (uploads.root / first["handle"] / "filler.bin").write_bytes(b"x" * 8192)
+
+        r = client.post("/mcp", headers=HEADERS, json={
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "create_upload_url", "arguments": {}},
+        })
+        result = r.json()["result"]
+        assert result["isError"] is True, result
+        text = " ".join(c.get("text", "") for c in result["content"])
+        assert "Settings" in text and "Disk space" in text
+
+    def test_a_store_that_cannot_sign_is_a_503_rather_than_a_traceback(
+        self, client, uploads, monkeypatch
+    ):
+        """The other refusal `mint` can raise, mapped rather than escaping as a 500.
+
+        Its real cause — no APP_SECRET — cannot be reached through this door:
+        the OAuth guard verifies the caller's token against the same secret, so
+        a server without one answers 401 before the route runs (checked: it
+        does). What is untested and testable is the MAPPING, so that is what
+        this drives, with the service's own refusal.
+        """
+        from app.services.uploads import UploadsError
+
+        async def cannot_sign(*, subject, secret, now=None):
+            raise UploadsError(
+                "this server has no APP_SECRET set, so it cannot mint an upload URL"
+            )
+
+        monkeypatch.setattr(app.state.uploads, "mint", cannot_sign)
+        r = client.post("/api/uploads")
+        assert r.status_code == 503, r.text
+        assert "APP_SECRET" in r.json()["detail"]
+
+    def test_the_service_really_does_refuse_without_a_secret(self, uploads):
+        """The precondition the mapping above stands in for."""
+        import asyncio
+
+        from app.services.uploads import UploadsError
+
+        with pytest.raises(UploadsError, match="APP_SECRET"):
+            asyncio.run(uploads.mint(subject="owner", secret=None))
+
+
 class TestTheTicketStaysOutOfTheLogs:
     """The token now travels in a tool RESULT, which is a place transcripts get
     kept. services/log_safety.py redacts query strings and userinfo — a bearer
