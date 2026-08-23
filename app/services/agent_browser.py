@@ -325,6 +325,14 @@ class AgentBrowserService:
         `subject or OWNER` mirrors ws_guard's fallback and for the same reason —
         a caller with no recorded subject falls back to the one resource owner,
         which is the strictest reading, never to "anybody's tickets".
+
+        Note this is the OPPOSITE convention from `tokens.verify`, where
+        `subject=None` means "any subject". That is deliberate, not an
+        inconsistency to be tidied away: there, None is a documented hole for an
+        instance whose owner was never recorded, and the worst case is a token
+        check that does not narrow. Here the same default would hand one
+        caller's staged files to another — so unknown resolves to the strictest
+        answer, not the loosest.
         """
         if self._uploads is None:
             raise AgentBrowserError(

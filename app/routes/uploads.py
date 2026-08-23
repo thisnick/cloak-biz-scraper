@@ -36,6 +36,8 @@ from fastapi import APIRouter, HTTPException, Request
 from python_multipart.exceptions import FormParserError
 from python_multipart.multipart import MultipartParser, parse_options_header
 
+from ..models import StagedFile as StagedFileView
+from ..models import StagedUpload
 from ..services import uploads as uploads_service
 from ..services.uploads import StagedFile, StagedWrite
 from .mcp import origin_allowed
@@ -61,6 +63,17 @@ _STATUS: tuple[tuple[type[Exception], int], ...] = (
     (uploads_service.Expired, 410),
     (uploads_service.NotStaged, 404),
 )
+
+
+def _fields(staged: StagedFile) -> dict[str, Any]:
+    """The service's record as the wire model's fields.
+
+    Two types for one thing on purpose: the service dataclass is what the store
+    hands back, and the pydantic model is what the schema is published from —
+    the same split `ScrapeResult` and a `Job` already live on.
+    """
+    return {"path": staged.path, "name": staged.name, "bytes": staged.bytes,
+            "sha256": staged.sha256, "content_type": staged.content_type}
 
 
 def _bearer(headers) -> str | None:
@@ -218,8 +231,8 @@ async def _consume(request: Request, store, handle: str, subject: str) -> list[S
     return ingest.staged
 
 
-@router.post("/uploads/{handle}")
-async def stage_upload(request: Request, handle: str) -> dict[str, Any]:
+@router.post("/uploads/{handle}", response_model=StagedUpload)
+async def stage_upload(request: Request, handle: str) -> StagedUpload:
     """Stage one or more files against a ticket, and answer with their paths.
 
     The response carries the first file's record at the top level and every
@@ -264,15 +277,7 @@ async def stage_upload(request: Request, handle: str) -> dict[str, Any]:
                    "e.g. curl -F file=@photo.jpg",
         )
     first = staged[0]
-    return {
-        "path": first.path,
-        "name": first.name,
-        "bytes": first.bytes,
-        "sha256": first.sha256,
-        "content_type": first.content_type,
-        "files": [
-            {"path": f.path, "name": f.name, "bytes": f.bytes,
-             "sha256": f.sha256, "content_type": f.content_type}
-            for f in staged
-        ],
-    }
+    return StagedUpload(
+        **_fields(first),
+        files=[StagedFileView(**_fields(f)) for f in staged],
+    )

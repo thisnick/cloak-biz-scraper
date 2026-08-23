@@ -38,11 +38,12 @@ from .models import (
     ProfileView,
     ScrapeResult,
     ServerInfo,
+    UploadTicket,
 )
 from .routes.guard import subject_of
 from .services.tokens import OWNER
 from .services.urls import public_base
-from .services.views import instance_view
+from .services.views import instance_view, upload_ticket
 
 logger = logging.getLogger("cloakbiz.mcp")
 
@@ -408,6 +409,46 @@ def build(app) -> FastMCP:
         if outcome.screenshot:
             blocks.append(Image(data=outcome.screenshot, format="png"))
         return blocks
+
+    @mcp.tool()
+    async def create_upload_url(ctx: Context) -> UploadTicket:
+        """Get a temporary URL for putting a file on this server, so a browser can upload it.
+
+        Use this when a page needs a file — a photo for a listing, a document for a
+        form — and the file is on YOUR machine, not this server's. MCP cannot carry
+        the bytes, so they go over plain HTTP instead: this mints a short-lived URL,
+        you POST the file to it, and it answers with a path on this server. Hand that
+        path to agent_browser to attach it to a file input.
+
+            1. create_upload_url()                     -> upload_url, token, curl
+            2. run the curl, once per file             -> {"path": "/data/uploads/..."}
+            3. agent_browser(id, "upload @e3 <path>")  -> attached to the page
+
+        You need a shell or an HTTP client for step 2. The `curl` field is the whole
+        command with the URL and token already filled in — run it as-is and change
+        only the filename. If you cannot run commands, or it fails, say so and stop:
+        there is no way to move the bytes from inside the conversation itself, and
+        pasting the file as text will not work. You can post several files in one
+        command by repeating `-F file=@...`; the answer then also carries a `files`
+        list with one entry each.
+
+        Images and PDFs only, checked by content rather than by filename. Uploaded
+        files are temporary — they are deleted a couple of hours after upload, so get
+        a fresh URL for each new task instead of reusing an old path. An expired path
+        simply fails at step 3 and tells you to upload again.
+        """
+        from .services.uploads import UploadsError
+
+        try:
+            ticket = await app.state.uploads.mint(
+                subject=_subject(ctx), secret=app.state.secret.current()
+            )
+        except UploadsError as exc:
+            # NoRoom carries the pointer at Settings -> Disk space; the no-secret
+            # case says what is unset. Both are states a person can resolve, so
+            # the message is the whole point of surfacing them.
+            raise ValueError(str(exc)) from exc
+        return upload_ticket(ticket, base_url=_base_url(ctx))
 
     @mcp.tool()
     async def server_info() -> ServerInfo:

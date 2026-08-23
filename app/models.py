@@ -338,6 +338,68 @@ class AgentBrowserResult(BaseModel):
     )
 
 
+class StagedFile(BaseModel):
+    """One file staged on this server, ready for `agent_browser`'s `upload` verb."""
+
+    path: str = Field(
+        description="Absolute path on this server. Pass it to agent_browser as "
+                    "`upload @eN <path>`. It is accepted only while its upload URL is "
+                    "live, and only for the caller it was staged for."
+    )
+    name: str = Field(description="The filename as stored — sanitized, and given a "
+                                  "-1/-2 suffix if another file already had that name.")
+    bytes: int
+    sha256: str = Field(description="Of the stored bytes. Posting the same file twice "
+                                    "returns the first copy's path rather than a second copy.")
+    content_type: str = Field(description="Decided by the file's first bytes, not by its "
+                                          "name or the Content-Type that was sent.")
+
+
+class StagedUpload(StagedFile):
+    """The answer to one POST to an upload URL.
+
+    The top-level fields describe the FIRST file, and `files` lists every file
+    the request staged. That shape is deliberate rather than accidental: the
+    pre-baked curl posts one file and a model should be able to read `path`
+    without indexing, while `-F file=@a -F file=@b` is a natural thing to type
+    and deserves a complete answer instead of a silent one.
+    """
+
+    files: list[StagedFile] = Field(
+        description="Every file this request staged, in the order they were sent. "
+                    "For a single-file POST it holds exactly the record above."
+    )
+
+
+class UploadTicket(BaseModel):
+    """A temporary URL for putting a file on this server, and the bearer for it.
+
+    Minted fresh per call and never stored, like the CDP and VNC URLs: `token`
+    is a short-lived grant to add bytes to THIS one staging slot and nothing
+    else. It is not the OAuth access token and cannot be used as one.
+    """
+
+    handle: str
+    upload_url: str = Field(description="POST files here as multipart/form-data.")
+    token: str = Field(
+        description="Send as `Authorization: Bearer <token>`. Header only — this "
+                    "endpoint does not accept the token in the URL."
+    )
+    curl: str = Field(
+        description="The whole command with the URL and token already filled in. Run "
+                    "it as-is and change only the filename."
+    )
+    expires_at: float = Field(description="Unix seconds. After this the URL stops "
+                                          "accepting files and the staged paths stop resolving.")
+    expires_in: int = Field(description="Seconds the ticket is good for, from now.")
+    max_files: int = Field(description="Most files one upload URL will hold.")
+    max_bytes_per_file: int = Field(description="Largest single file it will accept.")
+    accepts: list[str] = Field(
+        description="Content types accepted, decided by the file's first bytes rather "
+                    "than by its name or declared type."
+    )
+
+
 class ProxyInfo(BaseModel):
     configured: bool = Field(
         description="Whether the optional residential proxy is fully set up. False can mean "

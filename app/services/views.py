@@ -15,8 +15,9 @@ from ..models import (
     PoolInfo,
     ProxyInfo,
     ServerInfo,
+    UploadTicket,
 )
-from . import tokens
+from . import tokens, uploads
 
 
 def instance_view(inst, *, secret: str | None = None, base_url: str = "",
@@ -79,6 +80,49 @@ def instance_view(inst, *, secret: str | None = None, base_url: str = "",
         idle_sec=round(inst.idle_sec(), 1),
         geoip=inst.geoip,
         humanize=inst.humanize,
+    )
+
+
+def upload_ticket(ticket, *, base_url: str = "") -> UploadTicket:
+    """One staging slot, as both façades hand it to a caller.
+
+    Here rather than at either call site for the reason this module exists: the
+    tool and `POST /api/uploads` must describe the same ticket in the same
+    words, and two hand-written dicts that agree today disagree after the next
+    field is added.
+
+    **The caps come from the store's own constants, never from a literal here.**
+    A tool description that overstates what the server will accept is a bug with
+    a very long feedback loop — the model believes it for the rest of the
+    session and keeps posting files that keep being refused. Reading them from
+    `services/uploads` is what makes "what a model is told" and "what is
+    enforced" the same number by construction.
+
+    `curl` is pre-baked and copy-pasteable because models follow a whole command
+    far more reliably than they assemble one from parts, and because the one
+    thing that must not be got wrong — the token in a header rather than the URL
+    — is then not something the caller has to know.
+
+    `expires_in` is the full TTL rather than a fresh subtraction: the ticket was
+    minted for this very response, so the two are the same number, and deriving
+    it from the wall clock would make an otherwise pure view non-deterministic.
+    `expires_at` carries the absolute answer for anyone who needs to reason
+    about it later.
+    """
+    url = f"{base_url}/uploads/{ticket.handle}"
+    return UploadTicket(
+        handle=ticket.handle,
+        upload_url=url,
+        token=ticket.token,
+        curl=(
+            f"curl -H 'Authorization: Bearer {ticket.token}' "
+            f"-F 'file=@photo.jpg' {url}"
+        ),
+        expires_at=ticket.expires_at,
+        expires_in=uploads.TTL_SEC,
+        max_files=uploads.MAX_FILES_PER_TICKET,
+        max_bytes_per_file=uploads.MAX_BYTES_PER_FILE,
+        accepts=list(uploads.ACCEPTS),
     )
 
 

@@ -196,3 +196,268 @@ class TestAnArchiveIdIsNotASweep:
         assert result["isError"] is True, result
         text = " ".join(c.get("text", "") for c in result["content"])
         assert "archive task" in text and "scrape_listings" in text
+
+
+# ── create_upload_url: one ticket, two doors ─────────────────────────────────
+
+JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 60
+PNG = b"\x89PNG\r\n\x1a\n" + b"\x01" * 60
+NOT_AN_IMAGE = b"NOTION_API_TOKEN=secret_abcdef\n"
+
+
+def _rest_ticket(client) -> dict:
+    r = client.post("/api/uploads")
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def _mcp_ticket(client) -> dict:
+    r = client.post("/mcp", headers=HEADERS, json={
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "create_upload_url", "arguments": {}},
+    })
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["result"]["isError"] is False, body
+    return body["result"]["structuredContent"]
+
+
+@pytest.fixture
+def uploads(tmp_path):
+    """This test's own staging root, so a mint never writes to a shared volume."""
+    from app.services.uploads import UploadService
+
+    app.state.uploads = UploadService(tmp_path / "uploads")
+    return app.state.uploads
+
+
+class TestUploadTicketParity:
+    """`create_upload_url` mints fresh randomness on every call, so a naive
+    "call both, compare" would only ever prove that two random tickets differ.
+
+    The service call is therefore frozen to ONE ticket and both façades are asked
+    to describe it. What is left varying is exactly what parity is about — the
+    view builder and the two serialisation paths, FastAPI's `response_model`
+    against FastMCP's structured output. The live, unfrozen call is pinned
+    separately below on the fields that are not random.
+    """
+
+    @pytest.fixture
+    def frozen(self, uploads, monkeypatch):
+        from app.services.uploads import Ticket
+
+        ticket = Ticket(handle="upl_00112233445566aa", token="payload.signature",
+                        expires_at=1_800_000_000.0)
+
+        async def one_ticket(*, subject, secret, now=None):
+            return ticket
+
+        monkeypatch.setattr(app.state.uploads, "mint", one_ticket)
+        return ticket
+
+    def test_the_two_facades_describe_one_ticket_identically(self, client, frozen):
+        rest = _rest_ticket(client)
+        mcp = _mcp_ticket(client)
+        # Control first: prove this ran on the real ticket, not on two error
+        # bodies that would be trivially equal.
+        assert rest["handle"] == frozen.handle and rest["token"] == frozen.token, rest
+        assert rest == mcp, (
+            "MCP and REST disagree about an upload ticket. A field built at a call "
+            "site instead of in views.upload_ticket is how it shows up.\n"
+            f"  only in REST: {set(rest) - set(mcp)}\n"
+            f"  only in MCP : {set(mcp) - set(rest)}\n"
+            f"  differing   : {[k for k in rest if k in mcp and rest[k] != mcp[k]]}"
+        )
+        assert _sha(rest) == _sha(mcp)
+
+    def test_both_doors_hand_out_the_same_absolute_upload_url(self, client, frozen):
+        """The URL is the whole point of the ticket, and it is derived from the
+        request's own origin — the one field most likely to differ between an
+        ASGI tool call and a FastAPI route."""
+        rest, mcp = _rest_ticket(client), _mcp_ticket(client)
+        assert rest["upload_url"] == f"https://testserver/uploads/{frozen.handle}"
+        assert mcp["upload_url"] == rest["upload_url"]
+
+    def test_a_live_mint_agrees_on_everything_that_is_not_random(self, client, uploads):
+        """The unfrozen path, so the parity above cannot pass on a stub alone."""
+        rest, mcp = _rest_ticket(client), _mcp_ticket(client)
+        assert rest["handle"] != mcp["handle"], "each call really did mint its own"
+        stable = ("expires_in", "max_files", "max_bytes_per_file", "accepts")
+        assert {k: rest[k] for k in stable} == {k: mcp[k] for k in stable}
+        for payload in (rest, mcp):
+            assert payload["upload_url"].startswith("https://testserver/uploads/upl_")
+            assert payload["curl"].endswith(payload["upload_url"])
+            assert payload["token"] in payload["curl"]
+
+
+class TestThePublishedUploadSurface:
+    """What a model is TOLD must be what the server actually does. A tool
+    description that overstates the caps is a bug with a very long feedback
+    loop: the model believes it for the rest of the session and keeps posting
+    files that keep being refused."""
+
+    def test_exactly_one_new_tool_appears(self, client):
+        r = client.post("/mcp", headers=HEADERS,
+                        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        names = {t["name"] for t in r.json()["result"]["tools"]}
+        assert "create_upload_url" in names
+        assert len(names) == 15, sorted(names)
+        assert "stage_from_url" not in names and "release_upload" not in names
+
+    def test_it_takes_no_arguments(self, client):
+        """No arguments is the design: the caps are the server's, so there is
+        nothing for a caller to size in advance."""
+        r = client.post("/mcp", headers=HEADERS,
+                        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        tool = next(t for t in r.json()["result"]["tools"] if t["name"] == "create_upload_url")
+        assert tool["inputSchema"].get("properties", {}) == {}
+        assert not tool["inputSchema"].get("required")
+
+    def test_the_description_teaches_the_three_step_flow(self, client):
+        r = client.post("/mcp", headers=HEADERS,
+                        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        doc = next(t for t in r.json()["result"]["tools"]
+                   if t["name"] == "create_upload_url")["description"]
+        assert "create_upload_url()" in doc and "agent_browser" in doc
+        # The two sentences that stop a no-egress client burning turns, and stop
+        # a model trying to paste a photo as ~a million tokens of base64.
+        assert "say so and stop" in doc
+        assert "pasting the file as text will not work" in doc
+        assert "checked by content rather than by filename" in doc
+
+    def test_the_caps_it_reports_are_the_caps_that_are_enforced(self, client, uploads,
+                                                                monkeypatch):
+        """Not "the number equals another literal" — the number is lowered, the
+        ticket is asked what it allows, and the endpoint is made to prove it."""
+        from app.services import uploads as store
+
+        monkeypatch.setattr(store, "MAX_BYTES_PER_FILE", 200)
+        ticket = _rest_ticket(client)
+        assert ticket["max_bytes_per_file"] == 200
+
+        auth = {"Authorization": f"Bearer {ticket['token']}"}
+        ok = client.post(ticket["upload_url"], headers=auth,
+                         files={"file": ("small.jpg", JPEG, "image/jpeg")})
+        too_big = client.post(ticket["upload_url"], headers=auth,
+                              files={"file": ("big.jpg", JPEG + b"\x00" * 5000,
+                                              "image/jpeg")})
+        assert ok.status_code == 200, ok.text
+        assert too_big.status_code == 413, too_big.text
+
+    def test_the_file_count_it_reports_is_the_count_that_is_enforced(self, client, uploads,
+                                                                    monkeypatch):
+        from app.services import uploads as store
+
+        monkeypatch.setattr(store, "MAX_FILES_PER_TICKET", 2)
+        ticket = _rest_ticket(client)
+        assert ticket["max_files"] == 2
+
+        r = client.post(ticket["upload_url"],
+                        headers={"Authorization": f"Bearer {ticket['token']}"},
+                        files=[("file", (f"p{n}.jpg", JPEG + bytes([n]), "image/jpeg"))
+                               for n in range(3)])
+        assert r.status_code == 409, r.text
+
+    def test_what_it_says_it_accepts_is_what_it_accepts(self, client, uploads):
+        ticket = _rest_ticket(client)
+        assert ticket["accepts"] == ["image/jpeg", "image/png", "image/webp",
+                                     "image/gif", "application/pdf"]
+
+        auth = {"Authorization": f"Bearer {ticket['token']}"}
+        refused = client.post(ticket["upload_url"], headers=auth,
+                              files={"file": ("photo.jpg", NOT_AN_IMAGE, "image/jpeg")})
+        assert refused.status_code == 415, refused.text
+        for name, data, declared in (("a.jpg", JPEG, "image/jpeg"),
+                                     ("b.png", PNG, "image/png")):
+            r = client.post(ticket["upload_url"], headers=auth,
+                            files={"file": (name, data, declared)})
+            assert r.status_code == 200, r.text
+            assert r.json()["content_type"] in ticket["accepts"]
+
+    def test_the_expiry_it_reports_is_the_expiry_it_was_minted_with(self, client, uploads):
+        import time
+
+        from app.services import uploads as store
+
+        ticket = _rest_ticket(client)
+        assert ticket["expires_in"] == store.TTL_SEC
+        assert abs(ticket["expires_at"] - (time.time() + ticket["expires_in"])) < 5
+
+    def test_the_pre_baked_curl_is_a_command_that_actually_works(self, client, uploads):
+        """Models follow a whole command far more reliably than they assemble one
+        from parts, so the whole command has to be right — including the part
+        that matters, the token in a HEADER rather than in the URL."""
+        import shlex
+
+        ticket = _rest_ticket(client)
+        argv = shlex.split(ticket["curl"])
+        assert argv[0] == "curl"
+        name, _, value = argv[argv.index("-H") + 1].partition(": ")
+        url = argv[-1]
+        assert name == "Authorization" and value.startswith("Bearer ")
+        assert url == ticket["upload_url"]
+        assert ticket["token"] not in url, "the token must not ride in the URL"
+        assert "-F" in argv and argv[argv.index("-F") + 1].startswith("file=@")
+
+        r = client.post(url, headers={name: value},
+                        files={"file": ("photo.jpg", JPEG, "image/jpeg")})
+        assert r.status_code == 200, r.text
+        assert r.json()["path"].endswith(f"/{ticket['handle']}/photo.jpg")
+
+    def test_the_path_it_hands_back_is_one_agent_browser_will_accept(self, client, uploads):
+        """The end of the chain the description promises: step 2's path is a path
+        step 3 resolves. If these two ever disagreed, the tool would be telling a
+        model to do something that cannot work."""
+        import pathlib
+
+        ticket = _rest_ticket(client)
+        r = client.post(ticket["upload_url"],
+                        headers={"Authorization": f"Bearer {ticket['token']}"},
+                        files={"file": ("photo.jpg", JPEG, "image/jpeg")})
+        staged = r.json()["path"]
+
+        assert app.state.uploads.resolve_for("owner", [staged]) == [
+            pathlib.Path(staged).resolve()
+        ]
+
+    def test_minting_sweeps_expired_tickets_first(self, client, uploads):
+        """The mint is the only thing that frees this space, so the sweep has to
+        happen on the way through rather than on a timer that would keep a
+        sleeping container awake."""
+        import json
+        import time
+
+        dead = _rest_ticket(client)["handle"]
+        manifest = uploads.root / dead / ".ticket.json"
+        record = json.loads(manifest.read_text())
+        record["expires"] = time.time() - 1
+        manifest.write_text(json.dumps(record))
+
+        _rest_ticket(client)
+
+        assert not (uploads.root / dead).exists(), "the expired ticket survived a mint"
+
+
+class TestTheTicketStaysOutOfTheLogs:
+    """The token now travels in a tool RESULT, which is a place transcripts get
+    kept. services/log_safety.py redacts query strings and userinfo — a bearer
+    in a header is outside what it can see, so the only defence is that nothing
+    logs it. This is what checks that."""
+
+    def test_no_log_line_anywhere_carries_the_token(self, client, uploads, caplog):
+        import logging
+
+        with caplog.at_level(logging.DEBUG):
+            ticket = _rest_ticket(client)
+            r = client.post(ticket["upload_url"],
+                            headers={"Authorization": f"Bearer {ticket['token']}"},
+                            files={"file": ("photo.jpg", JPEG, "image/jpeg")})
+        assert r.status_code == 200, r.text
+
+        logged = "\n".join(record.getMessage() for record in caplog.records)
+        assert ticket["token"] not in logged
+        assert ticket["curl"] not in logged
+        # The handle is deliberately NOT secret — it is in the URL path, it is
+        # useless without the token, and a log that cannot name the ticket
+        # cannot explain anything.
+        assert ticket["handle"] in logged, "nothing was logged at all; the test proves nothing"

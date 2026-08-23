@@ -37,6 +37,7 @@ from ..models import (
     ProfileView,
     ScrapeResult,
     ServerInfo,
+    UploadTicket,
 )
 from ..services.geo import GeoUnresolved, ProxyUnreachable
 from ..services.instances import BrowserUnavailable, CapExceeded
@@ -45,7 +46,7 @@ from ..services.proxy import ProxyNotConfigured
 from ..services.scrape import NotASweep, NotionNotConfigured
 from ..services.tokens import OWNER
 from ..services.urls import public_base
-from ..services.views import instance_view
+from ..services.views import instance_view, upload_ticket
 from ..sources import UnsupportedURL
 from .guard import subject_of
 
@@ -141,6 +142,30 @@ async def get_scrape_listing_results(request: Request, job_id: str) -> ScrapeRes
 async def archive_page(request: Request, body: ArchiveRequest) -> ArchiveResult:
     """Read a page and append it to a Notion page. Blocking, ~40-60s."""
     return await request.app.state.archive.archive(body.url, body.notion_page_id)
+
+
+@router.post("/uploads", response_model=UploadTicket)
+async def create_upload_url(request: Request) -> UploadTicket:
+    """REST mirror of the create_upload_url MCP tool — mints one staging slot.
+
+    Takes no body: the ticket's caps are the server's, so there is nothing for a
+    caller to size in advance. The bytes go to the `upload_url` this returns,
+    which is NOT under /api and carries its own short-lived ticket rather than
+    this OAuth token — see routes/uploads.py for why.
+    """
+    from ..services.uploads import NoRoom, UploadsError
+
+    try:
+        ticket = await request.app.state.uploads.mint(
+            subject=_subject(request), secret=request.app.state.secret.current()
+        )
+    except NoRoom as exc:
+        # 507: the request was fine, the volume is full. The message names the
+        # one place a person can free it.
+        raise HTTPException(status_code=507, detail=str(exc)) from exc
+    except UploadsError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return upload_ticket(ticket, base_url=_base_url(request))
 
 
 @router.get("/server-info", response_model=ServerInfo)

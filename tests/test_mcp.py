@@ -84,6 +84,7 @@ class TestStateless:
             "list_instances",
             "get_instance",
             "agent_browser",
+            "create_upload_url",
             "server_info",
             "list_profiles",
             "create_profile",
