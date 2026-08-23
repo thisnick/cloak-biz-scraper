@@ -1,9 +1,10 @@
 """One HMAC signer, for every bearer this app mints.
 
-There are now five kinds of signed token here — the UI session cookie, the CDP
-token, the VNC token, and OAuth's access and refresh tokens — and **all five are
-keyed on the same APP_SECRET**. That is a deliberate simplification (one secret,
-rotatable, revoking everything at once) with one sharp consequence:
+There are now six kinds of signed token here — the UI session cookie, the CDP
+token, the VNC token, OAuth's access and refresh tokens, and the upload ticket —
+and **all six are keyed on the same APP_SECRET**. That is a deliberate
+simplification (one secret, rotatable, revoking everything at once) with one
+sharp consequence:
 
     a valid signature proves the token came from us. It proves NOTHING about
     what the token is FOR.

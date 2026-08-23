@@ -1,0 +1,854 @@
+"""Bytes an agent hands us, staged at a path this service is willing to vouch for.
+
+MCP tool arguments are JSON, so a photo cannot travel in a tool call — the agent
+POSTs it over plain HTTP instead and gets back a container-side path. That path
+is later fed to `agent-browser upload`, which is `setInputFiles`, which reads
+whatever it is pointed at. Two directories above this one sit `settings.json`
+and the `.dek` that decrypts it, so the interesting question is never "can we
+write the bytes" but **"can we still prove, later, that we wrote them"**.
+
+That proof is `.ticket.json`. Every staged file is recorded there with the name
+we chose for it, and `resolve_for` will hand back nothing that is not in that
+record. A path the caller invented — `/data/.dek`, `/etc/passwd`, a name we
+never wrote — has no entry, so there is nothing to return. And what is returned
+is the path built from the *manifest*, never the caller's string reused after a
+boolean check: the same discipline `reclaim.removable_child` states outright
+("callers remove the Path returned here, never the one they passed in").
+
+**One directory per ticket, directly under the uploads root.** That is what
+makes every entry a direct child, which is exactly the shape
+`reclaim.removable_child` requires, so expiry can reuse the containment rule the
+rest of the volume already deletes through instead of growing a second one.
+
+**On the volume, not /tmp.** services/heartbeat.py documents that Railway sleeps
+after ten minutes without outbound traffic, and the container can nap between
+the upload and the browser call — the model thinks, the user wanders off. A
+staged file that evaporates between two tool calls is a miserable bug to
+diagnose.
+
+**The token is its own kind.** `signing.py`'s thesis is that a valid signature
+proves a token came from us and proves nothing about what it is *for*; the
+audience is the type system. A ticket is `upload:<handle>`, so a CDP token, a
+VNC token, a session cookie and a ticket for a *different* handle all fail to
+verify here, and a ticket grants exactly "add bytes to this one staging slot".
+
+**Content is decided by the first bytes, not by what the caller called it.** An
+extension is a claim and `Content-Type` is a claim; the magic number is
+evidence. That is what makes "upload my .env named photo.jpg" a 415 rather than
+a file sitting on the volume waiting to be posted to a listing site.
+
+Nothing here is released by hand. There is no release call, because "the client
+must remember to clean up" is a contract clients do not keep — a conversation
+ends, a model moves on, a Railway nap lands mid-task. Files expire on a clock
+instead: `resolve_for` refuses a ticket past its TTL long before `sweep` takes
+the bytes away, so the expiry a caller actually experiences is a refusal that
+says to upload again, not a mystery 404.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import re
+import secrets
+import threading
+import time
+from dataclasses import dataclass
+from hashlib import sha256
+from pathlib import Path
+from typing import AsyncIterator, Callable, Iterable
+
+from . import reclaim, signing
+from .profile_sizes import measure_dir
+
+logger = logging.getLogger("cloakbiz.uploads")
+
+# ── The caps, as the four numbers a model is told and the server enforces ────
+#
+# Per-file is generous on purpose: full-resolution camera output and scanned
+# PDFs both live near 100 MB, and a user should not have to think about it. The
+# per-ticket total is the one that actually binds — 12 x 100 MB is 1.2 GB, which
+# no Railway volume should absorb from a single call. Both are enforced WHILE
+# the bytes stream, never after the body has landed.
+MAX_BYTES_PER_FILE = 100 * 1024 * 1024
+MAX_FILES_PER_TICKET = 12
+MAX_BYTES_PER_TICKET = 250 * 1024 * 1024
+
+# The global ceiling, checked when a ticket is minted. These are the first
+# genuinely large files on a volume that also holds profiles, evidence,
+# settings.json and the .dek. Refusing to mint is far kinder than filling the
+# volume and having profile writes start failing — and with no manual release,
+# the TTL and the mint-time sweep are the only things that ever free this space,
+# which makes this check load-bearing rather than belt-and-braces.
+UPLOADS_BUDGET_BYTES = 1024 * 1024 * 1024
+
+# Two hours: long enough that the same photos can be posted to several sites in
+# one session, short enough that a forgotten ticket is a rounding error on the
+# volume. The signed token and the manifest carry the SAME expiry, so a live
+# token can never name a dead ticket or the reverse.
+TTL_SEC = 2 * 60 * 60
+
+HANDLE_PREFIX = "upl_"
+_HANDLE_RE = re.compile(r"^upl_[0-9a-f]{16}$")
+
+# The audience half of `upload:<handle>`. See tokens.py: cdp/vnc are separate
+# audiences for the same reason.
+AUD = "upload"
+
+MANIFEST_NAME = ".ticket.json"
+_INCOMING_PREFIX = ".incoming-"
+
+# What the client is told it may send, in the order a model reads them.
+ACCEPTS = ("image/jpeg", "image/png", "image/webp", "image/gif", "application/pdf")
+
+# WebP needs twelve bytes to identify (RIFF....WEBP); everything else needs
+# fewer, so twelve is the whole sniff window and nothing is written before it
+# has been read.
+_SNIFF_BYTES = 12
+_MAGIC = (
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+    (b"%PDF-", "application/pdf"),
+)
+
+_EXTENSION = {
+    "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp",
+    "image/gif": ".gif", "application/pdf": ".pdf",
+}
+
+# A filename is caller-controlled text that becomes a path component, so it is
+# an allow-list, not a blocklist. Everything outside it collapses to "_".
+_UNSAFE_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
+MAX_NAME_LEN = 100
+
+
+class UploadsError(Exception):
+    """Something about this upload is refused. Every subclass says what to do."""
+
+
+class NotStaged(UploadsError):
+    """This path is not a file we wrote down. The refusal the whole module exists for."""
+
+
+class Expired(UploadsError):
+    """A real staged file, past its TTL. Deliberately NOT the same error as
+    NotStaged: this one is the status check, arriving at the only moment it
+    matters, and "upload it again" is a different instruction from "you made
+    that path up"."""
+
+
+class UnsupportedType(UploadsError):
+    """The bytes are not one of the accepted image/PDF formats."""
+
+
+class TooLarge(UploadsError):
+    """A per-file or per-ticket byte cap tripped mid-stream."""
+
+
+class TooMany(UploadsError):
+    """This ticket already holds MAX_FILES_PER_TICKET files."""
+
+
+class NoRoom(UploadsError):
+    """The uploads folder is at its global budget; minting is refused."""
+
+
+@dataclass(frozen=True)
+class StagedFile:
+    """One file on the volume, as the caller is told about it.
+
+    `path` is absolute and container-side because that is what
+    `agent-browser upload` takes, and a path reads to a model far better than an
+    opaque handle would. It is safe to hand out only because `resolve_for` will
+    not accept it back without finding it in a manifest first.
+    """
+
+    path: str
+    name: str
+    bytes: int
+    sha256: str
+    content_type: str
+
+
+@dataclass(frozen=True)
+class Ticket:
+    """A freshly minted staging slot: where to POST, and the bearer that opens it."""
+
+    handle: str
+    token: str
+    expires_at: float
+
+
+@dataclass(frozen=True)
+class UploadsView:
+    """What staged uploads are costing, and when that was measured."""
+
+    handles: int
+    files: int
+    bytes: int
+    expired: int  # tickets past their TTL that no sweep has reached yet
+    measured_at: float
+
+
+@dataclass(frozen=True)
+class SweptUploads:
+    """What a sweep actually removed — never what it set out to remove."""
+
+    handles: int
+    files: int
+    bytes: int
+    kept: int      # tickets still live, left exactly as they were
+    refused: int   # entries reclaim.Unsafe would not vouch for
+
+
+# ── Tokens ───────────────────────────────────────────────────────────────────
+
+
+def audience(handle: str) -> str:
+    return f"{AUD}:{handle}"
+
+
+def issue_ticket(handle: str, secret: str, *, subject: str,
+                 ttl_sec: int = TTL_SEC, now: float | None = None) -> str:
+    """The bearer for one staging slot and one subject. Minted per ticket."""
+    return signing.issue(
+        {"aud": audience(handle), "sub": subject}, secret, ttl_sec=ttl_sec, now=now
+    )
+
+
+def ticket_subject(token: str | None, handle: str, secret: str | None, *,
+                   now: float | None = None) -> str | None:
+    """The subject a live ticket for *this* handle was minted for, else None.
+
+    The upload route sits outside the OAuth gate, so it has no other identity to
+    work from: the subject comes out of the signed bytes, and the store then
+    matches it against the one recorded in the ticket's manifest. Only APP_SECRET
+    can produce those bytes, so a caller cannot name a subject of their choosing.
+
+    The audience check inside is what stops a ticket for one slot writing into
+    another, and what stops every other bearer this app mints — CDP, VNC, the
+    session cookie, an OAuth access or refresh token — from writing at all.
+    """
+    if not handle or not _HANDLE_RE.match(handle):
+        return None
+    claims = signing.verify(token, secret, audience=audience(handle), now=now)
+    if claims is None:
+        return None
+    subject = claims.get("sub")
+    return subject if isinstance(subject, str) else None
+
+
+def verify_ticket(token: str | None, handle: str, secret: str | None, *,
+                  subject: str | None, now: float | None = None) -> bool:
+    """True only for a live ticket minted for this handle AND this subject.
+
+    `subject=None` means "any subject", matching tokens.verify. Nothing in the
+    upload path passes None — the route reads the subject out of the token with
+    `ticket_subject` and the manifest is what it is checked against.
+    """
+    actual = ticket_subject(token, handle, secret, now=now)
+    if actual is None:
+        return False
+    return subject is None or actual == subject
+
+
+# ── Names, magic bytes, manifests ────────────────────────────────────────────
+
+
+def sniff(head: bytes) -> str | None:
+    """The content type these first bytes actually are, or None.
+
+    Not the extension and not the declared Content-Type — both are things the
+    caller said. This is the check that makes "upload my .env, call it
+    photo.jpg" fail, whatever it was named and whatever header rode with it.
+    """
+    for magic, content_type in _MAGIC:
+        if head.startswith(magic):
+            return content_type
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def _require_type(head: bytes) -> str:
+    content_type = sniff(head)
+    if content_type is None:
+        raise UnsupportedType(
+            "that file is not an image or a PDF — this endpoint accepts "
+            + ", ".join(ACCEPTS)
+            + ", checked by content rather than by filename"
+        )
+    return content_type
+
+
+def human_size(count: int) -> str:
+    """A byte count as a person reads it. MB is the unit these caps are written
+    in, but a cap lowered under a test would otherwise print "0 MB"."""
+    if count >= 1024 * 1024:
+        return f"{count // (1024 * 1024)} MB"
+    if count >= 1024:
+        return f"{count // 1024} KB"
+    return f"{count} bytes"
+
+
+def _split_ext(name: str) -> tuple[str, str]:
+    stem, dot, ext = name.rpartition(".")
+    if not dot or len(ext) > 8:  # ".tar.gz" is fine; "a.name-with-dots" is not an ext
+        return name, ""
+    return stem, f".{ext}"
+
+
+def safe_name(raw: str, content_type: str) -> str:
+    """A caller-supplied filename reduced to one safe path component.
+
+    Basename only (both separators, because a Windows client sends
+    `C:\\photos\\a.jpg`), an allow-list of characters, and a length cap that
+    keeps the extension. Leading dots are stripped, which is not cosmetic: it is
+    what guarantees a staged file can never be named `.ticket.json` or shadow an
+    in-flight `.incoming-*` temp file, so the manifest cannot be overwritten by
+    something it is supposed to be describing.
+    """
+    basename = re.split(r"[\\/]", raw or "")[-1]
+    cleaned = _UNSAFE_CHARS.sub("_", basename).strip("._-")
+    if not cleaned:
+        return f"upload{_EXTENSION.get(content_type, '')}"
+    stem, ext = _split_ext(cleaned)
+    stem = stem[: max(1, MAX_NAME_LEN - len(ext))]
+    return f"{stem}{ext}"
+
+
+def _unique_name(name: str, taken: Iterable[str]) -> str:
+    """`photo.jpg`, `photo-1.jpg`, `photo-2.jpg` — two different files that
+    arrived under one name are two files, not one overwritten one."""
+    taken = set(taken)
+    if name not in taken:
+        return name
+    stem, ext = _split_ext(name)
+    stem = stem[: max(1, MAX_NAME_LEN - len(ext) - 5)]
+    for n in range(1, 1000):
+        candidate = f"{stem}-{n}{ext}"
+        if candidate not in taken:
+            return candidate
+    return f"{stem}-{secrets.token_hex(4)}{ext}"  # pragma: no cover - 999 collisions
+
+
+def _read_manifest(ticket_dir: Path) -> dict | None:
+    """The ticket's record, or None for anything we cannot read as one.
+
+    Fail closed and never raise: a missing, truncated or hand-edited manifest
+    means nothing in that directory resolves, which is the safe reading. A
+    half-written one cannot happen — see _write_manifest — but a volume can
+    still hand back garbage, and the answer to garbage is "not staged".
+    """
+    try:
+        raw = (ticket_dir / MANIFEST_NAME).read_bytes()
+    except OSError:
+        return None
+    try:
+        manifest = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        logger.warning("unreadable manifest in %s; treating it as empty", ticket_dir.name)
+        return None
+    if (
+        not isinstance(manifest, dict)
+        or not isinstance(manifest.get("sub"), str)
+        or not isinstance(manifest.get("expires"), (int, float))
+        or not isinstance(manifest.get("files"), list)
+    ):
+        logger.warning("malformed manifest in %s; treating it as empty", ticket_dir.name)
+        return None
+    return manifest
+
+
+def _write_manifest(ticket_dir: Path, manifest: dict) -> None:
+    """Replace the manifest atomically.
+
+    Temp file plus os.replace, because the crash window matters here: the
+    manifest IS the allow-list, and one truncated by a container that died
+    mid-write would make every file in the ticket unresolvable — the exact
+    "staged file evaporated between two tool calls" bug this store exists to
+    avoid. os.replace is atomic within a directory, so a reader sees the old
+    record or the new one and never a partial one.
+    """
+    tmp = ticket_dir / f"{MANIFEST_NAME}.tmp-{secrets.token_hex(4)}"
+    tmp.write_text(json.dumps(manifest, separators=(",", ":"), sort_keys=True))
+    os.replace(tmp, ticket_dir / MANIFEST_NAME)
+
+
+def _expired(manifest: dict, now: float) -> bool:
+    return float(manifest.get("expires") or 0) <= now
+
+
+def _record(ticket_dir: Path, entry: dict) -> StagedFile:
+    return StagedFile(
+        path=str(ticket_dir / entry["name"]),
+        name=entry["name"],
+        bytes=int(entry.get("bytes", 0)),
+        sha256=str(entry.get("sha256", "")),
+        content_type=str(entry.get("content_type", "")),
+    )
+
+
+_NOT_STAGED = (
+    "{path!r} is not an uploaded file — call create_upload_url first, POST the file to "
+    "the URL it hands back, and use the path from that response"
+)
+_EXPIRED = (
+    "{path!r} has expired — staged files last two hours. Call create_upload_url and "
+    "upload it again."
+)
+
+
+# ── The store ────────────────────────────────────────────────────────────────
+
+
+class StagedWrite:
+    """One file being written into one ticket, checked byte by byte.
+
+    Deliberately a push interface rather than "hand me a stream": the multipart
+    parser is callback-driven, and inverting it into an async iterator would
+    mean buffering a whole part somewhere first — which is the one thing this
+    class exists to avoid. `stage()` wraps it for callers that do have a stream.
+
+    **A refusal cleans up after itself.** Every path out of feed/commit that
+    raises unlinks the partial file before the exception leaves, so a tripped
+    cap cannot leave 250 MB on the volume for a sweep to find in two hours. That
+    is here rather than in the caller because a caller can forget.
+    """
+
+    def __init__(self, service: "UploadService", ticket_dir: Path, *,
+                 filename: str, used_bytes: int) -> None:
+        self._service = service
+        self._ticket_dir = ticket_dir
+        self._filename = filename
+        self._used = used_bytes
+        self._tmp = ticket_dir / f"{_INCOMING_PREFIX}{secrets.token_hex(8)}"
+        self._out = open(self._tmp, "wb")
+        self._digest = sha256()
+        self._written = 0
+        self._head = b""
+        self._closed = False
+        self.content_type: str | None = None
+
+    # ── writing ──
+    def feed(self, data: bytes) -> None:
+        """Take the next slice of the part. Raises the moment a rule is broken."""
+        if not data:
+            return
+        try:
+            if self.content_type is None:
+                self._head += data
+                if len(self._head) < _SNIFF_BYTES:
+                    return  # still nothing on disk: we have not decided what this is
+                data, self._head = self._head, b""
+                self.content_type = _require_type(data)
+            self._admit(data)
+        except UploadsError:
+            self.abort()
+            raise
+
+    def _admit(self, data: bytes) -> None:
+        self._written += len(data)
+        if self._written > MAX_BYTES_PER_FILE:
+            raise TooLarge(
+                f"that file is over the {human_size(MAX_BYTES_PER_FILE)} limit for a "
+                "single upload"
+            )
+        if self._used + self._written > MAX_BYTES_PER_TICKET:
+            raise TooLarge(
+                f"this upload URL can hold {human_size(MAX_BYTES_PER_TICKET)} in total and "
+                "that file would take it over. Get a fresh upload URL for the rest."
+            )
+        self._digest.update(data)
+        self._out.write(data)
+
+    async def commit(self) -> StagedFile:
+        """Name the file, record it in the manifest, and hand back its path.
+
+        Keyed by sha256: the same bytes staged twice return the file that is
+        already there, at the same path, which makes a retried curl idempotent
+        for free rather than leaving two copies of one photo on the volume.
+
+        The caps are re-checked HERE against a freshly read manifest, not
+        against the count this write started with — two POSTs to one ticket can
+        overlap, and the check that decides is the one holding the lock.
+        """
+        try:
+            if self.content_type is None:
+                # The whole part was shorter than the sniff window. A six-byte
+                # GIF header is a legitimate (if useless) file; an empty part is
+                # not, and `sniff(b"")` says so.
+                self.content_type = _require_type(self._head)
+                self._admit(self._head)
+                self._head = b""
+            self._out.close()
+            checksum = self._digest.hexdigest()
+
+            async with self._service._lock:
+                manifest = _read_manifest(self._ticket_dir)
+                if manifest is None:
+                    raise NotStaged("that upload URL is no longer valid")
+                if _expired(manifest, time.time()):
+                    raise Expired(
+                        "that upload URL has expired — call create_upload_url for a new one"
+                    )
+                entries = list(manifest.get("files") or [])
+                for entry in entries:
+                    if entry.get("sha256") == checksum:
+                        self.abort()
+                        return _record(self._ticket_dir, entry)
+                if len(entries) >= MAX_FILES_PER_TICKET:
+                    raise TooMany(
+                        f"this upload URL already holds {MAX_FILES_PER_TICKET} files, which "
+                        "is its limit. Call create_upload_url for another."
+                    )
+                total = sum(int(e.get("bytes", 0)) for e in entries)
+                if total + self._written > MAX_BYTES_PER_TICKET:
+                    raise TooLarge(
+                        f"this upload URL can hold {human_size(MAX_BYTES_PER_TICKET)} in total "
+                        "and that file would take it over. Get a fresh upload URL for "
+                        "the rest."
+                    )
+                name = _unique_name(
+                    safe_name(self._filename, self.content_type),
+                    {str(e.get("name")) for e in entries},
+                )
+                os.replace(self._tmp, self._ticket_dir / name)
+                self._closed = True
+                entry = {
+                    "name": name, "bytes": self._written, "sha256": checksum,
+                    "content_type": self.content_type,
+                }
+                manifest["files"] = entries + [entry]
+                _write_manifest(self._ticket_dir, manifest)
+        except UploadsError:
+            self.abort()
+            raise
+        logger.info(
+            "staged %s (%d bytes, %s) in %s",
+            name, self._written, self.content_type, self._ticket_dir.name,
+        )
+        return _record(self._ticket_dir, entry)
+
+    def abort(self) -> None:
+        """Close and remove the partial file. Idempotent, and safe after commit."""
+        if not self._closed:
+            self._closed = True
+            try:
+                self._out.close()
+            except OSError:  # pragma: no cover - defensive
+                pass
+            self._tmp.unlink(missing_ok=True)
+
+
+class UploadService:
+    """The staging store: mint a ticket, stream bytes into it, resolve a path back.
+
+    Holds the root and nothing else. The signing secret is passed in per call
+    rather than captured, exactly as services/tokens.py takes it: APP_SECRET is
+    read from the environment on every use so a rotation takes effect on the
+    redeploy that restarts the process, and a captured copy would quietly
+    outlive it.
+
+    The root is created lazily, on the first mint. A volume that cannot be
+    written to must not be discovered at construction time, where it would take
+    down boot for a feature nobody has used yet.
+    """
+
+    def __init__(self, root: str | Path) -> None:
+        self.root = Path(root)
+        # Guards only the read-modify-write of a manifest, which is small and
+        # never holds across a byte of I/O. Built here rather than per call so
+        # two POSTs to one ticket contend on the same lock.
+        self._lock = asyncio.Lock()
+
+    # ── minting ──
+    async def mint(self, *, subject: str, secret: str | None,
+                   now: float | None = None) -> Ticket:
+        """A fresh ticket: its own directory, its own manifest, its own bearer.
+
+        Sweeps first, then checks the global budget, and the order is the point:
+        expired tickets are the space a new one is entitled to reuse, and with
+        no manual release the sweep is the only thing that frees any. Doing both
+        HERE rather than in the caller is what stops a future second door onto
+        this store from forgetting one of them.
+        """
+        if not secret:
+            raise UploadsError(
+                "this server has no APP_SECRET set, so it cannot mint an upload URL"
+            )
+        await self.sweep(now=now)
+        used, _files = await asyncio.to_thread(measure_dir, self.root)
+        if used >= UPLOADS_BUDGET_BYTES:
+            raise NoRoom(
+                f"uploaded files are already using {human_size(used)}, which is the "
+                f"{human_size(UPLOADS_BUDGET_BYTES)} this server keeps for them. "
+                "They expire on their own within two hours; to free the space now, open "
+                "Settings \u2192 Disk space and clear uploaded files."
+            )
+        now = time.time() if now is None else now
+        handle = f"{HANDLE_PREFIX}{secrets.token_hex(8)}"
+        ticket_dir = self.root / handle
+        ticket_dir.mkdir(parents=True)
+        _write_manifest(ticket_dir, {
+            "sub": subject, "created": now, "expires": now + TTL_SEC, "files": [],
+        })
+        logger.info("minted upload ticket %s for %s", handle, subject)
+        return Ticket(
+            handle=handle,
+            token=issue_ticket(handle, secret, subject=subject, now=now),
+            expires_at=now + TTL_SEC,
+        )
+
+    # ── writing ──
+    def begin(self, handle: str, *, subject: str, filename: str,
+              now: float | None = None) -> StagedWrite:
+        """Open a write into a live, subject-owned ticket.
+
+        Everything checkable before a byte arrives is checked before a byte
+        arrives: a handle that is not one of ours, a ticket that is gone, one
+        belonging to somebody else, one past its TTL, or one already full. What
+        cannot be known yet — the type and the size — is checked as it streams.
+        """
+        now = time.time() if now is None else now
+        ticket_dir = self._ticket_dir(handle)
+        manifest = self._live_manifest(ticket_dir, subject, now)
+        entries = manifest.get("files") or []
+        if len(entries) >= MAX_FILES_PER_TICKET:
+            raise TooMany(
+                f"this upload URL already holds {MAX_FILES_PER_TICKET} files, which is its "
+                "limit. Call create_upload_url for another."
+            )
+        return StagedWrite(
+            self, ticket_dir, filename=filename,
+            used_bytes=sum(int(e.get("bytes", 0)) for e in entries),
+        )
+
+    async def stage(self, handle: str, *, subject: str, filename: str,
+                    stream: AsyncIterator[bytes], now: float | None = None) -> StagedFile:
+        """`begin` + feed a whole stream + `commit`, for callers that have one.
+
+        The HTTP route does not use this — its parser pushes — but a stream is
+        the natural shape for a test and for the deferred server-side fetch, and
+        both must go through exactly the same caps and sniffing as the route.
+        """
+        write = self.begin(handle, subject=subject, filename=filename, now=now)
+        try:
+            async for chunk in stream:
+                write.feed(chunk)
+            return await write.commit()
+        finally:
+            write.abort()
+
+    # ── the security function ──
+    def resolve_for(self, subject: str, paths: Iterable[str],
+                    *, now: float | None = None) -> list[Path]:
+        """The real files behind caller-supplied paths, or raise. **Both gates.**
+
+        1. **Manifest allow-list.** The path must name a file recorded in a
+           ticket that is live and owned by this subject. Not "a path that looks
+           like ours" — a path we wrote down.
+        2. **Containment.** The caller's path and the path built from the
+           manifest must both resolve inside that ticket's own directory.
+           `resolve()` follows a symlink, so a link planted in a ticket dir and
+           pointing at `/data/.dek` lands outside the root and is refused.
+
+        Gate 2 is redundant given gate 1 and stays anyway — the same
+        belt-and-braces shape as parse_command's verb allow-list plus its
+        per-verb flag whitelist.
+
+        What comes back is built from the manifest, so a caller that hands these
+        to a subprocess is never handing over its own string. The two refusals
+        read differently on purpose: "not an uploaded file" and "expired" call
+        for different fixes, and the second is the only status check this
+        feature has.
+        """
+        now = time.time() if now is None else now
+        return [self._resolve_one(str(raw), subject, now) for raw in paths]
+
+    def _resolve_one(self, raw: str, subject: str, now: float) -> Path:
+        candidate = Path(raw)
+        handle = candidate.parent.name
+        if not _HANDLE_RE.match(handle):
+            # `/etc/passwd`, `/data/.dek` and `.../upl_x/../../.dek` all land
+            # here: the parent is not one of our handles, so there is no
+            # manifest to look in and nothing to return.
+            raise NotStaged(_NOT_STAGED.format(path=raw))
+        ticket_dir = self.root / handle
+        manifest = _read_manifest(ticket_dir)
+        if manifest is None or manifest.get("sub") != subject:
+            # One refusal for "no such ticket" and "somebody else's ticket".
+            # Which of the two it was is only useful to a caller who should not
+            # have been holding the path.
+            raise NotStaged(_NOT_STAGED.format(path=raw))
+        if _expired(manifest, now):
+            raise Expired(_EXPIRED.format(path=raw))
+        entry = next(
+            (e for e in manifest.get("files") or [] if e.get("name") == candidate.name),
+            None,
+        )
+        if entry is None:
+            raise NotStaged(_NOT_STAGED.format(path=raw))
+        try:
+            root = ticket_dir.resolve()
+            claimed = candidate.resolve()
+            target = (ticket_dir / str(entry["name"])).resolve()
+        except (OSError, RuntimeError):  # pragma: no cover - defensive
+            raise NotStaged(_NOT_STAGED.format(path=raw)) from None
+        if not claimed.is_relative_to(root) or not target.is_relative_to(root):
+            raise NotStaged(_NOT_STAGED.format(path=raw))
+        if not target.is_file():
+            raise NotStaged(_NOT_STAGED.format(path=raw))
+        return target
+
+    # ── expiry ──
+    async def sweep(self, *, now: float | None = None) -> SweptUploads:
+        """Remove every ticket past its expiry. Returns what it actually freed.
+
+        Deliberately not a timer. services/heartbeat.py documents that Railway
+        sleeps on the absence of outbound packets and that a heartbeat running
+        unconditionally "would reset the sleep timer forever and quietly bill
+        the user 24/7 for an idle service". A periodic cleanup task would do
+        exactly that, so this runs only when something already asked: startup,
+        a mint, or the settings page.
+        """
+        swept = await asyncio.to_thread(self._sweep, time.time() if now is None else now)
+        if swept.handles or swept.refused:
+            logger.info(
+                "swept %d expired upload ticket(s), freeing %d bytes across %d file(s); "
+                "%d live ticket(s) kept, %d entr(ies) refused",
+                swept.handles, swept.bytes, swept.files, swept.kept, swept.refused,
+            )
+        return swept
+
+    def _sweep(self, now: float) -> SweptUploads:
+        handles = files = freed = kept = refused = 0
+        for entry in reclaim.children(self.root):
+            manifest = None if entry.is_symlink() else _read_manifest(entry)
+            if manifest is not None:
+                if not _expired(manifest, now):
+                    kept += 1
+                    continue
+            elif not self._older_than_any_ticket(entry, now):
+                # No readable manifest: a directory caught mid-mint, or one
+                # whose record was damaged. Nothing can resolve out of it, so it
+                # is inert — and leaving it until it is older than any live
+                # ticket could be is what stops a sweep racing a mint from
+                # deleting the ticket being created.
+                kept += 1
+                continue
+            size, count = (0, 0) if entry.is_symlink() else measure_dir(entry)
+            try:
+                gone = reclaim.remove_child(self.root, entry)
+            except reclaim.Unsafe as exc:
+                # Never delete on a guess: an entry the containment rule will
+                # not vouch for is left exactly where it is and reported.
+                logger.warning("left the upload entry %s alone: %s", entry.name, exc)
+                refused += 1
+                continue
+            if not gone:
+                logger.warning("could not fully remove the upload ticket %s", entry.name)
+                continue
+            handles += 1
+            files += count
+            freed += size
+        return SweptUploads(
+            handles=handles, files=files, bytes=freed, kept=kept, refused=refused
+        )
+
+    @staticmethod
+    def _older_than_any_ticket(entry: Path, now: float) -> bool:
+        try:
+            return (now - entry.lstat().st_mtime) > TTL_SEC
+        except OSError:  # pragma: no cover - it vanished under us
+            return False
+
+    # ── internals ──
+    def _ticket_dir(self, handle: str) -> Path:
+        if not _HANDLE_RE.match(handle or ""):
+            raise NotStaged("that is not an upload URL this server minted")
+        return self.root / handle
+
+    def _live_manifest(self, ticket_dir: Path, subject: str, now: float) -> dict:
+        manifest = _read_manifest(ticket_dir)
+        if manifest is None or manifest.get("sub") != subject:
+            raise NotStaged("that is not an upload URL this server minted")
+        if _expired(manifest, now):
+            raise Expired(
+                "that upload URL has expired — call create_upload_url for a new one"
+            )
+        return manifest
+
+
+class StagedUploads:
+    """Cached, off-the-event-loop size of what is staged on the volume.
+
+    The same shape as TaskHistory and ProfileSizes, for the same reason: this is
+    a walk of the volume and the settings page must never wait on one. The store
+    is reached through a callable because it is swapped at runtime and under
+    tests, and a captured one would report sizes for a root nobody is writing to.
+
+    `expired` is reported rather than hidden, following TaskHistory's honesty
+    about orphans: bytes whose ticket is dead are still bytes on the volume, and
+    a number that quietly excluded them would understate the problem it exists
+    to explain.
+    """
+
+    def __init__(self, uploads: "UploadService | Callable[[], UploadService]") -> None:
+        self._get_uploads = uploads if callable(uploads) else lambda: uploads
+        self._lock = threading.Lock()
+        self._cache: UploadsView | None = None
+
+    def invalidate(self) -> None:
+        """Forget the measurement — uploads were swept or cleared, so the number
+        the page is showing is now a lie."""
+        with self._lock:
+            self._cache = None
+
+    async def snapshot(self, *, refresh: bool = False) -> UploadsView:
+        with self._lock:
+            cached = self._cache
+        if cached is not None and not refresh:
+            return cached
+        view = await asyncio.to_thread(self._measure)
+        with self._lock:
+            self._cache = view
+        return view
+
+    def _measure(self) -> UploadsView:
+        """Runs in a worker thread, never the loop.
+
+        `bytes` is what the volume is actually holding, manifests included —
+        that is the number the Disk space row exists to explain. `files` counts
+        what was uploaded, from the manifests, because a manifest is our
+        bookkeeping and not something the user put there.
+        """
+        root = self._get_uploads().root
+        now = time.time()
+        handles = files = total = expired = 0
+        for entry in reclaim.children(root):
+            if entry.is_symlink():
+                # Somebody else's disk. reclaim's rule: identified as a link,
+                # never followed.
+                continue
+            if not entry.is_dir():
+                try:
+                    total += entry.lstat().st_size
+                except OSError:  # pragma: no cover - it vanished mid-walk
+                    pass
+                continue
+            handles += 1
+            size, _count = measure_dir(entry)
+            total += size
+            manifest = _read_manifest(entry)
+            if manifest is None or _expired(manifest, now):
+                expired += 1
+            if manifest is not None:
+                files += len(manifest.get("files") or [])
+        return UploadsView(
+            handles=handles, files=files, bytes=total, expired=expired,
+            measured_at=now,
+        )

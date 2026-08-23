@@ -26,7 +26,7 @@ from starlette.routing import Route
 
 from . import __version__, mcp_server
 from .config import CONFIG, bootstrap_binary_cache, purge_binary_env
-from .routes import api, cdp, health, oauth, ui, vnc
+from .routes import api, cdp, health, oauth, ui, uploads, vnc
 from .routes.guard import AuthGuard
 from .routes.mcp import MCPEndpoint
 from .response_security import ResponseSecurity
@@ -43,6 +43,7 @@ from .services.ratelimit import RateLimiter
 from .services.scrape import ScrapeService
 from .services.secret import SecretService
 from .services.settings import SettingsService
+from .services.uploads import UploadService
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
@@ -127,6 +128,18 @@ async def lifespan(app: FastAPI):
         CONFIG.binary_cache_dir, lambda: app.state.settings, app.state.instances,
     )
     app.state.task_history = TaskHistory(lambda: app.state.jobs)
+    # Where an agent's POSTed bytes land, and the only place a path handed to
+    # `agent-browser upload` may point. Files expire on a two-hour clock nobody
+    # has to remember; the sweep below is what actually takes them away.
+    app.state.uploads = UploadService(CONFIG.uploads_dir)
+    # Non-fatal, exactly like ensure_default above: a volume that cannot be
+    # listed is a reason to skip a cleanup, never a reason to fail boot for a
+    # feature nobody has used yet. Expired files are inert whether or not this
+    # runs — resolve_for refuses them — so the worst a failure costs is disk.
+    try:
+        await app.state.uploads.sweep()
+    except Exception:  # noqa: BLE001
+        logger.exception("could not sweep expired uploads at startup")
     app.state.scrape = ScrapeService(app.state.instances, jobs, settings_service)
     # The same job store the sweeps use: one Tasks list, one retention policy,
     # one place a run's evidence is reachable from.
@@ -187,6 +200,9 @@ app.include_router(health.router)
 app.include_router(oauth.router)
 app.include_router(api.router)
 app.include_router(cdp.router)
+# Outside the AuthGuard on purpose — its own short-lived ticket is the
+# credential. See routes/uploads.py and routes/guard.py.
+app.include_router(uploads.router)
 app.include_router(vnc.router)
 app.include_router(ui.router)
 

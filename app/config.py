@@ -69,6 +69,13 @@ class Config:
         """What each attempt actually saw: snapshot, HTML, screenshot."""
         return self.data_dir / "evidence"
 
+    @property
+    def uploads_dir(self) -> Path:
+        """Files an agent staged for a browser to upload. On the volume, not
+        /tmp, because Railway naps between the upload and the browser call — see
+        services/uploads.py."""
+        return self.data_dir / "uploads"
+
     @classmethod
     def from_env(cls) -> "Config":
         # Deliberately no app_secret field. SecretService reads the authoritative

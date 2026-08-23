@@ -22,6 +22,9 @@ The rule lives here once, above both, and neither route can forget it.
   (services/tokens.py). They are WebSockets, where the client usually cannot
   send an Authorization header at all, which is the whole reason that separate
   token exists.
+* `/uploads/{handle}` — its own short-lived ticket (services/uploads.py). The
+  bytes arrive from a curl in an agent's sandbox, which cannot do an OAuth
+  dance; the ticket grants "add bytes to this one staging slot" and nothing else.
 
 **The 401 must teach the client how to fix itself.** An MCP client that gets a
 bare 401 gives up; one that gets `WWW-Authenticate` with `resource_metadata`
