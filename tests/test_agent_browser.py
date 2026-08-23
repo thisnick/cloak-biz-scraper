@@ -916,6 +916,58 @@ class TestUploadRefusals:
             )
         assert spy == [], "a partial set of files was attached anyway"
 
+    async def test_the_wrong_kind_of_element_is_told_what_to_try_instead(
+        self, tmp_path, monkeypatch
+    ):
+        """The CDP error a styled picker button really produces, turned into a
+        next step rather than a dead end."""
+        import asyncio
+
+        store, ticket, staged = await _staging(tmp_path / "uploads", ("a.jpg", JPEG))
+        spy, _calls = _fake_exec_sequence([
+            (1, b"", b"CDP error (DOM.setFileInputFiles): Node is not a file input "
+                     b"element"),
+        ])
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", spy)
+        svc = AgentBrowserService(_FakeInstances(_FakeInst()), store)
+
+        out = await svc.drive("i1", f"upload @e3 {staged[0].path}", subject=OWNER)
+
+        assert not out.ok
+        assert "Node is not a file input element" in out.output, (
+            "the CLI's own words were thrown away"
+        )
+        assert 'upload "input[type=file]"' in out.output
+
+    async def test_an_ordinary_upload_failure_is_not_given_the_hint(
+        self, tmp_path, monkeypatch
+    ):
+        """The hint is for one specific failure. Attaching it to every failed
+        upload would be noise that teaches a model to ignore it."""
+        import asyncio
+
+        store, ticket, staged = await _staging(tmp_path / "uploads", ("a.jpg", JPEG))
+        spy, _calls = _fake_exec_sequence([(1, b"", b"Element not found: @e3")])
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", spy)
+        svc = AgentBrowserService(_FakeInstances(_FakeInst()), store)
+
+        out = await svc.drive("i1", f"upload @e3 {staged[0].path}", subject=OWNER)
+
+        assert out.output == "Element not found: @e3"
+
+    async def test_another_verb_never_gets_the_upload_hint(self, monkeypatch):
+        import asyncio
+
+        spy, _calls = _fake_exec_sequence([
+            (1, b"", b"Node is not a file input element"),
+        ])
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", spy)
+        svc = AgentBrowserService(_FakeInstances(_FakeInst()))
+
+        out = await svc.drive("i1", "click @e3", subject=OWNER)
+
+        assert "input[type=file]" not in out.output
+
     async def test_a_service_with_no_staging_store_says_so(self, spy):
         svc = AgentBrowserService(_FakeInstances(_FakeInst()))
         with pytest.raises(AgentBrowserError, match="cannot stage uploads"):
@@ -1057,6 +1109,15 @@ class TestTheToolDescriptionMatchesWhatIsEnforced:
     def test_it_tells_the_model_where_the_path_must_come_from(self, doc):
         assert "create_upload_url" in doc
         assert "A path you wrote yourself is" in doc and "refused" in doc
+
+    def test_it_offers_the_selector_escape_hatch(self, doc):
+        """Verified against a real browser: a hidden `<input type=file>` behind a
+        styled button IS uploadable by CSS selector, and `snapshot -i` does not
+        show it — the accessibility tree lists the button only. Without this
+        sentence a model follows the documented snapshot-then-act workflow onto
+        a page that would have worked, and stops."""
+        assert "input[type=file]" in doc
+        assert "not a file input" in doc
 
     def test_it_admits_the_case_it_cannot_serve(self, doc):
         """setInputFiles binds to an <input type=file>; a native chooser needs

@@ -203,6 +203,41 @@ def parse_command(command: str) -> list[str]:
     return argv
 
 
+# What CDP answers when `setInputFiles` is pointed at something that is not an
+# `<input type=file>`. Verified against agent-browser 0.32.3 driving real
+# CloakBrowser Pro 148, where a styled picker button produced exactly this and
+# nothing reached the page.
+_NOT_A_FILE_INPUT = "not a file input element"
+
+# The hint, and why it is worth coupling to somebody else's error string: on a
+# real listing site the file input is usually hidden behind a styled button, so
+# `snapshot -i` lists the BUTTON and not the input — the accessibility tree does
+# not carry it. A model following the documented snapshot-then-act workflow
+# therefore meets this error on a page that would have worked by CSS selector,
+# reads "a file picker is not supported", and gives up. The coupling is cheap
+# (a substring of stderr) and fails safe: if the CLI rewords its error we lose a
+# hint, never correctness.
+_UPLOAD_HINT = (
+    " — that element is not a file input. Most pages hide the real one behind a "
+    "styled button and a snapshot only shows the button, so try a CSS selector "
+    'instead: upload "input[type=file]" <path>. If the page has no file input at '
+    "all and the button opens the operating system's own picker, that cannot be "
+    "driven from here."
+)
+
+
+def _with_upload_hint(output: str) -> str:
+    """Turn a legible CDP error into a next step.
+
+    `Node is not a file input element` tells a reader what went wrong and
+    nothing about what to do, which on this particular failure is the difference
+    between abandoning a page and uploading to it.
+    """
+    if _NOT_A_FILE_INPUT in output.lower():
+        return output + _UPLOAD_HINT
+    return output
+
+
 @dataclass
 class DriveOutcome:
     instance_id: str
@@ -406,5 +441,7 @@ class AgentBrowserService:
             return DriveOutcome(instance_id, command, False, str(exc), None)
         ok = rc == 0
         output = (out.strip() or err.strip() or ("done" if ok else "failed"))
+        if argv[0] == "upload" and not ok:
+            output = _with_upload_hint(output)
         logger.info("agent_browser %s %r rc=%s", instance_id, argv[0], rc)
         return DriveOutcome(instance_id, command, ok, output, None)

@@ -393,8 +393,12 @@ def build(app) -> FastMCP:
         create_upload_url's flow gave you — call it, POST the file to the URL it
         returns, and use the path from that response. A path you wrote yourself is
         refused, and so is one whose file has expired; both say what to do instead.
-        Works on file inputs; a button that opens the operating system's file picker
-        is not supported.
+        It needs a real file input. Most sites hide theirs behind a styled button,
+        and a snapshot shows you only the button — so if `upload @eN` says the node
+        is not a file input, pass a CSS selector instead:
+        `upload "input[type=file]" <path>`. That usually works even when the input
+        is invisible. What genuinely cannot work is a button that opens the
+        operating system's own file picker, with no input on the page at all.
 
         One action per call. Quote arguments that contain spaces. Only the
         listed read/interact verbs are accepted; anything else is refused. Only

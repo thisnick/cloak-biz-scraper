@@ -2304,6 +2304,37 @@ class TestConnectedAppsUi:
 JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 60
 
 
+def _boundary_bytes() -> list[int]:
+    """Byte counts where two roundings are most likely to part company.
+
+    COMPUTED, not typed. The first version of this test listed twelve values by
+    hand and every one of them happened to be a case where the two
+    implementations agreed — it passed while they disagreed on 1,521 of 6,139
+    values, because half-to-even and half-up differ at exactly the boundaries a
+    person picking round numbers never writes down. So the sample is generated
+    from the shape of the disagreement instead: every tenth-of-a-unit below ten,
+    and every half-unit at and above it, at each scale.
+    """
+    values = {0, 1, 512, 1023, 1024}
+    for scale in (1024, 1024 ** 2, 1024 ** 3):
+        # Below ten the JS rounds `n * 10`, so its boundaries sit at every
+        # HUNDREDTH-and-a-half of a unit — 1.25 KB is one, and it is the case a
+        # sample stepping in tenths walks straight past.
+        for tenth in range(0, 100):
+            values.add(round(scale * (tenth + 0.5) / 10))
+            values.add(round(scale * tenth / 10))
+        # At and above ten it rounds `n`, so the boundaries are half-units.
+        for whole in (10, 11, 99, 100, 500, 512, 1023):
+            values.add(scale * whole)
+            values.add(round(scale * (whole + 0.5)))
+    return sorted(values)
+
+
+# The three the review measured, kept by name so the regression they represent
+# is legible without running the generator in your head.
+MEASURED_DISAGREEMENTS = (10752, 1280, 512512, 11010048)
+
+
 class TestOneByteFormatter:
     """"How big is that" had three answers: a service's refusals, the settings
     banners, and the dashboard's own JavaScript. Two of those are Python and now
@@ -2320,17 +2351,11 @@ class TestOneByteFormatter:
         assert ui.human_size is presentation.human_size
         assert uploads.human_size is presentation.human_size
 
-    @pytest.mark.parametrize("count", [0, 1, 999, 1023, 1024, 1536, 10 * 1024,
-                                       1024 ** 2, 1_500_000, 104_857_600,
-                                       1024 ** 3, 3 * 1024 ** 3])
-    def test_the_dashboard_javascript_agrees_with_it(self, count):
-        """The third formatter, run for real.
-
-        `human()` is extracted from the shipped template and evaluated by node,
-        so this compares the actual bytes that reach a browser against the
-        actual Python — not one literal against another. Skipped where node is
-        absent, the same way the other node-dependent tests skip.
-        """
+    @staticmethod
+    def _run_js(counts: list[int]) -> list[str]:
+        """The dashboard's `human()`, extracted from the shipped template and
+        run by node — the actual bytes that reach a browser, in one process for
+        the whole sample rather than one process per value."""
         import json
         import re
         import shutil
@@ -2344,15 +2369,75 @@ class TestOneByteFormatter:
         source = re.search(r"function human\(n\)\{.*?\n    \}", template, re.S)
         assert source, "the dashboard's human() could not be found to test"
 
-        out = subprocess.run(
-            [node, "-e", source.group(0) + f"\nprocess.stdout.write(human({count}));"],
-            capture_output=True, text=True, check=True,
+        script = (source.group(0) + "\nconst xs=JSON.parse(process.argv[1]);"
+                  "process.stdout.write(JSON.stringify(xs.map(human)));")
+        out = subprocess.run([node, "-e", script, json.dumps(counts)],
+                             capture_output=True, text=True, check=True)
+        return json.loads(out.stdout)
+
+    def test_the_dashboard_javascript_agrees_over_every_rounding_boundary(self):
+        counts = _boundary_bytes()
+        assert len(counts) > 100, "the sample generator produced almost nothing"
+
+        rendered = self._run_js(counts)
+        disagreements = [(n, js, human_size(n))
+                         for n, js in zip(counts, rendered) if js != human_size(n)]
+
+        assert not disagreements, (
+            f"the dashboard and the server disagree about "
+            f"{len(disagreements)} of {len(counts)} byte counts, e.g.\n"
+            + "\n".join(f"  {n:>15,}  row(JS)={js!r}  banner(py)={py!r}"
+                         for n, js, py in disagreements[:6])
         )
-        assert out.stdout == human_size(count), (
-            f"the dashboard and the server disagree about {count} bytes: "
-            f"{out.stdout!r} vs {human_size(count)!r}"
-        )
-        assert json.dumps(out.stdout)  # it really produced a string
+
+    @pytest.mark.parametrize("count", MEASURED_DISAGREEMENTS)
+    def test_the_measured_disagreements_are_gone(self, count):
+        """The four the review actually caught, named individually so a failure
+        points at the specific regression rather than at a generated list."""
+        assert self._run_js([count])[0] == human_size(count)
+
+    def test_the_disk_space_total_degrades_one_row_at_a_time(self):
+        """The chip over the accordion, run for real.
+
+        Its three inputs fail independently — that is the whole design of the
+        endpoint beneath it — so a chip that shows nothing when one of them
+        failed throws away two measurements that worked. Checked by running the
+        shipped function, because a chip is JavaScript and every other assertion
+        about it would be about the source rather than the behaviour.
+        """
+        import json
+        import re
+        import shutil
+        import subprocess
+
+        node = shutil.which("node")
+        if node is None:
+            pytest.skip("node is not installed; the JS cannot be run")
+
+        template = pathlib.Path("app/templates/index.html").read_text()
+        human = re.search(r"function human\(n\)\{.*?\n    \}", template, re.S)
+        total = re.search(r"function usedTotal\(sizes\)\{.*?\n    \}", template, re.S)
+        assert human and total, "the dashboard's usedTotal() could not be found"
+
+        cases = [[1024, 2048, 4096], [1024, None, 4096], [None, None, 4096],
+                 [None, None, None]]
+        script = (human.group(0) + total.group(0) +
+                  "\nconst xs=JSON.parse(process.argv[1]);"
+                  "process.stdout.write(JSON.stringify(xs.map(usedTotal)));")
+        out = json.loads(subprocess.run([node, "-e", script, json.dumps(cases)],
+                                        capture_output=True, text=True,
+                                        check=True).stdout)
+
+        assert out[0] == f"{human_size(1024 + 2048 + 4096)} used"
+        assert out[1].startswith(f"{human_size(1024 + 4096)} used"), out[1]
+        assert "could not be measured" in out[1]
+        assert out[2].startswith(f"{human_size(4096)} used"), out[2]
+        assert out[3] == "", "nothing measured should show nothing, not '0 B used'"
+
+    def test_the_generated_sample_really_covers_the_measured_ones(self):
+        """A control on the generator: if it stopped producing boundary values,
+        the sweep above would pass on a sample that proves nothing."""
+        assert set(MEASURED_DISAGREEMENTS) <= set(_boundary_bytes())
 
 
 class TestStorage:
@@ -2712,17 +2797,50 @@ class TestStorage:
         finally:
             write.abort()
 
-    def test_expired_uploads_are_shown_rather_than_hidden(self, auth, storage):
+    def test_expired_uploads_that_survive_the_sweep_are_shown_not_hidden(
+        self, auth, storage
+    ):
         """TaskHistory's honesty about orphans, applied here: bytes whose ticket
-        is dead are still bytes on the volume."""
+        is dead are still bytes on the volume.
+
+        Reaching that state now takes a ticket the sweep will not take, because
+        this endpoint sweeps on the way in — which is the point of the third
+        sweep site, and it makes a non-zero `expired` MORE informative than it
+        used to be: it no longer means "nobody has cleaned up yet", it means
+        "something is expired and could not be removed".
+        """
+        import asyncio
+
         stale = self._ticket(storage, files=[("a.jpg", JPEG)])
         self._ticket(storage, files=[("b.jpg", JPEG + b"\x04")])
+        self._expire(storage, stale)
+        held = asyncio.run(storage.uploads.begin(stale.handle, subject="owner",
+                                                 filename="c.jpg", now=1.0))
+        try:
+            uploads = auth.get("/settings/storage").json()["uploads"]
+
+            assert uploads["handles"] == 2 and uploads["expired"] == 1
+            assert uploads["bytes"] == self._on_disk(storage.uploads.root)
+        finally:
+            held.abort()
+
+    def test_an_expired_upload_is_swept_by_the_page_that_reports_it(self, auth,
+                                                                    storage):
+        """The third sweep site. Railway forbids a timer, so a sweep happens
+        when somebody asks — and the moment a human is looking at the number is
+        the moment it had better be true."""
+        stale = self._ticket(storage, files=[("a.jpg", JPEG + b"\x0f" * 700)])
+        live = self._ticket(storage, files=[("b.jpg", JPEG + b"\x10")])
         self._expire(storage, stale)
 
         uploads = auth.get("/settings/storage").json()["uploads"]
 
-        assert uploads["handles"] == 2 and uploads["expired"] == 1
-        assert uploads["bytes"] == self._on_disk(storage.uploads.root)
+        assert not (storage.uploads.root / stale.handle).exists()
+        assert (storage.uploads.root / live.handle).is_dir()
+        assert uploads["handles"] == 1 and uploads["expired"] == 0
+        assert uploads["bytes"] == self._on_disk(storage.uploads.root), (
+            "the number was measured before the sweep it triggered"
+        )
 
     def test_one_broken_measurement_does_not_cost_the_other_two(self, auth, storage,
                                                                 monkeypatch):
@@ -2803,6 +2921,32 @@ class TestStorage:
         assert human_size(freed) in shown(r)
         assert "Cleared 2 uploads" in shown(r)
 
+    def test_two_clears_at_once_do_not_both_claim_the_whole_amount(self, storage):
+        """`SweptUploads` documents itself as reporting what a clear ACTUALLY
+        removed, never what it set out to remove. Two clears walking the same
+        volume, each taking part of it and each reporting the total, is that
+        promise failing rather than two banners overlapping."""
+        import asyncio
+
+        for n in range(4):
+            self._ticket(storage, files=[(f"p{n}.jpg", JPEG + bytes([n]) * 900)])
+        for entry in storage.uploads.root.iterdir():
+            self._expire(storage, types.SimpleNamespace(handle=entry.name))
+        before = self._on_disk(storage.uploads.root)
+
+        async def both():
+            return await asyncio.gather(storage.uploads.clear(),
+                                        storage.uploads.clear())
+
+        first, second = asyncio.run(both())
+
+        actually_freed = before - self._on_disk(storage.uploads.root)
+        assert first.bytes + second.bytes == actually_freed, (
+            f"two clears reported {first.bytes} + {second.bytes} = "
+            f"{first.bytes + second.bytes} bytes freed; {actually_freed} left the disk"
+        )
+        assert first.handles + second.handles == 4
+
     def test_an_upload_in_flight_is_never_cleared_by_either_scope(self, auth, storage):
         """Reservations live in memory and the files they cover live on disk, so
         the two could disagree about what is there. They must not: removing a
@@ -2832,18 +2976,38 @@ class TestStorage:
         assert not (storage.uploads.root / ticket.handle).exists()
 
     def test_clearing_nothing_is_reported_as_success(self, auth, storage):
+        """A status and a sentence say nothing about what happened. The state
+        before and after is what makes this more than a smoke test."""
+        live = self._ticket(storage, files=[("b.jpg", JPEG + b"\x11")])
+        before = self._on_disk(storage.uploads.root)
+
         r = auth.post("/settings/storage/uploads/clear", follow_redirects=False)
+
         assert r.status_code == 200
         assert "Nothing to clear" in shown(r)
+        assert (storage.uploads.root / live.handle).is_dir(), "it cleared something"
+        assert self._on_disk(storage.uploads.root) == before
+        assert "freed" not in shown(r), "it claimed to have freed something"
 
     def test_the_default_scope_is_the_safe_one(self, auth, storage):
         """A POST with no scope at all — a client that forgot the field, or a
-        form that lost it — must not become a full clear."""
+        form that lost it — must not become a full clear.
+
+        The first version of this discarded the response, so a 500 would have
+        passed it: "the live ticket survived" is also true of a request that
+        never ran. It needs a positive half — the expired one really was taken —
+        or it only proves the endpoint did nothing.
+        """
+        stale = self._ticket(storage, files=[("a.jpg", JPEG + b"\x12")])
         live = self._ticket(storage, files=[("b.jpg", JPEG + b"\x0b")])
+        self._expire(storage, stale)
 
-        auth.post("/settings/storage/uploads/clear", follow_redirects=False)
+        r = auth.post("/settings/storage/uploads/clear", follow_redirects=False)
 
-        assert (storage.uploads.root / live.handle).is_dir()
+        assert r.status_code == 200, r.text
+        assert "Cleared 1 upload" in shown(r)
+        assert not (storage.uploads.root / stale.handle).exists(), "it cleared nothing"
+        assert (storage.uploads.root / live.handle).is_dir(), "it cleared everything"
 
     def test_clearing_uploads_carries_both_csrf_layers(self, client, storage):
         live = self._ticket(storage, files=[("b.jpg", JPEG + b"\x0c")])
@@ -2891,11 +3055,11 @@ class TestStorage:
     def test_a_clear_invalidates_the_cached_measurement(self, auth, storage):
         """The number on the page after a clear must not be the number from
         before it — that is a cache reporting a volume that no longer exists."""
-        self._expire(storage, self._ticket(storage,
-                                           files=[("a.jpg", JPEG + b"\x0d" * 700)]))
+        self._ticket(storage, files=[("a.jpg", JPEG + b"\x0d" * 700)])
         assert auth.get("/settings/storage").json()["uploads"]["handles"] == 1
 
-        auth.post("/settings/storage/uploads/clear", follow_redirects=False)
+        auth.post("/settings/storage/uploads/clear", data={"scope": "all"},
+                  follow_redirects=False)
 
         after = auth.get("/settings/storage").json()["uploads"]
         assert after["handles"] == 0 and after["bytes"] == 0

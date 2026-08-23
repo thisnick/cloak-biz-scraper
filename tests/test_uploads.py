@@ -648,6 +648,40 @@ class TestTheVolumeIsBounded:
         assert pathlib.Path(live.path).is_file(), "a real staged file was taken too"
         assert store._volume_committed_and_reserved() == _disk(store.root)
 
+    async def test_a_ticket_cleared_mid_write_is_a_refusal_not_a_traceback(
+        self, store, monkeypatch
+    ):
+        """The race `busy_handles` normally prevents, forced open.
+
+        A naive version of this — rmtree the directory and commit — cannot reach
+        the guard at all: `commit` re-reads the manifest first and raises the
+        OTHER `NotStaged`. So the directory is removed at the last possible
+        moment, between that read and the rename, which is exactly where a
+        concurrent clear would land if the busy check ever stopped covering it.
+        """
+        import shutil
+
+        ticket = await _mint(store)
+        write = await store.begin(ticket.handle, subject=SUBJECT, filename="a.jpg")
+        write.feed(JPEG)
+
+        real_unique = uploads_service._unique_name
+
+        def vanish(name, taken):
+            shutil.rmtree(store.root / ticket.handle)
+            return real_unique(name, taken)
+
+        monkeypatch.setattr(uploads_service, "_unique_name", vanish)
+
+        with pytest.raises(NotStaged) as refused:
+            await write.commit()
+
+        assert "cleared while the file was arriving" in str(refused.value)
+        assert isinstance(refused.value.__cause__, OSError), (
+            "the underlying failure was swallowed rather than wrapped"
+        )
+        assert store._reserved == {}, "the abandoned write kept its reservation"
+
     async def test_an_ordinary_sweep_leaves_an_in_flight_write_alone(self, store):
         """`reclaim_incoming` is a startup-only door. At any other moment a
         `.incoming-*` file belongs to a write that is still happening."""
@@ -1003,16 +1037,52 @@ class TestStagedUploads:
         view = await StagedUploads(lambda: store).snapshot()
         assert (view.handles, view.files, view.bytes, view.expired) == (0, 0, 0, 0)
 
-    async def test_the_measurement_is_cached_until_invalidated(self, store):
+    async def test_a_repeat_visit_costs_nothing_when_nothing_has_moved(self, store):
+        """The reason there is a cache at all: this is a walk of the volume and
+        a page visit must not pay for it twice."""
         sizes = StagedUploads(lambda: store)
-        first = await sizes.snapshot()
         ticket = await _mint(store)
         await _stage(store, ticket.handle)
 
-        assert (await sizes.snapshot()).handles == 0, "cached, as the page expects"
-        sizes.invalidate()
+        first = await sizes.snapshot()
+        assert first.handles == 1
+        assert (await sizes.snapshot()) is first, "the second visit re-walked"
+
+    async def test_the_number_never_outlives_the_bytes_it_describes(self, store):
+        """Uploads are the most volatile of the three things Disk space reports,
+        and a sweep runs on every mint — so a view cached the way the browser
+        cache's is would be wrong within one tool call and stay wrong until
+        somebody pressed Clear."""
+        sizes = StagedUploads(lambda: store)
+        ticket = await _mint(store)
+        await _stage(store, ticket.handle, JPEG + b"\x0e" * 900)
+        loaded = await sizes.snapshot()
+        assert loaded.handles == 1 and loaded.bytes > 900
+
+        _rewrite_expiry(store, ticket.handle, time.time() - 1)
+        await store.sweep()          # …as a mint would
+
+        after = await sizes.snapshot()
+        assert after.handles == 0, "the page is still showing a volume that is gone"
+        assert after.bytes == 0
+        assert after.measured_at >= loaded.measured_at
+
+    async def test_a_fresh_upload_shows_up_without_anyone_invalidating(self, store):
+        sizes = StagedUploads(lambda: store)
+        assert (await sizes.snapshot()).handles == 0
+
+        ticket = await _mint(store)
+        await _stage(store, ticket.handle)
+
         assert (await sizes.snapshot()).handles == 1
-        assert first.measured_at > 0
+
+    async def test_invalidate_still_forces_a_re_walk(self, store):
+        """Kept for a caller that knows the volume moved by some route the store
+        did not see — the clear uses it, and it costs nothing to honour."""
+        sizes = StagedUploads(lambda: store)
+        first = await sizes.snapshot()
+        sizes.invalidate()
+        assert (await sizes.snapshot()) is not first
 
 
 # ── The endpoint ─────────────────────────────────────────────────────────────

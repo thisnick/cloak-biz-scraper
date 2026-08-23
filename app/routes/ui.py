@@ -74,6 +74,11 @@ def _require(request: Request) -> None:
         raise NotAuthenticated()
 
 
+# NOTE for whoever reads a surprising 200 here: `origin_allowed` compares
+# host[:port] and ignores the SCHEME, so `http://testserver` is accepted against
+# an https Host, and it treats a differing port as a different origin. Both are
+# pre-existing routes/mcp.py behaviour, shared deliberately so this app has one
+# Origin rule rather than two — not something the uploads work introduced.
 def _require_same_origin(request: Request) -> None:
     """CSRF defence-in-depth for a cookie-authenticated state change.
 
@@ -1131,6 +1136,8 @@ async def _uploads_payload(request: Request, refresh: bool) -> dict[str, Any] | 
 async def storage_sizes(request: Request, refresh: bool = False) -> dict[str, Any]:
     """What the browser cache, the task history, and staged uploads are using.
 
+    Sweeps expired uploads on the way in, then measures.
+
     One request for both, filled in after the page paints. Each half degrades on
     its own: a volume that cannot be walked answers `null` for that section and
     the page simply keeps its placeholder, because a settings page that cannot
@@ -1139,6 +1146,16 @@ async def storage_sizes(request: Request, refresh: bool = False) -> dict[str, An
     here should still surface as a 500.
     """
     _require(request)
+    # The third sweep site. Railway sleeps on the absence of outbound packets,
+    # so a periodic cleanup task would keep an idle service awake and billing
+    # (services/heartbeat.py) — sweeps are opportunistic instead, and this is
+    # the moment a human is actually looking at the number, which makes it the
+    # moment it had better be true. Non-fatal: a sweep that fails costs a stale
+    # figure, never the page that also carries the licence and proxy settings.
+    try:
+        await request.app.state.uploads.sweep()
+    except Exception:  # noqa: BLE001
+        logger.exception("could not sweep expired uploads before measuring")
     payload: dict[str, Any] = {}
     for key, build in (("builds", _builds_payload), ("history", _history_payload),
                        ("uploads", _uploads_payload)):

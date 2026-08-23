@@ -838,7 +838,7 @@
               <div class="field">
                 <label>Uploaded files</label>
                 <div class="mono" data-storage="uploads">—</div>
-                <div class="help">Files your assistant sent here to attach to a page. They expire on their own about two hours after upload, so this usually clears itself. The size counts everything on the disk, including uploads still arriving.</div>
+                <div class="help">Files your assistant sent here to attach to a page. They expire on their own about two hours after the upload link was created, and expired ones are removed whenever this page is opened — so it usually clears itself. The size counts everything on the disk, including uploads still arriving; anything still listed as expired is one that could not be removed, because a file is being written into it right now.</div>
                 <div class="btnrow">
                   <form method="post" action="/settings/storage/uploads/clear" onsubmit="return confirm('Clear the expired uploads? Files still within their two hours are kept. This cannot be undone.');">
                     <input type="hidden" name="scope" value="expired">
@@ -910,6 +910,17 @@
       var w=document.getElementById('licence-wait');if(w)w.hidden=false;
     });
     // Bytes for a person. Shared by the two after-paint size fetches below.
+    // A named function so it can be run outside a browser and checked, the way
+    // human() is. The three rows degrade one at a time, and so must this: a walk
+    // that failed costs its own share of the total, never the whole number. A
+    // chip that vanishes because one of three measurements broke tells the
+    // reader less than a chip that is short by one row and says so.
+    function usedTotal(sizes){
+      var known=sizes.filter(function(x){return typeof x==='number';});
+      if(!known.length)return '';
+      return human(known.reduce(function(a,x){return a+x;},0))+' used'+
+        (known.length<sizes.length?' (some of it could not be measured)':'');
+    }
     function human(n){
       if(n<1024)return n+' B';
       var units=['KB','MB','GB','TB'],i=-1;
@@ -995,8 +1006,8 @@
           if(e)e.textContent=u.files.toLocaleString()+' file'+(u.files===1?'':'s')+' · '+
             human(u.bytes)+(u.expired?' · '+u.expired+' upload'+(u.expired===1?'':'s')+' expired':'');
         }
-        var chip=at('chip');
-        if(chip&&b&&h&&u)chip.textContent=human((b.total_bytes||0)+(h.bytes||0)+(u.bytes||0))+' used';
+        var chip=at('chip'),used=usedTotal([b&&b.total_bytes,h&&h.bytes,u&&u.bytes]);
+        if(chip&&used)chip.textContent=used;
       }
       function load(){
         fetch('/settings/storage',

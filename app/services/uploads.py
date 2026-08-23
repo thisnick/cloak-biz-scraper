@@ -619,6 +619,7 @@ class StagedWrite:
                 # becoming committed: for one instant they are counted twice,
                 # never zero times, which is the direction an invariant may err.
                 self._service._release(self.reservation)
+                self._service._revision += 1
         except UploadsError:
             self.abort()
             raise
@@ -674,6 +675,27 @@ class UploadService:
         # plain dict, mutated without awaiting, which is atomic under one event
         # loop; the lock is what makes the surrounding decide-then-reserve atomic.
         self._reserved: dict[str, tuple[str, int, int]] = {}
+        # Bumped whenever the volume changes. `StagedUploads` caches a
+        # measurement against it, so a cached number cannot outlive the bytes it
+        # describes. A counter rather than a back-reference to the measurement:
+        # the store must not need to know who is watching, and a sweep triggered
+        # by a mint has no idea a settings page exists.
+        self._revision = 0
+        # Serialises reclaims. Two clears running at once each walked the volume,
+        # each removed part of it, and each reported the whole amount freed —
+        # which is exactly the promise `SweptUploads` is documented not to make.
+        self._reclaim_lock = asyncio.Lock()
+
+    @property
+    def revision(self) -> int:
+        """How many times the bytes under this root have changed.
+
+        Cheap, monotonic, and deliberately coarse: a reader that saw revision N
+        knows nothing has moved only while it still reads N. Anything finer
+        would be a cache-invalidation protocol, and this needs a "is my number
+        stale" answer, not a diff.
+        """
+        return self._revision
 
     # ── the admission ledger ──
     def _reserved_total(self) -> int:
@@ -804,6 +826,7 @@ class UploadService:
             _write_manifest(ticket_dir, {
                 "sub": subject, "created": now, "expires": now + TTL_SEC, "files": [],
             })
+        self._revision += 1
         logger.info("minted upload ticket %s for %s", handle, subject)
         return Ticket(
             handle=handle,
@@ -1001,10 +1024,18 @@ class UploadService:
 
     async def _reclaim(self, *, expired_only: bool, now: float | None,
                        reclaim_incoming: bool = False) -> SweptUploads:
-        swept = await asyncio.to_thread(
-            self._sweep, time.time() if now is None else now, expired_only,
-            reclaim_incoming,
-        )
+        # One reclaim at a time. Without this, two clears walk the same volume,
+        # each removes part of it, and each reports the total — two banners
+        # claiming to have freed 5 MB when 5 MB existed. `SweptUploads` says in
+        # its own docstring that it reports what was actually removed, so this
+        # is the stated contract failing rather than a cosmetic overlap.
+        async with self._reclaim_lock:
+            swept = await asyncio.to_thread(
+                self._sweep, time.time() if now is None else now, expired_only,
+                reclaim_incoming,
+            )
+        if swept.handles or swept.bytes:
+            self._revision += 1
         if swept.handles or swept.refused:
             logger.info(
                 "swept %d expired upload ticket(s), freeing %d bytes across %d file(s); "
@@ -1128,21 +1159,33 @@ class StagedUploads:
         self._get_uploads = uploads if callable(uploads) else lambda: uploads
         self._lock = threading.Lock()
         self._cache: UploadsView | None = None
+        self._cached_revision = -1
 
     def invalidate(self) -> None:
         """Forget the measurement — uploads were swept or cleared, so the number
         the page is showing is now a lie."""
         with self._lock:
             self._cache = None
+            self._cached_revision = -1
 
     async def snapshot(self, *, refresh: bool = False) -> UploadsView:
+        """The cached view, re-measured whenever the volume has moved under it.
+
+        Cached on the store's revision rather than on a timer or on nothing:
+        uploads are the most volatile of the three things this page reports, and
+        a sweep runs on every mint — so a number cached the way the browser
+        cache's is would be wrong within one tool call, and stay wrong until
+        somebody pressed Clear. `invalidate()` still exists for a caller that
+        knows better; this is what covers the callers that do not know at all.
+        """
+        revision = self._get_uploads().revision
         with self._lock:
-            cached = self._cache
-        if cached is not None and not refresh:
+            cached, cached_at = self._cache, self._cached_revision
+        if cached is not None and not refresh and cached_at == revision:
             return cached
         view = await asyncio.to_thread(self._measure)
         with self._lock:
-            self._cache = view
+            self._cache, self._cached_revision = view, revision
         return view
 
     def _measure(self) -> UploadsView:

@@ -15,9 +15,12 @@ third cannot import it and is written to match, which is noted where it lives.
 """
 from __future__ import annotations
 
+import math
 import re
 
-_UNITS = ("B", "KB", "MB", "GB", "TB")
+# KB upward. Bytes are handled before the loop, exactly as the dashboard's copy
+# does, so the two cannot part company at the first boundary.
+_UNITS = ("KB", "MB", "GB", "TB")
 
 
 def human_size(count: int) -> str:
@@ -25,25 +28,37 @@ def human_size(count: int) -> str:
 
     One decimal below ten and none above it, because "1.4 GB" is a number
     somebody can act on and "1.43 GB" is noise. A trailing ".0" is dropped —
-    "1 KB", not "1.0 KB" — which is not only taste: the dashboard's own
-    JavaScript copy has always rounded that way, and a test that runs both found
-    the two surfaces disagreeing about every exact power of 1024. One of them
-    had to move, and this is the reading a person would rather see.
+    "1 KB", not "1.0 KB".
+
+    **This is a deliberate transliteration of the dashboard's JavaScript, not an
+    independent implementation of the same rule, and the arithmetic is copied
+    step for step on purpose.** The two were written to the same description and
+    still disagreed: Python's format-string rounding is half-to-even and
+    `Math.round` is half-up, so they parted at every `.5` boundary — 10752 bytes
+    read `11 KB` in the row and `10 KB` in the banner beneath it. A shared
+    *description* is not a shared implementation; only the same operations in
+    the same order are. `floor(x + 0.5)` is half-up, and a node-driven test
+    compares the two over the boundary cases a hand-written parameter list is
+    exactly the kind of thing to miss.
 
     Used both in banners a human reads and in refusals a model reads — they want
     the same thing, and two formatters that agree today are two that disagree
     after the next edit.
     """
+    if count < 1024:
+        return f"{int(count)} B"
     value = float(count)
-    for unit in _UNITS:
-        if value < 1024 or unit == "TB":
-            if unit == "B":
-                return f"{int(value)} B"
-            if value >= 10:
-                return f"{value:.0f} {unit}"
-            return f"{value:.1f} {unit}".replace(".0 ", " ")
+    index = -1
+    while True:
         value /= 1024
-    return f"{value:.0f} TB"  # pragma: no cover - unreachable, the loop returns
+        index += 1
+        if not (value >= 1024 and index < len(_UNITS) - 1):
+            break
+    rounded = (math.floor(value + 0.5) if value >= 10
+               else math.floor(value * 10 + 0.5) / 10)
+    text = str(int(rounded)) if rounded == int(rounded) else f"{rounded:.1f}"
+    return f"{text} {_UNITS[index]}"
+
 
 # From cloakbrowser/download.py:180 — appended to every "Pro binary could not be
 # downloaded" RuntimeError:
