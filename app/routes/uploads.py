@@ -38,6 +38,7 @@ without being buffered.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -62,6 +63,25 @@ router = APIRouter()
 _BODY_SLACK = 1024 * 1024
 _MAX_BODY = uploads_service.MAX_BYTES_PER_TICKET + _BODY_SLACK
 
+# How long a connection may go completely silent mid-upload before its write is
+# abandoned and the space it reserved is given back.
+#
+# **This exists because the reservation created a way to hold the volume without
+# spending anything.** Send the headers and the first part header — enough to
+# reach `begin` — then stop writing. Measured: four stalled connections, 859
+# bytes on disk between them, held 1,999,389 of a 2,000,000 budget and a
+# legitimate upload got a 507. At production constants about ten such requests
+# hold the whole gigabyte, indefinitely, at no cost to the attacker.
+#
+# IDLE, not wall-clock, so a slow upload is never the victim: a client that is
+# still sending is still welcome however long it takes. And generous, because
+# the number that must not bind is a real person on a bad connection. Two
+# minutes of TOTAL SILENCE is roughly 26x the gap between 64 KiB chunks for the
+# slowest client that could finish a 100 MB file inside the ticket's two-hour
+# life at all (about 15 KB/s) — so the TTL binds long before this does, and
+# anything this catches was never going to finish.
+IDLE_TIMEOUT_SEC = 120.0
+
 # Status codes per refusal. Each says something a client can act on, which is
 # the whole reason the service raises distinct exceptions rather than one.
 _STATUS: tuple[tuple[type[Exception], int], ...] = (
@@ -83,6 +103,10 @@ def _fields(staged: StagedFile) -> dict[str, Any]:
     """
     return {"path": staged.path, "name": staged.name, "bytes": staged.bytes,
             "sha256": staged.sha256, "content_type": staged.content_type}
+
+
+class Stalled(Exception):
+    """A connection that opened an upload and then went quiet."""
 
 
 def _bearer(headers) -> str | None:
@@ -236,8 +260,29 @@ async def _consume(request: Request, store, handle: str, subject: str,
     ingest = _Ingest(store, handle=handle, subject=subject, declared=declared)
     parser = MultipartParser(boundary, ingest.callbacks())
     read = 0
+    stream = request.stream().__aiter__()
     try:
-        async for chunk in request.stream():
+        while True:
+            try:
+                chunk = await asyncio.wait_for(
+                    stream.__anext__(), IDLE_TIMEOUT_SEC
+                )
+            except StopAsyncIteration:
+                break
+            except asyncio.TimeoutError as exc:
+                # The write is dropped by the `finally` below, which is what
+                # returns its reservation to the pool. Nothing else reclaims it:
+                # the ledger is in memory and this request is the only thing
+                # that knows the write exists.
+                logger.warning(
+                    "abandoning an upload to %s: nothing arrived for %.0fs",
+                    handle, IDLE_TIMEOUT_SEC,
+                )
+                raise Stalled(
+                    f"nothing arrived for {int(IDLE_TIMEOUT_SEC)} seconds, so this "
+                    "upload was abandoned and its space released. Send the file in "
+                    "one go and try again."
+                ) from exc
             read += len(chunk)
             if read > _MAX_BODY:
                 # A client that lied about (or omitted) Content-Length. The cap
@@ -293,6 +338,10 @@ async def stage_upload(request: Request, handle: str) -> StagedUpload:
         )
     except uploads_service.UploadsError as exc:
         raise HTTPException(status_code=_status_for(exc), detail=str(exc)) from exc
+    except Stalled as exc:
+        # 408: the request is not wrong, it stopped. A client that hit this can
+        # simply send the file again.
+        raise HTTPException(status_code=408, detail=str(exc)) from exc
     except FormParserError as exc:
         raise HTTPException(
             status_code=400, detail=f"that is not a well-formed multipart body: {exc}"

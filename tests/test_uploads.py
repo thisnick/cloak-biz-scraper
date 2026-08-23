@@ -12,11 +12,13 @@ prove is a dead ticket.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import pathlib
 import time
 
 import pytest
+import pytest_asyncio
 from conftest import isolate_auth
 from fastapi.testclient import TestClient
 
@@ -201,11 +203,16 @@ class TestSafeName:
     @pytest.mark.parametrize("raw,expected", [
         ("photo.jpg", "photo.jpg"),
         ("../evil", "evil"),
-        ("../../.dek", "dek"),
+        # A name that is nothing BUT an extension keeps it and gains a stem.
+        # `.dek` and `.env` are not extensions anyone wants, but the rule that
+        # produces them is the one that stops `a;rm -rf /.jpg` — basename
+        # `.jpg` — arriving with no extension at all.
+        ("../../.dek", "upload.dek"),
+        ("a;rm -rf /.jpg", "upload.jpg"),
         ("/etc/passwd", "passwd"),
         ("C:\\photos\\a.jpg", "a.jpg"),
         (".ticket.json", "ticket.json"),
-        (".env", "env"),
+        (".env", "upload.env"),
         ("..", "upload.jpg"),
         ("", "upload.jpg"),
         ("caf\u00e9 \u2014 photo.jpg", "caf_photo.jpg"),
@@ -575,6 +582,128 @@ class TestTheVolumeIsBounded:
         with pytest.raises(TooLarge) as refused:
             await _stage(store, ticket.handle, JPEG + b"\x00" * 5000)
         assert "in flight" not in str(refused.value)
+
+    async def test_committing_gives_the_reservation_back(self, store, monkeypatch):
+        """Driven through begin/commit rather than `stage`, deliberately.
+
+        `stage` aborts in a `finally`, and abort releases too — so a commit that
+        stopped releasing was invisible to every test that went through it. The
+        release has to be watched where it happens.
+        """
+        monkeypatch.setattr(uploads_service, "MAX_BYTES_PER_FILE", 4096)
+        ticket = await _mint(store)
+
+        write = await store.begin(ticket.handle, subject=SUBJECT, filename="a.jpg")
+        assert store._reserved, "the write is holding budget while it runs"
+        write.feed(JPEG)
+        staged = await write.commit()
+
+        assert staged.bytes == len(JPEG)
+        assert store._reserved == {}, "a committed upload is still holding budget"
+
+    async def test_successive_uploads_reuse_the_space_the_last_one_released(
+        self, store, monkeypatch
+    ):
+        """The behaviour that release-on-commit buys: without it the ledger
+        climbs with every upload and the fourth is refused on a volume holding
+        almost nothing."""
+        monkeypatch.setattr(uploads_service, "MAX_BYTES_PER_FILE", 100_000)
+        monkeypatch.setattr(uploads_service, "MAX_BYTES_PER_TICKET", 250_000)
+        monkeypatch.setattr(uploads_service, "UPLOADS_BUDGET_BYTES", 250_000)
+        ticket = await _mint(store)
+
+        for n in range(6):
+            write = await store.begin(ticket.handle, subject=SUBJECT,
+                                      filename=f"p{n}.jpg")
+            write.feed(JPEG + bytes([n]))
+            await write.commit()
+            assert store._reserved == {}, f"upload {n} kept its reservation"
+
+        assert len(_manifest(store, ticket.handle)["files"]) == 6
+        assert _disk(store.root) < 10_000, "six tiny files, and the volume knows it"
+
+    async def test_a_crash_orphan_is_reclaimed_at_startup(self, store):
+        """The one thing the budget walk cannot see.
+
+        `.incoming-*` is excluded from the volume measurement because its
+        writer's reservation already covers it — true while the writer lives,
+        false after a kill -9, an OOM, or a redeploy mid-upload. The ledger dies
+        with the process and the file does not, so those bytes are on the disk
+        and in no total. Nothing sweeps them either: they sit inside tickets
+        that have not expired.
+        """
+        ticket = await _mint(store)
+        orphan = store.root / ticket.handle / ".incoming-deadbeefdeadbeef"
+        orphan.write_bytes(b"x" * 40_000)
+        live = await _stage(store, ticket.handle, JPEG, name="real.jpg")
+
+        # The state the reviewer measured: on the disk, invisible to the budget.
+        assert _disk(store.root) > 40_000
+        assert store._volume_committed_and_reserved() < 40_000
+
+        swept = await store.sweep(reclaim_incoming=True)
+
+        assert not orphan.exists()
+        assert swept.bytes >= 40_000, "the sweep did not report what it freed"
+        assert pathlib.Path(live.path).is_file(), "a real staged file was taken too"
+        assert store._volume_committed_and_reserved() == _disk(store.root)
+
+    async def test_an_ordinary_sweep_leaves_an_in_flight_write_alone(self, store):
+        """`reclaim_incoming` is a startup-only door. At any other moment a
+        `.incoming-*` file belongs to a write that is still happening."""
+        ticket = await _mint(store)
+        write = await store.begin(ticket.handle, subject=SUBJECT, filename="big.jpg")
+        try:
+            write.feed(JPEG + b"\x00" * 8192)
+            partial = next(p for p in (store.root / ticket.handle).iterdir()
+                           if p.name.startswith(".incoming-"))
+
+            await store.sweep()
+
+            assert partial.exists(), "a sweep took a file that was still arriving"
+        finally:
+            write.abort()
+
+    async def test_the_in_flight_note_counts_what_it_attributes(self, store,
+                                                                monkeypatch):
+        """A global count under a local description sends a model the wrong way:
+        "3 other uploads to this upload URL" when two of them are elsewhere is
+        the difference between waiting and fetching a fresh URL."""
+        monkeypatch.setattr(uploads_service, "MAX_BYTES_PER_FILE", 32 * 1024)
+        monkeypatch.setattr(uploads_service, "MAX_BYTES_PER_TICKET", 32 * 1024)
+        here, there = await _mint(store), await _mint(store)
+
+        mine = await store.begin(here.handle, subject=SUBJECT, filename="a.jpg")
+        theirs = [await store.begin(there.handle, subject=SUBJECT, filename="b.jpg")]
+        try:
+            with pytest.raises(TooLarge) as refused:
+                await store.begin(here.handle, subject=SUBJECT, filename="c.jpg")
+        finally:
+            mine.abort()
+            for w in theirs:
+                w.abort()
+
+        message = str(refused.value)
+        assert "1 other upload to this upload URL" in message
+        assert "1 upload elsewhere on this server" in message
+        assert "3 other uploads to this upload URL" not in message
+
+    async def test_the_note_names_only_the_place_that_has_uploads(self, store,
+                                                                  monkeypatch):
+        monkeypatch.setattr(uploads_service, "MAX_BYTES_PER_FILE", 32 * 1024)
+        monkeypatch.setattr(uploads_service, "MAX_BYTES_PER_TICKET", 32 * 1024)
+        ticket = await _mint(store)
+
+        holding = await store.begin(ticket.handle, subject=SUBJECT, filename="a.jpg")
+        try:
+            with pytest.raises(TooLarge) as refused:
+                await store.begin(ticket.handle, subject=SUBJECT, filename="b.jpg")
+        finally:
+            holding.abort()
+
+        message = str(refused.value)
+        assert "1 other upload to this upload URL" in message
+        assert "elsewhere on this server" not in message
 
     async def test_a_refused_upload_gives_its_reservation_back(self, store, monkeypatch):
         """An upload that fails must cost nothing. Otherwise a run of failures
@@ -1211,6 +1340,133 @@ class TestEndpointBody:
             ("file", (f"p{n}.jpg", JPEG + bytes([n]), "image/jpeg")) for n in range(13)
         ])
         assert r.status_code == 409, r.text
+
+
+@pytest.mark.asyncio
+class TestAStalledConnection:
+    """The way the reservation created to hold the volume without spending.
+
+    Send the request headers and the first part header — enough to reach `begin`
+    and take a reservation — then stop writing. Measured before the fix: four
+    such connections, 859 bytes between them on disk, holding 1,999,389 of a
+    2,000,000 budget, and a legitimate upload got a 507.
+
+    Driven over a real ASGI transport with an ASYNC body generator, because that
+    is the only shape that reproduces it: a synchronous generator sleeping in
+    the test's own thread blocks the event loop, so the timeout can never fire
+    and the test passes for entirely the wrong reason.
+    """
+
+    @pytest_asyncio.fixture
+    async def live(self, tmp_path, monkeypatch):
+        import httpx
+
+        from app.main import app as real_app
+        from app.routes import uploads as upload_routes
+
+        from app.services.secret import SecretService
+
+        monkeypatch.setenv("APP_SECRET", SECRET)
+        monkeypatch.setattr(upload_routes, "IDLE_TIMEOUT_SEC", 0.25)
+        # No lifespan: this route sits outside the OAuth gate, so the only state
+        # it reads is the store and the secret. Running the real lifespan here
+        # would also start the MCP session manager's task group, which pytest's
+        # fixture teardown then tries to exit from a different task than entered
+        # it — an error about this test's plumbing, not about uploads.
+        # setattr with raising=False: app.state is populated by the lifespan,
+        # which this fixture deliberately does not run, so on a cold module
+        # neither attribute exists yet. monkeypatch still restores whatever was
+        # (or was not) there afterwards.
+        monkeypatch.setattr(real_app.state, "secret", SecretService(), raising=False)
+        store = UploadService(tmp_path / "uploads")
+        monkeypatch.setattr(real_app.state, "uploads", store, raising=False)
+        ticket = await store.mint(subject=SUBJECT, secret=SECRET)
+        transport = httpx.ASGITransport(app=real_app)
+        async with httpx.AsyncClient(transport=transport,
+                                     base_url="http://testserver") as client:
+            yield client, ticket, store
+
+    @staticmethod
+    async def _stalls(pause: float):
+        yield (b"--abc\r\nContent-Disposition: form-data; name=\"file\"; "
+               b"filename=\"big.jpg\"\r\n\r\n") + JPEG
+        await asyncio.sleep(pause)      # …and then nothing ever comes
+        yield b"\r\n--abc--\r\n"
+
+    @staticmethod
+    async def _trickles(gap: float, chunks: int):
+        yield (b"--abc\r\nContent-Disposition: form-data; name=\"file\"; "
+               b"filename=\"slow.jpg\"\r\n\r\n") + JPEG
+        for _ in range(chunks):
+            await asyncio.sleep(gap)
+            yield b"\x00" * 512
+        yield b"\r\n--abc--\r\n"
+
+    def _headers(self, ticket):
+        return {"Authorization": f"Bearer {ticket.token}",
+                "Content-Type": "multipart/form-data; boundary=abc"}
+
+    async def test_it_is_abandoned_and_gives_its_space_back(self, live):
+        client, ticket, store = live
+
+        r = await client.post(f"/uploads/{ticket.handle}",
+                              headers=self._headers(ticket),
+                              content=self._stalls(1.0))
+
+        assert r.status_code == 408, r.text
+        assert "abandoned" in r.json()["detail"]
+        assert store._reserved == {}, "the abandoned upload still holds volume budget"
+        left = sorted(p.name for p in (store.root / ticket.handle).iterdir())
+        assert left == [".ticket.json"], f"a part-written file survived: {left}"
+
+    async def test_the_space_it_held_is_usable_again(self, live, monkeypatch):
+        """The consequence that matters. Without the timeout the hold lasts for
+        the life of the process, at no cost to whoever opened it."""
+        client, ticket, store = live
+        monkeypatch.setattr(uploads_service, "MAX_BYTES_PER_FILE", 200_000)
+        monkeypatch.setattr(uploads_service, "UPLOADS_BUDGET_BYTES", 260_000)
+
+        stalled = await client.post(f"/uploads/{ticket.handle}",
+                                    headers=self._headers(ticket),
+                                    content=self._stalls(1.0))
+        assert stalled.status_code == 408, stalled.text
+
+        ok = await client.post(f"/uploads/{ticket.handle}",
+                               headers={"Authorization": f"Bearer {ticket.token}"},
+                               files={"file": ("photo.jpg", JPEG, "image/jpeg")})
+        assert ok.status_code == 200, ok.text
+
+    async def test_several_stalls_cannot_wedge_the_volume(self, live, monkeypatch):
+        """The measured attack, scaled down: enough concurrent holds to cover
+        the whole budget, then a legitimate upload."""
+        client, ticket, store = live
+        monkeypatch.setattr(uploads_service, "MAX_BYTES_PER_FILE", 200_000)
+        monkeypatch.setattr(uploads_service, "MAX_BYTES_PER_TICKET", 900_000)
+        monkeypatch.setattr(uploads_service, "UPLOADS_BUDGET_BYTES", 900_000)
+
+        stalls = [client.post(f"/uploads/{ticket.handle}", headers=self._headers(ticket),
+                              content=self._stalls(1.0)) for _ in range(4)]
+        assert {r.status_code for r in await asyncio.gather(*stalls)} == {408}
+
+        assert store._reserved == {}
+        ok = await client.post(f"/uploads/{ticket.handle}",
+                               headers={"Authorization": f"Bearer {ticket.token}"},
+                               files={"file": ("photo.jpg", JPEG, "image/jpeg")})
+        assert ok.status_code == 200, ok.text
+
+    async def test_a_slow_but_progressing_upload_is_never_abandoned(self, live):
+        """The victim this must not create. The timeout is between chunks, so a
+        client that keeps sending is welcome however long it takes in total —
+        here nearly five times the idle limit, spread over chunks that keep
+        arriving."""
+        client, ticket, _store = live
+
+        r = await client.post(f"/uploads/{ticket.handle}",
+                              headers=self._headers(ticket),
+                              content=self._trickles(0.2, 6))
+
+        assert r.status_code == 200, r.text
+        assert r.json()["bytes"] == len(JPEG) + 6 * 512
 
 
 class TestRouteIsOutsideTheOAuthGate:

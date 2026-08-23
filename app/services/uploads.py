@@ -317,12 +317,15 @@ def _require_type(head: bytes) -> str:
 def _split_ext(name: str) -> tuple[str, str]:
     """`("photo", ".jpg")`, or the whole name and no extension.
 
-    An empty stem means there was no extension to find, only a leading dot —
-    `.env` is a name, not an extension — and a non-alphanumeric or very long
-    tail is not one either.
+    A non-alphanumeric or very long tail is not an extension. An empty stem IS
+    one — `.jpg` is a name with nothing but an extension, and `safe_name` gives
+    it a stem rather than dropping the half that carries meaning. That case is
+    reachable from ordinary input: `a;rm -rf /.jpg` has the basename `.jpg`, and
+    it used to arrive called `jpg`, with no extension at all, on a feature whose
+    whole job is posting files to forms that check them.
     """
     stem, dot, ext = name.rpartition(".")
-    if not dot or not stem or not ext.isalnum() or len(ext) > 8:
+    if not dot or not ext.isalnum() or len(ext) > 8:
         return name, ""
     return stem, f".{ext}"
 
@@ -422,6 +425,15 @@ def _volume_bytes(root: Path) -> int:
     conservative. A partially-written `.incoming-*` file is already covered by
     its writer's reservation; counting it as well would charge those bytes
     twice, and the effective budget would shrink and grow with traffic.
+
+    **That reasoning holds only while the writer is alive.** After `kill -9`, an
+    OOM, or a Railway redeploy mid-upload, the in-memory ledger dies and the
+    file does not — and this walk then genuinely cannot see bytes that are
+    genuinely there, which breaks the invariant rather than merely relaxing it:
+    measured at 1.20x budget with three such orphans. Nothing sweeps them
+    either, because they live inside tickets that are not expired yet. So the
+    startup sweep deletes every `.incoming-*` it finds: nothing can be in flight
+    at boot, so anything wearing that name is by definition abandoned.
 
     Never raises, for the same reason `measure_dir` does not: a volume that
     cannot be walked is a reason to refuse an upload, not to crash one.
@@ -687,18 +699,28 @@ class UploadService:
         is bytes PROMISED rather than bytes written, the refusal says so and
         says what to do instead.
         """
-        held = len(self._reserved)
-        if not held:
-            return ""
         mine = sum(1 for owner, _size, _o in self._reserved.values() if owner == handle)
-        where = "to this upload URL" if mine else "elsewhere on this server"
-        one = held == 1
+        others = len(self._reserved) - mine
+        if not mine and not others:
+            return ""
+        # Count and attribution have to agree. The first version of this reported
+        # the GLOBAL total under a LOCAL description — one write here and two
+        # elsewhere came out as "3 other uploads to this upload URL" — and the
+        # difference is not cosmetic: a model reads this and chooses between
+        # waiting and fetching a fresh URL.
+        parts = []
+        if mine:
+            parts.append(f"{mine} other upload{'' if mine == 1 else 's'} to this "
+                         "upload URL")
+        if others:
+            parts.append(f"{others} upload{'' if others == 1 else 's'} elsewhere on "
+                         "this server")
+        plural = (mine + others) > 1
         return (
-            f" {held} other upload{'' if one else 's'} {where} "
-            f"{'is' if one else 'are'} still in flight, holding room until "
-            f"{'it finishes' if one else 'they finish'}; an upload that sends no "
-            "Content-Length has to reserve the maximum. Retry in a moment, or send a "
-            "Content-Length so yours reserves only what it needs."
+            f" {' and '.join(parts)} {'are' if plural else 'is'} still in flight, "
+            f"holding room until {'they finish' if plural else 'it finishes'}; an "
+            "upload that sends no Content-Length has to reserve the maximum. Retry in "
+            "a moment, or send a Content-Length so yours reserves only what it needs."
         )
 
     def busy_handles(self) -> set[str]:
@@ -951,7 +973,8 @@ class UploadService:
         return target
 
     # ── expiry ──
-    async def sweep(self, *, now: float | None = None) -> SweptUploads:
+    async def sweep(self, *, now: float | None = None,
+                    reclaim_incoming: bool = False) -> SweptUploads:
         """Remove every ticket past its expiry. Returns what it actually freed.
 
         Deliberately not a timer. services/heartbeat.py documents that Railway
@@ -961,7 +984,8 @@ class UploadService:
         exactly that, so this runs only when something already asked: startup,
         a mint, or the settings page.
         """
-        return await self._reclaim(expired_only=True, now=now)
+        return await self._reclaim(expired_only=True, now=now,
+                                   reclaim_incoming=reclaim_incoming)
 
     async def clear(self, *, expired_only: bool = True,
                     now: float | None = None) -> SweptUploads:
@@ -975,9 +999,11 @@ class UploadService:
         """
         return await self._reclaim(expired_only=expired_only, now=now)
 
-    async def _reclaim(self, *, expired_only: bool, now: float | None) -> SweptUploads:
+    async def _reclaim(self, *, expired_only: bool, now: float | None,
+                       reclaim_incoming: bool = False) -> SweptUploads:
         swept = await asyncio.to_thread(
-            self._sweep, time.time() if now is None else now, expired_only
+            self._sweep, time.time() if now is None else now, expired_only,
+            reclaim_incoming,
         )
         if swept.handles or swept.refused:
             logger.info(
@@ -987,9 +1013,12 @@ class UploadService:
             )
         return swept
 
-    def _sweep(self, now: float, expired_only: bool = True) -> SweptUploads:
+    def _sweep(self, now: float, expired_only: bool = True,
+               reclaim_incoming: bool = False) -> SweptUploads:
         busy = self.busy_handles()
         handles = files = freed = kept = refused = 0
+        if reclaim_incoming:
+            freed += self._drop_abandoned_writes()
         for entry in reclaim.children(self.root):
             if entry.name in busy:
                 # A write is streaming into this one. Removing it would pull the
@@ -1027,6 +1056,35 @@ class UploadService:
         return SweptUploads(
             handles=handles, files=files, bytes=freed, kept=kept, refused=refused
         )
+
+    def _drop_abandoned_writes(self) -> int:
+        """Remove every `.incoming-*` file. **Startup only.**
+
+        Safe there and nowhere else: nothing can be in flight before the first
+        request is served, so anything wearing that name is a write whose
+        process died — after a crash, an OOM kill, or a redeploy. Those files
+        are the one thing the budget walk cannot see and the sweep would not
+        reach, because they live inside tickets that have not expired; without
+        this they sit on the volume, uncounted, until their ticket's TTL.
+
+        Returns the bytes it actually removed, like everything else here.
+        """
+        freed = 0
+        for entry in reclaim.children(self.root):
+            if entry.is_symlink() or not entry.is_dir():
+                continue
+            for leftover in reclaim.children(entry):
+                if not leftover.name.startswith(_INCOMING_PREFIX):
+                    continue
+                try:
+                    size = leftover.lstat().st_size
+                    leftover.unlink()
+                except OSError:  # pragma: no cover - it vanished under us
+                    continue
+                logger.info("removed an abandoned upload of %d bytes from %s",
+                            size, entry.name)
+                freed += size
+        return freed
 
     @staticmethod
     def _older_than_any_ticket(entry: Path, now: float) -> bool:

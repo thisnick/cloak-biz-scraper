@@ -140,7 +140,10 @@ async def lifespan(app: FastAPI):
     # feature nobody has used yet. Expired files are inert whether or not this
     # runs — resolve_for refuses them — so the worst a failure costs is disk.
     try:
-        await app.state.uploads.sweep()
+        # reclaim_incoming only here: nothing can be mid-upload before the first
+        # request is served, so a part-written file at boot is one whose process
+        # died — and it is the one thing the budget arithmetic cannot see.
+        await app.state.uploads.sweep(reclaim_incoming=True)
     except Exception:  # noqa: BLE001
         logger.exception("could not sweep expired uploads at startup")
     app.state.scrape = ScrapeService(app.state.instances, jobs, settings_service)
