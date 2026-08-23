@@ -698,13 +698,19 @@ class TestUploadResolvesThroughTheStore:
         monkeypatch.setattr(asyncio, "create_subprocess_exec", spy)
         svc = AgentBrowserService(_FakeInstances(_FakeInst(cdp_port=4242)), store)
 
-        out = await svc.drive("i1", f"upload @e3 {staged[0].path}", subject=OWNER)
+        # A caller string that is VALID but not character-identical to the path
+        # the store returns. Without this the assertion normalises both sides and
+        # cannot tell them apart — the review found exactly that, and this test
+        # was passing for a reason it did not intend.
+        noisy = f"{pathlib.Path(staged[0].path).parent}/./photo.jpg"
+        out = await svc.drive("i1", f"upload @e3 {noisy}", subject=OWNER)
 
         assert out.ok and out.output == "attached 1 file"
         program, args = calls[0]
         assert program == "agent-browser"
         assert args[:4] == ("--cdp", "4242", "upload", "@e3")
         assert args[4:] == (str(pathlib.Path(staged[0].path).resolve()),)
+        assert "/./" not in args[4], "the caller's own string reached argv"
 
     async def test_the_subprocess_gets_the_path_the_store_returned_not_the_callers_string(
         self, tmp_path, monkeypatch
@@ -765,14 +771,15 @@ class TestUploadResolvesThroughTheStore:
         monkeypatch.setattr(asyncio, "create_subprocess_exec", spy)
         svc = AgentBrowserService(_FakeInstances(_FakeInst()), store)
 
-        out = await svc.drive(
-            "i1", "upload @e7 " + " ".join(s.path for s in staged), subject=OWNER
-        )
+        noisy = [f"{pathlib.Path(f.path).parent}/./{pathlib.Path(f.path).name}"
+                 for f in staged]
+        out = await svc.drive("i1", "upload @e7 " + " ".join(noisy), subject=OWNER)
 
         assert out.ok
         args = calls[0][1]
         assert args[3] == "@e7", "the selector is passed through, like every other verb"
-        assert list(args[4:]) == [str(pathlib.Path(s.path).resolve()) for s in staged]
+        assert list(args[4:]) == [str(pathlib.Path(f.path).resolve()) for f in staged]
+        assert not any("/./" in a for a in args[4:]), "a caller string reached argv"
 
     async def test_the_selector_is_never_treated_as_a_path(self, tmp_path, monkeypatch):
         """`@e3` is a page ref. If it were run through the store it would be
@@ -885,6 +892,30 @@ class TestUploadRefusals:
             await svc.drive("i1", command, subject=OWNER)
         assert spy == []
 
+    async def test_a_store_that_returned_fewer_paths_than_asked_is_refused_loudly(
+        self, tmp_path, spy, monkeypatch
+    ):
+        """The cross-unit invariant, pinned.
+
+        `resolve_for` is a 1:1 comprehension today, so this cannot happen — the
+        assertion exists because that is a property of ANOTHER module and
+        nothing declares it a contract. The failure it would otherwise produce
+        is the quiet kind: a browser told to attach two files when three were
+        named, and no error anywhere. Here it is made to happen on purpose.
+        """
+        store, ticket, staged = await _staging(
+            tmp_path / "uploads", ("a.jpg", JPEG), ("b.png", PNG)
+        )
+        monkeypatch.setattr(store, "resolve_for",
+                            lambda subject, paths, **kw: [pathlib.Path(staged[0].path)])
+        svc = AgentBrowserService(_FakeInstances(_FakeInst()), store)
+
+        with pytest.raises(AgentBrowserError, match="different set of files"):
+            await svc.drive(
+                "i1", f"upload @e3 {staged[0].path} {staged[1].path}", subject=OWNER
+            )
+        assert spy == [], "a partial set of files was attached anyway"
+
     async def test_a_service_with_no_staging_store_says_so(self, spy):
         svc = AgentBrowserService(_FakeInstances(_FakeInst()))
         with pytest.raises(AgentBrowserError, match="cannot stage uploads"):
@@ -926,9 +957,10 @@ class TestUploadOverRest:
             AgentBrowserService(_FakeInstances(_FakeInst(cdp_port=5150)), store),
         )
 
+        noisy = f"{pathlib.Path(staged[0].path).parent}/./photo.jpg"
         r = client.post(
             "/api/instances/i1/agent-browser",
-            json={"command": f"upload @e3 {staged[0].path}"},
+            json={"command": f"upload @e3 {noisy}"},
             headers={"Authorization": f"Bearer {mint_access(app)}"},
         )
 
@@ -936,6 +968,7 @@ class TestUploadOverRest:
         assert r.json()["output"] == "attached 1 file"
         assert calls[0][1][:4] == ("--cdp", "5150", "upload", "@e3")
         assert calls[0][1][4] == str(pathlib.Path(staged[0].path).resolve())
+        assert "/./" not in calls[0][1][4], "the caller's own string reached argv"
 
     def test_a_path_the_store_never_wrote_is_a_400_that_says_what_to_do(
         self, client, monkeypatch, tmp_path
@@ -957,38 +990,107 @@ class TestUploadOverRest:
         assert "create_upload_url" in r.json()["detail"]
 
 
+# Verbs the allow-list accepts but the description deliberately does not list:
+# aliases and rarely-useful variants that would crowd the block a model reads
+# without teaching it anything. Written down as a set rather than left implicit,
+# so a verb ADDED to the allow-list without a line in the description trips this
+# file — that is the dangerous direction, a new capability nobody wrote down.
+UNDOCUMENTED_VERBS = frozenset({
+    "open",      # alias of navigate
+    "dblclick", "hover", "scroll", "select", "type", "wait",
+})
+
+
+def _published_description() -> str:
+    """What a model is actually SHOWN, not what the source says.
+
+    Read off the built server rather than sliced out of the file: the thing
+    under test is the published surface, and a docstring is only a means to it.
+    """
+    import asyncio
+
+    from app import mcp_server
+
+    tools = asyncio.run(mcp_server.build(app).list_tools())
+    return next(t for t in tools if t.name == "agent_browser").description
+
+
+def _described_verbs(description: str) -> set[str]:
+    """The verbs the description's block advertises, parsed out of the prose.
+
+    Parsed rather than listed, and that is the whole point of the change that
+    introduced this. The version before it compared a HARDCODED set of twelve
+    known-good verbs against the allow-list, so it could only ever re-confirm
+    what it already named: a bogus `download @e3 <path>` line added to the
+    description left the entire suite green. A test that cannot see tomorrow's
+    drift is not guarding against it.
+
+    The block is the run of deeply-indented lines; each begins with the verb
+    form, separated from its gloss by two or more spaces. `back / forward /
+    reload` is three verbs on one line and is read as three.
+    """
+    import re
+
+    verbs: set[str] = set()
+    for line in description.splitlines():
+        if not line.strip() or (len(line) - len(line.lstrip())) < 12:
+            continue
+        head = re.split(r"\s{2,}", line.strip())[0]
+        for part in head.split("/"):
+            token = part.strip().split(" ")[0]
+            if token:
+                verbs.add(token)
+    return verbs
+
+
 class TestTheToolDescriptionMatchesWhatIsEnforced:
     """A tool description that overstates what the server accepts is a bug with
     a very long feedback loop — the model believes it for the whole session."""
 
-    def _doc(self) -> str:
-        import inspect
+    @pytest.fixture(scope="class")
+    def doc(self) -> str:
+        return _published_description()
 
-        from app import mcp_server
-        source = inspect.getsource(mcp_server)
-        start = source.index("async def agent_browser(")
-        return source[start:source.index('"""', source.index('"""', start) + 3)]
+    def test_the_verb_block_lists_upload_with_a_path(self, doc):
+        assert "upload @e3 <path>     attach an uploaded file to a file input" in doc
 
-    def test_the_verb_block_lists_upload_with_a_path(self):
-        assert "upload @e3 <path>     attach an uploaded file to a file input" in self._doc()
-
-    def test_it_tells_the_model_where_the_path_must_come_from(self):
-        doc = self._doc()
+    def test_it_tells_the_model_where_the_path_must_come_from(self, doc):
         assert "create_upload_url" in doc
         assert "A path you wrote yourself is" in doc and "refused" in doc
 
-    def test_it_admits_the_case_it_cannot_serve(self):
+    def test_it_admits_the_case_it_cannot_serve(self, doc):
         """setInputFiles binds to an <input type=file>; a native chooser needs
         Playwright's filechooser event, which the CLI has no fallback for. A
         model that does not know will loop on a page it cannot serve."""
-        assert "file picker" in self._doc()
+        assert "file picker" in doc
 
-    def test_every_verb_the_description_advertises_is_actually_allowed(self):
+    def test_the_verb_block_is_actually_being_parsed(self, doc):
+        """The control. Every assertion below is `parsed <= allowed`, which a
+        parser that found NOTHING would satisfy perfectly."""
+        described = _described_verbs(doc)
+        assert {"navigate", "snapshot", "read", "click", "fill", "press", "upload",
+                "get", "back", "forward", "reload", "screenshot"} <= described
+        assert len(described) >= 12
+
+    def test_every_verb_the_description_advertises_is_actually_allowed(self, doc):
         from app.services.agent_browser import ALLOWED_VERBS
 
-        doc = self._doc()
-        advertised = {"navigate", "snapshot", "read", "click", "fill", "press",
-                      "upload", "get", "back", "forward", "reload", "screenshot"}
-        for verb in advertised:
-            assert verb in doc, f"{verb} is enforced but not described"
-            assert verb in ALLOWED_VERBS, f"{verb} is described but not allowed"
+        described = _described_verbs(doc)
+        overstated = described - set(ALLOWED_VERBS)
+        assert not overstated, (
+            f"the description advertises {sorted(overstated)}, which parse_command "
+            "refuses. A model will try them for the whole session and be told no."
+        )
+
+    def test_no_allowed_verb_is_advertised_by_accident_or_hidden_by_accident(self, doc):
+        """The other direction: a verb added to the allow-list without a line in
+        the description. That is a capability nobody wrote down, and it is the
+        direction that matters more."""
+        from app.services.agent_browser import ALLOWED_VERBS
+
+        undescribed = set(ALLOWED_VERBS) - _described_verbs(doc)
+        assert undescribed == set(UNDOCUMENTED_VERBS), (
+            "the set of allowed-but-undescribed verbs changed.\n"
+            f"  newly undescribed: {sorted(undescribed - set(UNDOCUMENTED_VERBS))}\n"
+            f"  no longer undescribed: {sorted(set(UNDOCUMENTED_VERBS) - undescribed)}"
+        )

@@ -662,6 +662,31 @@ class UploadService:
         """Give bytes back. Idempotent: commit and abort may both reach here."""
         self._reserved.pop(reservation, None)
 
+    def _in_flight_note(self, handle: str) -> str:
+        """Why a nearly-empty volume can still refuse, and what to do about it.
+
+        An upload that sends no Content-Length has to reserve the per-file
+        maximum, because a bound that only holds for clients which declare their
+        size is not a bound. The cost is that two of those can use up a ticket's
+        room while holding almost nothing — and "no room" on a volume that is
+        visibly empty is a baffling thing to be told. So when what is in the way
+        is bytes PROMISED rather than bytes written, the refusal says so and
+        says what to do instead.
+        """
+        held = len(self._reserved)
+        if not held:
+            return ""
+        mine = sum(1 for owner, _size, _o in self._reserved.values() if owner == handle)
+        where = "to this upload URL" if mine else "elsewhere on this server"
+        one = held == 1
+        return (
+            f" {held} other upload{'' if one else 's'} {where} "
+            f"{'is' if one else 'are'} still in flight, holding room until "
+            f"{'it finishes' if one else 'they finish'}; an upload that sends no "
+            "Content-Length has to reserve the maximum. Retry in a moment, or send a "
+            "Content-Length so yours reserves only what it needs."
+        )
+
     def _volume_committed_and_reserved(self) -> int:
         """Everything the budget has to cover: bytes on disk plus bytes promised.
 
@@ -780,18 +805,24 @@ class UploadService:
                 - self._volume_committed_and_reserved()
                 - _MANIFEST_ENTRY_BYTES
             )
+            # Both room figures can be short because of bytes that are promised
+            # rather than written, and a refusal that does not say so is a
+            # mystery. The note is empty when nothing is in flight, so the
+            # ordinary "you sent too much" case reads exactly as before.
+            in_flight = self._in_flight_note(handle)
             limits: list[tuple[int, UploadsError]] = [
                 (MAX_BYTES_PER_FILE, TooLarge(
                     f"that file is over the {human_size(MAX_BYTES_PER_FILE)} limit for a "
                     "single upload")),
                 (room_in_ticket, TooLarge(
                     f"this upload URL can hold {human_size(MAX_BYTES_PER_TICKET)} in total "
-                    "and that file would take it over. Get a fresh upload URL for the rest.")),
+                    "and that file would take it over. Get a fresh upload URL for the "
+                    f"rest.{in_flight}")),
                 (room_on_volume, NoRoom(
                     "there is no room on this server for another upload right now — "
                     f"uploaded files may use {human_size(UPLOADS_BUDGET_BYTES)} in total. "
                     "They expire on their own within two hours; to free the space now, open "
-                    "Settings \u2192 Disk space and clear uploaded files.")),
+                    f"Settings \u2192 Disk space and clear uploaded files.{in_flight}")),
             ]
             if declared_bytes is not None:
                 limits.append((max(0, declared_bytes), TooLarge(

@@ -538,6 +538,44 @@ class TestTheVolumeIsBounded:
         assert (await first.commit()).bytes == 8192
         assert _disk(store.root) <= uploads_service.UPLOADS_BUDGET_BYTES
 
+    async def test_a_refusal_caused_by_an_upload_in_flight_says_so(
+        self, store, monkeypatch
+    ):
+        """"No room" on a volume that is visibly empty is a baffling thing to be
+        told. When what is in the way is bytes PROMISED rather than bytes
+        written, the refusal has to name the cause and the fix — the same
+        standard the two `upload` refusals are held to."""
+        # Equal caps, so one pessimistic reservation uses the ticket's whole
+        # room and the next caller has none. Note how narrow that is: while ANY
+        # room is left, a second write is admitted with a smaller allowance
+        # rather than refused, so this is the edge and not the common case.
+        monkeypatch.setattr(uploads_service, "MAX_BYTES_PER_FILE", 32 * 1024)
+        monkeypatch.setattr(uploads_service, "MAX_BYTES_PER_TICKET", 32 * 1024)
+        ticket = await _mint(store)
+
+        holding = await store.begin(ticket.handle, subject=SUBJECT, filename="a.jpg")
+        try:
+            with pytest.raises(TooLarge) as refused:
+                await store.begin(ticket.handle, subject=SUBJECT, filename="b.jpg")
+        finally:
+            holding.abort()
+
+        message = str(refused.value)
+        assert "still in flight" in message
+        assert "Content-Length" in message
+        assert "Retry" in message
+
+    async def test_an_ordinary_too_large_refusal_does_not_mention_other_uploads(
+        self, store, monkeypatch
+    ):
+        """The note is conditional. With nothing in flight, the plain refusal
+        must read exactly as it did — an explanation nobody needs is noise."""
+        monkeypatch.setattr(uploads_service, "MAX_BYTES_PER_FILE", 64)
+        ticket = await _mint(store)
+        with pytest.raises(TooLarge) as refused:
+            await _stage(store, ticket.handle, JPEG + b"\x00" * 5000)
+        assert "in flight" not in str(refused.value)
+
     async def test_a_refused_upload_gives_its_reservation_back(self, store, monkeypatch):
         """An upload that fails must cost nothing. Otherwise a run of failures
         is its own outage: the volume looks full and nothing can be freed."""

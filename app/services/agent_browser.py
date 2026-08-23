@@ -352,6 +352,18 @@ class AgentBrowserService:
             # check this feature has. The wording belongs to the store, so the
             # refusal a model reads cannot drift from the rule that produced it.
             raise AgentBrowserError(str(exc)) from exc
+        # Pinning a cross-unit invariant, not defending against a known bug.
+        # There is no silent-drop defect today: resolve_for is a 1:1 list
+        # comprehension, so a path either comes back or raises. But that is a
+        # property of ANOTHER module, undocumented as a contract, and the failure
+        # it would produce here is the quiet kind — a browser told to attach two
+        # files when the caller named three, and no error anywhere. One line
+        # turns that into a loud one.
+        if len(resolved) != len(argv[2:]):
+            raise AgentBrowserError(
+                f"resolved {len(resolved)} of {len(argv) - 2} file paths; refusing to "
+                "attach a different set of files than you asked for"
+            )
         return ["upload", argv[1], *(str(path) for path in resolved)]
 
     async def drive(self, instance_id: str, command: str, *,

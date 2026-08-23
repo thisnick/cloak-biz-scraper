@@ -358,6 +358,23 @@ class TestThePublishedUploadSurface:
                                for n in range(3)])
         assert r.status_code == 409, r.text
 
+    def test_the_accepted_list_is_exactly_what_the_sniffer_can_recognise(self, client,
+                                                                         uploads):
+        """Both directions, derived rather than listed.
+
+        A hardcoded list can only re-confirm itself: a type added to the sniffer
+        and forgotten in `ACCEPTS` would be silently accepted and never
+        advertised, and one removed from the sniffer but left in `ACCEPTS` would
+        be advertised and always refused. Neither is visible to a test that
+        compares one literal against another — which is the same defect the
+        agent_browser verb-block test was just fixed for.
+        """
+        from app.services import uploads as store
+
+        recognisable = {content_type for _magic, content_type in store._MAGIC}
+        recognisable.add(store.sniff(b"RIFF" + b"\x00" * 4 + b"WEBP"))
+        assert set(_rest_ticket(client)["accepts"]) == recognisable
+
     def test_what_it_says_it_accepts_is_what_it_accepts(self, client, uploads):
         ticket = _rest_ticket(client)
         assert ticket["accepts"] == ["image/jpeg", "image/png", "image/webp",
