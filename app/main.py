@@ -43,7 +43,7 @@ from .services.ratelimit import RateLimiter
 from .services.scrape import ScrapeService
 from .services.secret import SecretService
 from .services.settings import SettingsService
-from .services.uploads import UploadService
+from .services.uploads import StagedUploads, UploadService
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
@@ -132,6 +132,9 @@ async def lifespan(app: FastAPI):
     # `agent-browser upload` may point. Files expire on a two-hour clock nobody
     # has to remember; the sweep below is what actually takes them away.
     app.state.uploads = UploadService(CONFIG.uploads_dir)
+    # The third thing that grows on this volume, measured the same way as the
+    # other two: off the event loop, cached, and never during a render.
+    app.state.staged_uploads = StagedUploads(lambda: app.state.uploads)
     # Non-fatal, exactly like ensure_default above: a volume that cannot be
     # listed is a reason to skip a cleanup, never a reason to fail boot for a
     # feature nobody has used yet. Expired files are inert whether or not this

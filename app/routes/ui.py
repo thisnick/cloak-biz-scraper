@@ -27,6 +27,7 @@ from fastapi.templating import Jinja2Templates
 from ..config import CONFIG
 from ..models import ScrapeResult
 from ..services import sessions
+from ..services.presentation import human_size
 from ..services.ratelimit import client_key
 from ..services.settings import Settings
 
@@ -1086,18 +1087,6 @@ async def profile_delete(request: Request, name: str = Form("")) -> Response:
 # to press "Remove" to find out what removing would free.
 
 
-def _size(num: int) -> str:
-    """Bytes for a person: 747 MB, 1.4 GB. Only ever used in a message."""
-    value = float(num)
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if value < 1024 or unit == "TB":
-            if unit == "B":
-                return f"{int(value)} B"
-            return f"{value:.0f} {unit}" if value >= 10 else f"{value:.1f} {unit}"
-        value /= 1024
-    return f"{value:.0f} TB"  # pragma: no cover - unreachable, the loop returns
-
-
 async def _builds_payload(request: Request, refresh: bool) -> dict[str, Any] | None:
     view = await request.app.state.browser_builds.snapshot(refresh=refresh)
     in_use = view.in_use
@@ -1130,9 +1119,17 @@ async def _history_payload(request: Request, refresh: bool) -> dict[str, Any] | 
     }
 
 
+async def _uploads_payload(request: Request, refresh: bool) -> dict[str, Any] | None:
+    view = await request.app.state.staged_uploads.snapshot(refresh=refresh)
+    return {
+        "handles": view.handles, "files": view.files, "bytes": view.bytes,
+        "expired": view.expired, "measured_at": view.measured_at,
+    }
+
+
 @router.get("/settings/storage")
 async def storage_sizes(request: Request, refresh: bool = False) -> dict[str, Any]:
-    """What the browser cache and the task history are using on the volume.
+    """What the browser cache, the task history, and staged uploads are using.
 
     One request for both, filled in after the page paints. Each half degrades on
     its own: a volume that cannot be walked answers `null` for that section and
@@ -1143,7 +1140,8 @@ async def storage_sizes(request: Request, refresh: bool = False) -> dict[str, An
     """
     _require(request)
     payload: dict[str, Any] = {}
-    for key, build in (("builds", _builds_payload), ("history", _history_payload)):
+    for key, build in (("builds", _builds_payload), ("history", _history_payload),
+                       ("uploads", _uploads_payload)):
         try:
             payload[key] = await build(request, refresh)
         except OSError:
@@ -1182,7 +1180,7 @@ async def prune_builds(request: Request) -> Response:
         Result("storage", True,
                f"Removed {len(removed.removed)} older browser "
                f"version{'' if len(removed.removed) == 1 else 's'} and freed "
-               f"{_size(removed.bytes)}. The build in use ({removed.kept}) was kept."),
+               f"{human_size(removed.bytes)}. The build in use ({removed.kept}) was kept."),
     )
 
 
@@ -1209,13 +1207,58 @@ async def clear_history(request: Request) -> Response:
             f"and {cleared.orphans} leftover evidence "
             f"folder{'' if cleared.orphans == 1 else 's'} from runs already gone"
         )
-    message = " ".join(parts) + f", freeing {_size(cleared.bytes)}."
+    message = " ".join(parts) + f", freeing {human_size(cleared.bytes)}."
     if cleared.kept:
         message += (
             f" {cleared.kept} run{'' if cleared.kept == 1 else 's'} still working "
             f"{'was' if cleared.kept == 1 else 'were'} kept."
         )
     return _render(request, Result("storage", True, message))
+
+
+@router.post("/settings/storage/uploads/clear", response_class=HTMLResponse)
+async def clear_uploads(request: Request, scope: str = Form("expired")) -> Response:
+    """Remove staged uploads. Expired ones by default; everything on request.
+
+    Two scopes rather than one button, because a live ticket may be mid-flight —
+    the same reason `clear_history` keeps a run that is still working. The
+    default is the safe one; the full clear is the human's escape hatch for a
+    volume filling up and is behind its own confirmation. Neither will touch a
+    ticket with a write streaming into it: that is the service's own guard,
+    re-read at the moment of removal rather than from the listing this started
+    with.
+
+    The banner reports what was actually freed, never what it set out to free.
+    """
+    _require(request)
+    _require_same_origin(request)
+
+    cleared = await request.app.state.uploads.clear(expired_only=(scope != "all"))
+    request.app.state.staged_uploads.invalidate()
+
+    if not cleared.handles:
+        message = (
+            "Nothing to clear — there are no uploaded files."
+            if not cleared.kept
+            else f"Nothing to clear — {_tickets(cleared.kept)} still in use, and "
+                 "uploaded files expire on their own within two hours."
+        )
+        return _render(request, Result("storage", True, message))
+
+    message = f"Cleared {_tickets(cleared.handles)} and freed {human_size(cleared.bytes)}."
+    if cleared.kept:
+        message += f" {_tickets(cleared.kept).capitalize()} still in use {'was' if cleared.kept == 1 else 'were'} kept."
+    if cleared.refused:
+        message += (
+            f" {cleared.refused} item{'' if cleared.refused == 1 else 's'} could not be "
+            "removed safely and {} left alone.".format(
+                "was" if cleared.refused == 1 else "were")
+        )
+    return _render(request, Result("storage", True, message))
+
+
+def _tickets(count: int) -> str:
+    return f"{count} upload{'' if count == 1 else 's'}"
 
 
 # ── Notion ──────────────────────────────────────────────────────────────────

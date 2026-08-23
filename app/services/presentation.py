@@ -1,4 +1,4 @@
-"""Turning library errors into things a non-technical user can act on.
+"""Turning machine facts into things a non-technical user can act on.
 
 The `cloakbrowser` package raises errors written for the person who installed it
 from a terminal. Our user deployed a button on Railway and has no shell. Where
@@ -6,10 +6,44 @@ that gap makes advice actively wrong, we fix it *here* — at the edge, where th
 audience is known — and never by editing the diagnostics themselves. Those are
 correct for their own audience, and rewriting them in place would degrade the
 logs, which a maintainer does read.
+
+Byte counts live here for the same reason: "how big is that" is a presentation
+question with one right answer for this audience, and it was being answered in
+three places at once — a service's refusals, the settings banners, and the
+dashboard's own JavaScript. Two of those are Python and now share this; the
+third cannot import it and is written to match, which is noted where it lives.
 """
 from __future__ import annotations
 
 import re
+
+_UNITS = ("B", "KB", "MB", "GB", "TB")
+
+
+def human_size(count: int) -> str:
+    """Bytes as a person reads them: `747 MB`, `1.4 GB`, `64 B`.
+
+    One decimal below ten and none above it, because "1.4 GB" is a number
+    somebody can act on and "1.43 GB" is noise. A trailing ".0" is dropped —
+    "1 KB", not "1.0 KB" — which is not only taste: the dashboard's own
+    JavaScript copy has always rounded that way, and a test that runs both found
+    the two surfaces disagreeing about every exact power of 1024. One of them
+    had to move, and this is the reading a person would rather see.
+
+    Used both in banners a human reads and in refusals a model reads — they want
+    the same thing, and two formatters that agree today are two that disagree
+    after the next edit.
+    """
+    value = float(count)
+    for unit in _UNITS:
+        if value < 1024 or unit == "TB":
+            if unit == "B":
+                return f"{int(value)} B"
+            if value >= 10:
+                return f"{value:.0f} {unit}"
+            return f"{value:.1f} {unit}".replace(".0 ", " ")
+        value /= 1024
+    return f"{value:.0f} TB"  # pragma: no cover - unreachable, the loop returns
 
 # From cloakbrowser/download.py:180 — appended to every "Pro binary could not be
 # downloaded" RuntimeError:

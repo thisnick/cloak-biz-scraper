@@ -60,6 +60,9 @@ from pathlib import Path
 from typing import AsyncIterator, Callable, Iterable
 
 from . import reclaim, signing
+# Re-exported deliberately: routes/uploads.py builds its own refusals from the
+# same numbers, and one formatter for the whole feature is the point.
+from .presentation import human_size
 from .profile_sizes import measure_dir
 
 logger = logging.getLogger("cloakbiz.uploads")
@@ -297,16 +300,6 @@ def _require_type(head: bytes) -> str:
             + ", checked by content rather than by filename"
         )
     return content_type
-
-
-def human_size(count: int) -> str:
-    """A byte count as a person reads it. MB is the unit these caps are written
-    in, but a cap lowered under a test would otherwise print "0 MB"."""
-    if count >= 1024 * 1024:
-        return f"{count // (1024 * 1024)} MB"
-    if count >= 1024:
-        return f"{count // 1024} KB"
-    return f"{count} bytes"
 
 
 def _split_ext(name: str) -> tuple[str, str]:
@@ -581,7 +574,16 @@ class StagedWrite:
                     safe_name(self._filename, self.content_type),
                     {str(e.get("name")) for e in entries},
                 )
-                os.replace(self._tmp, self._ticket_dir / name)
+                try:
+                    os.replace(self._tmp, self._ticket_dir / name)
+                except OSError as exc:
+                    # The ticket was swept or cleared while these bytes were
+                    # arriving. `busy_handles` is what normally prevents it;
+                    # this is what stops the race that remains from being a 500.
+                    raise NotStaged(
+                        "that upload URL was cleared while the file was arriving — "
+                        "call create_upload_url for a new one"
+                    ) from exc
                 self._closed = True
                 entry = {
                     "name": name, "bytes": self._written, "sha256": checksum,
@@ -686,6 +688,24 @@ class UploadService:
             "Content-Length has to reserve the maximum. Retry in a moment, or send a "
             "Content-Length so yours reserves only what it needs."
         )
+
+    def busy_handles(self) -> set[str]:
+        """Tickets with a write in flight right now.
+
+        The owner's clear reads this and leaves them alone, the same way
+        `clear_history` keeps a run that is still working. Without it the clear
+        would delete a directory out from under an open file handle: on POSIX
+        the writer keeps writing to an unlinked inode and only discovers it at
+        the rename, which is a 500 for something that is nobody's mistake.
+
+        In memory rather than on disk, and that is a real limitation worth
+        stating: a restart forgets every reservation. It is safe in the
+        direction that matters — a forgotten reservation frees budget it was
+        holding, and the writer it belonged to died with the process — but it
+        means this is not a lock, only a courtesy between callers in one
+        process, which is all there is on a single-container deployment.
+        """
+        return {handle for handle, _size, _o in self._reserved.values()}
 
     def _volume_committed_and_reserved(self) -> int:
         """Everything the budget has to cover: bytes on disk plus bytes promised.
@@ -929,7 +949,24 @@ class UploadService:
         exactly that, so this runs only when something already asked: startup,
         a mint, or the settings page.
         """
-        swept = await asyncio.to_thread(self._sweep, time.time() if now is None else now)
+        return await self._reclaim(expired_only=True, now=now)
+
+    async def clear(self, *, expired_only: bool = True,
+                    now: float | None = None) -> SweptUploads:
+        """The owner's override, from Settings \u2192 Disk space.
+
+        `expired_only` is the default because a live ticket may be mid-flight —
+        the same reason `clear_history` keeps a run that is still working. The
+        full clear is the human's escape hatch for a volume filling up, and it
+        still refuses to touch a ticket with a write in flight, because that is
+        not a judgement call the button can make from the dashboard.
+        """
+        return await self._reclaim(expired_only=expired_only, now=now)
+
+    async def _reclaim(self, *, expired_only: bool, now: float | None) -> SweptUploads:
+        swept = await asyncio.to_thread(
+            self._sweep, time.time() if now is None else now, expired_only
+        )
         if swept.handles or swept.refused:
             logger.info(
                 "swept %d expired upload ticket(s), freeing %d bytes across %d file(s); "
@@ -938,15 +975,21 @@ class UploadService:
             )
         return swept
 
-    def _sweep(self, now: float) -> SweptUploads:
+    def _sweep(self, now: float, expired_only: bool = True) -> SweptUploads:
+        busy = self.busy_handles()
         handles = files = freed = kept = refused = 0
         for entry in reclaim.children(self.root):
+            if entry.name in busy:
+                # A write is streaming into this one. Removing it would pull the
+                # directory out from under an open file handle.
+                kept += 1
+                continue
             manifest = None if entry.is_symlink() else _read_manifest(entry)
             if manifest is not None:
-                if not _expired(manifest, now):
+                if expired_only and not _expired(manifest, now):
                     kept += 1
                     continue
-            elif not self._older_than_any_ticket(entry, now):
+            elif expired_only and not self._older_than_any_ticket(entry, now):
                 # No readable manifest: a directory caught mid-mint, or one
                 # whose record was damaged. Nothing can resolve out of it, so it
                 # is inert — and leaving it until it is older than any live

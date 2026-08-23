@@ -20,6 +20,7 @@ from fastapi.testclient import TestClient
 from app.config import CONFIG
 from app.main import app
 from app.services import sessions
+from app.services.presentation import human_size
 from app.services.scrape import ScrapeService
 from app.services.secret import SecretService
 from app.services.settings import SettingsService
@@ -2298,8 +2299,64 @@ class TestConnectedAppsUi:
         assert info["client_secret"] not in wired.get("/").text
 
 
+# A real JPEG header. Staging checks the first bytes, never the filename, so a
+# fixture with the wrong ones is refused — which is the point.
+JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 60
+
+
+class TestOneByteFormatter:
+    """"How big is that" had three answers: a service's refusals, the settings
+    banners, and the dashboard's own JavaScript. Two of those are Python and now
+    share one function; the third cannot import it, so it is checked against it.
+    """
+
+    def test_the_two_python_callers_are_the_same_function(self):
+        """Not a tautology: it is the assertion that fails the day somebody
+        writes a second `human_size` next to a call site because importing felt
+        like a detour."""
+        from app.routes import ui
+        from app.services import presentation, uploads
+
+        assert ui.human_size is presentation.human_size
+        assert uploads.human_size is presentation.human_size
+
+    @pytest.mark.parametrize("count", [0, 1, 999, 1023, 1024, 1536, 10 * 1024,
+                                       1024 ** 2, 1_500_000, 104_857_600,
+                                       1024 ** 3, 3 * 1024 ** 3])
+    def test_the_dashboard_javascript_agrees_with_it(self, count):
+        """The third formatter, run for real.
+
+        `human()` is extracted from the shipped template and evaluated by node,
+        so this compares the actual bytes that reach a browser against the
+        actual Python — not one literal against another. Skipped where node is
+        absent, the same way the other node-dependent tests skip.
+        """
+        import json
+        import re
+        import shutil
+        import subprocess
+
+        node = shutil.which("node")
+        if node is None:
+            pytest.skip("node is not installed; the JS formatter cannot be run")
+
+        template = pathlib.Path("app/templates/index.html").read_text()
+        source = re.search(r"function human\(n\)\{.*?\n    \}", template, re.S)
+        assert source, "the dashboard's human() could not be found to test"
+
+        out = subprocess.run(
+            [node, "-e", source.group(0) + f"\nprocess.stdout.write(human({count}));"],
+            capture_output=True, text=True, check=True,
+        )
+        assert out.stdout == human_size(count), (
+            f"the dashboard and the server disagree about {count} bytes: "
+            f"{out.stdout!r} vs {human_size(count)!r}"
+        )
+        assert json.dumps(out.stdout)  # it really produced a string
+
+
 class TestStorage:
-    """Disk space: the two things that grow on the volume forever.
+    """Disk space: the three things that grow on the volume forever.
 
     The numbers are shown where the buttons are, so both are tested together —
     a measurement that fails must still leave a settings page that can configure
@@ -2325,7 +2382,63 @@ class TestStorage:
             BrowserBuilds(cache, lambda: app.state.settings, app.state.instances),
         )
         monkeypatch.setattr(app.state, "task_history", TaskHistory(lambda: app.state.jobs))
-        return types.SimpleNamespace(cache=cache, jobs=jobs)
+
+        from app.services.uploads import StagedUploads, UploadService
+
+        uploads = UploadService(tmp_path / "uploads")
+        monkeypatch.setattr(app.state, "uploads", uploads)
+        monkeypatch.setattr(app.state, "staged_uploads",
+                            StagedUploads(lambda: app.state.uploads))
+        return types.SimpleNamespace(cache=cache, jobs=jobs, uploads=uploads)
+
+    def _ticket(self, storage, *, files=()):
+        """A real staged ticket, through the real store — the size this row
+        reports is only meaningful if the bytes got there the way real ones do."""
+        import asyncio
+
+        async def build():
+            ticket = await storage.uploads.mint(subject="owner", secret=SECRET)
+            for name, payload in files:
+                async def one(data=payload):
+                    yield data
+                await storage.uploads.stage(ticket.handle, subject="owner",
+                                            filename=name, stream=one())
+            return ticket
+
+        return asyncio.run(build())
+
+    def _expire(self, storage, ticket):
+        """Age a ticket, AFTER every ticket a test needs has been minted.
+
+        Order matters and it bit this file once: minting sweeps, so a ticket
+        expired before a later `_ticket()` call is swept away by that call and
+        the test measures a volume with one fewer ticket on it than it thinks.
+        """
+        import json
+        import time
+
+        record = storage.uploads.root / ticket.handle / ".ticket.json"
+        manifest = json.loads(record.read_text())
+        manifest["expires"] = time.time() - 1
+        record.write_text(json.dumps(manifest))
+        return ticket
+
+    @staticmethod
+    def _on_disk(root) -> int:
+        """What the volume is actually holding. Every size assertion below is
+        derived from this rather than from a number written into the test — a
+        literal compared against another literal proves only that someone typed
+        the same thing twice."""
+        import os
+
+        total = 0
+        for dirpath, _dirs, names in os.walk(root):
+            for name in names:
+                try:
+                    total += os.stat(os.path.join(dirpath, name)).st_size
+                except OSError:
+                    pass
+        return total
 
     def _build(self, storage, name, *, size=100, in_use=False):
         directory = storage.cache / name
@@ -2404,16 +2517,20 @@ class TestStorage:
 
         self._build(storage, "chromium-148.0.7778.215.5-pro", in_use=True)
         self._run(storage)
+        self._ticket(storage, files=[("photo.jpg", JPEG)])
+        from app.services import uploads as uploads_module
+
         boom = lambda p: (_ for _ in ()).throw(OSError("disk is having a day"))
         monkeypatch.setattr(binaries, "measure_dir", boom)
         monkeypatch.setattr(history_module, "measure_dir", boom)
+        monkeypatch.setattr(uploads_module, "measure_dir", boom)
 
         page = auth.get("/?view=settings")
         assert page.status_code == 200 and "Disk space" in page.text
 
         body = auth.get("/settings/storage")
         assert body.status_code == 200
-        assert body.json() == {"builds": None, "history": None}
+        assert body.json() == {"builds": None, "history": None, "uploads": None}
 
     def test_the_page_renders_over_a_hostile_volume(self, auth, storage, tmp_path):
         """Dangling links, an unreadable directory, and missing roots: the page
@@ -2438,6 +2555,7 @@ class TestStorage:
             assert body.status_code == 200
             assert body.json()["builds"]["total_bytes"] == 0
             assert body.json()["history"]["runs"] == 0
+            assert body.json()["uploads"]["handles"] == 0
         finally:
             locked.chmod(0o700)
 
@@ -2554,6 +2672,233 @@ class TestStorage:
         assert "freed 300 B" in prune and "chromium-148.0.7778.215.5-pro) was kept" in prune
         assert "Cleared 2 runs" in clear and "1 leftover evidence folder" in clear
         assert "1 run still working was kept" in clear
+
+    # ── uploaded files ───────────────────────────────────────────────────────
+
+    def test_uploads_are_reported_alongside_the_other_two(self, auth, storage):
+        self._ticket(storage, files=[("a.jpg", JPEG), ("b.jpg", JPEG + b"\x01")])
+
+        uploads = auth.get("/settings/storage").json()["uploads"]
+
+        assert uploads["handles"] == 1 and uploads["files"] == 2
+        assert uploads["expired"] == 0
+
+    def test_the_size_it_reports_is_what_is_actually_on_the_disk(self, auth, storage):
+        """Derived from a walk of the volume, not compared against a number
+        typed into this test. The row exists to explain what the disk is holding,
+        so the two had better be the same thing."""
+        self._ticket(storage, files=[("a.jpg", JPEG + b"\x02" * 500)])
+
+        reported = auth.get("/settings/storage").json()["uploads"]["bytes"]
+
+        assert reported == self._on_disk(storage.uploads.root)
+
+    def test_the_size_includes_an_upload_still_arriving(self, auth, storage):
+        """The accounting walk deliberately EXCLUDES in-flight temp files, so it
+        does not charge them twice against their reservation. The display must
+        not inherit that: a user asking what is on the disk wants what is on the
+        disk, and a number that silently omits a part-written file understates
+        the very thing they came to look at."""
+        import asyncio
+
+        ticket = self._ticket(storage)
+        write = asyncio.run(storage.uploads.begin(
+            ticket.handle, subject="owner", filename="big.jpg"))
+        try:
+            write.feed(JPEG + b"\x03" * 4096)
+            reported = auth.get("/settings/storage").json()["uploads"]["bytes"]
+            assert reported == self._on_disk(storage.uploads.root)
+            assert reported > 4096, "the part-written file was left out"
+        finally:
+            write.abort()
+
+    def test_expired_uploads_are_shown_rather_than_hidden(self, auth, storage):
+        """TaskHistory's honesty about orphans, applied here: bytes whose ticket
+        is dead are still bytes on the volume."""
+        stale = self._ticket(storage, files=[("a.jpg", JPEG)])
+        self._ticket(storage, files=[("b.jpg", JPEG + b"\x04")])
+        self._expire(storage, stale)
+
+        uploads = auth.get("/settings/storage").json()["uploads"]
+
+        assert uploads["handles"] == 2 and uploads["expired"] == 1
+        assert uploads["bytes"] == self._on_disk(storage.uploads.root)
+
+    def test_one_broken_measurement_does_not_cost_the_other_two(self, auth, storage,
+                                                                monkeypatch):
+        """Each third degrades on its own — the property the existing tuple
+        already had, now with a third member that could break it."""
+        from app.services import uploads as uploads_module
+
+        self._build(storage, "chromium-148.0.7778.215.5-pro", size=700, in_use=True)
+        self._run(storage, size=250)
+        self._ticket(storage, files=[("a.jpg", JPEG)])
+        monkeypatch.setattr(
+            uploads_module, "measure_dir",
+            lambda p: (_ for _ in ()).throw(OSError("the uploads volume is having a day")),
+        )
+
+        body = auth.get("/settings/storage").json()
+
+        assert body["uploads"] is None
+        assert body["builds"]["total_bytes"] == 700 and body["history"]["runs"] == 1
+
+    def test_the_row_asks_for_its_size_after_the_page_paints(self, auth, storage):
+        self._ticket(storage, files=[("a.jpg", JPEG + b"\x05" * 900)])
+        page = shown(auth.get("/?view=settings"))
+
+        assert 'data-storage="uploads"' in page
+        assert "Uploaded files" in page
+        # …and the render measured nothing: no size for it is in the HTML.
+        assert human_size(self._on_disk(storage.uploads.root)) not in page
+
+    def test_both_upload_buttons_confirm_first_and_say_different_things(self, auth,
+                                                                        storage):
+        """Two scopes, two warnings. The full clear can take a file an assistant
+        is part-way through using, so it must not share a sentence with the safe
+        one — a confirmation that does not distinguish them is not a
+        confirmation."""
+        import re
+
+        page = shown(auth.get("/?view=settings"))
+        forms = [m for m in re.findall(r"<form[^>]*/settings/storage/uploads/clear.*?</form>",
+                                       page, re.S)]
+        assert len(forms) == 2, "expected a scoped form per clear"
+        assert all("confirm(" in form for form in forms)
+        warnings = [re.search(r"confirm\('([^']*)'", form).group(1) for form in forms]
+        assert warnings[0] != warnings[1]
+        assert sorted(re.search(r'name="scope" value="(\w+)"', f).group(1)
+                      for f in forms) == ["all", "expired"]
+
+    def test_clearing_expired_uploads_keeps_the_live_ones(self, auth, storage):
+        dead = self._ticket(storage, files=[("a.jpg", JPEG + b"\x06" * 400)])
+        live = self._ticket(storage, files=[("b.jpg", JPEG + b"\x07" * 400)])
+        self._expire(storage, dead)
+        before = self._on_disk(storage.uploads.root)
+
+        r = auth.post("/settings/storage/uploads/clear", data={"scope": "expired"},
+                      follow_redirects=False)
+
+        assert r.status_code == 200, r.text
+        assert not (storage.uploads.root / dead.handle).exists()
+        assert (storage.uploads.root / live.handle).is_dir()
+        freed = before - self._on_disk(storage.uploads.root)
+        assert human_size(freed) in shown(r), (
+            "the banner must report what actually left the disk"
+        )
+
+    def test_clearing_everything_takes_the_live_ones_too(self, auth, storage):
+        dead = self._ticket(storage, files=[("a.jpg", JPEG + b"\x08")])
+        live = self._ticket(storage, files=[("b.jpg", JPEG + b"\x09")])
+        self._expire(storage, dead)
+        before = self._on_disk(storage.uploads.root)
+
+        r = auth.post("/settings/storage/uploads/clear", data={"scope": "all"},
+                      follow_redirects=False)
+
+        assert r.status_code == 200, r.text
+        assert not (storage.uploads.root / dead.handle).exists()
+        assert not (storage.uploads.root / live.handle).exists()
+        freed = before - self._on_disk(storage.uploads.root)
+        assert human_size(freed) in shown(r)
+        assert "Cleared 2 uploads" in shown(r)
+
+    def test_an_upload_in_flight_is_never_cleared_by_either_scope(self, auth, storage):
+        """Reservations live in memory and the files they cover live on disk, so
+        the two could disagree about what is there. They must not: removing a
+        ticket with a write streaming into it pulls the directory out from under
+        an open file handle, and on POSIX the writer only finds out at the
+        rename — a 500 for something that is nobody's mistake."""
+        import asyncio
+
+        ticket = self._ticket(storage)
+        write = asyncio.run(storage.uploads.begin(
+            ticket.handle, subject="owner", filename="big.jpg"))
+        try:
+            write.feed(JPEG + b"\x0a" * 2048)
+
+            for scope in ("expired", "all"):
+                r = auth.post("/settings/storage/uploads/clear", data={"scope": scope},
+                              follow_redirects=False)
+                assert r.status_code == 200, r.text
+                assert (storage.uploads.root / ticket.handle).is_dir(), scope
+                assert "still in use" in shown(r), scope
+        finally:
+            write.abort()
+
+        # …and once it finishes, the same button takes it.
+        r = auth.post("/settings/storage/uploads/clear", data={"scope": "all"},
+                      follow_redirects=False)
+        assert not (storage.uploads.root / ticket.handle).exists()
+
+    def test_clearing_nothing_is_reported_as_success(self, auth, storage):
+        r = auth.post("/settings/storage/uploads/clear", follow_redirects=False)
+        assert r.status_code == 200
+        assert "Nothing to clear" in shown(r)
+
+    def test_the_default_scope_is_the_safe_one(self, auth, storage):
+        """A POST with no scope at all — a client that forgot the field, or a
+        form that lost it — must not become a full clear."""
+        live = self._ticket(storage, files=[("b.jpg", JPEG + b"\x0b")])
+
+        auth.post("/settings/storage/uploads/clear", follow_redirects=False)
+
+        assert (storage.uploads.root / live.handle).is_dir()
+
+    def test_clearing_uploads_carries_both_csrf_layers(self, client, storage):
+        live = self._ticket(storage, files=[("b.jpg", JPEG + b"\x0c")])
+
+        signed_out = client.post("/settings/storage/uploads/clear",
+                                 data={"scope": "all"}, follow_redirects=False)
+        assert signed_out.status_code == 303
+        assert signed_out.headers["location"] == "/login"
+
+        client.post("/login", data={"secret": SECRET})
+        foreign = client.post("/settings/storage/uploads/clear", data={"scope": "all"},
+                              headers={"Origin": "https://evil.example"},
+                              follow_redirects=False)
+        assert foreign.status_code == 403
+        assert (storage.uploads.root / live.handle).is_dir(), "a cross-site POST cleared it"
+
+    def test_there_is_no_get_form_of_the_clear(self, auth, storage):
+        """SameSite=lax carries the session on a top-level cross-site GET, so a
+        state change behind GET would be reachable from any page."""
+        assert auth.get("/settings/storage/uploads/clear").status_code == 405
+
+    def test_the_clear_calls_the_service_it_claims_to(self, auth, storage, monkeypatch):
+        """Bound against the REAL signature, so a route that grows an argument
+        the service does not take fails here rather than being swallowed."""
+        from app.services.uploads import SweptUploads, UploadService
+
+        called = []
+
+        async def fake_clear(*args, **kwargs):
+            inspect.signature(UploadService.clear).bind(None, *args, **kwargs)
+            called.append(kwargs.get("expired_only"))
+            return SweptUploads(handles=2, files=3, bytes=4096, kept=1, refused=0)
+
+        monkeypatch.setattr(app.state.uploads, "clear", fake_clear)
+
+        expired = shown(auth.post("/settings/storage/uploads/clear",
+                                  data={"scope": "expired"}, follow_redirects=False))
+        everything = shown(auth.post("/settings/storage/uploads/clear",
+                                     data={"scope": "all"}, follow_redirects=False))
+
+        assert called == [True, False]
+        assert human_size(4096) in expired and "Cleared 2 uploads" in expired
+        assert "1 upload still in use was kept" in everything
+
+    def test_a_clear_invalidates_the_cached_measurement(self, auth, storage):
+        """The number on the page after a clear must not be the number from
+        before it — that is a cache reporting a volume that no longer exists."""
+        self._expire(storage, self._ticket(storage,
+                                           files=[("a.jpg", JPEG + b"\x0d" * 700)]))
+        assert auth.get("/settings/storage").json()["uploads"]["handles"] == 1
+
+        auth.post("/settings/storage/uploads/clear", follow_redirects=False)
+
+        after = auth.get("/settings/storage").json()["uploads"]
+        assert after["handles"] == 0 and after["bytes"] == 0
 
     def test_nothing_to_do_is_reported_as_success(self, auth, storage):
         self._build(storage, "chromium-148.0.7778.215.5-pro", in_use=True)

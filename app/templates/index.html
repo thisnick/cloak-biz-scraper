@@ -834,6 +834,22 @@
                   </form>
                 </div>
               </div>
+
+              <div class="field">
+                <label>Uploaded files</label>
+                <div class="mono" data-storage="uploads">—</div>
+                <div class="help">Files your assistant sent here to attach to a page. They expire on their own about two hours after upload, so this usually clears itself. The size counts everything on the disk, including uploads still arriving.</div>
+                <div class="btnrow">
+                  <form method="post" action="/settings/storage/uploads/clear" onsubmit="return confirm('Clear the expired uploads? Files still within their two hours are kept. This cannot be undone.');">
+                    <input type="hidden" name="scope" value="expired">
+                    <button class="btn danger" type="submit">Clear expired uploads</button>
+                  </form>
+                  <form method="post" action="/settings/storage/uploads/clear" onsubmit="return confirm('Clear EVERY uploaded file, including ones still within their two hours? An assistant part-way through a task will have to upload again. This cannot be undone.');">
+                    <input type="hidden" name="scope" value="all">
+                    <button class="btn danger" type="submit">Clear all uploads</button>
+                  </form>
+                </div>
+              </div>
             </div>
           </div>
         </div>
@@ -963,15 +979,24 @@
         if(btn&&(!b.in_use_known||!b.stale_count))btn.disabled=true;
       }
       function paint(d){
-        var b=d&&d.builds,h=d&&d.history;
+        var b=d&&d.builds,h=d&&d.history,u=d&&d.uploads;
         if(b)paintBuilds(b);
         if(h){
           var e=at('history');
           if(e)e.textContent=h.runs.toLocaleString()+' task'+(h.runs===1?'':'s')+' · '+
             human(h.bytes)+' saved'+(h.orphans?' · including '+h.orphans+' from tasks already gone':'');
         }
+        if(u){
+          // Expired-but-not-yet-swept is shown rather than hidden, for the same
+          // reason the task history shows its orphans: those bytes are on the
+          // disk, and a number that quietly left them out would understate the
+          // very thing this row exists to explain.
+          var e=at('uploads');
+          if(e)e.textContent=u.files.toLocaleString()+' file'+(u.files===1?'':'s')+' · '+
+            human(u.bytes)+(u.expired?' · '+u.expired+' upload'+(u.expired===1?'':'s')+' expired':'');
+        }
         var chip=at('chip');
-        if(chip&&b&&h)chip.textContent=human((b.total_bytes||0)+(h.bytes||0))+' used';
+        if(chip&&b&&h&&u)chip.textContent=human((b.total_bytes||0)+(h.bytes||0)+(u.bytes||0))+' used';
       }
       function load(){
         fetch('/settings/storage',
