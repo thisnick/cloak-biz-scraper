@@ -8,6 +8,9 @@ would show up as an agent and a dashboard disagreeing about the same browser.
 """
 from __future__ import annotations
 
+import re
+import shlex
+
 from ..models import (
     BrowserInfo,
     InstanceView,
@@ -83,6 +86,28 @@ def instance_view(inst, *, secret: str | None = None, base_url: str = "",
     )
 
 
+# A hostname, optionally with a port; or a bracketed IPv6 literal. Deliberately
+# an allow-list: the alternative is guessing which of a shell's metacharacters
+# matter, and the answer changes with the shell.
+_HOST = re.compile(r"^(?:[A-Za-z0-9._-]+|\[[0-9A-Fa-f:.]+\])(?::\d{1,5})?$")
+
+
+def _require_usable_host(base_url: str) -> None:
+    """Refuse to mint a ticket this server cannot address.
+
+    Not "omit the field", the way `instance_view` omits a URL it cannot sign:
+    `upload_url` is the ticket's whole point, and a caller handed one without it
+    has nothing to do. An error that says the server could not work out its own
+    address is a state somebody can act on; `https:///uploads/...` is not.
+    """
+    scheme, separator, host = base_url.partition("://")
+    if not separator or scheme not in ("http", "https") or not _HOST.match(host):
+        raise uploads.NoPublicUrl(
+            "this server could not work out its own address, so it cannot hand out "
+            "an upload URL. The request arrived without a usable Host header."
+        )
+
+
 def upload_ticket(ticket, *, base_url: str = "") -> UploadTicket:
     """One staging slot, as both façades hand it to a caller.
 
@@ -103,20 +128,32 @@ def upload_ticket(ticket, *, base_url: str = "") -> UploadTicket:
     thing that must not be got wrong — the token in a header rather than the URL
     — is then not something the caller has to know.
 
+    **That convenience is also the sharpest edge here, and it is why the host is
+    checked and every interpolation is quoted.** The address comes from the
+    `Host` header, this deployment runs behind no TrustedHostMiddleware, and the
+    tool's own description tells a model to run the string AS-IS. A header of
+    `evil.example$(id)` survives shlex as a single word and is then
+    command-substituted by the shell the model runs it in — injection into an
+    instruction we asked it to execute verbatim. So a host that is not a
+    hostname is refused outright rather than escaped and shipped, and the escape
+    is applied as well, because one of those being right is not a reason for the
+    other to be missing.
+
     `expires_in` is the full TTL rather than a fresh subtraction: the ticket was
     minted for this very response, so the two are the same number, and deriving
     it from the wall clock would make an otherwise pure view non-deterministic.
     `expires_at` carries the absolute answer for anyone who needs to reason
     about it later.
     """
+    _require_usable_host(base_url)
     url = f"{base_url}/uploads/{ticket.handle}"
     return UploadTicket(
         handle=ticket.handle,
         upload_url=url,
         token=ticket.token,
         curl=(
-            f"curl -H 'Authorization: Bearer {ticket.token}' "
-            f"-F 'file=@photo.jpg' {url}"
+            f"curl -H {shlex.quote(f'Authorization: Bearer {ticket.token}')} "
+            f"-F 'file=@photo.jpg' {shlex.quote(url)}"
         ),
         expires_at=ticket.expires_at,
         expires_in=uploads.TTL_SEC,

@@ -433,9 +433,10 @@ def build(app) -> FastMCP:
         list with one entry each.
 
         Images and PDFs only, checked by content rather than by filename. Uploaded
-        files are temporary — they are deleted a couple of hours after upload, so get
-        a fresh URL for each new task instead of reusing an old path. An expired path
-        simply fails at step 3 and tells you to upload again.
+        files are temporary — the clock starts when you call this, not when you
+        upload, and everything staged under one URL is deleted a couple of hours
+        later. Get a fresh URL for each new task instead of reusing an old path. An
+        expired path simply fails at step 3 and tells you to upload again.
         """
         from .services.uploads import UploadsError
 
@@ -443,12 +444,15 @@ def build(app) -> FastMCP:
             ticket = await app.state.uploads.mint(
                 subject=_subject(ctx), secret=app.state.secret.current()
             )
+            return upload_ticket(ticket, base_url=_base_url(ctx))
         except UploadsError as exc:
-            # NoRoom carries the pointer at Settings -> Disk space; the no-secret
-            # case says what is unset. Both are states a person can resolve, so
-            # the message is the whole point of surfacing them.
+            # Every refusal arrives as one ValueError, so THE MESSAGE IS THE ONLY
+            # THING that distinguishes "the volume is full" from "this server
+            # cannot work out its own address" — the REST twin gets a distinct
+            # status code for each and this door does not. Passing `exc` through
+            # verbatim is therefore load-bearing rather than lazy, and a test
+            # pins that the two read differently.
             raise ValueError(str(exc)) from exc
-        return upload_ticket(ticket, base_url=_base_url(ctx))
 
     @mcp.tool()
     async def server_info() -> ServerInfo:

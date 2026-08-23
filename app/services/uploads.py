@@ -174,6 +174,18 @@ class NoRoom(UploadsError):
     """The uploads folder is at its global budget; minting is refused."""
 
 
+class NoPublicUrl(UploadsError):
+    """This server cannot tell a client what address to POST bytes to.
+
+    The whole ticket is an instruction to go somewhere, so a ticket without a
+    usable address is not a degraded answer — it is a wrong one. Reachable
+    because the address comes from the `Host` header and nothing upstream
+    guarantees one: a request with no Host, or one carrying something that is
+    not a hostname at all, would otherwise produce `https:///uploads/...` or
+    worse, a URL that ends up inside a shell command we tell a model to run.
+    """
+
+
 @dataclass(frozen=True)
 class StagedFile:
     """One file on the volume, as the caller is told about it.

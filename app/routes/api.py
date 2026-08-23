@@ -153,19 +153,30 @@ async def create_upload_url(request: Request) -> UploadTicket:
     which is NOT under /api and carries its own short-lived ticket rather than
     this OAuth token — see routes/uploads.py for why.
     """
-    from ..services.uploads import NoRoom, UploadsError
+    from ..services.uploads import NoPublicUrl, NoRoom, UploadsError
 
     try:
         ticket = await request.app.state.uploads.mint(
             subject=_subject(request), secret=request.app.state.secret.current()
         )
+        # Inside the same try as the mint, deliberately: building the view is
+        # the half that can refuse a hostile Host header, and a refusal that
+        # escaped from here would be a 500 rather than a sentence.
+        return upload_ticket(ticket, base_url=_base_url(request))
+    except NoPublicUrl as exc:
+        # 400: the request is what is wrong. Everything else here is the
+        # server's own state.
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except NoRoom as exc:
         # 507: the request was fine, the volume is full. The message names the
         # one place a person can free it.
         raise HTTPException(status_code=507, detail=str(exc)) from exc
     except UploadsError as exc:
+        # Reachable only if the secret service stops answering: a deployment
+        # with no APP_SECRET cannot get this far, because AuthGuard verifies the
+        # caller's token against that same secret and answers 401 first. Kept
+        # because that is a property of the guard, not of this route.
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-    return upload_ticket(ticket, base_url=_base_url(request))
 
 
 @router.get("/server-info", response_model=ServerInfo)

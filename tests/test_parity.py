@@ -25,6 +25,13 @@ from app.models import Listing, SyncResult
 
 from conftest import mint_access
 
+# Without an Origin — which is every server-side MCP client, and the only shape
+# in which a forged Host reaches the tool at all: with one present, the Origin
+# rule refuses the request first, because an Origin that disagrees with the Host
+# is exactly what that rule is for.
+NO_ORIGIN_HEADERS = {"Content-Type": "application/json",
+                     "Accept": "application/json, text/event-stream"}
+
 HEADERS = {"Content-Type": "application/json",
            "Accept": "application/json, text/event-stream",
            # A real MCP client sends an Origin, and /mcp validates it. Sending our
@@ -290,6 +297,114 @@ class TestUploadTicketParity:
             assert payload["token"] in payload["curl"]
 
 
+class TestTheMcpDoorEndToEnd:
+    """The claim the whole unit rests on, driven through the MCP door itself.
+
+    Everything else here compares payloads. A payload comparison cannot see the
+    two arguments the tool actually passes to the service — the subject it mints
+    for and the secret it signs with — because neither appears in the answer.
+    The frozen fixture this file used to rely on discarded both, and both could
+    be replaced with a constant while the suite stayed green: one produced a
+    ticket that accepted the file and then refused to resolve it, the other a
+    ticket the endpoint rejected outright. Both are the promise step 3 of the
+    tool's own description makes.
+
+    So this test does the whole flow: mint over /mcp, POST real bytes to the URL
+    it returned with the token it returned, and hand the path it answered with
+    back to the thing that decides whether `agent_browser upload` will accept it.
+    """
+
+    def _mint_over_mcp(self, client) -> dict:
+        return _mcp_ticket(client)
+
+    def test_a_ticket_minted_over_mcp_stages_a_file_that_then_resolves(self, client,
+                                                                       uploads):
+        import pathlib as _pathlib
+
+        from app.services.tokens import OWNER
+
+        ticket = self._mint_over_mcp(client)
+
+        posted = client.post(
+            ticket["upload_url"],
+            headers={"Authorization": f"Bearer {ticket['token']}"},
+            files={"file": ("photo.jpg", JPEG, "image/jpeg")},
+        )
+        assert posted.status_code == 200, (
+            f"the token this tool handed out did not open the URL it handed out: "
+            f"{posted.status_code} {posted.text}"
+        )
+
+        staged = posted.json()["path"]
+        assert app.state.uploads.resolve_for(OWNER, [staged]) == [
+            _pathlib.Path(staged).resolve()
+        ], "the file staged, and then the subject it was staged for could not use it"
+
+    def test_the_same_flow_over_rest_agrees_step_for_step(self, client, uploads):
+        """The control: the door that was already verified, driven identically,
+        so a failure above is about the MCP door and not about the flow."""
+        import pathlib as _pathlib
+
+        from app.services.tokens import OWNER
+
+        ticket = _rest_ticket(client)
+        posted = client.post(ticket["upload_url"],
+                             headers={"Authorization": f"Bearer {ticket['token']}"},
+                             files={"file": ("photo.jpg", JPEG, "image/jpeg")})
+        assert posted.status_code == 200, posted.text
+        staged = posted.json()["path"]
+        assert app.state.uploads.resolve_for(OWNER, [staged]) == [
+            _pathlib.Path(staged).resolve()
+        ]
+
+    def test_both_doors_mint_for_the_same_subject(self, client, uploads):
+        """Directly, from the manifest rather than the payload: the subject a
+        ticket was minted for is recorded on disk and appears in no response."""
+        import json
+
+        rest, mcp = _rest_ticket(client), _mcp_ticket(client)
+        subjects = {
+            json.loads((uploads.root / t["handle"] / ".ticket.json").read_text())["sub"]
+            for t in (rest, mcp)
+        }
+        assert subjects == {"owner"}, subjects
+
+
+class TestBothDoorsUseTheOneViewBuilder:
+    """"One implementation behind two doors" is the module docstring's claim, and
+    comparing payloads does not check it — two implementations that happen to
+    agree pass that test perfectly, and a REST route that rebuilt the ticket
+    inline with every value correct went green. This watches the call happen."""
+
+    def test_each_facade_actually_calls_views_upload_ticket(self, client, uploads,
+                                                            monkeypatch):
+        from app import mcp_server
+        from app.routes import api
+        from app.services import views
+
+        calls = []
+        real = views.upload_ticket
+
+        def spy(ticket, *, base_url=""):
+            calls.append(base_url)
+            return real(ticket, base_url=base_url)
+
+        # Both façades bind the name at import, so each binding is patched — and
+        # to the SAME wrapper, which is what makes "both went through one
+        # builder" the thing being observed rather than "each went through its
+        # own".
+        monkeypatch.setattr(mcp_server, "upload_ticket", spy)
+        monkeypatch.setattr(api, "upload_ticket", spy)
+
+        rest, mcp = _rest_ticket(client), _mcp_ticket(client)
+
+        assert len(calls) == 2, (
+            f"only {len(calls)} of the two doors went through views.upload_ticket"
+        )
+        assert calls == ["https://testserver", "https://testserver"]
+        assert set(rest) == set(mcp)
+
+
 class TestThePublishedUploadSurface:
     """What a model is TOLD must be what the server actually does. A tool
     description that overstates the caps is a bug with a very long feedback
@@ -523,6 +638,228 @@ class TestMintingCanBeRefused:
             asyncio.run(uploads.mint(subject="owner", secret=None))
 
 
+class TestTheAddressComesFromAHeader:
+    """`upload_url` is built from the `Host` header, this deployment runs behind
+    no TrustedHostMiddleware, and the tool's description tells a model to run the
+    `curl` string AS-IS. That makes a hostile Host injection into an instruction
+    we asked something to execute verbatim, so it is refused rather than escaped
+    and shipped — and escaped as well, because one being right is not a reason
+    for the other to be missing."""
+
+    @pytest.mark.parametrize("host", [
+        "",                       # no Host at all
+        "evil.example$(id)",      # command substitution, survives shlex as one word
+        "evil.example`id`",       # the older spelling of the same thing
+        "evil.example;id",
+        "has space.example",
+        "o'quote.example",
+        "evil.example\nX-Injected: 1",
+    ])
+    def test_a_host_that_is_not_a_hostname_is_refused(self, client, uploads, host):
+        r = client.post("/api/uploads", headers={"Host": host})
+
+        assert r.status_code != 200, (
+            f"minted a ticket for Host {host!r}: {r.text}"
+        )
+        assert r.status_code == 400, r.text
+        assert "could not work out its own address" in r.json()["detail"]
+
+    def test_an_ordinary_host_still_mints(self, client, uploads):
+        """The control: the refusal above is not simply refusing everything."""
+        for host in ("testserver", "testserver:8000", "a-b.example.com"):
+            r = client.post("/api/uploads", headers={"Host": host})
+            assert r.status_code == 200, (host, r.text)
+            assert r.json()["upload_url"] == f"https://{host}/uploads/{r.json()['handle']}"
+
+    def test_the_curl_is_a_single_safe_command(self, client, uploads):
+        """shlex round-trips the command back to the exact URL and header, so
+        nothing in it is a second word or an operator."""
+        import shlex
+
+        ticket = _rest_ticket(client)
+        argv = shlex.split(ticket["curl"])
+
+        assert argv[-1] == ticket["upload_url"]
+        assert argv[argv.index("-H") + 1] == f"Authorization: Bearer {ticket['token']}"
+        assert len(argv) == 6, argv  # curl -H <hdr> -F <file> <url>
+
+    @pytest.mark.parametrize("host", ["evil.example$(id)", "evil.example;id",
+                                      "o'quote.example", "has space.example"])
+    def test_the_escaping_holds_on_its_own_with_the_host_check_disabled(self, host,
+                                                                        monkeypatch):
+        """The inner layer, tested by removing the outer one.
+
+        With the host check in place nothing hostile can reach the string, which
+        makes `shlex.quote` unobservable through the API — provably a no-op, and
+        therefore untestable from outside. That is not a reason to leave it
+        unchecked: it is the layer that would matter if the host rule were ever
+        relaxed, so the rule is switched off here and the escaping is made to
+        stand by itself.
+        """
+        import shlex
+
+        from app.services import views
+        from app.services.uploads import Ticket
+
+        monkeypatch.setattr(views, "_require_usable_host", lambda base_url: None)
+        ticket = views.upload_ticket(
+            Ticket(handle="upl_00112233445566aa", token="tok.sig", expires_at=1.0),
+            base_url=f"https://{host}",
+        )
+
+        argv = shlex.split(ticket.curl)
+        assert len(argv) == 6, argv
+        assert argv[-1] == ticket.upload_url, (
+            "the hostile host broke out of the URL argument"
+        )
+        assert host in argv[-1], "the host was mangled rather than quoted"
+
+    def test_a_forged_host_with_an_origin_is_refused_before_it_reaches_the_tool(
+        self, client, uploads
+    ):
+        """The layer above, worth pinning while we are here: a browser-shaped
+        request whose Origin disagrees with its Host never gets as far as
+        minting. The test below is the case that does — no Origin at all, which
+        is every server-side MCP client."""
+        r = client.post("/mcp", headers={**HEADERS, "Host": "evil.example$(id)"},
+                        json={"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                              "params": {"name": "create_upload_url", "arguments": {}}})
+        assert r.status_code == 403, r.text
+
+    def test_the_mcp_door_refuses_the_same_host_with_the_same_sentence(self, client,
+                                                                       uploads):
+        """The MCP door collapses every refusal into one ValueError, so the
+        message is the only thing distinguishing this from a full volume."""
+        r = client.post("/mcp",
+                        headers={**NO_ORIGIN_HEADERS, "Host": "evil.example$(id)"},
+                        json={"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                              "params": {"name": "create_upload_url", "arguments": {}}})
+        result = r.json()["result"]
+        assert result["isError"] is True, result
+        text = " ".join(c.get("text", "") for c in result["content"])
+        assert "could not work out its own address" in text
+
+
+class TestTheTwoRefusalsStayDistinguishable:
+    """One door gets a status code per failure; the other gets one ValueError for
+    all of them. So over MCP the message is the ONLY thing telling "the volume is
+    full" from "this server cannot address itself", and the two must not
+    converge — a model reading them does different things."""
+
+    def test_a_full_volume_and_a_bad_host_read_differently_over_mcp(self, client,
+                                                                    uploads,
+                                                                    monkeypatch):
+        from app.services import uploads as store
+
+        def _call(headers):
+            r = client.post("/mcp", headers=headers, json={
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "create_upload_url", "arguments": {}}})
+            result = r.json()["result"]
+            assert result["isError"] is True, result
+            return " ".join(c.get("text", "") for c in result["content"])
+
+        bad_host = _call({**NO_ORIGIN_HEADERS, "Host": "evil.example$(id)"})
+
+        monkeypatch.setattr(store, "UPLOADS_BUDGET_BYTES", 8192)
+        first = _rest_ticket(client)
+        (uploads.root / first["handle"] / "filler.bin").write_bytes(b"x" * 8192)
+        full = _call(HEADERS)
+
+        assert bad_host != full
+        assert "Disk space" in full and "Disk space" not in bad_host
+        assert "address" in bad_host and "address" not in full
+
+    def test_the_rest_door_gives_each_its_own_status(self, client, uploads,
+                                                     monkeypatch):
+        from app.services import uploads as store
+
+        bad_host = client.post("/api/uploads", headers={"Host": "evil.example$(id)"})
+        monkeypatch.setattr(store, "UPLOADS_BUDGET_BYTES", 8192)
+        first = _rest_ticket(client)
+        (uploads.root / first["handle"] / "filler.bin").write_bytes(b"x" * 8192)
+        full = client.post("/api/uploads")
+
+        assert (bad_host.status_code, full.status_code) == (400, 507)
+
+
+class TestTheDescriptionDoesNotUnderstateTheEndpoint:
+    """The sentence added beyond the plan was unpinned: replacing it with the
+    outright lie "You may post exactly one file per command" left the suite
+    green. Claim and behaviour are checked together here, so neither can move
+    without the other."""
+
+    def test_several_files_in_one_command_really_work_and_are_described(self, client,
+                                                                        uploads):
+        import re
+
+        ticket = _rest_ticket(client)
+        posted = client.post(
+            ticket["upload_url"],
+            headers={"Authorization": f"Bearer {ticket['token']}"},
+            files=[("file", ("a.jpg", JPEG, "image/jpeg")),
+                   ("file", ("b.png", PNG, "image/png"))],
+        )
+        assert posted.status_code == 200, posted.text
+        assert len(posted.json()["files"]) == 2, "the endpoint takes several parts"
+
+        r = client.post("/mcp", headers=HEADERS,
+                        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        doc = next(t for t in r.json()["result"]["tools"]
+                   if t["name"] == "create_upload_url")["description"]
+
+        assert not re.search(r"(exactly|only) one file per (command|request|call)",
+                             doc, re.I), (
+            "the description tells a model it may send one file per command, and "
+            "the endpoint above just took two"
+        )
+        assert re.search(r"several files in one|more than one file|repeating `-F",
+                         doc, re.I), (
+            "the endpoint takes several files per command and the description "
+            "never says so"
+        )
+
+    def test_the_expiry_clock_is_described_from_the_right_moment(self, client):
+        """The clock runs from the mint, not from the upload — a file posted an
+        hour into a ticket's life has one hour left, not two. The description
+        said otherwise."""
+        import re
+
+        r = client.post("/mcp", headers=HEADERS,
+                        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        doc = next(t for t in r.json()["result"]["tools"]
+                   if t["name"] == "create_upload_url")["description"]
+
+        assert not re.search(r"hours after upload", doc, re.I)
+        assert "the clock starts when you call this" in doc
+
+
+class TestTheWireModelCannotSilentlyDropAField:
+    """`StagedUpload` inherits pydantic's `extra='ignore'`, so a field added to
+    the service record and passed through would vanish on the way out with no
+    error anywhere. The two field sets are pinned against each other."""
+
+    def test_the_wire_record_carries_every_field_the_store_records(self):
+        import dataclasses
+
+        from app.models import StagedFile as Wire
+        from app.services.uploads import StagedFile as Record
+
+        stored = {f.name for f in dataclasses.fields(Record)}
+        published = set(Wire.model_fields)
+        assert stored == published, (
+            "the staging record and the model it is published as have drifted.\n"
+            f"  recorded but never published: {sorted(stored - published)}\n"
+            f"  published but never recorded: {sorted(published - stored)}"
+        )
+
+    def test_the_upload_response_is_that_record_plus_the_list(self):
+        from app.models import StagedFile as Wire
+        from app.models import StagedUpload
+
+        assert set(StagedUpload.model_fields) == set(Wire.model_fields) | {"files"}
+
+
 class TestTheTicketStaysOutOfTheLogs:
     """The token now travels in a tool RESULT, which is a place transcripts get
     kept. services/log_safety.py redacts query strings and userinfo — a bearer
@@ -539,10 +876,18 @@ class TestTheTicketStaysOutOfTheLogs:
                             files={"file": ("photo.jpg", JPEG, "image/jpeg")})
         assert r.status_code == 200, r.text
 
-        logged = "\n".join(record.getMessage() for record in caplog.records)
+        # OUR records only. The first version of this scoped nothing, and its
+        # control passed on httpx's own client-side line — `HTTP Request: POST
+        # https://testserver/uploads/upl_…` — which carries the handle because
+        # the handle is in the URL. With every cloakbiz logger silenced the whole
+        # test still went green: a control written precisely so it could not pass
+        # by capturing nothing, passing by capturing something irrelevant.
+        ours = [r for r in caplog.records if r.name.startswith("cloakbiz")]
+        logged = "\n".join(record.getMessage() for record in ours)
         assert ticket["token"] not in logged
         assert ticket["curl"] not in logged
         # The handle is deliberately NOT secret — it is in the URL path, it is
         # useless without the token, and a log that cannot name the ticket
         # cannot explain anything.
-        assert ticket["handle"] in logged, "nothing was logged at all; the test proves nothing"
+        assert ours, "this server logged nothing at all; the test proves nothing"
+        assert ticket["handle"] in logged, "nothing of ours named the ticket"
