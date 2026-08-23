@@ -5,7 +5,16 @@ name: CI
 # fixtures set APP_SECRET — so no secrets or network are needed. The tests that
 # need a real browser (Playwright layout checks) or node+martian (Notion
 # markdown) skip themselves cleanly when those aren't present; they run in the
-# container image, not here.
+# container image, not here. That is a real gap to know about rather than a bug:
+# on the last run this workflow reported 1114 passed / 26 skipped where the same
+# commit gives 1132 / 8 locally, so a green badge here is a weaker signal than a
+# green local run.
+#
+# Node is pinned below because two tests compare the dashboard's own JavaScript
+# byte formatter against the server's — GitHub's runners happen to ship node, so
+# those were executing incidentally rather than by arrangement. With it pinned,
+# a skip in CI can no longer be legitimate, and those two fail instead (see
+# TestOneByteFormatter): a guard that goes silent must not look like a pass.
 
 on:
   push:
@@ -24,6 +33,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
 
       - uses: actions/setup-python@v6
         with:

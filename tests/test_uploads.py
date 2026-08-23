@@ -682,6 +682,29 @@ class TestTheVolumeIsBounded:
         )
         assert store._reserved == {}, "the abandoned write kept its reservation"
 
+    async def test_reclaiming_refuses_to_run_while_a_write_is_in_flight(self, store):
+        """`reclaim_incoming=True` deletes part-written files, which is safe at
+        startup and nowhere else. It is a public parameter, so the precondition
+        is asserted rather than left to a caller reading the comment — measured
+        before this guard existed, a mid-flight call freed 50,000 bytes and took
+        the live temp file with it."""
+        ticket = await _mint(store)
+        write = await store.begin(ticket.handle, subject=SUBJECT, filename="big.jpg")
+        try:
+            write.feed(JPEG + b"\x00" * 8192)
+            partial = next(p for p in (store.root / ticket.handle).iterdir()
+                           if p.name.startswith(".incoming-"))
+
+            with pytest.raises(AssertionError, match="startup-only"):
+                await store.sweep(reclaim_incoming=True)
+
+            assert partial.exists(), "the live write was reclaimed anyway"
+        finally:
+            write.abort()
+
+        # …and with nothing in flight it runs, which is the case it exists for.
+        assert (await store.sweep(reclaim_incoming=True)) is not None
+
     async def test_an_ordinary_sweep_leaves_an_in_flight_write_alone(self, store):
         """`reclaim_incoming` is a startup-only door. At any other moment a
         `.incoming-*` file belongs to a write that is still happening."""
@@ -1075,6 +1098,39 @@ class TestStagedUploads:
         await _stage(store, ticket.handle)
 
         assert (await sizes.snapshot()).handles == 1
+
+    async def test_every_way_the_volume_moves_bumps_the_revision(self, store):
+        """The three sites individually, because the row's freshness is only as
+        good as the least-remembered one — and `abort` was missed exactly this
+        way: the caching tests observe the EFFECT through mint and sweep and
+        never the mechanism, so a site with no bump was invisible."""
+        before = store.revision
+        ticket = await _mint(store)
+        assert store.revision > before, "minting did not bump the revision"
+
+        after_mint = store.revision
+        await _stage(store, ticket.handle)
+        assert store.revision > after_mint, "committing did not bump the revision"
+
+        after_commit = store.revision
+        write = await store.begin(ticket.handle, subject=SUBJECT, filename="x.jpg")
+        write.feed(JPEG + b"\x00" * 4096)
+        write.abort()
+        assert store.revision > after_commit, "abandoning a write did not bump"
+
+    async def test_an_abandoned_upload_does_not_leave_a_stale_number(self, store):
+        """The user-visible half: a stalled 40 KB upload is dropped and the row
+        must stop counting it."""
+        sizes = StagedUploads(lambda: store)
+        ticket = await _mint(store)
+        write = await store.begin(ticket.handle, subject=SUBJECT, filename="big.jpg")
+        write.feed(JPEG + b"\x00" * 40_000)
+        during = await sizes.snapshot()
+        assert during.bytes > 40_000
+
+        write.abort()
+
+        assert (await sizes.snapshot()).bytes < 40_000
 
     async def test_invalidate_still_forces_a_re_walk(self, store):
         """Kept for a caller that knows the volume moved by some route the store

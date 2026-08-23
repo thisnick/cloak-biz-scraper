@@ -46,7 +46,7 @@ from ..services.proxy import ProxyNotConfigured
 from ..services.scrape import NotASweep, NotionNotConfigured
 from ..services.tokens import OWNER
 from ..services.urls import public_base
-from ..services.views import instance_view, upload_ticket
+from ..services.views import instance_view, require_usable_base_url, upload_ticket
 from ..sources import UnsupportedURL
 from .guard import subject_of
 
@@ -156,12 +156,14 @@ async def create_upload_url(request: Request) -> UploadTicket:
     from ..services.uploads import NoPublicUrl, NoRoom, UploadsError
 
     try:
+        # Before the mint, not after. A refusal must cost nothing, and minting
+        # first means a hostile Host header leaves a directory, a manifest and a
+        # reservation behind for two hours — which every later mint then
+        # re-walks. This needs only the address, which is already in hand.
+        require_usable_base_url(_base_url(request))
         ticket = await request.app.state.uploads.mint(
             subject=_subject(request), secret=request.app.state.secret.current()
         )
-        # Inside the same try as the mint, deliberately: building the view is
-        # the half that can refuse a hostile Host header, and a refusal that
-        # escaped from here would be a 500 rather than a sentence.
         return upload_ticket(ticket, base_url=_base_url(request))
     except NoPublicUrl as exc:
         # 400: the request is what is wrong. Everything else here is the

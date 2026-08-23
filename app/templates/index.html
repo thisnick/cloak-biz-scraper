@@ -408,6 +408,19 @@
 
           <div class="uc">
             <div class="uc-t">
+              <svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 16V4M8 8l4-4 4 4"/><path d="M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
+              Fill in a form and attach a file
+              <span class="info" tabindex="0" role="button" aria-label="Upload detail"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/><path d="M12 9v4M12 17h.01"/></svg><span class="tip">Photos and PDFs only. Your assistant needs to be able to run commands on your own machine — ChatGPT and Claude in a browser usually can’t, Claude Code and Cursor can. Files are removed from this server a couple of hours later.</span></span>
+            </div>
+            <p class="uc-d">Post a listing, not just read one — your assistant can send a photo or document from your computer and attach it to a form on the page.</p>
+            <ul class="uc-ex">
+              <li><i>“Fill in this listing form and attach the photos in my Desktop folder.”</i></li>
+              <li><i>“Upload this PDF to the document field on that page.”</i></li>
+            </ul>
+          </div>
+
+          <div class="uc">
+            <div class="uc-t">
               <svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m8 9-3 3 3 3M16 9l3 3-3 3M13 6l-2 12"/></svg>
               Get a CDP URL for your own tools
               <span class="info" tabindex="0" role="button" aria-label="Session detail"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/><path d="M12 9v4M12 17h.01"/></svg><span class="tip">Runs through your proxy when configured. The browser stays up ~15 min idle (60 min max); ask again for a fresh URL to reconnect.</span></span>
@@ -838,7 +851,7 @@
               <div class="field">
                 <label>Uploaded files</label>
                 <div class="mono" data-storage="uploads">—</div>
-                <div class="help">Files your assistant sent here to attach to a page. They expire on their own about two hours after the upload link was created, and expired ones are removed whenever this page is opened — so it usually clears itself. The size counts everything on the disk, including uploads still arriving; anything still listed as expired is one that could not be removed, because a file is being written into it right now.</div>
+                <div class="help">Files your assistant sent here to attach to a page. They expire on their own about two hours after the upload link was created, and expired ones are removed whenever this page is opened — so it usually clears itself. The size counts everything on the disk, including uploads still arriving. Anything still listed as expired could not be removed automatically — use <b>Clear all uploads</b>.</div>
                 <div class="btnrow">
                   <form method="post" action="/settings/storage/uploads/clear" onsubmit="return confirm('Clear the expired uploads? Files still within their two hours are kept. This cannot be undone.');">
                     <input type="hidden" name="scope" value="expired">

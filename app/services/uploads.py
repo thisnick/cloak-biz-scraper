@@ -645,6 +645,10 @@ class StagedWrite:
             except OSError:  # pragma: no cover - defensive
                 pass
             self._tmp.unlink(missing_ok=True)
+            # The bytes just left the volume, so anything caching a measurement
+            # of it is now describing a disk that no longer exists. Inside the
+            # `if`, because abort is idempotent and a second call changes nothing.
+            self._service._revision += 1
 
 
 class UploadService:
@@ -1049,6 +1053,17 @@ class UploadService:
         busy = self.busy_handles()
         handles = files = freed = kept = refused = 0
         if reclaim_incoming:
+            # A loaded parameter on a public method, so it carries its own guard
+            # rather than a comment asking the caller to be careful. Measured
+            # mid-flight before this existed: it freed 50,000 bytes and the live
+            # temp file was gone. Its one caller is the startup sweep, where the
+            # ledger is empty by construction — so an empty ledger IS the
+            # precondition, and asserting it fails loudly at the moment a second
+            # caller appears instead of silently corrupting an upload.
+            assert not self._reserved, (
+                "reclaim_incoming is startup-only: it removes part-written files, "
+                f"and {len(self._reserved)} upload(s) are in flight right now"
+            )
             freed += self._drop_abandoned_writes()
         for entry in reclaim.children(self.root):
             if entry.name in busy:
@@ -1215,6 +1230,13 @@ class StagedUploads:
             total += size
             manifest = _read_manifest(entry)
             if manifest is None or _expired(manifest, now):
+                # `expired` counts DEAD TICKETS STILL ON DISK: past their TTL, or
+                # with no readable record. Several different things produce that
+                # — a write holding the ticket open, a damaged manifest younger
+                # than the TTL, an entry the containment rule refused, a removal
+                # that half-failed. Describe the NUMBER in any copy written from
+                # this, never its reason: the field name invites a guess at a
+                # cause, and the last person to write that copy guessed wrong.
                 expired += 1
             if manifest is not None:
                 files += len(manifest.get("files") or [])

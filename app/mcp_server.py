@@ -43,7 +43,7 @@ from .models import (
 from .routes.guard import subject_of
 from .services.tokens import OWNER
 from .services.urls import public_base
-from .services.views import instance_view, upload_ticket
+from .services.views import instance_view, require_usable_base_url, upload_ticket
 
 logger = logging.getLogger("cloakbiz.mcp")
 
@@ -445,6 +445,9 @@ def build(app) -> FastMCP:
         from .services.uploads import UploadsError
 
         try:
+            # Before the mint: a refusal must not leave a ticket behind. See
+            # views.require_usable_base_url.
+            require_usable_base_url(_base_url(ctx))
             ticket = await app.state.uploads.mint(
                 subject=_subject(ctx), secret=app.state.secret.current()
             )

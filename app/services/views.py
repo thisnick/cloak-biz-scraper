@@ -89,16 +89,27 @@ def instance_view(inst, *, secret: str | None = None, base_url: str = "",
 # A hostname, optionally with a port; or a bracketed IPv6 literal. Deliberately
 # an allow-list: the alternative is guessing which of a shell's metacharacters
 # matter, and the answer changes with the shell.
-_HOST = re.compile(r"^(?:[A-Za-z0-9._-]+|\[[0-9A-Fa-f:.]+\])(?::\d{1,5})?$")
+# `\Z`, not `$`: `$` also matches before a trailing newline, so `evil.example\n`
+# would be admitted. Unreachable through HTTP — the server strips it — and
+# `shlex.quote` contains it if it ever were, but an anchor that means "end of
+# string, or nearly" is not what this is trying to say.
+_HOST = re.compile(r"^(?:[A-Za-z0-9._-]+|\[[0-9A-Fa-f:.]+\])(?::\d{1,5})?\Z")
 
 
-def _require_usable_host(base_url: str) -> None:
+def require_usable_base_url(base_url: str) -> None:
     """Refuse to mint a ticket this server cannot address.
 
     Not "omit the field", the way `instance_view` omits a URL it cannot sign:
     `upload_url` is the ticket's whole point, and a caller handed one without it
     has nothing to do. An error that says the server could not work out its own
     address is a state somebody can act on; `https:///uploads/...` is not.
+
+    **Public, because both façades call it before they mint.** It reads only
+    `base_url`, which they already hold, and calling it first is what stops a
+    refusal from costing a ticket: `mint()` creates a directory, writes a
+    manifest and takes budget, and a refusal raised after that leaves all three
+    behind until the TTL — with every later mint re-walking the pile. Measured
+    at 115x the median mint after 2,000 refused calls.
     """
     scheme, separator, host = base_url.partition("://")
     if not separator or scheme not in ("http", "https") or not _HOST.match(host):
@@ -145,7 +156,10 @@ def upload_ticket(ticket, *, base_url: str = "") -> UploadTicket:
     `expires_at` carries the absolute answer for anyone who needs to reason
     about it later.
     """
-    _require_usable_host(base_url)
+    # Kept here as well as at the façades, which now call it BEFORE minting:
+    # this is the one that makes the rule true of every caller, that one is what
+    # stops a refusal costing a ticket.
+    require_usable_base_url(base_url)
     url = f"{base_url}/uploads/{ticket.handle}"
     return UploadTicket(
         handle=ticket.handle,

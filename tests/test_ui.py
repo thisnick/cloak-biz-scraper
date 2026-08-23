@@ -2304,6 +2304,22 @@ class TestConnectedAppsUi:
 JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 60
 
 
+def _no_node(what: str):
+    """Skip on a contributor's machine; FAIL in CI.
+
+    CI pins node with `actions/setup-node`, so a skip there cannot be a genuine
+    absence — it means this guard has gone silent, which must not read as a
+    pass. Locally node really may not be installed, and failing someone's test
+    run over a JavaScript comparison they did not touch would cost more than the
+    gap it closes. `CI` is set by GitHub Actions and by nothing local.
+    """
+    import os
+
+    if os.environ.get("CI"):
+        pytest.fail(f"node is missing in CI, so {what} did not run")
+    pytest.skip(f"node is not installed; {what} cannot be checked")
+
+
 def _boundary_bytes() -> list[int]:
     """Byte counts where two roundings are most likely to part company.
 
@@ -2330,7 +2346,7 @@ def _boundary_bytes() -> list[int]:
     return sorted(values)
 
 
-# The three the review measured, kept by name so the regression they represent
+# The four the review measured, kept by name so the regression they represent
 # is legible without running the generator in your head.
 MEASURED_DISAGREEMENTS = (10752, 1280, 512512, 11010048)
 
@@ -2363,7 +2379,7 @@ class TestOneByteFormatter:
 
         node = shutil.which("node")
         if node is None:
-            pytest.skip("node is not installed; the JS formatter cannot be run")
+            _no_node("the JS/Python formatter guard")
 
         template = pathlib.Path("app/templates/index.html").read_text()
         source = re.search(r"function human\(n\)\{.*?\n    \}", template, re.S)
@@ -2412,7 +2428,7 @@ class TestOneByteFormatter:
 
         node = shutil.which("node")
         if node is None:
-            pytest.skip("node is not installed; the JS cannot be run")
+            _no_node("the Disk space total")
 
         template = pathlib.Path("app/templates/index.html").read_text()
         human = re.search(r"function human\(n\)\{.*?\n    \}", template, re.S)
@@ -2869,6 +2885,29 @@ class TestStorage:
         assert "Uploaded files" in page
         # …and the render measured nothing: no size for it is in the HTML.
         assert human_size(self._on_disk(storage.uploads.root)) not in page
+
+    def test_the_uploads_help_points_at_a_button_that_exists(self, auth, storage):
+        """Copy is reviewed by a person, not a test — but one property is worth
+        pinning, because it is the one the last version got wrong: the help must
+        tell the reader what to DO, and the thing it names must be on the page.
+
+        The expected label is read off the rendered button rather than typed, so
+        this cannot pass by two literals agreeing, and a sentence that explains
+        a cause instead of naming an action fails it.
+        """
+        import re
+
+        page = shown(auth.get("/?view=settings"))
+        block = re.search(r"<label>Uploaded files</label>(.*?)</div>\s*</div>",
+                          page, re.S).group(1)
+        help_text = re.search(r'<div class="help">(.*?)</div>', block, re.S).group(1)
+        buttons = re.findall(r'<button[^>]*>([^<]+)</button>', block)
+
+        assert buttons, "the row rendered no buttons to point at"
+        assert any(label.strip() in help_text for label in buttons), (
+            "the help text names no button on this row, so a reader who still "
+            f"sees expired uploads is not told what to do. Buttons: {buttons}"
+        )
 
     def test_both_upload_buttons_confirm_first_and_say_different_things(self, auth,
                                                                         storage):

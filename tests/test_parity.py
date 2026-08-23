@@ -370,6 +370,41 @@ class TestTheMcpDoorEndToEnd:
         assert subjects == {"owner"}, subjects
 
 
+class TestTheSubjectComesFromTheVerifiedToken:
+    """`OWNER` is also what a hardcoded constant produces, so asserting
+    `{"owner"}` cannot tell a façade that reads the token from one that ignores
+    it — hardcoding `subject=OWNER` in either left the whole suite passing.
+
+    Same defect as the resolved-path tests that normalised both sides: an
+    expected value the bug itself can reach. These mint under a subject no
+    constant would return.
+    """
+
+    @pytest.mark.parametrize("door", ["rest", "mcp"])
+    def test_each_facade_mints_for_the_subject_in_the_token(self, client, uploads,
+                                                            door):
+        import json
+
+        headers = {"Authorization": f"Bearer {mint_access(app, subject='somebody-else')}"}
+
+        if door == "rest":
+            r = client.post("/api/uploads", headers=headers)
+            assert r.status_code == 200, r.text
+            handle = r.json()["handle"]
+        else:
+            r = client.post("/mcp", headers={**HEADERS, **headers}, json={
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "create_upload_url", "arguments": {}}})
+            body = r.json()["result"]
+            assert body["isError"] is False, body
+            handle = body["structuredContent"]["handle"]
+
+        manifest = json.loads((uploads.root / handle / ".ticket.json").read_text())
+        assert manifest["sub"] == "somebody-else", (
+            "the ticket was minted for a subject the caller's token does not name"
+        )
+
+
 class TestBothDoorsUseTheOneViewBuilder:
     """"One implementation behind two doors" is the module docstring's claim, and
     comparing payloads does not check it — two implementations that happen to
@@ -664,6 +699,68 @@ class TestTheAddressComesFromAHeader:
         assert r.status_code == 400, r.text
         assert "could not work out its own address" in r.json()["detail"]
 
+    @pytest.mark.parametrize("door", ["rest", "mcp"])
+    def test_a_refused_mint_leaves_nothing_behind(self, client, uploads, door):
+        """A refusal must cost nothing.
+
+        Before the address was validated ahead of the mint, each refused call
+        left a directory, a manifest and a reservation with nothing to clean
+        them up until the TTL — and every later mint re-walked the pile, taking
+        the median mint from 0.7 ms to 84.6 ms after 2,000 refused calls.
+        """
+        from app.services import reclaim
+
+        before = sorted(p.name for p in reclaim.children(uploads.root))
+
+        if door == "rest":
+            r = client.post("/api/uploads", headers={"Host": "evil.example$(id)"})
+            assert r.status_code == 400, r.text
+        else:
+            r = client.post("/mcp",
+                            headers={**NO_ORIGIN_HEADERS, "Host": "evil.example$(id)"},
+                            json={"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                  "params": {"name": "create_upload_url",
+                                             "arguments": {}}})
+            assert r.json()["result"]["isError"] is True, r.text
+
+        assert sorted(p.name for p in reclaim.children(uploads.root)) == before
+        assert uploads._reserved == {}
+
+    def test_the_anchor_is_end_of_string_not_end_of_line(self):
+        """`$` also matches before a trailing newline, so `evil.example\n` would
+        be admitted by it and is not by `\\Z`.
+
+        Tested by calling the validator, not over HTTP, and that is the honest
+        framing: `urls.base_from` strips the header, so a trailing newline never
+        reaches this rule and the HTTP case is a 200 for a *stripped* host. The
+        anchor still has to mean what it says — the next caller of this function
+        may not be an HTTP header.
+        """
+        from app.services.uploads import NoPublicUrl
+        from app.services.views import require_usable_base_url
+
+        require_usable_base_url("https://evil.example")          # the control
+        with pytest.raises(NoPublicUrl):
+            require_usable_base_url("https://evil.example\n")
+
+    def test_the_view_builder_refuses_on_its_own(self):
+        """Both façades check the address before minting, so the copy inside
+        `upload_ticket` is no longer reachable through either door — which is
+        exactly why it needs its own test rather than none.
+
+        It is what makes the rule true of EVERY caller, including the deferred
+        server-side fetch that would be a second writer. Called directly here,
+        because that is the only way left to reach it.
+        """
+        from app.services.uploads import NoPublicUrl, Ticket
+        from app.services.views import upload_ticket
+
+        ticket = Ticket(handle="upl_00112233445566aa", token="tok.sig",
+                        expires_at=1.0)
+        assert upload_ticket(ticket, base_url="https://ok.example").upload_url
+        with pytest.raises(NoPublicUrl):
+            upload_ticket(ticket, base_url="https://evil.example$(id)")
+
     def test_an_ordinary_host_still_mints(self, client, uploads):
         """The control: the refusal above is not simply refusing everything."""
         for host in ("testserver", "testserver:8000", "a-b.example.com"):
@@ -701,7 +798,7 @@ class TestTheAddressComesFromAHeader:
         from app.services import views
         from app.services.uploads import Ticket
 
-        monkeypatch.setattr(views, "_require_usable_host", lambda base_url: None)
+        monkeypatch.setattr(views, "require_usable_base_url", lambda base_url: None)
         ticket = views.upload_ticket(
             Ticket(handle="upl_00112233445566aa", token="tok.sig", expires_at=1.0),
             base_url=f"https://{host}",
@@ -714,17 +811,39 @@ class TestTheAddressComesFromAHeader:
         )
         assert host in argv[-1], "the host was mangled rather than quoted"
 
-    def test_a_forged_host_with_an_origin_is_refused_before_it_reaches_the_tool(
+    def test_an_origin_that_disagrees_with_the_host_never_reaches_the_tool(
         self, client, uploads
     ):
-        """The layer above, worth pinning while we are here: a browser-shaped
-        request whose Origin disagrees with its Host never gets as far as
-        minting. The test below is the case that does — no Origin at all, which
-        is every server-side MCP client."""
+        """The layer above, and ONLY for a mismatch.
+
+        I described this once as "the Origin rule refuses a forged Host first",
+        which overstates which guard does the work: it compares Origin against
+        Host, so a caller who forges both passes it cleanly. See the next test —
+        the host rule is what actually holds.
+        """
         r = client.post("/mcp", headers={**HEADERS, "Host": "evil.example$(id)"},
                         json={"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                               "params": {"name": "create_upload_url", "arguments": {}}})
         assert r.status_code == 403, r.text
+
+    def test_a_forged_host_with_a_matching_origin_is_stopped_by_the_host_rule(
+        self, client, uploads
+    ):
+        """The case that shows which guard is load-bearing. Nothing is exposed —
+        the request is still refused — but it is refused by the host rule, not
+        by the Origin rule, which passes it straight through."""
+        hostile = "evil.example$(id)"
+        r = client.post("/mcp",
+                        headers={**HEADERS, "Host": hostile,
+                                 "Origin": f"https://{hostile}"},
+                        json={"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                              "params": {"name": "create_upload_url", "arguments": {}}})
+
+        assert r.status_code == 200, r.text  # the Origin rule let it through
+        result = r.json()["result"]
+        assert result["isError"] is True, result
+        text = " ".join(c.get("text", "") for c in result["content"])
+        assert "could not work out its own address" in text
 
     def test_the_mcp_door_refuses_the_same_host_with_the_same_sentence(self, client,
                                                                        uploads):
@@ -889,5 +1008,14 @@ class TestTheTicketStaysOutOfTheLogs:
         # The handle is deliberately NOT secret — it is in the URL path, it is
         # useless without the token, and a log that cannot name the ticket
         # cannot explain anything.
-        assert ours, "this server logged nothing at all; the test proves nothing"
-        assert ticket["handle"] in logged, "nothing of ours named the ticket"
+        # Per-record, not per-corpus, and this is the THIRD version of this
+        # control. The first passed on httpx's own client-side line, because the
+        # handle is in the URL. The second passed on any cloakbiz record that
+        # happened to name the handle, so silencing the mint left the `staged …`
+        # line standing in for it. A control satisfied by a line other than the
+        # one it is about is not checking that line.
+        minted = [r for r in ours
+                  if r.name == "cloakbiz.uploads"
+                  and r.getMessage().startswith("minted upload ticket")]
+        assert len(minted) == 1, f"expected one mint record, got {len(minted)}"
+        assert ticket["handle"] in minted[0].getMessage()

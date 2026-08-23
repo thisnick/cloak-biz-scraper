@@ -31,8 +31,12 @@ https://github.com/user-attachments/assets/8bc957ef-130d-4516-a356-9efdcedeb60d
   listings, dedupe into a Notion database, and archive full pages.
 - **Connect your own driver over CDP** — every instance hands back a CDP URL you can
   attach Playwright, or any other browser driver, to.
-- **`agent_browser` MCP tools** — your assistant (ChatGPT, Claude) can open and browse
-  any website through the cloaked browser.
+- **`agent_browser` MCP tools** — your assistant (ChatGPT, Claude) can open, browse, and
+  fill in any website through the cloaked browser.
+- **Send it a file to upload** — your assistant can put a photo or PDF on the server and
+  attach it to a form in the cloaked browser, so it can post listings and not just read
+  them. Images and PDFs only, checked by what the file actually is rather than what it's
+  called, and they're deleted a couple of hours later.
 
 ## Set it up
 
@@ -106,6 +110,8 @@ Once it's connected, just ask:
 - *"Search BizBuySell for California businesses under $2M cash flow, then sweep the first five pages using cloaked scraper."*
 - *"Sweep this search and save new listings to my Notion, skipping ones already there."*
 - *"Archive this listing's full page into my Notion."*
+- *"Upload this photo to the listing form on that page."* — your assistant will ask you
+  for the file, put it on the server, and attach it.
 - *"Launch my Default profile in cloaked scraper and give me a CDP URL"* — then drive it from Playwright yourself.
 
 ## Design
@@ -114,6 +120,8 @@ Once it's connected, just ask:
   single service layer, reachable four ways: the **MCP** endpoint (`/mcp`), a **REST**
   API (`/api/*`), a per-instance **CDP** URL, and the **web portal**. All configuration
   lives on a `/data` volume; the deploy sets only `APP_SECRET`.
+- **Settings → Disk space** shows what the volume is holding — browser versions, saved
+  task history, and uploaded files — and clears each of them.
 - **Auth.** The web UI uses a cookie session (log in with `APP_SECRET`). `/mcp` and
   `/api/*` use OAuth 2.1 with dynamic client registration + PKCE — unauthenticated calls
   get a 401. CDP and live-view URLs carry short-lived, single-browser signed tokens,
@@ -147,9 +155,15 @@ archive_page(url, notion_page_id)                         -> ArchiveResult   # b
 create_instance(profile?, country?, region?, geoip?)      -> InstanceView    # includes a CDP URL
 list_instances() / get_instance(id) / close_instance(id)
 agent_browser(instance_id, command)                       -> command output (+ optional screenshot)
+create_upload_url()                                       -> UploadTicket    # POST a file, get a path
 list_profiles() / create_profile(...) / update_profile(...) / new_proxy_session(name) / delete_profile(name)
 server_info()                                             -> ServerInfo
 ```
+
+`create_upload_url` takes no arguments: it returns a short-lived URL, a token, and a
+ready-made `curl` command. POST a file to it and you get back a path on the server.
+`agent_browser`'s `upload` verb accepts that path and **only** paths that came from this
+flow — one you assemble yourself is refused.
 
 A sweep is asynchronous (returns a `job_id`; collect with `get_scrape_listing_results`);
 an archive blocks. `sync=false` needs no Notion and writes nothing; `sync=true` dedupes
