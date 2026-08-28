@@ -447,11 +447,13 @@ def build(app) -> FastMCP:
         try:
             # Before the mint: a refusal must not leave a ticket behind. See
             # views.require_usable_base_url.
-            require_usable_base_url(_base_url(ctx))
+            # One binding, passed to both — see the REST twin.
+            base = _base_url(ctx)
+            require_usable_base_url(base)
             ticket = await app.state.uploads.mint(
                 subject=_subject(ctx), secret=app.state.secret.current()
             )
-            return upload_ticket(ticket, base_url=_base_url(ctx))
+            return upload_ticket(ticket, base_url=base)
         except UploadsError as exc:
             # Every refusal arrives as one ValueError, so THE MESSAGE IS THE ONLY
             # THING that distinguishes "the volume is full" from "this server

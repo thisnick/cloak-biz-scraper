@@ -160,11 +160,14 @@ async def create_upload_url(request: Request) -> UploadTicket:
         # first means a hostile Host header leaves a directory, a manifest and a
         # reservation behind for two hours — which every later mint then
         # re-walks. This needs only the address, which is already in hand.
-        require_usable_base_url(_base_url(request))
+        # One binding, passed to both, so "the address checked is the address
+        # used" is provable rather than merely true of a pure function today.
+        base = _base_url(request)
+        require_usable_base_url(base)
         ticket = await request.app.state.uploads.mint(
             subject=_subject(request), secret=request.app.state.secret.current()
         )
-        return upload_ticket(ticket, base_url=_base_url(request))
+        return upload_ticket(ticket, base_url=base)
     except NoPublicUrl as exc:
         # 400: the request is what is wrong. Everything else here is the
         # server's own state.

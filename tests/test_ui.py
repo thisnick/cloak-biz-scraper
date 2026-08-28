@@ -2909,6 +2909,20 @@ class TestStorage:
             f"sees expired uploads is not told what to do. Buttons: {buttons}"
         )
 
+        # Two assertions, because the harm and the remedy are different
+        # properties and this test at first pinned only the remedy. The defect
+        # it exists for was a cause ALONGSIDE an action, which "the help names a
+        # button" cannot see: several different states produce a non-zero
+        # `expired`, so a sentence naming one of them sends the reader the wrong
+        # way. See the comment at StagedUploads._measure.
+        causal = re.findall(r"\b(because|since|due to|as a result of)\b",
+                            help_text, re.I)
+        assert not causal, (
+            f"the help explains WHY rather than only what to do: {causal}. "
+            "State the definition and the action; a cause is a claim that has "
+            "to be re-verified on every edit of the sweep, the clear or _measure."
+        )
+
     def test_both_upload_buttons_confirm_first_and_say_different_things(self, auth,
                                                                         storage):
         """Two scopes, two warnings. The full clear can take a file an assistant

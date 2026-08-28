@@ -1090,6 +1090,27 @@ class TestStagedUploads:
         assert after.bytes == 0
         assert after.measured_at >= loaded.measured_at
 
+    async def test_a_removal_that_half_failed_is_reported_not_swallowed(
+        self, store, monkeypatch
+    ):
+        """The banner's job is to explain, at the moment of action, anything the
+        row could not. A failure counted nowhere breaks that: reclaim.Unsafe is
+        reported and `not gone` was not, so a sweep that failed on every entry
+        returned all zeros — indistinguishable from an empty volume. The row
+        then said `1 expired` while the banner said there was nothing to clear.
+        """
+        ticket = await _mint(store)
+        await _stage(store, ticket.handle)
+        _rewrite_expiry(store, ticket.handle, time.time() - 1)
+        monkeypatch.setattr(uploads_service.reclaim, "remove_child",
+                            lambda root, entry: False)
+
+        swept = await store.clear()
+
+        assert swept.refused == 1, "a failed removal was counted nowhere"
+        assert swept.handles == 0, "it must not claim to have removed anything"
+        assert (store.root / ticket.handle).is_dir(), "the entry should still be there"
+
     async def test_a_fresh_upload_shows_up_without_anyone_invalidating(self, store):
         sizes = StagedUploads(lambda: store)
         assert (await sizes.snapshot()).handles == 0

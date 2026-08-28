@@ -4,11 +4,19 @@ name: CI
 # hermetic — respx fakes the Notion API and the IP-echo services, and the
 # fixtures set APP_SECRET — so no secrets or network are needed. The tests that
 # need a real browser (Playwright layout checks) or node+martian (Notion
-# markdown) skip themselves cleanly when those aren't present; they run in the
-# container image, not here. That is a real gap to know about rather than a bug:
-# on the last run this workflow reported 1114 passed / 26 skipped where the same
-# commit gives 1132 / 8 locally, so a green badge here is a weaker signal than a
-# green local run.
+# markdown) skip themselves cleanly when those aren't present.
+#
+# NO SINGLE ENVIRONMENT RUNS THE WHOLE SUITE; the union is what is green. All
+# three measured at 29ca730, 1397 collected in each:
+#
+#   macOS host   1389 passed,  8 skipped   Playwright yes, martian no
+#   CI (Linux)   1371 passed, 26 skipped   both node groups yes, Playwright no
+#   container    1357 passed, 40 skipped   martian yes, Chromium no (not in the
+#                                          image by design — it downloads on demand)
+#
+# So a green badge here is a weaker signal than a green local run, and the
+# container is NOT the place the skipped tests all run — it trades 8 skips for
+# 40. Earlier wording in this file said otherwise and was wrong.
 #
 # Node is pinned below because two tests compare the dashboard's own JavaScript
 # byte formatter against the server's — GitHub's runners happen to ship node, so

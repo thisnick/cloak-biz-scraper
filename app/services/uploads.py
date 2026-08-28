@@ -1094,7 +1094,13 @@ class UploadService:
                 refused += 1
                 continue
             if not gone:
+                # Counted, not merely logged. reclaim.Unsafe four lines up is
+                # reported and this was not, so a sweep that failed on every
+                # entry returned all zeros — indistinguishable from an empty
+                # volume, and the banner then told a reader there was nothing to
+                # clear about the very row that had just said otherwise.
                 logger.warning("could not fully remove the upload ticket %s", entry.name)
+                refused += 1
                 continue
             handles += 1
             files += count
