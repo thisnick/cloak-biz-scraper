@@ -7,7 +7,10 @@ archives promising listing pages into Notion, and leaves you a short review queu
 [Start the visual setup tutorial](set-up-daily-listing-watch.md){ .md-button .md-button--primary }
 [View the open-source project](https://github.com/thisnick/cloak-biz-scraper){ .md-button }
 
-![Seed search URLs stored in Notion](assets/setup-tutorial/notion-seed-urls.png)
+![Example morning review with scraped listings, triage decisions, and archive status](assets/setup-tutorial/outcome-morning-review.png)
+
+*Illustrative sample using fictional listings. Your review queue will contain the businesses
+found by your saved searches.*
 
 ## What you will build
 
@@ -19,16 +22,19 @@ archives promising listing pages into Notion, and leaves you a short review queu
    the details or wants to preserve the source.
 6. **A morning report** links the listings marked `REVIEW` and reports failures honestly.
 
-## Start with the outcome
+## Let your AI browse websites with anti-bot detection
 
-The setup guide is written for business searchers rather than developers. It walks through
-Railway deployment, Evomi credentials, CloakBrowser, both Notion connections, Claude and
-ChatGPT MCP setup, seed-search capture, triage criteria, testing, and scheduling.
+Some public websites block an AI agent's normal browser because it comes from a datacenter or
+looks automated. Once Cloak Biz Scraper is connected, tell the agent to use the scraper's
+`create_instance` and `agent_browser` MCP tools instead. The protected-site guide includes
+copy-and-paste prompts for one-page and multi-step browsing.
 
-[Open the complete tutorial](set-up-daily-listing-watch.md){ .md-button .md-button--primary }
+[Open the protected-site prompt guide](browse-protected-sites.md){ .md-button .md-button--primary }
 
-Already have the scraper connected? Use the [protected-site prompt guide](browse-protected-sites.md)
-or copy the [daily agent runbook](prompts/listing-watch-runbook.md) into Notion.
+![A live CloakBrowser instance the AI can operate](assets/setup-tutorial/scraper-live-browser.png)
+
+For the scheduled listing workflow, copy the [daily agent runbook](prompts/listing-watch-runbook.md)
+into Notion after completing the setup tutorial.
 
 ## Verified against the real workflow
 

@@ -50,10 +50,11 @@ compares the page's timezone and locale, and closes the browser.
 
 - Railway Serverless location and the required redeploy for the setting to affect the
   container.
-- CloakBrowser's key/concurrency model and the distinction between public and Pro builds.
-- Evomi's live **My Products → Core Residential → Proxy Generator** flow, credential labels,
-  format controls, Core Residential endpoint, and HTTP port. The captured guide images omit
-  the credential card and personal account controls.
+- CloakBrowser's key/concurrency model and current checkout instruction that a paid licence
+  key is emailed after payment.
+- Evomi's live **My Products → Core Residential → Proxy Generator** flow, whole-string copy
+  behavior, host-first format, Core Residential endpoint, and HTTP port. The captured guide
+  images omit the copied credential string and personal account controls.
 - Notion internal-connection permissions and page sharing.
 - Notion's hosted MCP URL, OAuth flow, read/write behavior, and current tool names.
 - Claude remote-connector and Cowork schedule flows.

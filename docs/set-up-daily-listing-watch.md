@@ -3,6 +3,8 @@
 This guide sets up a daily business-listing workflow for a searcher who does not want to
 check the same marketplace pages by hand every morning.
 
+## The outcome
+
 At the end, you will have:
 
 - a **Seed URLs** database in Notion that holds the searches you want watched;
@@ -11,6 +13,11 @@ At the end, you will have:
 - a scheduled Claude or ChatGPT Work task that runs every morning;
 - full listing-page text archived inside the Notion pages you may want to review; and
 - a morning report with new, rejected, review, and failed-source counts.
+
+![Example morning review with scraped listings, triage decisions, and archive status](assets/setup-tutorial/outcome-morning-review.png)
+
+*Illustrative sample using fictional listings. Your morning review will contain the
+businesses found by your saved searches.*
 
 The AI is an initial filter. It should reject only listings that clearly break a written
 rule. It should send ambiguous listings to you for review rather than pretending to perform
@@ -42,11 +49,12 @@ flowchart LR
 You need:
 
 1. A Railway account to host your copy of Cloak Biz Scraper.
-2. A [CloakBrowser key](https://cloakbrowser.dev/manager/). A public build is available,
-   but the project has not tested it against listing sites and it has fewer bypasses.
+2. A paid [CloakBrowser](https://cloakbrowser.dev/) licence key. CloakBrowser sends the key
+   to the email address used at checkout after payment.
 3. A residential proxy account. This guide uses
    [Evomi Core Residential](https://evomi.com/).
-4. A Notion workspace where you can create an internal integration and databases.
+4. A [Notion](https://www.notion.com/) workspace where you can create an internal
+   integration and databases.
 5. Claude or ChatGPT Work with scheduled tasks and the connector permissions described
    below.
 
@@ -76,11 +84,16 @@ or `APP_SECRET` in a prompt.
 
 ### Get a CloakBrowser key
 
-1. Open [CloakBrowser Manager](https://cloakbrowser.dev/manager/) and sign in.
-2. Copy a key with enough concurrent sessions for your expected workload. One daily listing
-   sweep can start with one browser session.
-3. In Cloak Biz Scraper, open **Settings → Browser licence**.
-4. Paste the key, leave the browser version blank to use the current build, and save it.
+1. Open the official [CloakBrowser website](https://cloakbrowser.dev/) and scroll to
+   **Pricing**. Choose a plan with enough concurrent sessions for your workload. A daily
+   listing sweep can start with the smallest paid plan.
+2. Select **Subscribe** and complete CloakBrowser's checkout. Use an email address you can
+   access: the checkout states that the licence key is emailed after payment.
+3. Open the licence email and copy the key. If it does not arrive promptly, check spam and
+   the email address on the payment receipt before contacting CloakBrowser support.
+4. In Cloak Biz Scraper, open **Settings → Browser licence**.
+5. Paste the emailed key, leave the browser version blank to use the current build, and save
+   it.
 
 ### Get an Evomi proxy
 
@@ -88,30 +101,38 @@ or `APP_SECRET` in a prompt.
    A small balance is enough for the one-page test later in this guide.
 2. Sign in at [my.evomi.com](https://my.evomi.com/). In the left sidebar, under **My
    Products**, open **Core Residential**.
-3. Select the **Proxy Generator** tab. The credential card directly below the heading shows
-   **Username**, **Password**, **Hostname**, and **Port**. These are proxy credentials; they
-   are different from your Evomi account password.
+3. Select the **Proxy Generator** tab. The proxy credentials generated here are different
+   from your Evomi account password.
 
 ![Open Proxy Generator under the Core Residential product](assets/setup-tutorial/evomi-proxy-generator-nav.png)
 
-4. Under **Format Settings**, choose **HTTP** and
+4. Under **Format Settings**, choose **HTTP** and the host-first format
    `hostname:port:username:password`. Leave the location at **Worldwide** for the first test;
-   the scraper adds the country and region selected in its own settings. The generated string
-   is convenient for checking the four pieces, but enter them in the scraper as separate
-   fields.
+   the scraper adds the country and region selected in its own settings.
 
-![Choose HTTP and the host-first credential format](assets/setup-tutorial/evomi-proxy-generator-format.png)
+![Choose HTTP and copy the host-first proxy string](assets/setup-tutorial/evomi-proxy-generator-format.png)
 
-5. Copy the username and password with their copy buttons. Do not copy them into a prompt,
-   screenshot, issue, or commit. If a credential has been exposed, use **Reset Proxy Key** in
-   the generator and update the scraper immediately.
-6. In Cloak Biz Scraper, open **Settings → Evomi Proxy** and enter the four values. For Core
-   Residential, the dashboard and current public API documentation identify
+5. Use Evomi's copy button to copy the **complete formatted proxy string**. It does not copy
+   the username and password separately. Do not paste that whole string into one scraper
+   field. Read it from left to right and split it into four values:
+
+   ```text
+   core-residential.evomi.com:1000:YOUR_USERNAME:YOUR_PASSWORD
+   | proxy host               |port| username   | password
+   ```
+
+   If the copied value begins with `http://`, remove that prefix first. The first segment is
+   **Proxy host**, the second is **Proxy port**, the third is **Proxy username**, and
+   everything after the third colon is **Proxy password**.
+6. Keep the copied string out of prompts, screenshots, issues, and commits. If it is exposed,
+   use **Reset Proxy Key** in Evomi and update the scraper immediately.
+7. In Cloak Biz Scraper, open **Settings → Evomi Proxy** and enter those four values in their
+   separate fields. For Core Residential, the dashboard and current public API documentation identify
    `core-residential.evomi.com` and HTTP port `1000`; treat your dashboard as the source of
    truth if Evomi changes them.
-7. Enter the country and optional region you want the browser to appear in. These values must
+8. Enter the country and optional region you want the browser to appear in. These values must
    match Evomi's targeting format.
-8. Select **Save & test**. A saved form is not enough; the test must show that traffic is
+9. Select **Save & test**. A saved form is not enough; the test must show that traffic is
    actually leaving through the proxy.
 
 ![Evomi proxy settings in Cloak Biz Scraper](assets/setup-tutorial/scraper-proxy-settings.png)
@@ -542,7 +563,7 @@ provider documents:
 See the separate **[verification record](tutorial-verification.md)** for live test results and
 the authenticated product checks completed before publication.
 
-- [CloakBrowser](https://cloakbrowser.dev/) and [CloakBrowser Manager](https://cloakbrowser.dev/manager/)
+- [CloakBrowser pricing and licence checkout](https://cloakbrowser.dev/)
 - [Railway Serverless](https://docs.railway.com/deployments/serverless)
 - [Evomi proxy instructions](https://docs.evomi.com/proxy-instructions/) and [Core Residential endpoint](https://docs.evomi.com/public-api/endpoints/default/)
 - [Create a Notion integration](https://www.notion.com/help/create-integrations-with-the-notion-api) and [working with Notion databases](https://developers.notion.com/guides/data-apis/working-with-databases)
