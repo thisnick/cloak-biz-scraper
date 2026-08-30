@@ -42,12 +42,13 @@ https://github.com/user-attachments/assets/8bc957ef-130d-4516-a356-9efdcedeb60d
 
 No terminal — one visit to the Railway dashboard, everything else in the app's web UI.
 
-For a complete, nontechnical workflow that checks listing searches every morning, applies
-objective triage rules, and archives review candidates into Notion, see
-**[the visual setup tutorial](https://thisnick.github.io/cloak-biz-scraper/)**. The
-[Markdown source](docs/set-up-daily-listing-watch.md) lives in this repository. For one-off access to
-pages that block ordinary AI browsers, see
-**[Browse a page that blocks ordinary AI browsers](docs/browse-protected-sites.md)**.
+Start with the **[visual setup site](https://thisnick.github.io/cloak-biz-scraper/)**. Its
+[shared scraper guide](docs/set-up-scraper-for-ai.md) covers deployment, the Pro key, proxy,
+MCP connection, and a harmless agent test. Then choose the
+[daily listing watch](docs/set-up-daily-listing-watch.md) or
+[protected-site prompt guide](docs/browse-protected-sites.md). The site also covers
+[live monitoring and takeover](docs/monitor-and-take-control.md) and
+[advanced controls](docs/advanced-controls.md).
 
 **Watch the deploy walkthrough:**
 
@@ -61,9 +62,10 @@ https://github.com/user-attachments/assets/3c86899d-9f1b-4946-b1ca-4b11a53514b5
    password — there's no other account to make.
 4. **Open your server's URL and log in** with `APP_SECRET`.
 5. **Fill in Settings** (each page tests itself and shows what it found):
-   - **CloakBrowser licence** — optional; blank runs the free public build (fewer bypasses).
-   - **Evomi proxy** — optional, but listing sites block non-residential IPs, so add one
-     before scraping them.
+   - **CloakBrowser licence** — the paid Pro build is required for the documented listing
+     and protected-site workflows. A blank key runs the public build for basic testing only.
+   - **Evomi proxy** — required for the documented workflows because target sites commonly
+     block Railway's datacenter IP.
    - **Notion** — optional; needed only to save listings into a database.
 
 ## Costs
@@ -72,11 +74,12 @@ Railway bills actual usage. The Hobby plan is **$5/month and includes $5 of usag
 Serverless on you pay for the minutes a sweep runs and close to nothing idle; without it,
 roughly **$8–9/month** whether you use it or not.
 
-Bring your own (both optional):
+Bring your own for the documented protected-site and listing workflows:
+
 - **CloakBrowser Pro** — [pricing](https://cloakbrowser.dev/). A blank key uses the free
-  public build.
+  public build, which is suitable for basic testing but not the verified workflow.
 - **Evomi residential proxy** — [pricing](https://evomi.com/); *Core Residential* is a
-  fine starting tier.
+  practical starting tier.
 
 ## Connect ChatGPT, Claude, or Claude Code
 

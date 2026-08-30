@@ -46,101 +46,32 @@ flowchart LR
 
 ## Before you start
 
-You need:
+This workflow builds on a working Cloak Biz Scraper connection.
 
-1. A Railway account to host your copy of Cloak Biz Scraper.
-2. A paid [CloakBrowser](https://cloakbrowser.dev/) licence key. CloakBrowser sends the key
-   to the email address used at checkout after payment.
-3. A residential proxy account. This guide uses
-   [Evomi Core Residential](https://evomi.com/).
-4. A [Notion](https://www.notion.com/) workspace where you can create an internal
-   integration and databases.
-5. Claude or ChatGPT Work with scheduled tasks and the connector permissions described
-   below.
+1. Complete **[Set up Cloak Biz Scraper for your AI](set-up-scraper-for-ai.md)**.
+2. Run its harmless connection test. Do not continue until your agent can call
+   `server_info`, `create_instance`, and `agent_browser`, and the server reports a
+   verified Pro browser and working residential proxy.
+3. Create or choose a [Notion](https://www.notion.com/) workspace where you can create an
+   internal integration and databases.
+4. Choose Claude or ChatGPT Work with scheduled tasks and the connector permissions
+   described below.
 
-The application is open source, but the services around it may charge for hosting, proxy
-traffic, browser concurrency, and AI usage. Check current prices on each provider's site.
-This setup replaces a separate listing-monitoring or lead-triage subscription; it does not
-make the underlying infrastructure free.
+The shared setup guide covers Railway deployment, the emailed CloakBrowser Pro key, Evomi
+credentials, and the scraper MCP connection. This guide starts with the listing-specific
+Notion workspace and daily workflow.
 
-## 1. Deploy your own Cloak Biz Scraper
+## 1. Set up Cloak Biz Scraper for AI
 
-1. Open the project's [one-click Railway template](https://railway.com/deploy/a7IwW8?referralCode=aXB6nz&utm_medium=integration&utm_source=template&utm_campaign=generic).
-2. Deploy the template and wait for the service to become healthy.
-3. In Railway, open **Settings → Deploy → Serverless**, enable it, then redeploy. The setting
-   takes effect on the newly deployed container, not the one already running.
-4. Open **Variables** and copy `APP_SECRET`. Treat it as a password.
-5. Open the public Railway URL and sign in with `APP_SECRET`.
+If you have not already done so, complete the
+**[shared scraper setup guide](set-up-scraper-for-ai.md)**. It is the required first step for
+both this listing workflow and protected-site browsing.
 
-The dashboard should look like this:
+The connection test in that guide opens Example Domain through `create_instance` and
+`agent_browser`. Passing it confirms that the deployment, Pro key, proxy, OAuth, and MCP
+tool connection work before Notion is added.
 
-![Cloak Biz Scraper overview](assets/setup-tutorial/scraper-overview.png)
-
-Railway creates a persistent `/data` volume. The app stores its settings, browser profiles,
-and recent task history there. Do not put your CloakBrowser key, proxy password, Notion token,
-or `APP_SECRET` in a prompt.
-
-## 2. Add CloakBrowser and the residential proxy
-
-### Get a CloakBrowser key
-
-1. Open the official [CloakBrowser website](https://cloakbrowser.dev/) and scroll to
-   **Pricing**. Choose a plan with enough concurrent sessions for your workload. A daily
-   listing sweep can start with the smallest paid plan.
-2. Select **Subscribe** and complete CloakBrowser's checkout. Use an email address you can
-   access: the checkout states that the licence key is emailed after payment.
-3. Open the licence email and copy the key. If it does not arrive promptly, check spam and
-   the email address on the payment receipt before contacting CloakBrowser support.
-4. In Cloak Biz Scraper, open **Settings → Browser licence**.
-5. Paste the emailed key, leave the browser version blank to use the current build, and save
-   it.
-
-### Get an Evomi proxy
-
-1. Create an [Evomi](https://evomi.com/) account and activate **Core Residential** traffic.
-   A small balance is enough for the one-page test later in this guide.
-2. Sign in at [my.evomi.com](https://my.evomi.com/). In the left sidebar, under **My
-   Products**, open **Core Residential**.
-3. Select the **Proxy Generator** tab. The proxy credentials generated here are different
-   from your Evomi account password.
-
-![Open Proxy Generator under the Core Residential product](assets/setup-tutorial/evomi-proxy-generator-nav.png)
-
-4. Under **Format Settings**, choose **HTTP** and the host-first format
-   `hostname:port:username:password`. Leave the location at **Worldwide** for the first test;
-   the scraper adds the country and region selected in its own settings.
-
-![Choose HTTP and copy the host-first proxy string](assets/setup-tutorial/evomi-proxy-generator-format.png)
-
-5. Use Evomi's copy button to copy the **complete formatted proxy string**. It does not copy
-   the username and password separately. Do not paste that whole string into one scraper
-   field. Read it from left to right and split it into four values:
-
-   ```text
-   core-residential.evomi.com:1000:YOUR_USERNAME:YOUR_PASSWORD
-   | proxy host               |port| username   | password
-   ```
-
-   If the copied value begins with `http://`, remove that prefix first. The first segment is
-   **Proxy host**, the second is **Proxy port**, the third is **Proxy username**, and
-   everything after the third colon is **Proxy password**.
-6. Keep the copied string out of prompts, screenshots, issues, and commits. If it is exposed,
-   use **Reset Proxy Key** in Evomi and update the scraper immediately.
-7. In Cloak Biz Scraper, open **Settings → Evomi Proxy** and enter those four values in their
-   separate fields. For Core Residential, the dashboard and current public API documentation identify
-   `core-residential.evomi.com` and HTTP port `1000`; treat your dashboard as the source of
-   truth if Evomi changes them.
-8. Enter the country and optional region you want the browser to appear in. These values must
-   match Evomi's targeting format.
-9. Select **Save & test**. A saved form is not enough; the test must show that traffic is
-   actually leaving through the proxy.
-
-![Evomi proxy settings in Cloak Biz Scraper](assets/setup-tutorial/scraper-proxy-settings.png)
-
-If the proxy is incomplete, rejected, or unreachable, Cloak Biz Scraper fails visibly. It
-does not silently fall back to the Railway server's datacenter IP.
-
-## 3. Build the Notion workspace
+## 2. Build the Notion workspace
 
 Use three Notion objects. Keeping them separate makes the scheduled prompt short and lets you
 change searches or screening rules without editing the schedule.
@@ -281,45 +212,11 @@ Replace its bracketed URLs and criteria, and delete any criterion you are not us
 
 ![A canonical Listing Watch runbook in Notion](assets/setup-tutorial/notion-runbook.png)
 
-## 4. Connect both MCPs to the AI
+## 3. Connect Notion to the same AI
 
-The agent needs two separate connections:
-
-1. **Cloak Biz Scraper MCP** to sweep search pages, archive detail pages, and operate the
-   protected browser.
-2. **Notion MCP** to read Seed URLs and the runbook, read the content appended by
-   `archive_page`, and update triage properties.
-
-### Connect Cloak Biz Scraper
-
-Open the app's **Connect** tab and copy the generated MCP URL. It ends in `/mcp`:
-
-![The scraper's Connect tab](assets/setup-tutorial/scraper-connect.png)
-
-The screenshot uses a local development address. Your agent must use the public HTTPS URL
-of your Railway deployment, not `127.0.0.1`.
-
-```text
-https://your-server.up.railway.app/mcp
-```
-
-Add it as a remote HTTP MCP connector with OAuth. When the connector sends you back to your
-server, enter `APP_SECRET` and approve the connection. Never give the AI your proxy, Notion,
-or CloakBrowser credentials.
-
-After connecting, verify that the agent can see these exact tools:
-
-- `server_info`
-- `scrape_listings`
-- `get_scrape_listing_results`
-- `archive_page`
-- `create_instance`
-- `agent_browser`
-
-If the project adds or changes tools later, disconnect and reconnect the MCP so the client
-refreshes its cached tool list.
-
-### Connect Notion
+The shared setup guide already connected the **Cloak Biz Scraper MCP**. This listing workflow
+also needs the **Notion MCP** to read Seed URLs and the runbook, read the content appended by
+`archive_page`, and update triage properties.
 
 Add Notion's hosted MCP at `https://mcp.notion.com/mcp` using Streamable HTTP and OAuth, or use
 the official Notion connector when your agent offers it. Sign in and authorize the intended
@@ -343,68 +240,46 @@ scraper appended the Example Domain capture:
 
 ![Claude reading content written by archive_page through Notion](assets/setup-tutorial/claude-archive-read.png)
 
-## 5. Choose Claude or ChatGPT Work
+## 4. Choose the scheduled agent
+
+Use the same Claude or ChatGPT account where you connected Cloak Biz Scraper and Notion.
 
 ### Claude
 
-For an individual Pro or Max account, open **Customize → Connectors**. The current connector
-screen has an **Add** button and shows connected custom servers in the same list:
+Scheduled tasks run through Claude Cowork. Open **Scheduled → New task**. Scheduled Cowork
+tasks can use remote connectors while your computer is asleep. Availability depends on the
+paid plan and current rollout.
 
-![Claude's Connectors screen](assets/setup-tutorial/claude-connectors.png)
-
-Select **Add → Add custom connector**. Enter `Cloak Biz Scraper` as the name, paste the public
-MCP URL from the scraper's **Connect** tab into **Remote MCP server URL**, and continue. Claude
-discovers the server's OAuth setup from that URL. Complete the redirect back to Cloak Biz
-Scraper, enter `APP_SECRET` only on your own scraper's authorization page, and approve the
-connection. Do not paste `APP_SECRET` into Claude.
-
-![Claude's Add custom connector form](assets/setup-tutorial/claude-add-connector.png)
+![Claude's Scheduled tasks page](assets/setup-tutorial/claude-scheduled.png)
 
 Enable both **Cloak Biz Scraper** and **Notion** for the task when Claude asks which connectors
 it may use.
 
-Scheduled tasks run through Claude Cowork. Open **Scheduled → New task**, then create the task
-with Claude or set it up manually. Scheduled Cowork tasks can use remote connectors while your
-computer is asleep. Availability depends on the paid plan and current rollout.
-
-![Claude's Scheduled tasks page](assets/setup-tutorial/claude-scheduled.png)
-
 ### ChatGPT Work
 
 ChatGPT Work is available on individual paid plans as well as managed workspaces, subject to
-rollout. Plus and Pro users can create scheduled tasks from **Scheduled** or ask Work to create
-one. Open **Scheduled**, select **Work** at the top, and put the short bootstrap prompt in
-**Schedule a task**. The task uses the connections and permissions available to that account.
+rollout. Plus and Pro users can create scheduled tasks from **Scheduled** or ask Work to
+create one. Open **Scheduled**, select **Work**, and use the short bootstrap prompt in Step 6.
 
 ![ChatGPT Scheduled with the Work surface available](assets/setup-tutorial/chatgpt-scheduled.png)
 
-In the current individual-account interface, open **Plugins → Create app**. Enter
-`Cloak Biz Scraper`, select **Server URL**, paste the public `/mcp` URL, and keep
-**Authentication** set to **OAuth**. Read the custom-server warning, check the acknowledgement
-only if the URL is your own deployment, and choose **Create**. Complete authorization on your
-scraper's page. Add the official Notion plugin as well and authorize the workspace that holds
-Seed URLs, Listings, and the runbook.
+Add the official Notion plugin and authorize the workspace that holds Seed URLs, Listings,
+and the runbook. The shared scraper setup guide covers the separate custom MCP connection.
 
-![ChatGPT's custom MCP app form](assets/setup-tutorial/chatgpt-connectors.png)
+OpenAI documents plan-dependent limits for raw custom MCP actions. This workflow needs action
+tools because `scrape_listings` starts a server task and `archive_page` writes to Notion.
+Before scheduling, prove compatibility on the actual account:
 
-OpenAI currently documents a separate restriction for developer-mode custom MCPs: full
-write/modify MCP actions are available to Business, Enterprise, and Edu, while Pro custom MCP
-access may be limited to read/fetch. `scrape_listings` starts a server task and `archive_page`
-writes to Notion, so do this compatibility test before relying on an individual account:
+1. Ask Work to call `server_info`.
+2. Ask Work to call `scrape_listings` on one seed with `max_pages=1` and `sync=false`.
+3. Poll with `get_scrape_listing_results` until it completes.
+4. Confirm the tools were called instead of being replaced with ordinary web browsing.
 
-1. Connect Cloak Biz Scraper from **Plugins → Create app**, or the equivalent custom-app
-   surface available to your account.
-2. Ask Work to call `server_info`.
-3. Ask Work to call `scrape_listings` on one seed with `max_pages=1` and `sync=false`.
-4. Poll with `get_scrape_listing_results` until it completes.
-5. Confirm all three tools were called rather than replaced with ordinary web browsing.
+If an action tool is absent or blocked, that account cannot yet run the raw custom-MCP
+workflow unattended. Use Claude or a ChatGPT plan and connection method that exposes the
+required actions.
 
-If the action tools are absent or blocked, the raw custom-MCP path on that account cannot run
-this full workflow yet. Use Claude, a workspace plan with full MCP, or a published app/plugin
-that exposes the required actions to your plan. Do not assume “Work is available” means every
-custom MCP action is available.
-
-## 6. Run one source manually before scheduling it
+## 5. Run one source manually before scheduling it
 
 Tell the agent:
 
@@ -441,7 +316,7 @@ run**. Each new row carries `synced_row_id`, which is the `notion_page_id` to us
 `archive_page`. Existing rows are counted in `synced.existing`; they are omitted from the
 array and are not refreshed.
 
-## 7. Save the daily bootstrap prompt
+## 6. Save the daily bootstrap prompt
 
 The long operating rules belong in the Notion runbook. The scheduled task should contain a
 short bootstrap prompt that points to the live Notion pages and names the exact tools.
@@ -469,7 +344,7 @@ End with the runbook's morning report and links to the listings ready for my rev
 Keep URLs out of this prompt. The agent reads the live Seed URLs database each time, so the
 database stays the source of truth.
 
-## 8. Schedule the morning run
+## 7. Schedule the morning run
 
 Choose a time after the marketplaces normally publish overnight changes. Start with one run
 per day and one page per source until proxy traffic and review volume are predictable.
@@ -497,7 +372,7 @@ per day and one page per source until proxy traffic and review volume are predic
    yet an unattended morning workflow; narrow or persist the necessary permissions where the
    product allows it.
 
-## 9. Review the first three runs
+## 8. Review the first three runs
 
 For the first few mornings, compare the report with the task history in Cloak Biz Scraper and
 the new Notion rows.

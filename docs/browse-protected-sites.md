@@ -7,6 +7,23 @@ Cloak Biz Scraper gives the AI a patched Chromium browser behind your residentia
 AI must call the scraper's MCP tools explicitly. “Try the website again” is often too vague;
 the agent may retry the same blocked browser.
 
+## Before you start
+
+Complete **[Set up Cloak Biz Scraper for your AI](set-up-scraper-for-ai.md)** first. That
+guide covers the Railway deployment, emailed CloakBrowser Pro key, residential proxy, MCP
+connection, and a harmless end-to-end test.
+
+Do not continue until your agent can call these tools from the **Cloak Biz Scraper MCP**:
+
+- `server_info`
+- `create_instance`
+- `agent_browser`
+- `get_instance` and `list_instances`
+- `close_instance`
+
+This guide does not require the business-listing workflow or Notion. Add Notion only when you
+want to archive a page there.
+
 ```mermaid
 flowchart LR
     A[Ordinary browser is blocked] --> B[create_instance<br>profile: Default]
@@ -118,6 +135,10 @@ already work, and unnecessary protected-browser traffic consumes proxy bandwidth
 
 Browsing and archiving are different operations.
 
+This optional section requires a Notion internal integration configured in the scraper with
+access to the destination page, plus the AI's Notion connector to read it afterward. Skip it
+if you only need to browse and return facts in the chat.
+
 If an existing Notion page should hold a permanent copy, tell the agent:
 
 ```text
@@ -147,6 +168,11 @@ The **Browsers** tab lets you watch the browser and take control when a site nee
   `get_instance` or `list_instances` for a fresh link rather than launching duplicate
   browsers.
 
+See **[Monitor a browser and take control](monitor-and-take-control.md)** for the complete
+live-preview, takeover, task-history, and evidence workflow. See
+**[Advanced controls](advanced-controls.md)** before changing proxy sessions, browser
+capacity, profiles, or stored data.
+
 Use the browser only for public pages or sites you are authorized to access. Respect site
 terms, access controls, rate limits, and paywalls.
 
@@ -162,4 +188,6 @@ the browser is using the configured residential proxy. Do not submit forms or sa
 
 Then repeat the check on a public page that previously blocked the ordinary browser. If it
 still fails, open Cloak Biz Scraper **Settings** and retest the browser licence and proxy
-before changing prompts.
+before changing prompts. Use the bounded proxy-rotation procedure in
+[Advanced controls](advanced-controls.md#rotate-a-profiles-proxy-exit) only when the current
+residential exit is clearly blocked.

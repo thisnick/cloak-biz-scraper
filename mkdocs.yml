@@ -1,5 +1,5 @@
 site_name: Cloak Biz Scraper
-site_description: Build a daily AI business-listing watch with your own scraper and Notion.
+site_description: Give Claude or ChatGPT a self-hosted cloaked browser, then build protected-site and listing workflows.
 site_url: https://thisnick.github.io/cloak-biz-scraper/
 repo_url: https://github.com/thisnick/cloak-biz-scraper
 repo_name: thisnick/cloak-biz-scraper
@@ -34,10 +34,16 @@ theme:
 
 nav:
   - Start here: index.md
-  - Daily listing watch: set-up-daily-listing-watch.md
-  - Browse protected sites: browse-protected-sites.md
-  - Agent runbook: prompts/listing-watch-runbook.md
-  - Verification record: tutorial-verification.md
+  - Set up the scraper for AI: set-up-scraper-for-ai.md
+  - Use cases:
+      - Daily listing watch: set-up-daily-listing-watch.md
+      - Browse protected sites: browse-protected-sites.md
+  - Operate it:
+      - Monitor and take control: monitor-and-take-control.md
+      - Advanced controls: advanced-controls.md
+  - Reference:
+      - Agent runbook: prompts/listing-watch-runbook.md
+      - Verification record: tutorial-verification.md
 
 markdown_extensions:
   - admonition

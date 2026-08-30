@@ -1,13 +1,14 @@
 # Tutorial verification record
 
-This is the working verification record for
-[Set up a daily listing watch](set-up-daily-listing-watch.md). It separates what was tested
-against the running product from what was checked against documentation or still needs an
-authenticated screenshot.
+This is the working verification record for the
+[shared scraper setup](set-up-scraper-for-ai.md),
+[daily listing watch](set-up-daily-listing-watch.md), and
+[protected-site browsing](browse-protected-sites.md) guides. It separates what was tested
+against the running product from what was checked against provider documentation.
 
 Verification date: **2026-08-30**<br>
-Repository commit tested: **e6cfa7d** plus the uncommitted documentation changes in this
-working tree.
+Runtime baseline tested: **e6cfa7d**. The later documentation changes reorganize the same
+verified setup and controls without changing runtime behavior.
 
 ## Tested against the local product
 
@@ -80,6 +81,10 @@ compares the page's timezone and locale, and closes the browser.
   hosted Notion integration to find that page, read the archived body, and identify the source
   as Example Domain without editing the page. A privacy-safe product screenshot is included in
   the tutorial.
+- The local dashboard's live **Settings → Capacity** and **Settings → Disk space** controls
+  were inspected again for the operations guide. Privacy-safe screenshots show the real
+  calculated task budget, host-memory warning, browser-build cleanup, task-evidence cleanup,
+  and upload cleanup controls.
 
 ## Publication status
 
