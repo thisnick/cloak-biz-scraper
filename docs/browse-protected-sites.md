@@ -42,15 +42,11 @@ Replace the URL and the information you want:
 ```text
 Use the Cloak Biz Scraper MCP, not your built-in browser, to open
 https://example.com/page and tell me [what you need].
-
-Call create_instance with profile="Default". Then use the returned instance_id with
-agent_browser. Navigate to the URL, inspect the page with snapshot -i or read, and use
-fresh snapshots after the page changes. Close only the browser instance you created for
-this request when you are done.
+Read the connected scraper's tool instructions and follow them.
 ```
 
-This names both the MCP and the tools, which keeps the agent from substituting a generic web
-browser.
+The connected MCP tool descriptions explain how to launch, operate, and close the browser.
+The longer prompt below is useful only when an agent still substitutes its ordinary browser.
 
 ## When the ordinary browser already failed
 
