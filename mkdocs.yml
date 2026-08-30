@@ -1,0 +1,61 @@
+site_name: Cloak Biz Scraper
+site_description: Build a daily AI business-listing watch with your own scraper and Notion.
+site_url: https://thisnick.github.io/cloak-biz-scraper/
+repo_url: https://github.com/thisnick/cloak-biz-scraper
+repo_name: thisnick/cloak-biz-scraper
+
+docs_dir: docs
+
+theme:
+  name: material
+  logo: assets/setup-tutorial/scraper-overview.png
+  favicon: assets/setup-tutorial/scraper-overview.png
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: deep purple
+      accent: amber
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: deep purple
+      accent: amber
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - content.code.copy
+    - navigation.footer
+    - navigation.sections
+    - navigation.top
+    - toc.follow
+
+nav:
+  - Start here: index.md
+  - Daily listing watch: set-up-daily-listing-watch.md
+  - Browse protected sites: browse-protected-sites.md
+  - Agent runbook: prompts/listing-watch-runbook.md
+  - Verification record: tutorial-verification.md
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+
+plugins:
+  - search
+
+copyright: Open source. Run the scraper on infrastructure and accounts you control.

@@ -42,15 +42,21 @@ https://github.com/user-attachments/assets/8bc957ef-130d-4516-a356-9efdcedeb60d
 
 No terminal — one visit to the Railway dashboard, everything else in the app's web UI.
 
+For a complete, nontechnical workflow that checks listing searches every morning, applies
+objective triage rules, and archives review candidates into Notion, see
+**[the visual setup tutorial](https://thisnick.github.io/cloak-biz-scraper/)**. The
+[Markdown source](docs/set-up-daily-listing-watch.md) lives in this repository. For one-off access to
+pages that block ordinary AI browsers, see
+**[Browse a page that blocks ordinary AI browsers](docs/browse-protected-sites.md)**.
+
 **Watch the deploy walkthrough:**
 
 https://github.com/user-attachments/assets/3c86899d-9f1b-4946-b1ca-4b11a53514b5
 
 1. **Deploy.** Click the button above. Railway generates your `APP_SECRET` for you and
    builds the server (~3 minutes).
-2. **Turn on Serverless.** Railway → your service → **Settings** → enable **Serverless**,
-   so it sleeps when idle. Skipping it costs roughly **$8–9/month** for a server doing
-   nothing.
+2. **Turn on Serverless.** Railway → your service → **Settings → Deploy → Serverless**,
+   then redeploy so the setting takes effect and the service sleeps when idle.
 3. **Copy `APP_SECRET`.** Railway → your service → **Variables**. This is your dashboard
    password — there's no other account to make.
 4. **Open your server's URL and log in** with `APP_SECRET`.
@@ -153,9 +159,9 @@ any behavioural change.
 and REST return identical payloads:
 
 ```
-scrape_listings(urls[], max_pages=1, sync=false, db_id=null) -> ScrapeResult  # async: one job_id for all URLs
+scrape_listings(urls[], max_pages=1, sync=false)             -> ScrapeResult  # async: one job_id for all URLs
 get_scrape_listing_results(job_id)                        -> ScrapeResult
-archive_page(url, notion_page_id)                         -> ArchiveResult   # blocks ~20s
+archive_page(url, notion_page_id)                         -> ArchiveResult   # blocks ~40–60s
 create_instance(profile?, country?, region?, geoip?)      -> InstanceView    # includes a CDP URL
 list_instances() / get_instance(id) / close_instance(id)
 agent_browser(instance_id, command)                       -> command output (+ optional screenshot)
