@@ -28,6 +28,7 @@ import logging
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import ToolAnnotations
 
 from . import __version__
 from .models import (
@@ -59,6 +60,58 @@ Money fields are reported exactly as the listing said them ("$1,258,000",
 "Not Disclosed", "$81,000 + Inventory"). They are strings, not numbers, on
 purpose: the card is quoted rather than interpreted.
 """
+
+
+# The safety hints in `tools/list`, which a client reads to decide what it may
+# run without asking first.
+#
+# Worth setting mostly because of what the spec says when they are ABSENT:
+# `destructiveHint` and `openWorldHint` both default to *true*, so an
+# unannotated server describes every tool it has — including the five that only
+# read status — as destructive and open-world. Annotating is therefore less
+# about flagging the dangerous tools than about clearing the safe ones.
+#
+# `openWorldHint` is true only where the CALLER can steer the tool at an
+# arbitrary external entity, which here means the three that take or follow a
+# URL. It is not "does a packet leave the box": create_instance probes its exit
+# IP and may resolve a licence key, but only ever against a fixed set of
+# endpoints that nothing in its signature can redirect. Read the other way the
+# hint would be true almost everywhere and would carry no signal.
+#
+# `destructiveHint` is read here as "can this lose something the caller would
+# want back", which is deliberately narrower than the spec's literal "performs
+# only additive updates". Taken literally it would also cover update_profile,
+# which overwrites a name or a geography, and new_proxy_session, which throws
+# the old session away — neither of which loses anything: the overwritten values
+# can be read first and set back, and the discarded session is internal, never
+# returned, and the entire point of the call. Flagging them would put six of the
+# ten writing tools behind a prompt, and a client that asks about most of the
+# server teaches its user to click through the ones that can actually take
+# something from them.
+#
+# `destructiveHint` and `idempotentHint` are meaningful only when readOnlyHint
+# is false, so READ_ONLY leaves them unset rather than asserting something the
+# spec ignores.
+#
+# They are hints, and a client is told not to trust them from a server it does
+# not trust. None of this replaces the OAuth guard, the profile lifecycle locks,
+# or the agent_browser verb allowlist — those enforce; this only describes.
+READ_ONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
+ADDITIVE = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False,
+)
+ADDITIVE_OPEN_WORLD = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True,
+)
+DESTRUCTIVE = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False,
+)
+DESTRUCTIVE_IDEMPOTENT = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False,
+)
+DESTRUCTIVE_OPEN_WORLD = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True,
+)
 
 
 def _request(ctx: Context):
@@ -133,7 +186,9 @@ def build(app) -> FastMCP:
     # exposes no seam; it is read when a session initializes, which is later.
     mcp._mcp_server.version = __version__
 
-    @mcp.tool()
+    # Annotated for sync=true, because an annotation cannot vary by argument:
+    # sync=false only reads, but the same tool writes Notion rows when asked to.
+    @mcp.tool(annotations=ADDITIVE_OPEN_WORLD)
     async def scrape_listings(
         urls: list[str], max_pages: int = 1, sync: bool = False
     ) -> ScrapeResult:
@@ -182,7 +237,7 @@ def build(app) -> FastMCP:
         job = app.state.scrape.start(urls, max_pages=max_pages, sync=sync)
         return ScrapeResult.of(job)
 
-    @mcp.tool()
+    @mcp.tool(annotations=READ_ONLY)
     async def get_scrape_listing_results(job_id: str) -> ScrapeResult:
         """Collect the results of a sweep started by scrape_listings.
 
@@ -203,7 +258,9 @@ def build(app) -> FastMCP:
             )
         return result
 
-    @mcp.tool()
+    # Not idempotent: it appends, so a second call with the same arguments
+    # leaves the page holding the content twice.
+    @mcp.tool(annotations=ADDITIVE_OPEN_WORLD)
     async def archive_page(url: str, notion_page_id: str) -> ArchiveResult:
         """Read a page and append its content to an existing Notion page.
 
@@ -213,7 +270,10 @@ def build(app) -> FastMCP:
         """
         return await app.state.archive.archive(url, notion_page_id)
 
-    @mcp.tool()
+    # Closed-world despite launching a browser: the open-world capability is
+    # exercised by agent_browser, which is annotated for it. This call reaches
+    # only the geo probe's own echo services and the CloakBrowser artifact.
+    @mcp.tool(annotations=ADDITIVE)
     async def create_instance(
         ctx: Context, profile: str = "Default", country: str | None = None,
         region: str | None = None, geoip: bool = True,
@@ -258,7 +318,7 @@ def build(app) -> FastMCP:
         return instance_view(inst, secret=app.state.secret.current(),
                              base_url=_base_url(ctx), subject=subject)
 
-    @mcp.tool()
+    @mcp.tool(annotations=READ_ONLY)
     async def list_profiles() -> list[ProfileView]:
         """List the durable browser identities available to create_instance.
 
@@ -270,7 +330,7 @@ def build(app) -> FastMCP:
         """
         return await app.state.profile_service.list_profiles()
 
-    @mcp.tool()
+    @mcp.tool(annotations=ADDITIVE)
     async def create_profile(
         name: str, country: str | None = None, region: str | None = None,
     ) -> ProfileView:
@@ -288,7 +348,9 @@ def build(app) -> FastMCP:
             name, country=country, region=region,
         )
 
-    @mcp.tool()
+    # Not idempotent, because of the rename: a geography-only change repeats
+    # cleanly, but replaying a rename fails on a name that is no longer there.
+    @mcp.tool(annotations=ADDITIVE)
     async def update_profile(
         name: str,
         new_name: str | None = None,
@@ -307,7 +369,11 @@ def build(app) -> FastMCP:
             name, new_name=new_name, country=country, region=region,
         )
 
-    @mcp.tool()
+    # Additive rather than destructive: cookies, logins, fingerprint, name and
+    # geography all survive; only the internal proxy session is replaced. And
+    # closed-world — rotate_session mints the new session here, without asking
+    # the proxy provider for one.
+    @mcp.tool(annotations=ADDITIVE)
     async def new_proxy_session(name: str) -> ProfileView:
         """Give a profile a fresh sticky proxy session for its next launch.
 
@@ -320,7 +386,7 @@ def build(app) -> FastMCP:
         """
         return await app.state.profile_service.new_proxy_session(name)
 
-    @mcp.tool()
+    @mcp.tool(annotations=DESTRUCTIVE)
     async def delete_profile(name: str) -> ProfileDeleteResult:
         """Permanently delete a profile and its saved cookies/logins.
 
@@ -331,7 +397,10 @@ def build(app) -> FastMCP:
         """
         return await app.state.profile_service.delete_profile(name)
 
-    @mcp.tool()
+    # Read-only despite handing back fresh CDP and VNC URLs on every call:
+    # tokens.issue signs claims with the app secret and records nothing, so the
+    # minting changes no state here or anywhere else. Same for get_instance.
+    @mcp.tool(annotations=READ_ONLY)
     async def list_instances(ctx: Context) -> list[InstanceView]:
         """Every running browser. Each carries a fresh, short-lived cdp_url and,
         where the browser has a live view, a vnc_url to watch it."""
@@ -343,7 +412,7 @@ def build(app) -> FastMCP:
             for i in app.state.instances.running.values()
         ]
 
-    @mcp.tool()
+    @mcp.tool(annotations=READ_ONLY)
     async def get_instance(ctx: Context, instance_id: str) -> InstanceView:
         """One running browser, with a FRESH, short-lived cdp_url and vnc_url.
 
@@ -359,7 +428,11 @@ def build(app) -> FastMCP:
         return instance_view(inst, secret=app.state.secret.current(),
                              base_url=_base_url(ctx), subject=_subject(ctx))
 
-    @mcp.tool()
+    # The only tool whose blast radius is unbounded, and the one a client should
+    # prompt on if it prompts on nothing else: it clicks and submits on whatever
+    # site the browser is pointed at, where a single action can be irreversible
+    # and belong to someone other than the caller.
+    @mcp.tool(annotations=DESTRUCTIVE_OPEN_WORLD)
     async def agent_browser(ctx: Context, instance_id: str, command: str):
         """Drive a running browser one action at a time, and see the result.
 
@@ -414,7 +487,8 @@ def build(app) -> FastMCP:
             blocks.append(Image(data=outcome.screenshot, format="png"))
         return blocks
 
-    @mcp.tool()
+    # Closed-world: the URL it mints points back at this server.
+    @mcp.tool(annotations=ADDITIVE)
     async def create_upload_url(ctx: Context) -> UploadTicket:
         """Get a temporary URL for putting a file on this server, so a browser can upload it.
 
@@ -463,7 +537,8 @@ def build(app) -> FastMCP:
             # pins that the two read differently.
             raise ValueError(str(exc)) from exc
 
-    @mcp.tool()
+    # Closed-world: proxy status comes from saved settings, not a live probe.
+    @mcp.tool(annotations=READ_ONLY)
     async def server_info() -> ServerInfo:
         """How this server is set up: proxy, browser, pool, and Notion status.
 
@@ -477,7 +552,11 @@ def build(app) -> FastMCP:
 
         return build_server_info(app.state.settings.load(), app.state.instances)
 
-    @mcp.tool()
+    # Destructive because live page state dies with the browser: a half-filled
+    # form is gone, where cookies and logins survive in the profile. Idempotent
+    # even so — instances.stop returns False for an id it no longer holds rather
+    # than raising, so a retry after a dropped response is safe.
+    @mcp.tool(annotations=DESTRUCTIVE_IDEMPOTENT)
     async def close_instance(instance_id: str) -> dict:
         """Close a browser and free its slot in the pool."""
         return {"ok": await app.state.instances.stop(instance_id), "instance_id": instance_id}

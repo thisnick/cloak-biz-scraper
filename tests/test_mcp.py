@@ -100,6 +100,39 @@ class TestStateless:
         deletion = tools["delete_profile"]["description"]
         assert "irreversible" in deletion and "Default" in deletion and "closing" in deletion
 
+    def test_every_tool_declares_its_safety(self, client):
+        """The machine-readable twin of the prose above.
+
+        Silence is not neutral here: `destructiveHint` and `openWorldHint` both
+        default to true, so a tool that declares nothing is read by a client as
+        the most dangerous thing it could be. Pinned as whole sets rather than
+        per tool so that adding a tool has to make a decision about it.
+        """
+        tools = {t["name"]: t for t in rpc(client, "tools/list").json()["result"]["tools"]}
+        hints = {name: tool["annotations"] for name, tool in tools.items()}
+
+        assert {n for n, h in hints.items() if h.get("readOnlyHint")} == {
+            "get_scrape_listing_results",
+            "list_profiles",
+            "list_instances",
+            "get_instance",
+            "server_info",
+        }
+        assert {n for n, h in hints.items() if h.get("destructiveHint")} == {
+            "agent_browser",
+            "delete_profile",
+            "close_instance",
+        }
+        # True only where the caller can steer the tool at an arbitrary external
+        # entity — the three that take or follow a URL. create_instance makes
+        # outbound calls too, but only to endpoints its arguments cannot move.
+        assert {n for n, h in hints.items() if h.get("openWorldHint")} == {
+            "scrape_listings",
+            "archive_page",
+            "agent_browser",
+        }
+        assert {n for n, h in hints.items() if h.get("idempotentHint")} == {"close_instance"}
+
     def test_the_async_pair_is_described_as_a_pair(self, client):
         """A model that does not know to call back reports zero listings for a
         sweep that is running perfectly well."""
