@@ -22,5 +22,9 @@ venv/
 .pytest_cache/
 site/
 
+# Devbox's generated Nix profile and project-local npm packages. Keep
+# devbox.json/devbox.lock tracked; they are the reproducible inputs.
+.devbox/
+
 # OS
 .DS_Store

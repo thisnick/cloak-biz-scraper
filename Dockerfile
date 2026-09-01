@@ -67,7 +67,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm \
 # only used when agent-browser LAUNCHES its own browser. We never do: the tool
 # always attaches to CloakBrowser's Chromium via --cdp, so the download would be
 # pure image bloat. (Verified: --cdp attach works with the npm install alone.)
-RUN npm install -g agent-browser@0.32.3 && npm cache clean --force
+RUN npm install -g agent-browser@0.36.0 && npm cache clean --force
 
 WORKDIR /app
 

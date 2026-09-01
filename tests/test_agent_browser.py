@@ -126,8 +126,11 @@ class TestInjectionIsInert:
         await svc.drive("i1", "navigate a; touch b", subject=OWNER)
         program, args = calls[0]  # the single command (no auto-screenshot)
         assert program == "agent-browser"
-        # --cdp <port> then the tokens, each its own argv item (";" is glued to "a")
-        assert args[:3] == ("--cdp", "4242", "navigate")
+        # A port-scoped session, then --cdp <port>, then the caller tokens; each
+        # is its own argv item (";" is glued to "a").
+        assert args[:5] == (
+            "--session", "cloakbiz-cdp-4242", "--cdp", "4242", "navigate",
+        )
         # The metacharacters are literal argv items, passed to agent-browser as
         # arguments — never a shell operator.
         assert "a;" in args and "touch" in args and "b" in args
@@ -199,6 +202,41 @@ class TestOptionInjection:
         with pytest.raises(AgentBrowserError):
             await svc.drive("A", "navigate --cdp 2222 http://x", subject=OWNER)
         assert ran == [], "a subprocess ran despite the smuggled --cdp"
+
+
+class TestPortScopedSessions:
+    @pytest.mark.asyncio
+    async def test_different_cdp_ports_never_share_agent_browser_daemons(self, monkeypatch):
+        """A shared default daemon can interleave attach-A, attach-B, action-A.
+        The service-supplied session key must therefore be stable per port and
+        different across ports, independently of caller input."""
+        import asyncio
+
+        calls = []
+
+        async def spy_exec(program, *args, **kwargs):
+            calls.append((program, args))
+
+            class _P:
+                returncode = 0
+
+                async def communicate(self):
+                    return (b"ok", b"")
+
+            return _P()
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", spy_exec)
+        svc = AgentBrowserService(_FakeInstances(_FakeInst()))
+
+        await svc._run(4101, ["get", "url"], timeout=1)
+        await svc._run(4102, ["get", "url"], timeout=1)
+
+        assert calls[0][1][:4] == (
+            "--session", "cloakbiz-cdp-4101", "--cdp", "4101",
+        )
+        assert calls[1][1][:4] == (
+            "--session", "cloakbiz-cdp-4102", "--cdp", "4102",
+        )
 
 
 # ── screenshots are opt-in, and the path stays ours ───────────────────────────
@@ -284,7 +322,9 @@ class TestScreenshotIsOptIn:
         out = await svc.drive("i1", "screenshot --full", subject=OWNER)
         assert out.screenshot == b"PNG"
         args = calls[0]
-        assert args[:3] == ("--cdp", "7777", "screenshot")
+        assert args[:5] == (
+            "--session", "cloakbiz-cdp-7777", "--cdp", "7777", "screenshot",
+        )
         assert "--full" in args
         # last arg is the path, under a temp dir the service made — not caller input
         assert args[-1].endswith("shot.png") and "ab-shot-" in args[-1]
@@ -516,7 +556,9 @@ class TestWarmOnCreate:
         assert len(calls) == 1
         program, args = calls[0]
         assert program == "agent-browser"
-        assert args[:3] == ("--cdp", "5555", "get") and "url" in args
+        assert args[:5] == (
+            "--session", "cloakbiz-cdp-5555", "--cdp", "5555", "get",
+        ) and "url" in args
 
     @pytest.mark.asyncio
     async def test_warm_swallows_every_failure(self, monkeypatch):
@@ -530,20 +572,39 @@ class TestWarmOnCreate:
 
         await svc.warm(1234)  # must not raise
 
-    def test_the_service_registers_its_warm_hook_when_the_pool_supports_it(self):
+    def test_the_service_registers_its_lifecycle_hooks_when_the_pool_supports_them(self):
         class _Pool:
             def __init__(self):
-                self.hook = None
+                self.warm_hook = None
+                self.close_hook = None
 
             def get(self, iid):
                 return None
 
             def set_launch_warm_hook(self, fn):
-                self.hook = fn
+                self.warm_hook = fn
+
+            def set_launch_close_hook(self, fn):
+                self.close_hook = fn
 
         pool = _Pool()
         svc = AgentBrowserService(pool)
-        assert pool.hook == svc.warm
+        assert pool.warm_hook == svc.warm
+        assert pool.close_hook == svc.close
+
+    @pytest.mark.asyncio
+    async def test_close_stops_only_the_port_scoped_daemon_without_reattaching(self, monkeypatch):
+        import asyncio
+
+        spy, calls = _fake_exec_sequence([(0, b"closed", b"")])
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", spy)
+        svc = AgentBrowserService(_FakeInstances(_FakeInst()))
+
+        await svc.close(5555)
+
+        assert calls == [
+            ("agent-browser", ("--session", "cloakbiz-cdp-5555", "close")),
+        ]
 
     def test_a_pool_without_the_hook_setter_is_fine(self):
         # The unit-test double has no setter; construction must not blow up.
@@ -708,9 +769,11 @@ class TestUploadResolvesThroughTheStore:
         assert out.ok and out.output == "attached 1 file"
         program, args = calls[0]
         assert program == "agent-browser"
-        assert args[:4] == ("--cdp", "4242", "upload", "@e3")
-        assert args[4:] == (str(pathlib.Path(staged[0].path).resolve()),)
-        assert "/./" not in args[4], "the caller's own string reached argv"
+        assert args[:6] == (
+            "--session", "cloakbiz-cdp-4242", "--cdp", "4242", "upload", "@e3",
+        )
+        assert args[6:] == (str(pathlib.Path(staged[0].path).resolve()),)
+        assert "/./" not in args[6], "the caller's own string reached argv"
 
     async def test_the_subprocess_gets_the_path_the_store_returned_not_the_callers_string(
         self, tmp_path, monkeypatch
@@ -740,7 +803,7 @@ class TestUploadResolvesThroughTheStore:
 
         await svc.drive("i1", f"upload @e3 {caller_path}", subject=OWNER)
 
-        passed = calls[0][1][4]
+        passed = calls[0][1][6]
         assert "/link/" not in passed, f"the caller's own string reached argv: {passed}"
         assert passed.startswith(str(real.resolve()))
         assert pathlib.Path(passed).read_bytes() == JPEG
@@ -756,7 +819,7 @@ class TestUploadResolvesThroughTheStore:
 
         await svc.drive("i1", f"upload @e3 {noisy}", subject=OWNER)
 
-        assert "/./" not in calls[0][1][4]
+        assert "/./" not in calls[0][1][6]
 
     async def test_every_file_in_a_variadic_upload_is_resolved_in_order(
         self, tmp_path, monkeypatch
@@ -777,9 +840,9 @@ class TestUploadResolvesThroughTheStore:
 
         assert out.ok
         args = calls[0][1]
-        assert args[3] == "@e7", "the selector is passed through, like every other verb"
-        assert list(args[4:]) == [str(pathlib.Path(f.path).resolve()) for f in staged]
-        assert not any("/./" in a for a in args[4:]), "a caller string reached argv"
+        assert args[5] == "@e7", "the selector is passed through, like every other verb"
+        assert list(args[6:]) == [str(pathlib.Path(f.path).resolve()) for f in staged]
+        assert not any("/./" in a for a in args[6:]), "a caller string reached argv"
 
     async def test_the_selector_is_never_treated_as_a_path(self, tmp_path, monkeypatch):
         """`@e3` is a page ref. If it were run through the store it would be
@@ -793,7 +856,7 @@ class TestUploadResolvesThroughTheStore:
 
         await svc.drive("i1", f"upload @e3 {staged[0].path}", subject=OWNER)
 
-        assert calls[0][1][3] == "@e3"
+        assert calls[0][1][5] == "@e3"
 
 
 @pytest.mark.asyncio
@@ -1018,9 +1081,11 @@ class TestUploadOverRest:
 
         assert r.status_code == 200, r.text
         assert r.json()["output"] == "attached 1 file"
-        assert calls[0][1][:4] == ("--cdp", "5150", "upload", "@e3")
-        assert calls[0][1][4] == str(pathlib.Path(staged[0].path).resolve())
-        assert "/./" not in calls[0][1][4], "the caller's own string reached argv"
+        assert calls[0][1][:6] == (
+            "--session", "cloakbiz-cdp-5150", "--cdp", "5150", "upload", "@e3",
+        )
+        assert calls[0][1][6] == str(pathlib.Path(staged[0].path).resolve())
+        assert "/./" not in calls[0][1][6], "the caller's own string reached argv"
 
     def test_a_path_the_store_never_wrote_is_a_400_that_says_what_to_do(
         self, client, monkeypatch, tmp_path

@@ -1,0 +1,28 @@
+{
+  "$schema": "https://raw.githubusercontent.com/jetify-com/devbox/0.18.0/.schema/devbox.schema.json",
+  "packages": [
+    "python@3.12.13",
+    "nodejs@24.12.0"
+  ],
+  "shell": {
+    "init_hook": [
+      "if [ -d \"$DEVBOX_PROJECT_ROOT/.venv\" ]; then export VIRTUAL_ENV=\"$DEVBOX_PROJECT_ROOT/.venv\"; export PATH=\"$VIRTUAL_ENV/bin:$PATH\"; fi",
+      "if [ -d \"$DEVBOX_PROJECT_ROOT/.devbox/npm/node_modules/.bin\" ]; then export PATH=\"$DEVBOX_PROJECT_ROOT/.devbox/npm/node_modules/.bin:$PATH\"; fi"
+    ],
+    "scripts": {
+      "setup": [
+        "python -m venv .venv",
+        ".venv/bin/python -m pip install --upgrade pip",
+        ".venv/bin/python -m pip install -r requirements-dev.txt",
+        "npm install --prefix .devbox/npm --no-save agent-browser@0.36.0"
+      ],
+      "test": ".venv/bin/python -m pytest -q",
+      "test-agent-browser": ".venv/bin/python -m pytest -q tests/test_agent_browser.py tests/test_instances.py tests/test_mcp.py tests/test_diag_coldstart.py",
+      "versions": "python --version && node --version && npm --version && agent-browser --version",
+      "verify": [
+        "python --version && node --version && npm --version && agent-browser --version",
+        "python -m pytest -q tests/test_agent_browser.py tests/test_instances.py tests/test_mcp.py tests/test_diag_coldstart.py"
+      ]
+    }
+  }
+}

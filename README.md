@@ -137,9 +137,13 @@ Once it's connected, just ask:
 Your licence key, proxy password, and Notion token are stored on the volume, **encrypted
 at rest** with a volume-local key.
 
-**Developing against it:** run the tests locally and in the container (`docker compose up`,
-then `pytest`), keep MCP and REST behavior aligned, and expect an adversarial review for
-anything touching credentials, filesystem deletion, browser control, or deployment.
+**Developing against it:** [Devbox](https://www.jetify.com/docs/devbox) provides the
+same Python and Node runtimes without installing them globally. Run `devbox run setup`
+once, then `devbox run test`; `devbox run test-agent-browser` runs the focused browser/MCP
+suite and `devbox run versions` prints every pinned runtime. You can also test in the
+deployment container (`docker compose up`, then `pytest`). Keep MCP and REST behavior
+aligned, and expect an adversarial review for anything touching credentials, filesystem
+deletion, browser control, or deployment.
 
 ## Contributing
 

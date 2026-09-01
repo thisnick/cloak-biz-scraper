@@ -91,6 +91,21 @@ _VERB_FLAGS = {
 _RUN_TIMEOUT = 45.0
 _SHOT_TIMEOUT = 20.0
 _WARM_TIMEOUT = 8.0
+_CLOSE_TIMEOUT = 5.0
+
+
+def _session(port: int) -> str:
+    """The agent-browser daemon/session dedicated to one bound CDP port.
+
+    agent-browser's implicit session is literally named ``default``. Passing a
+    different ``--cdp`` on two concurrent CLI invocations does not create two
+    daemons: each invocation sends a reattach followed by its action to that
+    shared daemon, so ``attach A, attach B, click A`` can click browser B.
+    A port is unique for the lifetime of a pool instance, making it the stable,
+    non-secret isolation key we need. agent-browser 0.34+ persists this binding
+    per named session and 0.36 keeps the same contract.
+    """
+    return f"cloakbiz-cdp-{port}"
 
 # First-call readiness race. The `agent-browser` CLI cold-starts a detached
 # per-session daemon (a node process) on its first invocation, and that daemon
@@ -267,6 +282,9 @@ class AgentBrowserService:
         register = getattr(instances, "set_launch_warm_hook", None)
         if callable(register):
             register(self.warm)
+        register_close = getattr(instances, "set_launch_close_hook", None)
+        if callable(register_close):
+            register_close(self.close)
 
     def _cdp_port(self, instance_id: str, subject: str | None) -> int:
         inst = self._instances.get(instance_id)
@@ -291,7 +309,7 @@ class AgentBrowserService:
     async def _run(self, port: int, argv: list[str], *, timeout: float) -> tuple[int, str, str]:
         """One `agent-browser --cdp <port> <argv>` invocation. exec, never a shell."""
         proc = await asyncio.create_subprocess_exec(
-            _binary(), "--cdp", str(port), *argv,
+            _binary(), "--session", _session(port), "--cdp", str(port), *argv,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         try:
@@ -334,6 +352,27 @@ class AgentBrowserService:
             await self._run(port, ["get", "url"], timeout=_WARM_TIMEOUT)
         except Exception as exc:  # noqa: BLE001 - warming must never surface
             logger.debug("agent_browser warm on cdp=%s did not complete: %r", port, exc)
+
+    async def close(self, port: int) -> None:
+        """Best-effort stop of the daemon dedicated to a closed pool instance.
+
+        No ``--cdp`` is supplied: the browser has already closed, and all we
+        need is the named daemon's own ``close`` action. This is an internal
+        lifecycle hook, not a caller-reachable verb.
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                _binary(), "--session", _session(port), "close",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                await asyncio.wait_for(proc.communicate(), _CLOSE_TIMEOUT)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                logger.debug("agent_browser close on cdp=%s timed out", port)
+        except Exception as exc:  # noqa: BLE001 - cleanup must never block pool release
+            logger.debug("agent_browser close on cdp=%s did not complete: %r", port, exc)
 
     async def _screenshot(self, port: int, flags: list[str]) -> bytes | None:
         """A PNG of the current page, written to a path THIS service picks (never

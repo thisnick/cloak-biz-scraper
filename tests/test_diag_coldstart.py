@@ -289,12 +289,14 @@ async def test_proxy_launch_error_omits_raw_and_encoded_credentials(tmp_path, mo
 
 def test_agent_browser_commands_attach_only_to_the_diagnostic_port():
     assert agent_browser_command(PROXY_CDP_PORT, "get", "url") == [
-        "agent-browser", "--cdp", "9502", "get", "url"
+        "agent-browser", "--session", "cloakbiz-cdp-9502",
+        "--cdp", "9502", "get", "url",
     ]
     assert agent_browser_command(
         PROXY_CDP_PORT, "navigate", "https://example.com", verbose=True
     ) == [
-        "agent-browser", "--verbose", "--cdp", "9502", "navigate",
+        "agent-browser", "--verbose", "--session", "cloakbiz-cdp-9502",
+        "--cdp", "9502", "navigate",
         "https://example.com",
     ]
 

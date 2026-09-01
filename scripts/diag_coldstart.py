@@ -239,7 +239,11 @@ def agent_browser_command(cdp_port: int, *args: str, verbose: bool = False) -> l
     command = ["agent-browser"]
     if verbose:
         command.append("--verbose")
-    command.extend(["--cdp", str(cdp_port), *args])
+    command.extend([
+        "--session", f"cloakbiz-cdp-{cdp_port}",
+        "--cdp", str(cdp_port),
+        *args,
+    ])
     return command
 
 

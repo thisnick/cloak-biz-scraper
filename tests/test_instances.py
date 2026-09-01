@@ -124,6 +124,32 @@ async def test_a_sweeps_browser_is_not_warmed(manager):
     assert warmed == [], "a sweep drives itself and must not be warmed"
 
 
+async def test_interactive_close_stops_the_port_scoped_driver(manager):
+    closed = []
+
+    async def close_driver(port):
+        closed.append(port)
+
+    manager.set_launch_close_hook(close_driver)
+    inst = await _launch(manager, "interactive", wait=False)
+
+    assert await manager.stop(inst.id)
+    assert closed == [inst.cdp_port]
+
+
+async def test_task_close_has_no_external_driver_to_stop(manager):
+    closed = []
+
+    async def close_driver(port):
+        closed.append(port)
+
+    manager.set_launch_close_hook(close_driver)
+    inst = await _launch(manager, "task", wait=False)
+
+    assert await manager.stop(inst.id)
+    assert closed == []
+
+
 async def test_interactive_is_bounded_only_by_max(manager):
     for _ in range(4):
         await _launch(manager, "interactive", wait=False)

@@ -201,6 +201,9 @@ class InstanceManager:
         # dependency on the agent-browser service; None means "not wired", which
         # is what the pool does on its own without the app assembling it.
         self._launch_warm_hook: Callable[[int], Awaitable[None]] | None = None
+        # Matching best-effort teardown for the port-scoped driver daemon. Kept
+        # as a hook for the same dependency direction as the warm-up.
+        self._launch_close_hook: Callable[[int], Awaitable[None]] | None = None
 
     def set_launch_warm_hook(
         self, hook: Callable[[int], Awaitable[None]] | None,
@@ -210,6 +213,13 @@ class InstanceManager:
         command doesn't race the agent-browser daemon's cold start. Fired
         fire-and-forget and best-effort — see AgentBrowserService.warm."""
         self._launch_warm_hook = hook
+
+    def set_launch_close_hook(
+        self, hook: Callable[[int], Awaitable[None]] | None,
+    ) -> None:
+        """Register a coroutine ``fn(cdp_port)`` that stops an interactive
+        browser's port-scoped driver daemon after the browser closes."""
+        self._launch_close_hook = hook
 
     @property
     def task_profiles(self) -> TaskProfilePool:
@@ -405,6 +415,8 @@ class InstanceManager:
                 except Exception as exc:
                     logger.warning("close ctx %s: %s", inst.id, exc)
             await self.displays.stop(inst.display)
+            if inst.origin == "interactive" and self._launch_close_hook is not None:
+                await self._launch_close_hook(inst.cdp_port)
             if log_closed:
                 logger.info("instance %s closed, freed :%d", inst.id, inst.display)
         finally:
