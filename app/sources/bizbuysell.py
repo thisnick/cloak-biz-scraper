@@ -74,7 +74,46 @@ JS_CARDS = r"""
   // exactly as written, including any "+ Inventory" or "Not Disclosed".
   const LABEL = /^\s*(asking price|price|cash flow|cashflow|sde|ebitda|revenue|gross revenue|gross income)\s*:?\s*/i;
   const value = (s) => { const v = clean(s).replace(LABEL, '').trim(); return v || null; };
-  const after = (raw, re) => { const m = (raw || '').match(re); return m ? value(m[0]) : null; };
+  // Keep the card's rendered line boundaries for labeled fallbacks. Running
+  // these regexes over clean(innerText) flattens every newline first, so a
+  // value such as "$1,000,000" can absorb all of the card text after it.
+  const lines = (root) => (root.innerText || root.textContent || '')
+    .split(/\n+/).map(clean).filter(Boolean);
+  const after = (cardLines, re) => {
+    for (const line of cardLines) {
+      const m = line.match(re);
+      if (m) return value(m[0]);
+    }
+    return null;
+  };
+  // BizBuySell also has a compact card layout with no asking-price class. It
+  // renders "$4,800,000 - Orange County, CA", then the price and location as
+  // separate lines. In that layout a generic `.location` element can actually
+  // contain the price. Validate the meaning before accepting either field.
+  const MONEY = /^(?:US\s*)?\$\s*\d[\d,.]*(?:\s*\+\s*Inventory)?$/i;
+  const isMoney = (s) => MONEY.test(clean(s)) || /^Not Disclosed$/i.test(clean(s));
+  const isLocation = (s) => {
+    const v = clean(s);
+    if (!v || isMoney(v) || /\$/.test(v)) return false;
+    if (/^(?:Relocatable|United States|Online|Remote)$/i.test(v)) return true;
+    return /^[^,:]{2,100},\s*(?:[A-Z]{2}|[A-Za-z][A-Za-z .'-]+)$/.test(v);
+  };
+  const compactFields = (cardLines) => {
+    for (let i = 0; i < cardLines.length; i++) {
+      // The compact layout's summary line is "$X - City, ST".
+      const pair = cardLines[i].match(
+        /^((?:US\s*)?\$\s*\d[\d,.]*(?:\s*\+\s*Inventory)?|Not Disclosed)\s+[-–—]\s+(.+)$/i
+      );
+      if (pair && isMoney(pair[1]) && isLocation(pair[2])) {
+        return { asking: clean(pair[1]), location: clean(pair[2]) };
+      }
+      // It also repeats the same values on adjacent standalone lines.
+      if (isMoney(cardLines[i]) && isLocation(cardLines[i + 1])) {
+        return { asking: clean(cardLines[i]), location: clean(cardLines[i + 1]) };
+      }
+    }
+    return { asking: null, location: null };
+  };
   const listingId = (href, id) => {
     if (id && /^\d+$/.test(id)) return id;
     const m = (href || '').match(/\/business-opportunity\/[^/]+\/(\d+)\/?/i);
@@ -84,9 +123,11 @@ JS_CARDS = r"""
   const cards = []; const seen = new Set();
   for (const a of Array.from(document.querySelectorAll('a[href*="/business-opportunity/"]'))) {
     const href = a.href; if (!href || seen.has(href)) continue; seen.add(href);
-    const raw = clean(a.innerText || a.textContent);
+    const cardLines = lines(a);
+    const compact = compactFields(cardLines);
     const asking = value(text(a, 'p.asking-price:not(.hide-on-desktop)') || text(a, 'p.asking-price'))
-                || after(raw, /Asking(?: Price)?:\s*[^\n]+/i);
+                || after(cardLines, /Asking(?: Price)?:\s*[^\n]+/i)
+                || compact.asking;
     // A card shows ONE profit figure in a .cash-flow element, and the element's
     // own text says which kind it is — "Cash Flow: $X", "SDE: $X", or
     // "EBITDA: $X". Route by that inline label so a figure lands in exactly one
@@ -98,14 +139,25 @@ JS_CARDS = r"""
     else if (cashEl) cashflow = value(cashEl);
     // Labeled fallbacks from the card's raw text, each kept to its own label so
     // the fallback cannot cross-fill either.
-    cashflow = cashflow || after(raw, /(?:Cash Flow|SDE):\s*[^\n]+/i);
-    ebitda = ebitda || after(raw, /EBITDA:\s*[^\n]+/i);
-    const revenue = after(raw, /(?:Gross )?Revenue:\s*[^\n]+/i);
+    cashflow = cashflow || after(cardLines, /(?:Cash Flow|SDE):\s*[^\n]+/i);
+    ebitda = ebitda || after(cardLines, /EBITDA:\s*[^\n]+/i);
+    const revenue = after(cardLines, /(?:Gross )?Revenue:\s*[^\n]+/i);
+    const locationEl = text(a, '.location');
+    // Existing cards use free-form location text (including values without a
+    // comma), so the selector only needs the guard this bug exposed: a money
+    // value cannot be a location. The stricter shape check is for scanning
+    // otherwise unlabelled lines, where false positives are easier.
+    const location = (locationEl && !isMoney(locationEl) && !/\$/.test(locationEl)
+                      ? locationEl : null)
+                  || compact.location
+                  // The first rendered line is the title and can itself end in
+                  // a place name; only subsequent lines are field candidates.
+                  || cardLines.slice(1).find(isLocation) || null;
     cards.push({
       listing_id: listingId(href, a.id),
       url: href,
       title: text(a, '.title') || clean(a.getAttribute('aria-label')) || null,
-      location: text(a, '.location'),
+      location: location,
       asking_price: asking,
       cashflow: cashflow,
       ebitda: ebitda,

@@ -7,13 +7,15 @@ database, and nobody notices until it is full of duplicates.
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from app import sources
 from app.sources import UnsupportedURL
-from app.sources.bizbuysell import BizBuySellBroker, BizBuySellSerp, listing_id_from
+from app.sources.bizbuysell import JS_CARDS, BizBuySellBroker, BizBuySellSerp, listing_id_from
 from app.sources.urls import canonical_url, normalize_url
 
 MURALI = "https://www.bizbuysell.com/business-broker/murali-barathi/krea-business/41243/"
@@ -350,6 +352,168 @@ class TestBrokerMapping:
         assert result.blocked is True
 
 
+class TestSerpJavascriptFallbacks:
+    """Field routing in JS_CARDS without depending on an installed browser."""
+
+    def test_compact_card_and_labeled_lines_keep_their_field_boundaries(self):
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node is required to execute the in-page card extractor")
+
+        cards = [
+            {
+                "id": "2549590",
+                "url": (
+                    "https://www.bizbuysell.com/business-opportunity/"
+                    "nadcap-and-as9100d-aerospace-cnc-manufacturer/2549590/"
+                ),
+                "title": "Nadcap & AS9100D Aerospace CNC Manufacturer",
+                "locationClass": "$4,800,000",
+                "innerText": (
+                    "Nadcap & AS9100D Aerospace CNC Manufacturer\n"
+                    "$4,800,000 - Orange County, CA\n"
+                    "$4,800,000\nOrange County, CA\nZaihua Hu\nCURB"
+                ),
+            },
+            {
+                "id": "2484641",
+                "url": (
+                    "https://www.bizbuysell.com/business-opportunity/"
+                    "auto-repair-franchise-6-bays/2484641/"
+                ),
+                "title": "Auto Repair Franchise",
+                "locationClass": "Los Angeles County, CA",
+                "asking": "$1,200,000",
+                "cash": "Cash Flow: $300,000",
+                "innerText": (
+                    "Auto Repair Franchise\nLos Angeles County, CA\n$1,200,000\n"
+                    "Cash Flow: $300,000\nRevenue: $1,000,000\n"
+                    "Presented by Valley Business Brokers"
+                ),
+            },
+            {
+                "id": "2549572",
+                "url": (
+                    "https://www.bizbuysell.com/business-opportunity/"
+                    "9-year-excavation-demolition-and-grading-contractor/2549572/"
+                ),
+                "title": "9 year-Excavation Demolition and Grading Contractor",
+                "locationClass": None,
+                "innerText": (
+                    "9 year-Excavation Demolition and Grading Contractor\n"
+                    "Los Angeles, CA\nLos Angeles, CA\n"
+                    "Dan McKirdy\nSelect Business Sales"
+                ),
+            },
+            {
+                "id": "2537261",
+                "url": (
+                    "https://www.bizbuysell.com/business-opportunity/"
+                    "mission-critical-engineering-and-specialty-construction-company-3-3m/2537261/"
+                ),
+                "title": "Mission-Critical Engineering & Specialty Construction Company – $3.3M",
+                "locationClass": "San Joaquin County, CA",
+                "asking": "Not Disclosed",
+                "cash": "Cash Flow: $3,342,276",
+                "innerText": (
+                    "Mission-Critical Engineering & Specialty Construction Company – $3.3M\n"
+                    "San Joaquin County, CA\nNot Disclosed\nCash Flow: $3,342,276"
+                ),
+            },
+            {
+                "id": "2456287",
+                "url": (
+                    "https://www.bizbuysell.com/business-opportunity/"
+                    "multi-provider-primary-care-and-sleep-medicine-practice-in-southern-ca/2456287/"
+                ),
+                "title": "Multi-Provider Primary Care & Sleep Medicine Practice in Southern CA",
+                "locationClass": "San Bernardino, CA",
+                "asking": "Not Disclosed",
+                "cash": "EBITDA: $874,000",
+                "innerText": (
+                    "Multi-Provider Primary Care & Sleep Medicine Practice in Southern CA\n"
+                    "San Bernardino, CA\nNot Disclosed\nEBITDA: $874,000"
+                ),
+            },
+            {
+                "id": "2281243",
+                "url": (
+                    "https://www.bizbuysell.com/business-opportunity/"
+                    "20m-growing-lab-full-service-lab-with-major-insurances-contracts-and/2281243/"
+                ),
+                "title": "20M Growing Lab, Full Service Lab with Major Insurance’s Contracts and",
+                "locationClass": "California",
+                "asking": "$29,000,000",
+                "cash": "Cash Flow: $6,000,000",
+                "innerText": (
+                    "20M Growing Lab, Full Service Lab with Major Insurance’s Contracts and\n"
+                    "California\n2\n$29,000,000\nCash Flow: $6,000,000"
+                ),
+            },
+        ]
+        harness = r"""
+const extractor = JSON.parse(process.argv[1]);
+const specs = JSON.parse(process.argv[2]);
+const element = (textContent) => ({textContent});
+const anchors = specs.map(spec => ({
+  href: spec.url,
+  id: spec.id,
+  innerText: spec.innerText,
+  textContent: spec.innerText,
+  innerHTML: '',
+  getAttribute: name => name === 'aria-label' ? null : null,
+  querySelector: sel => {
+    if (sel === '.title') return element(spec.title);
+    if (sel === '.location') return element(spec.locationClass);
+    if (sel.startsWith('p.asking-price')) return spec.asking ? element(spec.asking) : null;
+    if (sel === '.cash-flow') return spec.cash ? element(spec.cash) : null;
+    return null;
+  },
+}));
+global.window = {__cbsMarkdown: () => ''};
+global.document = {
+  title: 'Businesses For Sale',
+  body: {innerText: ''},
+  querySelectorAll: () => anchors,
+};
+global.location = {href: 'https://www.bizbuysell.com/california-businesses-for-sale/'};
+process.stdout.write(eval(extractor));
+"""
+        completed = subprocess.run(
+            [node, "-e", harness, json.dumps(JS_CARDS), json.dumps(cards)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        by_id = {x["listing_id"]: x for x in json.loads(completed.stdout)["cards"]}
+
+        compact = by_id["2549590"]
+        assert compact["asking_price"] == "$4,800,000"
+        assert compact["location"] == "Orange County, CA"
+
+        ordinary = by_id["2484641"]
+        assert ordinary["revenue"] == "$1,000,000"
+        assert ordinary["cashflow"] == "$300,000"
+
+        no_price = by_id["2549572"]
+        assert no_price["asking_price"] is None
+        assert no_price["location"] == "Los Angeles, CA"
+
+        undisclosed_cash = by_id["2537261"]
+        assert undisclosed_cash["asking_price"] == "Not Disclosed"
+        assert undisclosed_cash["cashflow"] == "$3,342,276"
+        assert undisclosed_cash["ebitda"] is None
+
+        undisclosed_ebitda = by_id["2456287"]
+        assert undisclosed_ebitda["asking_price"] == "Not Disclosed"
+        assert undisclosed_ebitda["cashflow"] is None
+        assert undisclosed_ebitda["ebitda"] == "$874,000"
+
+        state_only = by_id["2281243"]
+        assert state_only["location"] == "California"
+        assert state_only["asking_price"] == "$29,000,000"
+
+
 _FIXTURE = Path(__file__).parent / "fixtures" / "broker_profile.html"
 _SERP_FIXTURE = Path(__file__).parent / "fixtures" / "serp_results.html"
 
@@ -516,6 +680,54 @@ class TestSerpExtraction:
         assert card.ebitda == ""
 
     @pytest.mark.asyncio
+    async def test_a_labeled_fallback_stops_at_the_end_of_its_rendered_line(self):
+        """The broker attribution follows Revenue in the rendered card, but is
+        not part of the revenue value."""
+        card = (await self._by_id())["2484641"]
+        assert card.revenue == "$1,000,000"
+
+    @pytest.mark.asyncio
+    async def test_compact_card_recovers_unclassed_price_and_location(self):
+        """Some broker-backed cards put the price in `.location` and repeat
+        both values as plain lines. Route by value shape instead of class alone.
+        """
+        card = (await self._by_id())["2549590"]
+        assert card.asking_price == "$4,800,000"
+        assert card.location == "Orange County, CA"
+
+    @pytest.mark.asyncio
+    async def test_a_money_value_is_never_accepted_as_a_location(self):
+        card = (await self._by_id())["2549463"]
+        assert card.asking_price == "$8,000,000"
+        assert card.location == "Orange County, CA"
+
+    @pytest.mark.asyncio
+    async def test_compact_card_without_price_still_recovers_location(self):
+        card = (await self._by_id())["2549572"]
+        assert card.asking_price == ""
+        assert card.location == "Los Angeles, CA"
+
+    @pytest.mark.asyncio
+    async def test_not_disclosed_price_can_coexist_with_cash_flow(self):
+        card = (await self._by_id())["2537261"]
+        assert card.asking_price == "Not Disclosed"
+        assert card.cashflow == "$3,342,276"
+        assert card.ebitda == ""
+
+    @pytest.mark.asyncio
+    async def test_not_disclosed_price_can_coexist_with_ebitda(self):
+        card = (await self._by_id())["2456287"]
+        assert card.asking_price == "Not Disclosed"
+        assert card.cashflow == ""
+        assert card.ebitda == "$874,000"
+
+    @pytest.mark.asyncio
+    async def test_a_state_only_location_is_preserved(self):
+        card = (await self._by_id())["2281243"]
+        assert card.location == "California"
+        assert card.asking_price == "$29,000,000"
+
+    @pytest.mark.asyncio
     async def test_an_asking_only_card_leaves_every_profit_field_empty(self):
         card = (await self._by_id())["2530924"]
         assert card.asking_price == "$195,000"
@@ -537,4 +749,4 @@ class TestSerpExtraction:
             finally:
                 await browser.close()
         assert result.blocked is False
-        assert len(result.listings) == 5
+        assert len(result.listings) == 11

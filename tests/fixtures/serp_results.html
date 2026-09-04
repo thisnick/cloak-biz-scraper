@@ -49,6 +49,7 @@
       <p class="asking-price">$1,200,000</p>
       <p class="cash-flow show-on-mobile ng-star-inserted">Cash Flow: $300,000</p>
       <p class="revenue">Revenue: $1,000,000</p>
+      <p>Presented by Valley Business Brokers</p>
     </a>
 
     <!-- Asking-price-only card: no profit figure and no revenue at all. -->
@@ -56,6 +57,73 @@
       <span class="title">Coin Laundromat — Absentee Run</span>
       <span class="location">San Diego County, CA</span>
       <p class="asking-price">$195,000</p>
+    </a>
+
+    <!-- Regression shape for BizBuySell's alternate broker-backed card. The
+         production result rendered the combined price/location row plus the
+         two separate lines below, while its `.location` lookup returned the
+         price. That produced location="$4,800,000" and an empty asking price in
+         the September 4 listing watch. -->
+    <a href="https://www.bizbuysell.com/business-opportunity/nadcap-and-as9100d-aerospace-cnc-manufacturer-1-08m-annualized-sde/2549590/">
+      <span class="title">Nadcap &amp; AS9100D Aerospace CNC Manufacturer - $1.08M Annualized SDE</span>
+      <div><span class="location">$4,800,000</span> - <span>Orange County, CA</span></div>
+      <p>$4,800,000</p>
+      <p>Orange County, CA</p>
+      <p>Zaihua (Daniel) Hu</p>
+      <p>CURB</p>
+    </a>
+
+    <a href="https://www.bizbuysell.com/business-opportunity/mexican-restaurants-two-2-locations-real-estate-land-and-building/2549463/">
+      <span class="title">Mexican Restaurants | Two(2) Locations | Real Estate(Land &amp; Building)</span>
+      <div><span class="location">$8,000,000</span> - <span>Orange County, CA</span></div>
+      <p>$8,000,000</p>
+      <p>Orange County, CA</p>
+      <p>Mani Singh</p>
+      <p>TNW Business Brokers</p>
+    </a>
+
+    <!-- The same compact layout can omit price entirely. Its plain location
+         line is still evidence for location, while asking price stays empty. -->
+    <a href="https://www.bizbuysell.com/business-opportunity/9-year-excavation-demolition-and-grading-contractor/2549572/">
+      <span class="title">9 year-Excavation Demolition and Grading Contractor</span>
+      <div>Los Angeles, CA</div>
+      <p>Los Angeles, CA</p>
+      <p>Dan McKirdy</p>
+      <p>Select Business Sales</p>
+    </a>
+
+    <!-- Live September 4 samples from the isolated 50-card capture. BizBuySell
+         represents an absent public price as "Not Disclosed" and can pair it
+         with either Cash Flow or EBITDA. Both desktop and mobile field classes
+         are retained here because they are part of the rendered card shape. -->
+    <a href="https://www.bizbuysell.com/business-opportunity/mission-critical-engineering-and-specialty-construction-company-3-3m/2537261/">
+      <span class="title">Mission-Critical Engineering &amp; Specialty Construction Company – $3.3M</span>
+      <p class="location f-m ng-star-inserted">San Joaquin County, CA</p>
+      <p class="hide-on-desktop hide-on-tablet asking-price not-disclosed ng-star-inserted">Not Disclosed</p>
+      <p class="cash-flow-on-mobile ng-star-inserted">Cash Flow: $3,342,276</p>
+      <p class="asking-price not-disclosed ng-star-inserted">Not Disclosed</p>
+      <p class="cash-flow show-on-mobile ng-star-inserted">Cash Flow: $3,342,276</p>
+    </a>
+
+    <a href="https://www.bizbuysell.com/business-opportunity/multi-provider-primary-care-and-sleep-medicine-practice-in-southern-ca/2456287/">
+      <span class="title">Multi-Provider Primary Care &amp; Sleep Medicine Practice in Southern CA</span>
+      <p class="location f-m ng-star-inserted">San Bernardino, CA</p>
+      <p class="hide-on-desktop hide-on-tablet asking-price not-disclosed ng-star-inserted">Not Disclosed</p>
+      <p class="cash-flow-on-mobile ng-star-inserted">EBITDA: $874,000</p>
+      <p class="asking-price not-disclosed ng-star-inserted">Not Disclosed</p>
+      <p class="cash-flow show-on-mobile ng-star-inserted">EBITDA: $874,000</p>
+    </a>
+
+    <!-- A location can be the state name alone. The unrelated "2" line was
+         present in the rendered card and must not disturb field routing. -->
+    <a href="https://www.bizbuysell.com/business-opportunity/20m-growing-lab-full-service-lab-with-major-insurances-contracts-and/2281243/">
+      <span class="title">20M Growing Lab, Full Service Lab with Major Insurance’s Contracts and</span>
+      <p class="location f-m ng-star-inserted">California</p>
+      <p>2</p>
+      <p class="hide-on-desktop hide-on-tablet asking-price justify-start ng-star-inserted">$29,000,000</p>
+      <p class="cash-flow-on-mobile ng-star-inserted">Cash Flow: $6,000,000</p>
+      <p class="asking-price ng-star-inserted">$29,000,000</p>
+      <p class="cash-flow show-on-mobile ng-star-inserted">Cash Flow: $6,000,000</p>
     </a>
   </div>
 </body>
