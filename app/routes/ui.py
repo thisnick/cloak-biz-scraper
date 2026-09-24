@@ -948,13 +948,7 @@ async def profile_create(
 
 
 @router.post("/settings/profiles/edit")
-async def profile_edit(
-    request: Request,
-    name: str = Form(""),
-    new_name: str | None = Form(None),
-    country: str | None = Form(None),
-    region: str | None = Form(None),
-) -> Response:
+async def profile_edit(request: Request, name: str = Form("")) -> Response:
     """Rename and relocate a profile in one submit — the dialog behind each row.
 
     The dialog sends only the fields it actually offered: Default's name box is
@@ -965,10 +959,21 @@ async def profile_edit(
     than silently ignoring. A submit that changes nothing is a no-op redirect,
     not the service's "provide something to update" error: the user pressed
     Save on an unchanged form, which is not a failure.
+
+    The optional fields are read from the raw form, not declared as
+    `Form(None)` parameters: newer FastAPI (0.128 here; 0.115.6 did not) hands
+    an EMPTY form value to a parameter as its default, so `region=""` would arrive as None and the
+    clear would silently become "leave alone". The raw form still tells the
+    two apart.
     """
     _require(request)
     _require_same_origin(request)
     from ..services.profiles import ProfileError
+
+    form = await request.form()
+    new_name = form.get("new_name")
+    country = form.get("country")
+    region = form.get("region")
 
     changes: dict[str, str] = {}
     if new_name is not None and new_name.strip() != name:

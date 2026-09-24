@@ -185,13 +185,12 @@ async def lifespan(app: FastAPI):
 
     # Built here, not at import: the SDK's session manager is single-use, so one
     # per lifespan is what lets this app be started more than once in a process.
-    # streamable_http_app() is what constructs it from the FastMCP settings
-    # (stateless, JSON responses); the Starlette app it returns is deliberately
-    # discarded — its GET handler opens an SSE stream we refuse, and its routing
-    # cannot see the Origin check. MCPEndpoint drives the same manager instead.
-    mcp = mcp_server.build(app)
-    mcp.streamable_http_app()
-    app.state.mcp_manager = mcp.session_manager
+    # streamable_http_app() is what constructs it (stateless, JSON responses —
+    # see mcp_server.session_manager); the Starlette app it returns is
+    # deliberately discarded — its GET handler opens an SSE stream we refuse,
+    # and its routing cannot see the Origin check. MCPEndpoint drives the same
+    # manager instead.
+    app.state.mcp_manager = mcp_server.session_manager(mcp_server.build(app))
 
     reaper = asyncio.create_task(_reap_loop(app.state.instances))
     pulse = asyncio.create_task(heartbeat.loop(lambda: app.state.scrape.in_flight))
