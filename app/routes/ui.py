@@ -1132,6 +1132,14 @@ async def _uploads_payload(request: Request, refresh: bool) -> dict[str, Any] | 
     }
 
 
+async def _downloads_payload(request: Request, refresh: bool) -> dict[str, Any] | None:
+    view = await request.app.state.kept_downloads.snapshot(refresh=refresh)
+    return {
+        "handles": view.handles, "files": view.files, "bytes": view.bytes,
+        "expired": view.expired, "measured_at": view.measured_at,
+    }
+
+
 @router.get("/settings/storage")
 async def storage_sizes(request: Request, refresh: bool = False) -> dict[str, Any]:
     """What the browser cache, the task history, and staged uploads are using.
@@ -1156,9 +1164,13 @@ async def storage_sizes(request: Request, refresh: bool = False) -> dict[str, An
         await request.app.state.uploads.sweep()
     except Exception:  # noqa: BLE001
         logger.exception("could not sweep expired uploads before measuring")
+    try:
+        await request.app.state.downloads.sweep()
+    except Exception:  # noqa: BLE001
+        logger.exception("could not sweep expired downloads before measuring")
     payload: dict[str, Any] = {}
     for key, build in (("builds", _builds_payload), ("history", _history_payload),
-                       ("uploads", _uploads_payload)):
+                       ("uploads", _uploads_payload), ("downloads", _downloads_payload)):
         try:
             payload[key] = await build(request, refresh)
         except OSError:
@@ -1276,6 +1288,44 @@ async def clear_uploads(request: Request, scope: str = Form("expired")) -> Respo
 
 def _tickets(count: int) -> str:
     return f"{count} upload{'' if count == 1 else 's'}"
+
+
+@router.post("/settings/storage/downloads/clear", response_class=HTMLResponse)
+async def clear_downloads(request: Request, scope: str = Form("expired")) -> Response:
+    """Remove kept downloads. Expired ones by default; everything on request.
+
+    Same two scopes as uploads, for the same reason: a live download's link may
+    be in a chat the owner has not read yet. Neither scope touches a download
+    that is still arriving — the store re-reads that at the moment of removal.
+    """
+    _require(request)
+    _require_same_origin(request)
+
+    cleared = await request.app.state.downloads.clear(expired_only=(scope != "all"))
+    request.app.state.kept_downloads.invalidate()
+
+    def files(count: int) -> str:
+        return f"{count} download{'' if count == 1 else 's'}"
+
+    if not cleared.handles:
+        message = (
+            "Nothing to clear — there are no downloaded files."
+            if not cleared.kept
+            else f"Nothing to clear — {files(cleared.kept)} still in use, and downloaded "
+                 "files expire on their own within two hours."
+        )
+        return _render(request, Result("storage", True, message))
+
+    message = f"Cleared {files(cleared.handles)} and freed {human_size(cleared.bytes)}."
+    if cleared.kept:
+        message += (f" {files(cleared.kept).capitalize()} still in use "
+                    f"{'was' if cleared.kept == 1 else 'were'} kept.")
+    if cleared.refused:
+        message += (
+            f" {cleared.refused} item{'' if cleared.refused == 1 else 's'} could not be "
+            f"removed safely and {'was' if cleared.refused == 1 else 'were'} left alone."
+        )
+    return _render(request, Result("storage", True, message))
 
 
 # ── Notion ──────────────────────────────────────────────────────────────────

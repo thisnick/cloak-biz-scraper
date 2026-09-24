@@ -863,6 +863,22 @@
                   </form>
                 </div>
               </div>
+
+              <div class="field">
+                <label>Downloaded files</label>
+                <div class="mono" data-storage="downloads">—</div>
+                <div class="help">Files your assistant downloaded from a page, kept so it — or you — can fetch them with the link it was given. Each one is deleted about two hours after it was downloaded, and expired ones are removed whenever this page is opened. The size includes downloads still arriving.</div>
+                <div class="btnrow">
+                  <form method="post" action="/settings/storage/downloads/clear" onsubmit="return confirm('Clear the expired downloads? Files still within their two hours are kept. This cannot be undone.');">
+                    <input type="hidden" name="scope" value="expired">
+                    <button class="btn danger" type="submit">Clear expired downloads</button>
+                  </form>
+                  <form method="post" action="/settings/storage/downloads/clear" onsubmit="return confirm('Clear EVERY downloaded file, including ones still within their two hours? Links your assistant already handed out will stop working. This cannot be undone.');">
+                    <input type="hidden" name="scope" value="all">
+                    <button class="btn danger" type="submit">Clear all downloads</button>
+                  </form>
+                </div>
+              </div>
             </div>
           </div>
         </div>
@@ -1003,7 +1019,7 @@
         if(btn&&(!b.in_use_known||!b.stale_count))btn.disabled=true;
       }
       function paint(d){
-        var b=d&&d.builds,h=d&&d.history,u=d&&d.uploads;
+        var b=d&&d.builds,h=d&&d.history,u=d&&d.uploads,w=d&&d.downloads;
         if(b)paintBuilds(b);
         if(h){
           var e=at('history');
@@ -1019,7 +1035,12 @@
           if(e)e.textContent=u.files.toLocaleString()+' file'+(u.files===1?'':'s')+' · '+
             human(u.bytes)+(u.expired?' · '+u.expired+' upload'+(u.expired===1?'':'s')+' expired':'');
         }
-        var chip=at('chip'),used=usedTotal([b&&b.total_bytes,h&&h.bytes,u&&u.bytes]);
+        if(w){
+          var e=at('downloads');
+          if(e)e.textContent=w.files.toLocaleString()+' file'+(w.files===1?'':'s')+' · '+
+            human(w.bytes)+(w.expired?' · '+w.expired+' expired':'');
+        }
+        var chip=at('chip'),used=usedTotal([b&&b.total_bytes,h&&h.bytes,u&&u.bytes,w&&w.bytes]);
         if(chip&&used)chip.textContent=used;
       }
       function load(){

@@ -38,6 +38,9 @@ https://github.com/user-attachments/assets/8bc957ef-130d-4516-a356-9efdcedeb60d
 - **Send it a file to upload** — an HTTP-capable assistant can request a staging ticket,
   post a photo or PDF to the server, and attach it to a form in the cloaked browser.
   Files are checked by their contents and deleted a couple of hours later.
+- **Download files from a page** — `download @e5` clicks a download link or export button
+  in the cloaked browser, keeps the file on your server for two hours, and hands back a
+  link that works in curl or in your own browser. Plain clicks never save files.
 
 ## Set it up
 
@@ -117,6 +120,8 @@ Once it's connected, just ask:
 - *"Archive this listing's readable page content into its Notion page."*
 - *"Upload this photo to the listing form on that page."* — this requires an assistant
   that can send the file to the temporary HTTP upload URL before controlling the browser.
+- *"Download the PDF report on that page and send me the link."* — the link works for two
+  hours; an assistant with a shell can also fetch the file itself with the `curl` it is given.
 - *"Launch my Default profile in cloaked scraper and give me a CDP URL"* — then drive it from Playwright yourself.
 
 ## Design
@@ -126,7 +131,7 @@ Once it's connected, just ask:
   API (`/api/*`), a per-instance **CDP** URL, and the **web portal**. All configuration
   lives on a `/data` volume; the deploy sets only `APP_SECRET`.
 - **Settings → Disk space** shows what the volume is holding — browser versions, saved
-  task history, and uploaded files — and clears each of them.
+  task history, uploaded files, and downloaded files — and clears each of them.
 - **Auth.** The web UI uses a cookie session (log in with `APP_SECRET`). `/mcp` and
   `/api/*` use OAuth 2.1 with dynamic client registration + PKCE — unauthenticated calls
   get a 401. CDP and live-view URLs carry short-lived, single-browser signed tokens,
@@ -165,7 +170,7 @@ any behavioural change.
 | `list_instances()` | List running browsers with fresh CDP and live-view URLs. |
 | `get_instance(instance_id)` | Get one running browser and refresh its short-lived connection URLs. |
 | `close_instance(instance_id)` | Close a browser and discard its current page state; saved profile cookies and logins remain. Safe to retry. |
-| `agent_browser(instance_id, command)` | Run one allowlisted browser command such as `navigate`, `snapshot`, `read`, `click`, `fill`, `upload`, or `screenshot`. Screenshots return an image alongside the text result. |
+| `agent_browser(instance_id, command)` | Run one allowlisted browser command such as `navigate`, `snapshot`, `read`, `click`, `fill`, `upload`, `download`, or `screenshot`. Screenshots return an image alongside the text result; `download` returns a temporary link to the saved file. |
 | `create_upload_url()` | Mint a temporary HTTP upload ticket and ready-made `curl` command for staging images or PDFs. The tool itself does not carry the file bytes. |
 | `list_profiles()` | Read safe status for the durable browser profiles. |
 | `create_profile(name, country=null, region=null)` | Create a durable, initially logged-out browser identity without launching it. |
@@ -189,6 +194,15 @@ must run the returned `curl` command or make the equivalent multipart HTTP reque
 upload response contains a server path; `agent_browser`'s `upload` command accepts only a
 live path created by this flow. If the client has no shell or HTTP capability, it cannot
 perform this hand-off.
+
+Downloads go the other way and need no second tool. `agent_browser(id, "download @e5")`
+clicks the element, waits for the file it starts, and keeps it on the volume for two hours
+(100 MB per file, 1 GB in total; a bigger download is cancelled mid-transfer). The result
+carries a link — `GET /downloads/<handle>/<name>?t=<ticket>` — that opens exactly that
+one file for that long, in curl or a browser, and a ready-made `curl` command. The file is
+always served as an attachment, never rendered. Small images also come back inline over
+MCP; REST returns the same details in a `download` field. The caller never chooses a
+path on the server, and plain `click` no longer saves downloads anywhere.
 
 A sweep is asynchronous: collect it with `get_scrape_listing_results`. With `sync=false`,
 the completed result contains every listing found and does not use Notion. With

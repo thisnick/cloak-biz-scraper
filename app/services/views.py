@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import re
 import shlex
+from urllib.parse import quote
 
 from ..models import (
     BrowserInfo,
+    DownloadedFile,
     InstanceView,
     NotionInfo,
     PoolInfo,
@@ -20,7 +22,8 @@ from ..models import (
     ServerInfo,
     UploadTicket,
 )
-from . import tokens, uploads
+from . import downloads, tokens, uploads
+from .presentation import human_size
 
 
 def instance_view(inst, *, secret: str | None = None, base_url: str = "",
@@ -174,6 +177,50 @@ def upload_ticket(ticket, *, base_url: str = "") -> UploadTicket:
         max_files=uploads.MAX_FILES_PER_TICKET,
         max_bytes_per_file=uploads.MAX_BYTES_PER_FILE,
         accepts=list(uploads.ACCEPTS),
+    )
+
+
+def downloaded_file(kept, *, base_url: str) -> DownloadedFile:
+    """One kept download, as both façades hand it to a caller.
+
+    The fetch URL is built from `Host` exactly like an upload URL, so it goes
+    through the same refusal first: a URL pointing at an address this server
+    could not vouch for, inside a curl a model is told to run as-is, is the
+    injection `upload_ticket` documents. The filename is the store's sanitized
+    one, and quoted anyway.
+    """
+    try:
+        require_usable_base_url(base_url)
+    except uploads.NoPublicUrl as exc:
+        raise downloads.DownloadsError(
+            "the file was downloaded, but this server could not work out its own "
+            "address to link to it. The request arrived without a usable Host header."
+        ) from exc
+    url = f"{base_url}/downloads/{kept.handle}/{quote(kept.name)}?t={quote(kept.token)}"
+    return DownloadedFile(
+        name=kept.name,
+        bytes=kept.bytes,
+        sha256=kept.sha256,
+        content_type=kept.content_type,
+        source_url=kept.source_url,
+        url=url,
+        curl=f"curl -fsS -o {shlex.quote(kept.name)} {shlex.quote(url)}",
+        expires_at=kept.expires_at,
+        expires_in=downloads.TTL_SEC,
+    )
+
+
+def download_message(view: DownloadedFile) -> str:
+    """The text a model reads after `download`. Written for the two readers it
+    has: a model with a shell, which wants the curl, and a model without one,
+    which should hand the link to the person."""
+    source = f" from {view.source_url}" if view.source_url else ""
+    return (
+        f"Downloaded {view.name} ({human_size(view.bytes)}, {view.content_type}){source}.\n"
+        f"It is kept for {downloads.TTL_SEC // 3600} hours. The link below works as-is in a "
+        "browser or with curl — if you cannot run commands, give the link to the user.\n"
+        f"{view.url}\n"
+        f"{view.curl}"
     )
 
 

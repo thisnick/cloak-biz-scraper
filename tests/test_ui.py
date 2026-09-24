@@ -2490,7 +2490,14 @@ class TestStorage:
         monkeypatch.setattr(app.state, "uploads", uploads)
         monkeypatch.setattr(app.state, "staged_uploads",
                             StagedUploads(lambda: app.state.uploads))
-        return types.SimpleNamespace(cache=cache, jobs=jobs, uploads=uploads)
+        from app.services.downloads import DownloadService
+
+        downloads = DownloadService(tmp_path / "downloads")
+        monkeypatch.setattr(app.state, "downloads", downloads)
+        monkeypatch.setattr(app.state, "kept_downloads",
+                            StagedUploads(lambda: app.state.downloads))
+        return types.SimpleNamespace(cache=cache, jobs=jobs, uploads=uploads,
+                                     downloads=downloads)
 
     def _ticket(self, storage, *, files=()):
         """A real staged ticket, through the real store — the size this row
@@ -2619,6 +2626,7 @@ class TestStorage:
         self._build(storage, "chromium-148.0.7778.215.5-pro", in_use=True)
         self._run(storage)
         self._ticket(storage, files=[("photo.jpg", JPEG)])
+        (storage.downloads.root / "dl_0123456789abcdef").mkdir(parents=True)
         from app.services import uploads as uploads_module
 
         boom = lambda p: (_ for _ in ()).throw(OSError("disk is having a day"))
@@ -2631,7 +2639,8 @@ class TestStorage:
 
         body = auth.get("/settings/storage")
         assert body.status_code == 200
-        assert body.json() == {"builds": None, "history": None, "uploads": None}
+        assert body.json() == {"builds": None, "history": None, "uploads": None,
+                               "downloads": None}
 
     def test_the_page_renders_over_a_hostile_volume(self, auth, storage, tmp_path):
         """Dangling links, an unreadable directory, and missing roots: the page
@@ -2973,6 +2982,63 @@ class TestStorage:
         freed = before - self._on_disk(storage.uploads.root)
         assert human_size(freed) in shown(r)
         assert "Cleared 2 uploads" in shown(r)
+
+    def _download(self, storage, data=b"%PDF-1.4\n" + b"\x05" * 400):
+        """A kept download, made through the real store the running app holds."""
+        import asyncio
+
+        async def keep():
+            landing = await storage.downloads.begin()
+            landing.target.write_bytes(data)
+            return await storage.downloads.commit(landing, subject="owner", secret=SECRET)
+
+        return asyncio.run(keep())
+
+    def test_downloads_have_their_own_scoped_clear_forms(self, auth, storage):
+        import re
+
+        page = shown(auth.get("/?view=settings"))
+        forms = re.findall(r"<form[^>]*/settings/storage/downloads/clear.*?</form>",
+                           page, re.S)
+        assert len(forms) == 2 and all("confirm(" in form for form in forms)
+        assert sorted(re.search(r'name="scope" value="(\w+)"', f).group(1)
+                      for f in forms) == ["all", "expired"]
+
+    def test_clearing_expired_downloads_keeps_the_live_ones(self, auth, storage):
+        dead = self._download(storage)
+        live = self._download(storage, b"%PDF-1.4\n" + b"\x06" * 400)
+        import json
+        import time
+
+        record = storage.downloads.root / dead.handle / ".ticket.json"
+        manifest = json.loads(record.read_text())
+        manifest["expires"] = time.time() - 1
+        record.write_text(json.dumps(manifest))
+        before = self._on_disk(storage.downloads.root)
+
+        r = auth.post("/settings/storage/downloads/clear", data={"scope": "expired"},
+                      follow_redirects=False)
+
+        assert r.status_code == 200, r.text
+        assert not (storage.downloads.root / dead.handle).exists()
+        assert (storage.downloads.root / live.handle).is_dir()
+        freed = before - self._on_disk(storage.downloads.root)
+        assert human_size(freed) in shown(r) and "Cleared 1 download " in shown(r)
+
+    def test_clearing_all_downloads_takes_the_live_ones_too(self, auth, storage):
+        live = self._download(storage)
+        r = auth.post("/settings/storage/downloads/clear", data={"scope": "all"},
+                      follow_redirects=False)
+        assert r.status_code == 200, r.text
+        assert not (storage.downloads.root / live.handle).exists()
+        assert "Cleared 1 download " in shown(r)
+
+    def test_the_downloads_clear_needs_a_same_origin_post(self, auth, storage):
+        live = self._download(storage)
+        r = auth.post("/settings/storage/downloads/clear", data={"scope": "all"},
+                      headers={"Origin": "https://evil.example"}, follow_redirects=False)
+        assert r.status_code == 403
+        assert (storage.downloads.root / live.handle).is_dir()
 
     def test_two_clears_at_once_do_not_both_claim_the_whole_amount(self, storage):
         """`SweptUploads` documents itself as reporting what a clear ACTUALLY
