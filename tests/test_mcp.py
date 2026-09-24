@@ -91,6 +91,9 @@ class TestStateless:
             "update_profile",
             "new_proxy_session",
             "delete_profile",
+            # The in-chat live view (MCP Apps): one model-facing, one app-only.
+            "show_browser",
+            "live_view",
         }
 
     def test_profile_tools_describe_safety_and_destructive_boundaries(self, client):
@@ -117,6 +120,8 @@ class TestStateless:
             "list_instances",
             "get_instance",
             "server_info",
+            "show_browser",
+            "live_view",
         }
         assert {n for n, h in hints.items() if h.get("destructiveHint")} == {
             "agent_browser",

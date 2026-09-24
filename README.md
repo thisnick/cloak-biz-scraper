@@ -35,6 +35,10 @@ https://github.com/user-attachments/assets/8bc957ef-130d-4516-a356-9efdcedeb60d
   you can attach Playwright, or any other browser driver, to.
 - **`agent_browser` MCP tool** — your assistant (ChatGPT, Claude) can open, browse, and
   fill in any website through the cloaked browser.
+- **Watch it in the chat** — in chat apps that show interactive views (Claude, ChatGPT),
+  a live, view-only picture of the browser appears when your assistant opens one, with a
+  list of what it has done and any files it downloaded. **Take control ↗** opens that
+  browser on your dashboard, behind your login, when a step needs you.
 - **Send it a file to upload** — an HTTP-capable assistant can request a staging ticket,
   post a photo or PDF to the server, and attach it to a form in the cloaked browser.
   Files are checked by their contents and deleted a couple of hours later.
@@ -166,9 +170,11 @@ any behavioural change.
 | `scrape_listings(urls, max_pages=1, sync=false)` | Start one asynchronous BizBuySell sweep across one or more search-results or broker-profile URLs; results are merged and de-duplicated. |
 | `get_scrape_listing_results(job_id)` | Poll a sweep without blocking. Completed results are retained for two weeks. |
 | `archive_page(url, notion_page_id)` | Read a page and append its readable content to an existing Notion page. It takes roughly a minute and repeated successful calls append the content again. |
-| `create_instance(profile="Default", country=null, region=null, geoip=true)` | Launch a browser with a durable profile and return a short-lived CDP URL plus a live-view URL when available. It closes after 15 minutes idle or 60 minutes total. |
+| `create_instance(profile="Default", country=null, region=null, geoip=true)` | Launch a browser with a durable profile and return a short-lived CDP URL plus a live-view URL when available. In chat apps that support MCP Apps, a live view appears in the conversation. It closes after 15 minutes idle or 60 minutes total. |
 | `list_instances()` | List running browsers with fresh CDP and live-view URLs. |
 | `get_instance(instance_id)` | Get one running browser and refresh its short-lived connection URLs. |
+| `show_browser(instance_id)` | Bring the in-chat live view back for a running browser. Returns the same as `get_instance`, so a client without MCP Apps can hand the user its `vnc_url` instead. |
+| `live_view(instance_id, since="")` | App-only: polled by the in-chat live view for the latest frame, address, activity, and files. Hidden from the model by hosts that support MCP Apps. |
 | `close_instance(instance_id)` | Close a browser and discard its current page state; saved profile cookies and logins remain. Safe to retry. |
 | `agent_browser(instance_id, command)` | Run one allowlisted browser command such as `navigate`, `snapshot`, `read`, `click`, `fill`, `upload`, `download`, or `screenshot`. Screenshots return an image alongside the text result; `download` returns a temporary link to the saved file. |
 | `create_upload_url()` | Mint a temporary HTTP upload ticket and ready-made `curl` command for staging images or PDFs. The tool itself does not carry the file bytes. |
@@ -178,13 +184,15 @@ any behavioural change.
 | `new_proxy_session(name)` | Rotate a profile's sticky proxy session for its next launch while keeping cookies, logins, fingerprint, and geography. |
 | `delete_profile(name)` | Permanently delete a profile and its cookies and logins. `Default` cannot be deleted. |
 
-Every tool has a REST counterpart over the same service layer. Structured operations use
+Every tool except `live_view` has a REST counterpart over the same service layer
+(`live_view` only feeds the in-chat panel; the dashboard's own live view is its
+counterpart). Structured operations use
 the same response models, but transport-specific data can differ: for example,
 `agent_browser` returns a screenshot as an MCP image block and as base64 in REST.
 
 Tools also publish MCP safety hints so a client can make a better approval decision.
-`server_info`, `get_scrape_listing_results`, `list_profiles`, `list_instances`, and
-`get_instance` are marked read-only. `agent_browser`, `close_instance`, and
+`server_info`, `get_scrape_listing_results`, `list_profiles`, `list_instances`,
+`get_instance`, `show_browser`, and `live_view` are marked read-only. `agent_browser`, `close_instance`, and
 `delete_profile` are marked destructive; `close_instance` is also marked safe to retry.
 `scrape_listings` is marked write-capable because `sync=true` writes to Notion, even though
 its default `sync=false` mode does not.
