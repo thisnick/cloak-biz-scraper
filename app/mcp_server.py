@@ -328,8 +328,9 @@ def build(app) -> MCPServer:
         """
         state, jpeg = await app.state.live_view.state(instance_id, _subject(ctx), since=since)
         base = _base_url(ctx)
+        if "files" in state:
+            state["files"] = _file_links(state["files"], base)
         if state.get("status") != "closed":
-            state["files"] = _file_links(state.get("files") or [], base)
             state["control_url"] = (
                 f"{base}/?view=browsers&instance={quote(instance_id, safe='')}" if base else None
             )
