@@ -19,6 +19,7 @@
       {% if error %}<div class="banner bad">{{ error }}</div>{% endif %}
 
       <form method="post" action="/login">
+        {% if next %}<input type="hidden" name="next" value="{{ next }}">{% endif %}
         <label for="secret">APP_SECRET</label>
         <input type="password" id="secret" name="secret" autocomplete="current-password"
                autofocus required>

@@ -24,11 +24,17 @@ reading:
 """
 from __future__ import annotations
 
+import base64
+import functools
 import logging
+from pathlib import Path
+from urllib.parse import quote
 
-from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.apps import Apps
+from mcp.server.mcpserver import Context, Image, MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
-from mcp.types import ToolAnnotations
+from mcp.types import CallToolResult, ImageContent, TextContent, ToolAnnotations
 
 from . import __version__
 from .models import (
@@ -42,6 +48,12 @@ from .models import (
     UploadTicket,
 )
 from .routes.guard import subject_of
+from .services.agent_browser import InstanceNotDrivable
+from .services.geo import GeoUnresolved, ProxyUnreachable
+from .services.instances import BrowserUnavailable, CapExceeded
+from .services.license import LicenseNotPro
+from .services.proxy import ProxyNotConfigured
+from .services.scrape import NotionNotConfigured
 from .services.tokens import OWNER
 from .services.urls import public_base
 from .services.views import (
@@ -106,22 +118,72 @@ purpose: the card is quoted rather than interpreted.
 # model wants to look at fits; a file that would bloat every later turn does not.
 _INLINE_IMAGE_MAX = 5 * 1024 * 1024
 
-READ_ONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
+READ_ONLY = ToolAnnotations(read_only_hint=True, open_world_hint=False)
 ADDITIVE = ToolAnnotations(
-    readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False,
+    read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=False,
 )
 ADDITIVE_OPEN_WORLD = ToolAnnotations(
-    readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True,
+    read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=True,
 )
 DESTRUCTIVE = ToolAnnotations(
-    readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False,
+    read_only_hint=False, destructive_hint=True, idempotent_hint=False, open_world_hint=False,
 )
 DESTRUCTIVE_IDEMPOTENT = ToolAnnotations(
-    readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False,
+    read_only_hint=False, destructive_hint=True, idempotent_hint=True, open_world_hint=False,
 )
 DESTRUCTIVE_OPEN_WORLD = ToolAnnotations(
-    readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True,
+    read_only_hint=False, destructive_hint=True, idempotent_hint=False, open_world_hint=True,
 )
+
+
+# The failures a caller is MEANT to read: every deliberate refusal. ValueError
+# is the house convention for one (AgentBrowserError, ProfileError and NotASweep
+# all subclass it); the rest are the launch and sync refusals the REST twin turns
+# into a 4xx with the same text.
+#
+# The SDK shows a tool's own message only for ToolError. Anything else is a
+# crash, reported as a bare "Error executing tool X" with its text kept on the
+# server — which is right for a crash (an OSError's text carries paths) and
+# wrong for a refusal, whose sentence IS the answer. So refusals are re-raised
+# as ToolError, and what reaches the client reads exactly as it did on 1.x.
+REFUSALS: tuple[type[Exception], ...] = (
+    ValueError,
+    InstanceNotDrivable,
+    CapExceeded,
+    BrowserUnavailable,
+    GeoUnresolved,
+    ProxyUnreachable,
+    ProxyNotConfigured,
+    LicenseNotPro,
+    NotionNotConfigured,
+)
+
+
+def _refusals_reach_the_caller(fn):
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        try:
+            return await fn(*args, **kwargs)
+        except REFUSALS as exc:
+            raise ToolError(str(exc)) from exc
+    return wrapper
+
+
+# The in-chat live view (MCP Apps). The page is one self-contained document:
+# a host's default sandbox allows inline script and style and data: images, and
+# no network at all, so everything it needs is inlined and every frame comes
+# back through the `live_view` tool. See services/live_view.py.
+LIVE_VIEW_URI = "ui://cloak-biz-scraper/live-view.html"
+_UI_DIR = Path(__file__).parent / "ui"
+_EXT_APPS = _UI_DIR / "vendor" / "ext-apps-app-2.0.0.min.js"
+
+
+@functools.lru_cache(maxsize=1)
+def live_view_html() -> str:
+    """The panel's HTML with the vendored MCP Apps bridge inlined."""
+    page = (_UI_DIR / "live_view.html").read_text(encoding="utf-8")
+    bridge = _EXT_APPS.read_text(encoding="utf-8").replace("</script", "<\\/script")
+    return page.replace("<!--EXT_APPS-->", f"<script>\n{bridge}\n</script>", 1)
 
 
 def _request(ctx: Context):
@@ -152,53 +214,168 @@ def _subject(ctx: Context) -> str:
     return (subject_of(request) if request else None) or OWNER
 
 
-def build(app) -> FastMCP:
+def build(app) -> MCPServer:
     """Wire the tools to the services on `app.state`.
 
     Read at call time rather than captured, so the MCP app can be constructed
     before the lifespan has populated state.
     """
-    mcp = FastMCP(
-        "cloak-biz-scraper",
-        instructions=INSTRUCTIONS,
-        stateless_http=True,
-        # A single JSON response per POST. The SSE framing exists to interleave
-        # progress with a result; nothing here streams, so it would be envelope
-        # around a payload that arrives all at once anyway.
-        json_response=True,
-        # MUST be passed explicitly, and this is not a preference — it is a
-        # production outage otherwise.
-        #
-        # FastMCP's `host` defaults to "127.0.0.1", and when it is a loopback
-        # address the constructor silently turns on DNS-rebinding protection
-        # with allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*"]. We never
-        # pass `host` — uvicorn binds the socket, not FastMCP — so that default
-        # applies, and every request whose Host header is the Railway domain
-        # would be refused with 421 Misdirected Request. It passes locally
-        # (Host: 127.0.0.1:8000 matches the allowlist) and fails for every real
-        # user, which is the worst shape a bug can have.
-        #
-        # It could not be configured correctly even in principle: the allowlist
-        # wants hostnames, and Railway assigns the deployment's domain without
-        # telling the app. So the check is turned off *here* and done properly in
-        # routes/mcp.py, against the request's own Host rather than a list we
-        # would have to guess. Content-Type is still validated by the SDK either
-        # way — that part is not conditional on this setting.
-        transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+    # MCP Apps. Its tools and the page are fixed when the server is
+    # constructed, so everything bound to the live view is registered here,
+    # first; the plain tools follow on `mcp` below.
+    apps = Apps()
+    apps.add_html_resource(
+        LIVE_VIEW_URI, live_view_html(),
+        name="live-view", title="Live browser",
+        description="A view-only live picture of a running browser, with its activity and files.",
+        # The page draws its own card.
+        prefers_border=False,
     )
 
-    # Say who we actually are. FastMCP takes no `version`, so the lowlevel Server
-    # underneath falls back to `pkg_version("mcp")` and every client was told
-    # this server was version 1.28.1 — the SDK's version, reported as ours. A
-    # client has no way to know that is not us, so it is not cosmetic: it is a
-    # wrong answer to "what am I talking to", and it would silently track the
-    # SDK's releases forever. Set after construction because the constructor
-    # exposes no seam; it is read when a session initializes, which is later.
-    mcp._mcp_server.version = __version__
+    def ui_tool(**options):
+        """`apps.tool` bound to the live view, with refusals passed through."""
+        def register(fn):
+            return apps.tool(resource_uri=LIVE_VIEW_URI, **options)(
+                _refusals_reach_the_caller(fn))
+        return register
+
+    # Closed-world despite launching a browser: the open-world capability is
+    # exercised by agent_browser, which is annotated for it. This call reaches
+    # only the geo probe's own echo services and the CloakBrowser artifact.
+    @ui_tool(annotations=ADDITIVE)
+    async def create_instance(
+        ctx: Context, profile: str = "Default", country: str | None = None,
+        region: str | None = None, geoip: bool = True,
+    ) -> InstanceView:
+        """Launch a cloaked, anti-detection browser (CloakBrowser).
+
+        It carries a real, consistent browser fingerprint. With no CloakBrowser
+        key configured it deliberately runs the public build, which has fewer
+        bypasses and has not been tested by us against the listing sites. A
+        saved key must resolve Pro or launch fails visibly; it is never silently
+        downgraded to public. If an Evomi proxy is
+        configured, it exits through that residential IP, which is recommended
+        for listing sites that block datacenter addresses. Without a proxy it
+        launches through this server's direct datacenter connection. A proxy
+        configuration that is present but incomplete, rejected, or unreachable
+        fails visibly and is never bypassed with a direct retry.
+
+        profile: a DURABLE identity. Cookies, logins, and local storage are kept
+            in the profile's own storage and survive across relaunches, so the
+            same profile name stays logged in to sites. Default to the same
+            profile ("Default") for continuity; use a NEW name only when you
+            deliberately want a clean, logged-out identity. Each profile keeps a
+            stable fingerprint and, when a proxy is configured, a sticky exit IP.
+        country/region: where the optional proxy should exit; ignored in direct mode.
+        geoip: with a proxy, match the browser's timezone and locale to the exit
+            IP. Leave true unless proxy geo resolution is failing. Direct mode
+            does not probe or geolocate the server, so these fields remain unknown.
+
+        In chat apps that show interactive views (Claude, ChatGPT), a live view
+        of this browser appears in the conversation, so the user can watch what
+        you do; it is view-only. Tell them they can take control from its "Take
+        control" button if a site needs them (a login, a code, a CAPTCHA).
+
+        Lifecycle: the browser closes itself after 15 minutes idle or 60 minutes
+        total, freeing its slot. The returned cdp_url is a Chrome DevTools Protocol
+        websocket carrying a short-lived token (~10 min): drive it with
+        agent_browser, or attach your own client — Playwright's
+        connectOverCDP(cdp_url). The token is minted fresh on every get_instance /
+        list_instances call, so if a connection drops, re-fetch the instance to get
+        a working cdp_url rather than reusing an old one.
+        """
+        subject = _subject(ctx)
+        inst = await app.state.instances.launch(
+            InstanceCreate(profile=profile, country=country, region=region, geoip=geoip),
+            origin="interactive", subject=subject,
+        )
+        return instance_view(inst, secret=app.state.secret.current(),
+                             base_url=_base_url(ctx), subject=subject)
+
+    # get_instance, with the live view attached. It returns exactly what
+    # get_instance does, so a client that cannot show the view still gets a
+    # vnc_url to hand the user — the graceful degradation SEP-2133 asks for.
+    @ui_tool(annotations=READ_ONLY)
+    async def show_browser(ctx: Context, instance_id: str) -> InstanceView:
+        """Show the user a live, view-only picture of a running browser in the chat.
+
+        Use when the user wants to watch or check on a browser — e.g. "show me",
+        "what is it doing". In chat apps that show interactive views (Claude,
+        ChatGPT) a live view appears with its activity and any downloaded files;
+        a view appears automatically after create_instance, so call this only to
+        bring one back. Elsewhere, give the user the returned vnc_url instead: it
+        opens the same view in their own browser.
+        """
+        inst = app.state.instances.get(instance_id)
+        if inst is None:
+            raise ValueError(
+                f"No running browser with instance_id={instance_id!r}. It may have been "
+                f"closed, or reaped after going idle."
+            )
+        return instance_view(inst, secret=app.state.secret.current(),
+                             base_url=_base_url(ctx), subject=_subject(ctx))
+
+    # App-only: the page polls this. Hidden from the model by any host that
+    # honours `visibility`; a client that does not, and calls it anyway, gets
+    # one frame and a sentence telling it this is not for it.
+    @ui_tool(annotations=READ_ONLY, visibility=["app"])
+    async def live_view(ctx: Context, instance_id: str, since: str = "") -> CallToolResult:
+        """Polled by the in-chat live view panel; not useful to call directly.
+
+        Returns the browser's status, address, title, recent activity and files,
+        and its latest frame when it differs from `since` (the frame_id the
+        panel already shows).
+        """
+        state, jpeg = await app.state.live_view.state(instance_id, _subject(ctx), since=since)
+        base = _base_url(ctx)
+        if state.get("status") != "closed":
+            state["files"] = _file_links(state.get("files") or [], base)
+            state["control_url"] = (
+                f"{base}/?view=browsers&instance={quote(instance_id, safe='')}" if base else None
+            )
+        content: list = [TextContent(
+            type="text",
+            text=(f"Live view of {instance_id}: {state.get('status')}. This tool feeds the "
+                  "in-chat panel; to look at the page yourself, use agent_browser."),
+        )]
+        if jpeg is not None:
+            content.append(ImageContent(type="image", mime_type="image/jpeg",
+                                        data=base64.b64encode(jpeg).decode("ascii")))
+        return CallToolResult(content=content, structured_content=state)
+
+    def _file_links(kept_files: list, base: str) -> list[dict]:
+        from .services.downloads import DownloadsError
+
+        links = []
+        for kept in kept_files:
+            try:
+                view = downloaded_file(kept, base_url=base)
+            except DownloadsError:
+                continue
+            links.append({"name": view.name, "bytes": view.bytes,
+                          "content_type": view.content_type,
+                          "expires_at": view.expires_at, "url": view.url})
+        return links
+
+    mcp = MCPServer(
+        "cloak-biz-scraper",
+        instructions=INSTRUCTIONS,
+        # Say who we actually are. Left unset, the server reports an empty
+        # version (the 1.x SDK reported its OWN version, 1.28.1, as ours — a
+        # wrong answer to "what am I talking to" that a client cannot detect).
+        version=__version__,
+        extensions=[apps],
+    )
+
+    def tool(**options):
+        """`mcp.tool`, with this server's refusals passed through. See REFUSALS."""
+        def register(fn):
+            return mcp.tool(**options)(_refusals_reach_the_caller(fn))
+        return register
 
     # Annotated for sync=true, because an annotation cannot vary by argument:
     # sync=false only reads, but the same tool writes Notion rows when asked to.
-    @mcp.tool(annotations=ADDITIVE_OPEN_WORLD)
+    @tool(annotations=ADDITIVE_OPEN_WORLD)
     async def scrape_listings(
         urls: list[str], max_pages: int = 1, sync: bool = False
     ) -> ScrapeResult:
@@ -247,7 +424,7 @@ def build(app) -> FastMCP:
         job = app.state.scrape.start(urls, max_pages=max_pages, sync=sync)
         return ScrapeResult.of(job)
 
-    @mcp.tool(annotations=READ_ONLY)
+    @tool(annotations=READ_ONLY)
     async def get_scrape_listing_results(job_id: str) -> ScrapeResult:
         """Collect the results of a sweep started by scrape_listings.
 
@@ -270,7 +447,7 @@ def build(app) -> FastMCP:
 
     # Not idempotent: it appends, so a second call with the same arguments
     # leaves the page holding the content twice.
-    @mcp.tool(annotations=ADDITIVE_OPEN_WORLD)
+    @tool(annotations=ADDITIVE_OPEN_WORLD)
     async def archive_page(url: str, notion_page_id: str) -> ArchiveResult:
         """Read a page and append its content to an existing Notion page.
 
@@ -280,55 +457,7 @@ def build(app) -> FastMCP:
         """
         return await app.state.archive.archive(url, notion_page_id)
 
-    # Closed-world despite launching a browser: the open-world capability is
-    # exercised by agent_browser, which is annotated for it. This call reaches
-    # only the geo probe's own echo services and the CloakBrowser artifact.
-    @mcp.tool(annotations=ADDITIVE)
-    async def create_instance(
-        ctx: Context, profile: str = "Default", country: str | None = None,
-        region: str | None = None, geoip: bool = True,
-    ) -> InstanceView:
-        """Launch a cloaked, anti-detection browser (CloakBrowser).
-
-        It carries a real, consistent browser fingerprint. With no CloakBrowser
-        key configured it deliberately runs the public build, which has fewer
-        bypasses and has not been tested by us against the listing sites. A
-        saved key must resolve Pro or launch fails visibly; it is never silently
-        downgraded to public. If an Evomi proxy is
-        configured, it exits through that residential IP, which is recommended
-        for listing sites that block datacenter addresses. Without a proxy it
-        launches through this server's direct datacenter connection. A proxy
-        configuration that is present but incomplete, rejected, or unreachable
-        fails visibly and is never bypassed with a direct retry.
-
-        profile: a DURABLE identity. Cookies, logins, and local storage are kept
-            in the profile's own storage and survive across relaunches, so the
-            same profile name stays logged in to sites. Default to the same
-            profile ("Default") for continuity; use a NEW name only when you
-            deliberately want a clean, logged-out identity. Each profile keeps a
-            stable fingerprint and, when a proxy is configured, a sticky exit IP.
-        country/region: where the optional proxy should exit; ignored in direct mode.
-        geoip: with a proxy, match the browser's timezone and locale to the exit
-            IP. Leave true unless proxy geo resolution is failing. Direct mode
-            does not probe or geolocate the server, so these fields remain unknown.
-
-        Lifecycle: the browser closes itself after 15 minutes idle or 60 minutes
-        total, freeing its slot. The returned cdp_url is a Chrome DevTools Protocol
-        websocket carrying a short-lived token (~10 min): drive it with
-        agent_browser, or attach your own client — Playwright's
-        connectOverCDP(cdp_url). The token is minted fresh on every get_instance /
-        list_instances call, so if a connection drops, re-fetch the instance to get
-        a working cdp_url rather than reusing an old one.
-        """
-        subject = _subject(ctx)
-        inst = await app.state.instances.launch(
-            InstanceCreate(profile=profile, country=country, region=region, geoip=geoip),
-            origin="interactive", subject=subject,
-        )
-        return instance_view(inst, secret=app.state.secret.current(),
-                             base_url=_base_url(ctx), subject=subject)
-
-    @mcp.tool(annotations=READ_ONLY)
+    @tool(annotations=READ_ONLY)
     async def list_profiles() -> list[ProfileView]:
         """List the durable browser identities available to create_instance.
 
@@ -340,7 +469,7 @@ def build(app) -> FastMCP:
         """
         return await app.state.profile_service.list_profiles()
 
-    @mcp.tool(annotations=ADDITIVE)
+    @tool(annotations=ADDITIVE)
     async def create_profile(
         name: str, country: str | None = None, region: str | None = None,
     ) -> ProfileView:
@@ -360,7 +489,7 @@ def build(app) -> FastMCP:
 
     # Not idempotent, because of the rename: a geography-only change repeats
     # cleanly, but replaying a rename fails on a name that is no longer there.
-    @mcp.tool(annotations=ADDITIVE)
+    @tool(annotations=ADDITIVE)
     async def update_profile(
         name: str,
         new_name: str | None = None,
@@ -383,7 +512,7 @@ def build(app) -> FastMCP:
     # geography all survive; only the internal proxy session is replaced. And
     # closed-world — rotate_session mints the new session here, without asking
     # the proxy provider for one.
-    @mcp.tool(annotations=ADDITIVE)
+    @tool(annotations=ADDITIVE)
     async def new_proxy_session(name: str) -> ProfileView:
         """Give a profile a fresh sticky proxy session for its next launch.
 
@@ -396,7 +525,7 @@ def build(app) -> FastMCP:
         """
         return await app.state.profile_service.new_proxy_session(name)
 
-    @mcp.tool(annotations=DESTRUCTIVE)
+    @tool(annotations=DESTRUCTIVE)
     async def delete_profile(name: str) -> ProfileDeleteResult:
         """Permanently delete a profile and its saved cookies/logins.
 
@@ -410,7 +539,7 @@ def build(app) -> FastMCP:
     # Read-only despite handing back fresh CDP and VNC URLs on every call:
     # tokens.issue signs claims with the app secret and records nothing, so the
     # minting changes no state here or anywhere else. Same for get_instance.
-    @mcp.tool(annotations=READ_ONLY)
+    @tool(annotations=READ_ONLY)
     async def list_instances(ctx: Context) -> list[InstanceView]:
         """Every running browser. Each carries a fresh, short-lived cdp_url and,
         where the browser has a live view, a vnc_url to watch it."""
@@ -422,7 +551,7 @@ def build(app) -> FastMCP:
             for i in app.state.instances.running.values()
         ]
 
-    @mcp.tool(annotations=READ_ONLY)
+    @tool(annotations=READ_ONLY)
     async def get_instance(ctx: Context, instance_id: str) -> InstanceView:
         """One running browser, with a FRESH, short-lived cdp_url and vnc_url.
 
@@ -442,7 +571,7 @@ def build(app) -> FastMCP:
     # prompt on if it prompts on nothing else: it clicks and submits on whatever
     # site the browser is pointed at, where a single action can be irreversible
     # and belong to someone other than the caller.
-    @mcp.tool(annotations=DESTRUCTIVE_OPEN_WORLD)
+    @tool(annotations=DESTRUCTIVE_OPEN_WORLD)
     async def agent_browser(ctx: Context, instance_id: str, command: str):
         """Drive a running browser one action at a time, and see the result.
 
@@ -497,8 +626,6 @@ def build(app) -> FastMCP:
         listed read/interact verbs are accepted; anything else is refused. Only
         snapshot and screenshot take flags; the other verbs take plain arguments.
         """
-        from mcp.server.fastmcp import Image
-
         outcome = await app.state.agent_browser.drive(
             instance_id, command, subject=_subject(ctx)
         )
@@ -517,8 +644,6 @@ def build(app) -> FastMCP:
         image" means in a chat client — but a 90 MB file must not ride back
         through the MCP response. Everything else is the link.
         """
-        from mcp.server.fastmcp import Image
-
         from .services.downloads import IMAGE_TYPES, DownloadsError
 
         try:
@@ -535,7 +660,7 @@ def build(app) -> FastMCP:
         return blocks
 
     # Closed-world: the URL it mints points back at this server.
-    @mcp.tool(annotations=ADDITIVE)
+    @tool(annotations=ADDITIVE)
     async def create_upload_url(ctx: Context) -> UploadTicket:
         """Get a temporary URL for putting a file on this server, so a browser can upload it.
 
@@ -585,7 +710,7 @@ def build(app) -> FastMCP:
             raise ValueError(str(exc)) from exc
 
     # Closed-world: proxy status comes from saved settings, not a live probe.
-    @mcp.tool(annotations=READ_ONLY)
+    @tool(annotations=READ_ONLY)
     async def server_info() -> ServerInfo:
         """How this server is set up: proxy, browser, pool, and Notion status.
 
@@ -603,9 +728,44 @@ def build(app) -> FastMCP:
     # form is gone, where cookies and logins survive in the profile. Idempotent
     # even so — instances.stop returns False for an id it no longer holds rather
     # than raising, so a retry after a dropped response is safe.
-    @mcp.tool(annotations=DESTRUCTIVE_IDEMPOTENT)
+    @tool(annotations=DESTRUCTIVE_IDEMPOTENT)
     async def close_instance(instance_id: str) -> dict:
         """Close a browser and free its slot in the pool."""
         return {"ok": await app.state.instances.stop(instance_id), "instance_id": instance_id}
 
     return mcp
+
+
+def session_manager(mcp: MCPServer):
+    """Construct the stateless session manager `/mcp` hands requests to.
+
+    The Starlette app streamable_http_app() returns is deliberately discarded
+    (see main.py); what matters is the manager it builds, from these settings.
+    """
+    mcp.streamable_http_app(
+        stateless_http=True,
+        # A single JSON response per POST. The SSE framing exists to interleave
+        # progress with a result; nothing here streams, so it would be envelope
+        # around a payload that arrives all at once anyway.
+        json_response=True,
+        # MUST be passed explicitly, and this is not a preference — it is a
+        # production outage otherwise.
+        #
+        # streamable_http_app's `host` defaults to "127.0.0.1", and when it is a
+        # loopback address the SDK silently turns on DNS-rebinding protection
+        # with allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*"]. We never
+        # pass `host` — uvicorn binds the socket, not the SDK — so that default
+        # applies, and every request whose Host header is the Railway domain
+        # would be refused with 421 Misdirected Request. It passes locally
+        # (Host: 127.0.0.1:8000 matches the allowlist) and fails for every real
+        # user, which is the worst shape a bug can have.
+        #
+        # It could not be configured correctly even in principle: the allowlist
+        # wants hostnames, and Railway assigns the deployment's domain without
+        # telling the app. So the check is turned off *here* and done properly in
+        # routes/mcp.py, against the request's own Host rather than a list we
+        # would have to guess. Content-Type is still validated by the SDK either
+        # way — that part is not conditional on this setting.
+        transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+    )
+    return mcp.session_manager

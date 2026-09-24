@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live browser</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: var(--color-background-primary, #ffffff);
+    --bg-2: var(--color-background-secondary, #f4f4f5);
+    --bg-3: var(--color-background-tertiary, #e9e9ec);
+    --fg: var(--color-text-primary, #18181b);
+    --fg-2: var(--color-text-secondary, #52525b);
+    --fg-3: var(--color-text-tertiary, #8a8a93);
+    --line: var(--color-border-primary, #e4e4e7);
+    --ok: var(--color-text-success, #16a34a);
+    --warn: var(--color-text-warning, #d97706);
+    --bad: var(--color-text-danger, #dc2626);
+    --radius: var(--border-radius-lg, 12px);
+    --radius-sm: var(--border-radius-sm, 6px);
+    --font: var(--font-sans, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif);
+    --mono: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  }
+  [data-theme="dark"] {
+    --bg: var(--color-background-primary, #18181b);
+    --bg-2: var(--color-background-secondary, #232327);
+    --bg-3: var(--color-background-tertiary, #2e2e33);
+    --fg: var(--color-text-primary, #f4f4f5);
+    --fg-2: var(--color-text-secondary, #b4b4bb);
+    --fg-3: var(--color-text-tertiary, #85858d);
+    --line: var(--color-border-primary, #34343a);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: transparent; }
+  body { font: 13px/1.4 var(--font); color: var(--fg); }
+  .card { background: var(--bg); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+  .top { display: flex; align-items: center; gap: 10px; padding: 10px 12px; }
+  .pill { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600;
+          padding: 2px 8px; border-radius: 999px; background: var(--bg-2); color: var(--fg-2); flex: none; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--fg-3); }
+  .pill.live .dot { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 25%, transparent); }
+  .pill.connecting .dot { background: var(--warn); animation: pulse 1.2s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: .35; } }
+  .where { min-width: 0; flex: 1; }
+  .title { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .url { color: var(--fg-3); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .actions { display: flex; gap: 6px; flex: none; }
+  button { font: inherit; font-size: 12px; font-weight: 600; color: var(--fg); background: var(--bg-2);
+           border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 5px 10px; cursor: pointer; }
+  button:hover { background: var(--bg-3); }
+  button:focus-visible { outline: 2px solid var(--color-ring-primary, #6366f1); outline-offset: 1px; }
+  button.icon { padding: 5px 7px; line-height: 0; }
+  button[hidden] { display: none; }
+  .screen { position: relative; background: #0b0b0d; aspect-ratio: 16 / 9; border-top: 1px solid var(--line);
+            border-bottom: 1px solid var(--line); }
+  .screen img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; display: block; }
+  .screen .msg { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+                 text-align: center; padding: 16px; color: #e4e4e7; font-size: 13px; background: rgba(11,11,13,.55); }
+  .screen .msg[hidden] { display: none; }
+  .badge { position: absolute; left: 8px; bottom: 8px; font-size: 11px; font-weight: 600; color: #fff;
+           background: rgba(0,0,0,.55); padding: 2px 7px; border-radius: 999px; }
+  .tabs { display: flex; gap: 2px; padding: 8px 12px 0; }
+  .tab { background: none; border: none; border-bottom: 2px solid transparent; border-radius: 0;
+         color: var(--fg-3); padding: 4px 8px 6px; }
+  .tab:hover { background: none; color: var(--fg-2); }
+  .tab[aria-selected="true"] { color: var(--fg); border-bottom-color: var(--fg); }
+  .panel { padding: 4px 12px 10px; max-height: 148px; overflow-y: auto; }
+  .panel[hidden] { display: none; }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li { display: flex; align-items: baseline; gap: 8px; padding: 5px 0; border-bottom: 1px solid var(--bg-2); }
+  li:last-child { border-bottom: none; }
+  li .t { color: var(--fg-3); font-size: 11px; flex: none; width: 52px; text-align: right; font-variant-numeric: tabular-nums; }
+  li .x { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  li.fail .x { color: var(--bad); }
+  li.file { align-items: center; }
+  li.file .meta { color: var(--fg-3); font-size: 11px; flex: none; }
+  .empty { color: var(--fg-3); padding: 8px 0; }
+  .foot { display: flex; justify-content: space-between; gap: 8px; padding: 7px 12px; font-size: 11px;
+          color: var(--fg-3); background: var(--bg-2); border-top: 1px solid var(--line); }
+  .error { padding: 14px 12px; color: var(--bad); }
+  .fallback { padding: 0 12px 10px; font-size: 12px; color: var(--fg-2); word-break: break-all; }
+  .fallback[hidden] { display: none; }
+</style>
+</head>
+<body>
+<div class="card" id="card">
+  <div class="top">
+    <span class="pill connecting" id="pill"><span class="dot"></span><span id="pill-text">Connecting</span></span>
+    <div class="where">
+      <div class="title" id="title">Starting the browser…</div>
+      <div class="url" id="url"></div>
+    </div>
+    <div class="actions">
+      <button id="control" type="button" hidden title="Open this browser on the scraper's dashboard, where you can take control">Take control ↗</button>
+      <button id="pip" class="icon" type="button" hidden title="Pop out" aria-label="Pop out">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="5" width="18" height="14" rx="2"/><rect x="12" y="11" width="7" height="6" rx="1" fill="currentColor"/></svg></button>
+      <button id="full" class="icon" type="button" hidden title="Expand" aria-label="Expand">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg></button>
+      <button id="inline" class="icon" type="button" hidden title="Back to the chat" aria-label="Back to the chat">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5"/></svg></button>
+    </div>
+  </div>
+  <div class="fallback" id="fallback" hidden></div>
+  <div class="screen" id="screen">
+    <img id="frame" alt="The browser's current page" hidden>
+    <div class="msg" id="msg">Connecting to the browser…</div>
+    <span class="badge">Watching only</span>
+  </div>
+  <div class="tabs" role="tablist">
+    <button class="tab" role="tab" id="tab-activity" aria-selected="true" aria-controls="panel-activity" type="button">Activity</button>
+    <button class="tab" role="tab" id="tab-files" aria-selected="false" aria-controls="panel-files" type="button">Files</button>
+  </div>
+  <div class="panel" id="panel-activity" role="tabpanel"><ul id="activity"></ul><div class="empty" id="activity-empty">Nothing yet — actions the assistant takes show up here.</div></div>
+  <div class="panel" id="panel-files" role="tabpanel" hidden><ul id="files"></ul><div class="empty" id="files-empty">No files yet. Anything the assistant downloads in this browser shows up here.</div></div>
+  <div class="foot"><span id="foot-left">Cloak Biz Scraper</span><span id="foot-right"></span></div>
+</div>
+<!--EXT_APPS-->
+<script>
+(function () {
+  "use strict";
+  var M = window.McpApps;
+  var $ = function (id) { return document.getElementById(id); };
+  // Sized from the picture itself: the stream's reported viewport and the
+  // JPEG it sends are not always the same shape.
+  $("frame").addEventListener("load", function () {
+    var img = $("frame");
+    if (img.naturalWidth && img.naturalHeight) {
+      $("screen").style.aspectRatio = img.naturalWidth + " / " + img.naturalHeight;
+    }
+  });
+  var app = new M.App(
+    { name: "Cloak Biz Scraper live view", version: "1.0.0" },
+    { availableDisplayModes: ["inline", "pip", "fullscreen"] },
+    { autoResize: true }
+  );
+
+  var instanceId = null, frameId = "", timer = null, stopped = false, failures = 0;
+  var last = {}, controlUrl = null;
+
+  // ── host context: theme, styles, display modes ──────────────────────────
+  function applyContext(ctx) {
+    if (!ctx) return;
+    if (ctx.theme) M.applyDocumentTheme(ctx.theme);
+    if (ctx.styles && ctx.styles.variables) M.applyHostStyleVariables(ctx.styles.variables);
+    if (ctx.styles && ctx.styles.css && ctx.styles.css.fonts) M.applyHostFonts(ctx.styles.css.fonts);
+    var modes = ctx.availableDisplayModes || [];
+    var mode = ctx.displayMode || "inline";
+    $("pip").hidden = !(mode === "inline" && modes.indexOf("pip") >= 0);
+    $("full").hidden = !(mode === "inline" && modes.indexOf("fullscreen") >= 0);
+    $("inline").hidden = mode === "inline" || modes.indexOf("inline") < 0;
+  }
+  function setMode(mode) {
+    app.requestDisplayMode({ mode: mode }).then(function (r) {
+      if (r && r.mode) applyContext(Object.assign({}, app.getHostContext() || {}, { displayMode: r.mode }));
+    }).catch(function () {});
+  }
+  $("pip").onclick = function () { setMode("pip"); };
+  $("full").onclick = function () { setMode("fullscreen"); };
+  $("inline").onclick = function () { setMode("inline"); };
+
+  // ── tabs ────────────────────────────────────────────────────────────────
+  function selectTab(name) {
+    ["activity", "files"].forEach(function (n) {
+      $("tab-" + n).setAttribute("aria-selected", String(n === name));
+      $("panel-" + n).hidden = n !== name;
+    });
+  }
+  $("tab-activity").onclick = function () { selectTab("activity"); };
+  $("tab-files").onclick = function () { selectTab("files"); };
+
+  // ── opening things outside the chat ─────────────────────────────────────
+  // When the chat app will not open a link, say so. The dashboard link carries
+  // nothing secret and is shown to copy; a file link carries its download
+  // ticket, so it is never printed on a screen someone might be sharing.
+  function showFallback(text) {
+    var box = $("fallback");
+    box.textContent = text;
+    box.hidden = false;
+  }
+  function open(url, secret) {
+    var failed = function () {
+      showFallback(secret
+        ? "The chat app did not open the file. Ask the assistant for its download link."
+        : "The chat app did not open the link. Open it yourself: " + url);
+    };
+    app.openLink({ url: url }).then(function (r) { if (r && r.isError) failed(); }).catch(failed);
+  }
+  $("control").onclick = function () { if (controlUrl) open(controlUrl); };
+
+  function download(file) {
+    var caps = app.getHostCapabilities() || {};
+    if (!caps.downloadFile) { open(file.url, true); return; }
+    app.downloadFile({ contents: [{ type: "resource_link", uri: file.url, name: file.name,
+                                    mimeType: file.content_type }] })
+      .then(function (r) { if (r && r.isError) open(file.url, true); })
+      .catch(function () { open(file.url, true); });
+  }
+
+  // ── rendering ───────────────────────────────────────────────────────────
+  function ago(t) {
+    var s = Math.max(0, Math.round(Date.now() / 1000 - t));
+    if (s < 60) return s + "s ago";
+    if (s < 3600) return Math.round(s / 60) + "m ago";
+    return Math.round(s / 3600) + "h ago";
+  }
+  function size(n) {
+    if (n < 1024) return n + " B";
+    if (n < 1048576) return (n / 1024).toFixed(0) + " KB";
+    return (n / 1048576).toFixed(1) + " MB";
+  }
+  function host(url) {
+    try { return new URL(url).hostname; } catch (e) { return ""; }
+  }
+  function setStatus(kind, text) {
+    $("pill").className = "pill " + kind;
+    $("pill-text").textContent = text;
+  }
+  function message(text) {
+    $("msg").textContent = text;
+    $("msg").hidden = !text;
+  }
+
+  function render(state, jpeg) {
+    last = state;
+    if (state.status === "closed") {
+      setStatus("closed", "Closed");
+      message("This browser has closed.");
+      $("control").hidden = true;
+      $("foot-right").textContent = "";
+      return;
+    }
+    setStatus(state.status === "live" ? "live" : "connecting",
+              state.status === "live" ? "Live" : "Connecting");
+    $("title").textContent = state.title
+      || (state.url === "about:blank" ? "Blank page" : host(state.url))
+      || "Browser";
+    $("url").textContent = state.url || "";
+    $("url").title = state.url || "";
+    if (jpeg) {
+      $("frame").src = "data:" + (jpeg.mimeType || "image/jpeg") + ";base64," + jpeg.data;
+      $("frame").hidden = false;
+      frameId = state.frame_id || "";
+    }
+    message($("frame").hidden
+      ? (state.status === "live" ? "Waiting for the page to draw…" : "Connecting to the browser…")
+      : "");
+
+    controlUrl = state.control_url || null;
+    $("control").hidden = !controlUrl;
+
+    var acts = (state.activity || []).slice().reverse();
+    var ul = $("activity"); ul.textContent = "";
+    acts.forEach(function (a) {
+      var li = document.createElement("li");
+      if (!a.ok) li.className = "fail";
+      var t = document.createElement("span"); t.className = "t"; t.textContent = ago(a.at);
+      var x = document.createElement("span"); x.className = "x"; x.textContent = a.text; x.title = a.text;
+      li.appendChild(t); li.appendChild(x); ul.appendChild(li);
+    });
+    $("activity-empty").hidden = acts.length > 0;
+
+    var files = state.files || [];
+    var fl = $("files"); fl.textContent = "";
+    files.forEach(function (f) {
+      var li = document.createElement("li"); li.className = "file";
+      var x = document.createElement("span"); x.className = "x"; x.textContent = f.name; x.title = f.name;
+      var meta = document.createElement("span"); meta.className = "meta";
+      meta.textContent = size(f.bytes) + " · kept " + Math.max(0, Math.round((f.expires_at - Date.now() / 1000) / 60)) + " min";
+      var b = document.createElement("button"); b.type = "button"; b.textContent = "Download";
+      b.onclick = function () { download(f); };
+      li.appendChild(x); li.appendChild(meta); li.appendChild(b); fl.appendChild(li);
+    });
+    $("files-empty").hidden = files.length > 0;
+    $("tab-files").textContent = files.length ? "Files (" + files.length + ")" : "Files";
+
+    if (state.closes_at) {
+      var mins = Math.max(0, Math.round((state.closes_at - Date.now() / 1000) / 60));
+      $("foot-right").textContent = "Closes in " + mins + " min unless it's used";
+    }
+  }
+
+  function fail(text) {
+    stopped = true;
+    if (timer) clearTimeout(timer);
+    setStatus("closed", "Unavailable");
+    $("title").textContent = "No live view";
+    message(text || "The live view is not available.");
+  }
+
+  // ── polling ─────────────────────────────────────────────────────────────
+  function textOf(result) {
+    var c = (result && result.content) || [];
+    for (var i = 0; i < c.length; i++) if (c[i].type === "text") return c[i].text;
+    return "";
+  }
+  function imageOf(result) {
+    var c = (result && result.content) || [];
+    for (var i = 0; i < c.length; i++) if (c[i].type === "image") return c[i];
+    return null;
+  }
+
+  function schedule(ms) {
+    if (stopped) return;
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(tick, ms);
+  }
+
+  function tick() {
+    if (stopped || !instanceId) return;
+    app.callServerTool({ name: "live_view", arguments: { instance_id: instanceId, since: frameId } })
+      .then(function (result) {
+        if (result.isError) { fail(textOf(result)); return; }
+        failures = 0;
+        var state = result.structuredContent || {};
+        render(state, imageOf(result));
+        if (state.status === "closed") { stopped = true; return; }
+        schedule(document.hidden ? 5000 : 1000);
+      })
+      .catch(function () {
+        failures += 1;
+        setStatus("connecting", "Reconnecting");
+        schedule(Math.min(10000, 1000 * Math.pow(2, failures)));
+      });
+  }
+
+  function start(id) {
+    if (!id || id === instanceId) return;
+    instanceId = id;
+    stopped = false;
+    frameId = "";
+    tick();
+  }
+
+  document.addEventListener("visibilitychange", function () {
+    if (!document.hidden && instanceId && !stopped) schedule(0);
+  });
+
+  // ── wiring: handlers first, then connect ────────────────────────────────
+  app.ontoolinput = function (p) {
+    var args = (p && p.arguments) || {};
+    if (args.instance_id) start(args.instance_id);
+  };
+  app.ontoolresult = function (p) {
+    if (p && p.isError) { fail(textOf(p)); return; }
+    var sc = (p && p.structuredContent) || {};
+    if (sc.instance_id) start(sc.instance_id);
+    else fail("The browser did not start, so there is nothing to show.");
+  };
+  app.ontoolcancelled = function () { fail("The request was cancelled."); };
+  app.onhostcontextchanged = function (ctx) { applyContext(Object.assign({}, app.getHostContext() || {}, ctx)); };
+  app.onteardown = function () { stopped = true; if (timer) clearTimeout(timer); return {}; };
+
+  app.connect().then(function () {
+    applyContext(app.getHostContext());
+  }).catch(function (e) {
+    fail("Could not connect to the chat app: " + (e && e.message ? e.message : e));
+  });
+})();
+</script>
+</body>
+</html>

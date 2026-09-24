@@ -126,6 +126,17 @@ _WARM_TIMEOUT = 8.0
 _CLOSE_TIMEOUT = 5.0
 
 
+# The frame stream's encoding (see live_view.py). The daemon reads these when a
+# CLI invocation first starts it, and every invocation passes them, so whichever
+# call wins the cold start sets the same values. At quality 80 and full width a
+# 1280x720 frame is ~95 KB; the in-chat panel shows it at a few hundred pixels
+# wide and fetches it through MCP about once a second, so smaller is better.
+_STREAM_ENV = {
+    "AGENT_BROWSER_STREAM_QUALITY": "60",
+    "AGENT_BROWSER_STREAM_MAX_WIDTH": "1024",
+}
+
+
 def _session(port: int) -> str:
     """The agent-browser daemon/session dedicated to one bound CDP port.
 
@@ -370,6 +381,14 @@ class AgentBrowserService:
         # one — `upload` then refuses with a message that says so, rather than
         # the service failing to construct for a verb nobody is using.
         self._uploads = uploads
+        # Who hears about each finished action — the in-chat live view keeps its
+        # activity list and its files from these. Told after the action, never
+        # consulted before it: a listener cannot refuse or alter a command.
+        self._listeners: list[Callable[[str, list[str], DriveOutcome], None]] = []
+        # Warm-ups in flight, by CDP port. `stream_port` waits for one rather
+        # than becoming a second CLI cold-starting the same session daemon —
+        # the race warm() exists to prevent.
+        self._warming: dict[int, asyncio.Event] = {}
         # Warm the per-port agent-browser daemon the moment a browser launches,
         # so the caller's FIRST command meets a warm daemon instead of racing its
         # cold start. Registered as an optional hook the instance pool fires
@@ -383,6 +402,55 @@ class AgentBrowserService:
         register_close = getattr(instances, "set_launch_close_hook", None)
         if callable(register_close):
             register_close(self.close)
+
+    def add_listener(self, listener: Callable[[str, list[str], "DriveOutcome"], None]) -> None:
+        """Call ``listener(instance_id, argv, outcome)`` after every action that ran.
+
+        `argv` is the parsed, allow-listed command as the caller wrote it — before
+        `upload` swaps in the staged paths — so a listener sees verbs and targets,
+        never a path this service chose. A command refused before it ran (not
+        allowed, not drivable) is not an action and is not reported.
+        """
+        self._listeners.append(listener)
+
+    def _tell(self, instance_id: str, argv: list[str], outcome: "DriveOutcome") -> None:
+        for listener in self._listeners:
+            try:
+                listener(instance_id, list(argv), outcome)
+            except Exception:  # noqa: BLE001 - a listener must never fail the action
+                logger.exception("agent_browser listener failed")
+
+    async def stream_port(self, instance_id: str, subject: str | None) -> int | None:
+        """The local port of this browser's agent-browser frame stream, or None.
+
+        agent-browser runs a WebSocket frame server per session (see
+        live_view.py). `stream status` is asked through the same `--session` /
+        `--cdp` pair every action uses, so a daemon that is not up yet is brought
+        up attached to THIS browser — never left to launch one of its own. Same
+        drivability rules as an action: a sweep's browser and another subject's
+        are refused.
+        """
+        port = self._cdp_port(instance_id, subject)
+        warming = self._warming.get(port)
+        if warming is not None:
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(warming.wait(), _WARM_TIMEOUT)
+            # The browser may have closed while we waited; asking now would
+            # bring its daemon back up after the close hook stopped it.
+            port = self._cdp_port(instance_id, subject)
+        try:
+            rc, out, _err = await self._run(port, ["stream", "status", "--json"],
+                                            timeout=_WARM_TIMEOUT)
+        except TimeoutError:
+            return None
+        if rc != 0:
+            return None
+        try:
+            data = json.loads(out).get("data") or {}
+        except (ValueError, AttributeError):
+            return None
+        stream = data.get("port")
+        return stream if isinstance(stream, int) and data.get("enabled") else None
 
     def _cdp_port(self, instance_id: str, subject: str | None) -> int:
         return self._drivable(instance_id, subject).cdp_port
@@ -420,13 +488,17 @@ class AgentBrowserService:
         proc = await asyncio.create_subprocess_exec(
             _binary(), "--session", _session(port), "--cdp", str(port), *argv,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, **_STREAM_ENV},
         )
         if watch is not None:
             return await self._watched(proc, timeout, watch)
         try:
             out, err = await asyncio.wait_for(proc.communicate(), timeout)
         except asyncio.TimeoutError:
-            proc.kill()
+            # The CLI can exit on its own in the instant between the timeout and
+            # the kill; that is the outcome we wanted, not a crash.
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
             await proc.wait()
             raise TimeoutError(f"the browser did not respond within {int(timeout)}s") from None
         return proc.returncode, out.decode(errors="replace"), err.decode(errors="replace")
@@ -496,10 +568,15 @@ class AgentBrowserService:
         daemon up and make its initial CDP attach — and swallows everything. A
         warm that fails changes nothing the caller sees; the in-`drive` retry is
         the real guarantee. Short-bounded so it never adds meaningful latency."""
+        done = self._warming.setdefault(port, asyncio.Event())
         try:
             await self._run(port, ["get", "url"], timeout=_WARM_TIMEOUT)
         except Exception as exc:  # noqa: BLE001 - warming must never surface
             logger.debug("agent_browser warm on cdp=%s did not complete: %r", port, exc)
+        finally:
+            done.set()
+            if self._warming.get(port) is done:
+                del self._warming[port]
 
     async def close(self, port: int) -> None:
         """Best-effort stop of the daemon dedicated to a closed pool instance.
@@ -727,6 +804,13 @@ class AgentBrowserService:
         without regard to who asked."""
         argv = parse_command(command)
         inst = self._drivable(instance_id, subject)
+        outcome = await self._drive(inst, argv, command, subject)
+        self._tell(inst.id, argv, outcome)
+        return outcome
+
+    async def _drive(self, inst, argv: list[str], command: str,
+                     subject: str | None) -> DriveOutcome:
+        instance_id = inst.id
         port = inst.cdp_port
 
         # `screenshot` is intercepted, never passed through: the service captures

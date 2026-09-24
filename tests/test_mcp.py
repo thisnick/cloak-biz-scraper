@@ -91,6 +91,9 @@ class TestStateless:
             "update_profile",
             "new_proxy_session",
             "delete_profile",
+            # The in-chat live view (MCP Apps): one model-facing, one app-only.
+            "show_browser",
+            "live_view",
         }
 
     def test_profile_tools_describe_safety_and_destructive_boundaries(self, client):
@@ -117,6 +120,8 @@ class TestStateless:
             "list_instances",
             "get_instance",
             "server_info",
+            "show_browser",
+            "live_view",
         }
         assert {n for n, h in hints.items() if h.get("destructiveHint")} == {
             "agent_browser",
@@ -289,3 +294,31 @@ class TestLoopbackOriginRule:
             "/mcp", json=INIT, headers={**HEADERS, "Origin": "https://testserver.evil.example"}
         )
         assert r.status_code == 403
+
+
+class TestWhatAFailureTellsTheCaller:
+    """A refusal's sentence is the answer, so it must reach the caller; a crash's
+    text can carry paths and internals, so it must not. The 2.x SDK shows a tool's
+    own message only for ToolError, and mcp_server.REFUSALS is what bridges the
+    two — these pin both halves of that line."""
+
+    def _call(self, client, name, arguments):
+        body = rpc(client, "tools/call", {"name": name, "arguments": arguments}).json()
+        result = body["result"]
+        assert result["isError"] is True
+        return result["content"][0]["text"]
+
+    def test_a_refusal_raised_as_runtime_error_still_reads_in_full(self, client):
+        """InstanceNotDrivable is a RuntimeError, not a ValueError — the case a
+        ValueError-only bridge would silently reduce to a bare "Error executing"."""
+        text = self._call(client, "agent_browser", {"instance_id": "nope", "command": "get url"})
+        assert text.startswith("Error executing tool agent_browser: No running browser")
+
+    def test_a_crash_keeps_its_text_on_the_server(self, client, monkeypatch):
+        def crash(*args, **kwargs):
+            raise OSError("/data/secret/path is not readable")
+
+        monkeypatch.setattr("app.services.views.server_info", crash)
+        text = self._call(client, "server_info", {})
+        assert text == "Error executing tool server_info"
+        assert "/data" not in text

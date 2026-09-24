@@ -190,7 +190,10 @@
         </dialog>
         <div class="acc browsers">
           {% for i in instances %}
-          <div class="acc-item {{ 'open' if loop.first }}">
+          {# Open the first row — or, arriving from the in-chat live view's "Take
+             control" link, the browser it named, marked so it is easy to find. #}
+          {% set focused = focus_instance and i.instance_id == focus_instance %}
+          <div class="acc-item{{ ' open' if focused or (not focus_instance and loop.first) }}{{ ' focused' if focused }}" id="browser-{{ i.instance_id }}">
             <button class="acc-head">
               <svg class="chev" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M9 6l6 6-6 6"/></svg>
               <span class="h-title">{{ 'Task Browser' if i.origin=='task' else 'Manual browser' }}</span>
@@ -1198,6 +1201,10 @@
     });
   }
   document.querySelectorAll('.pane[data-instance]').forEach(wireKeyboard);
+
+  // Arrived from the in-chat live view: bring the browser it named into view.
+  var focused = document.querySelector('.acc-item.focused');
+  if (focused) focused.scrollIntoView({block: 'start'});
   // The same instance can have two panes (a view-only preview on Overview and the
   // full pane on Browsers), so a control/keyboard button must find *its own*
   // pane — the one in its accordion — not the first globally-matching one.

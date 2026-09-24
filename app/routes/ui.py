@@ -14,11 +14,13 @@ looks like logic belongs in services/ or stores/.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 from fastapi import APIRouter, Form, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
@@ -189,7 +191,8 @@ def _job_label(job) -> str:
 
 
 def _render(request: Request, result: Result | None = None, status: int = 200,
-            active: str | None = None, notion_mapping: Any = None) -> Response:
+            active: str | None = None, notion_mapping: Any = None,
+            focus: str | None = None) -> Response:
     settings: Settings = request.app.state.settings.load()
     from ..services.urls import public_base
     from ..services.views import browser_info, instance_view
@@ -232,6 +235,7 @@ def _render(request: Request, result: Result | None = None, status: int = 200,
             "history_jobs": history,
             "server_url": base.rstrip("/") + "/mcp",
             "active_hint": active,
+            "focus_instance": focus,
             # profiles (consumed by the New-browser dialog + Settings→Profiles)
             "profiles": profiles,
             "profiles_in_use": profiles_in_use,
@@ -285,7 +289,40 @@ def _keep(new: str, existing: str) -> str:
 # ── login ───────────────────────────────────────────────────────────────────
 
 
-def _login_context(request: Request, error: str | None = None) -> dict[str, Any]:
+_INSTANCE_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+def return_to(value: str | None) -> str | None:
+    """Where signing in may send you back to: a dashboard link, rebuilt, or None.
+
+    The in-chat live view links to `/?view=browsers&instance=<id>`, and that
+    link must survive the login it usually runs into. A `next` parameter is the
+    classic open redirect, so nothing of the caller's string is passed through:
+    only the dashboard's own path is accepted, and only the two parameters it
+    understands are copied across, each checked against what it may be. A
+    scheme, a host, `//evil`, `/\\evil` or any other path gives None.
+    """
+    if not value:
+        return None
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return None
+    if parts.scheme or parts.netloc or parts.path != "/":
+        return None
+    params = parse_qs(parts.query)
+    kept: dict[str, str] = {}
+    view = (params.get("view") or [None])[0]
+    if view in _VIEWS:
+        kept["view"] = view
+    instance = (params.get("instance") or [None])[0]
+    if instance and _INSTANCE_ID.fullmatch(instance):
+        kept["instance"] = instance
+    return "/?" + urlencode(kept) if kept else "/"
+
+
+def _login_context(request: Request, error: str | None = None,
+                   next_url: str | None = None) -> dict[str, Any]:
     """What the login page needs — including how to get back in.
 
     The recovery instructions used to live only on the settings page, which is
@@ -297,22 +334,26 @@ def _login_context(request: Request, error: str | None = None) -> dict[str, Any]
     return {
         "error": error,
         "unconfigured": secret_service.current() is None,
+        "next": next_url,
     }
 
 
 @router.get("/login", response_class=HTMLResponse)
 async def login_form(request: Request) -> Response:
+    next_url = return_to(request.query_params.get("next"))
     if _authed(request):
-        return RedirectResponse("/", status_code=303)
-    return templates.TemplateResponse(request, "login.html", _login_context(request))
+        return RedirectResponse(next_url or "/", status_code=303)
+    return templates.TemplateResponse(request, "login.html",
+                                      _login_context(request, next_url=next_url))
 
 
 @router.post("/login", response_class=HTMLResponse)
-async def login(request: Request, secret: str = Form("")) -> Response:
+async def login(request: Request, secret: str = Form(""), next: str = Form("")) -> Response:
     secret_service = request.app.state.secret
+    next_url = return_to(next)
     if secret_service.current() is None:
         return templates.TemplateResponse(
-            request, "login.html", _login_context(request), status_code=503
+            request, "login.html", _login_context(request, next_url=next_url), status_code=503
         )
 
     # Throttled before the secret is even looked at. MIN_SECRET_LENGTH allows a
@@ -331,6 +372,7 @@ async def login(request: Request, secret: str = Form("")) -> Response:
             _login_context(
                 request,
                 f"Too many wrong attempts. Wait {int(wait) + 1} seconds and try again.",
+                next_url=next_url,
             ),
             status_code=429,
         )
@@ -343,12 +385,12 @@ async def login(request: Request, secret: str = Form("")) -> Response:
         return templates.TemplateResponse(
             request,
             "login.html",
-            _login_context(request, "That is not the right secret."),
+            _login_context(request, "That is not the right secret.", next_url=next_url),
             status_code=401,
         )
 
     limiter.reset(key)
-    response = RedirectResponse("/", status_code=303)
+    response = RedirectResponse(next_url or "/", status_code=303)
     _set_session(response, sessions.issue(secret_service.current()))
     return response
 
@@ -390,7 +432,13 @@ _VIEWS = {"overview", "browsers", "tasks", "connect", "settings"}
 async def index(request: Request) -> Response:
     _require(request)
     view = request.query_params.get("view")
-    return _render(request, active=view if view in _VIEWS else None)
+    # `instance` opens that browser's row on Browsers — the in-chat live view's
+    # "Take control" link lands here. Ignored unless it is running right now.
+    focus = request.query_params.get("instance")
+    if focus not in request.app.state.instances.running:
+        focus = None
+    active = view if view in _VIEWS else ("browsers" if focus else None)
+    return _render(request, active=active, focus=focus)
 
 
 # ── Runs: the evidence a sweep already captured, finally reachable ───────────
@@ -948,13 +996,7 @@ async def profile_create(
 
 
 @router.post("/settings/profiles/edit")
-async def profile_edit(
-    request: Request,
-    name: str = Form(""),
-    new_name: str | None = Form(None),
-    country: str | None = Form(None),
-    region: str | None = Form(None),
-) -> Response:
+async def profile_edit(request: Request, name: str = Form("")) -> Response:
     """Rename and relocate a profile in one submit — the dialog behind each row.
 
     The dialog sends only the fields it actually offered: Default's name box is
@@ -965,10 +1007,21 @@ async def profile_edit(
     than silently ignoring. A submit that changes nothing is a no-op redirect,
     not the service's "provide something to update" error: the user pressed
     Save on an unchanged form, which is not a failure.
+
+    The optional fields are read from the raw form, not declared as
+    `Form(None)` parameters: newer FastAPI (0.128 here; 0.115.6 did not) hands
+    an EMPTY form value to a parameter as its default, so `region=""` would arrive as None and the
+    clear would silently become "leave alone". The raw form still tells the
+    two apart.
     """
     _require(request)
     _require_same_origin(request)
     from ..services.profiles import ProfileError
+
+    form = await request.form()
+    new_name = form.get("new_name")
+    country = form.get("country")
+    region = form.get("region")
 
     changes: dict[str, str] = {}
     if new_name is not None and new_name.strip() != name:

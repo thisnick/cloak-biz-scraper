@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from urllib.parse import urlencode
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -32,6 +33,7 @@ from .routes.mcp import MCPEndpoint
 from .response_security import ResponseSecurity
 from .services import heartbeat
 from .services.agent_browser import AgentBrowserService
+from .services.live_view import LiveViewService
 from .services.archive import ArchiveService
 from .services.binaries import BrowserBuilds
 from .services.history import TaskHistory
@@ -169,6 +171,9 @@ async def lifespan(app: FastAPI):
         app.state.instances, app.state.uploads, app.state.downloads,
         secret=lambda: app.state.secret.current(),
     )
+    # The in-chat live view: frames from agent-browser's stream while somebody
+    # watches, and the activity/files it hears from agent_browser.
+    app.state.live_view = LiveViewService(app.state.instances, app.state.agent_browser)
     logger.info(
         "ready: secret=%s license=%s proxy=%s notion=%s pool max=%d reserve=%d "
         "jobs=%d interrupted=%d oauth_clients=%d",
@@ -185,13 +190,12 @@ async def lifespan(app: FastAPI):
 
     # Built here, not at import: the SDK's session manager is single-use, so one
     # per lifespan is what lets this app be started more than once in a process.
-    # streamable_http_app() is what constructs it from the FastMCP settings
-    # (stateless, JSON responses); the Starlette app it returns is deliberately
-    # discarded — its GET handler opens an SSE stream we refuse, and its routing
-    # cannot see the Origin check. MCPEndpoint drives the same manager instead.
-    mcp = mcp_server.build(app)
-    mcp.streamable_http_app()
-    app.state.mcp_manager = mcp.session_manager
+    # streamable_http_app() is what constructs it (stateless, JSON responses —
+    # see mcp_server.session_manager); the Starlette app it returns is
+    # deliberately discarded — its GET handler opens an SSE stream we refuse,
+    # and its routing cannot see the Origin check. MCPEndpoint drives the same
+    # manager instead.
+    app.state.mcp_manager = mcp_server.session_manager(mcp_server.build(app))
 
     reaper = asyncio.create_task(_reap_loop(app.state.instances))
     pulse = asyncio.create_task(heartbeat.loop(lambda: app.state.scrape.in_flight))
@@ -204,6 +208,7 @@ async def lifespan(app: FastAPI):
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
+            await app.state.live_view.close()
             await app.state.instances.cleanup_all()
 
 
@@ -217,6 +222,14 @@ async def _login_redirect(request: Request, exc: ui.NotAuthenticated) -> Redirec
     303 so the browser re-issues as GET: a POST that lost its session (an expired
     cookie, a rotated secret) must not replay itself against /login.
     """
+    # A dashboard link — the live view's "Take control" — comes back to where it
+    # was going once signed in. ui.return_to decides what may; anything else is
+    # dropped and the login lands on the dashboard as before.
+    if request.method == "GET":
+        target = ui.return_to(
+            request.url.path + (f"?{request.url.query}" if request.url.query else ""))
+        if target and target != "/":
+            return RedirectResponse(f"/login?{urlencode({'next': target})}", status_code=303)
     return RedirectResponse("/login", status_code=303)
 
 
