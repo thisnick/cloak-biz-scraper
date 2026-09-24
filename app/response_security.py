@@ -52,7 +52,17 @@ _CSP_OAUTH = "; ".join(
 _OAUTH_PREFIX = "/authorize"
 
 
+# A kept download is bytes a website chose, served from the dashboard's own
+# origin. It always goes out as an attachment, but if a browser can ever be
+# talked into rendering one, `sandbox` gives it an opaque origin and no scripts,
+# and `default-src 'none'` lets it load nothing.
+_CSP_DOWNLOAD = "sandbox; default-src 'none'"
+_DOWNLOAD_PREFIX = "/downloads/"
+
+
 def _csp_for(path: str) -> str:
+    if path.startswith(_DOWNLOAD_PREFIX):
+        return _CSP_DOWNLOAD
     return _CSP_OAUTH if path.startswith(_OAUTH_PREFIX) else CONTENT_SECURITY_POLICY
 
 _NO_STORE = "no-store"

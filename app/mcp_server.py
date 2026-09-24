@@ -44,7 +44,13 @@ from .models import (
 from .routes.guard import subject_of
 from .services.tokens import OWNER
 from .services.urls import public_base
-from .services.views import instance_view, require_usable_base_url, upload_ticket
+from .services.views import (
+    download_message,
+    downloaded_file,
+    instance_view,
+    require_usable_base_url,
+    upload_ticket,
+)
 
 logger = logging.getLogger("cloakbiz.mcp")
 
@@ -96,6 +102,10 @@ purpose: the card is quoted rather than interpreted.
 # They are hints, and a client is told not to trust them from a server it does
 # not trust. None of this replaces the OAuth guard, the profile lifecycle locks,
 # or the agent_browser verb allowlist — those enforce; this only describes.
+# The largest downloaded image returned inline as well as by link. A photo a
+# model wants to look at fits; a file that would bloat every later turn does not.
+_INLINE_IMAGE_MAX = 5 * 1024 * 1024
+
 READ_ONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
 ADDITIVE = ToolAnnotations(
     readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False,
@@ -454,6 +464,7 @@ def build(app) -> FastMCP:
             fill @e3 "some text"  type into a field
             press Enter           press a key
             upload @e3 <path>     attach an uploaded file to a file input
+            download @e5          click a download link or button, keep the file, get a link to it
             get url               also: get title, get text @e3
             back / forward / reload
             screenshot            see the page as an image (add --full for the whole scroll height)
@@ -473,6 +484,15 @@ def build(app) -> FastMCP:
         is invisible. What genuinely cannot work is a button that opens the
         operating system's own file picker, with no input on the page at all.
 
+        `download` clicks the element and waits for the file it starts — a link, an
+        Export button, a "Download PDF" button. It answers with a link to the saved
+        file that works as-is in curl or a browser, for two hours. If you can run
+        commands, fetch it with the curl it gives you; if you cannot, give the link
+        to the user. Images also come back inline. Plain `click` does not save
+        downloads — use `download` for anything that should produce a file. Files
+        over 100 MB are cancelled; an element that only opens a page (not a file)
+        times out, so navigate to that page instead.
+
         One action per call. Quote arguments that contain spaces. Only the
         listed read/interact verbs are accepted; anything else is refused. Only
         snapshot and screenshot take flags; the other verbs take plain arguments.
@@ -482,9 +502,36 @@ def build(app) -> FastMCP:
         outcome = await app.state.agent_browser.drive(
             instance_id, command, subject=_subject(ctx)
         )
+        if outcome.download is not None:
+            return _download_blocks(outcome.download, _base_url(ctx))
         blocks: list = [outcome.output]
         if outcome.screenshot:
             blocks.append(Image(data=outcome.screenshot, format="png"))
+        return blocks
+
+    def _download_blocks(kept, base: str) -> list:
+        """The link and the curl as text; an image also inline when it is small.
+
+        Inline only for images, and only small ones: a model can look at a photo
+        it downloaded without a shell, which is most of what "download this
+        image" means in a chat client — but a 90 MB file must not ride back
+        through the MCP response. Everything else is the link.
+        """
+        from mcp.server.fastmcp import Image
+
+        from .services.downloads import IMAGE_TYPES, DownloadsError
+
+        try:
+            view = downloaded_file(kept, base_url=base)
+        except DownloadsError as exc:
+            return [str(exc)]
+        blocks: list = [download_message(view)]
+        if kept.content_type in IMAGE_TYPES and kept.bytes <= _INLINE_IMAGE_MAX:
+            try:
+                data = (app.state.downloads.root / kept.handle / kept.name).read_bytes()
+            except OSError:  # swept or cleared between the two calls
+                return blocks
+            blocks.append(Image(data=data, format=kept.content_type.split("/", 1)[1]))
         return blocks
 
     # Closed-world: the URL it mints points back at this server.

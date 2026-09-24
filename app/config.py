@@ -76,6 +76,12 @@ class Config:
         services/uploads.py."""
         return self.data_dir / "uploads"
 
+    @property
+    def downloads_dir(self) -> Path:
+        """Files a site handed the browser, kept for the agent to fetch. On the
+        volume for the same reason uploads are — see services/downloads.py."""
+        return self.data_dir / "downloads"
+
     @classmethod
     def from_env(cls) -> "Config":
         # Deliberately no app_secret field. SecretService reads the authoritative

@@ -28,6 +28,13 @@ wrote into a live, subject-owned staging ticket — and the argv handed to
 caller's string re-used after a boolean check. The verb still writes nothing;
 it reads one directory the server filled itself.
 
+**And one verb now WRITES, under the same discipline as `screenshot`.**
+`agent-browser download <selector> <path>` saves wherever it is told, so the
+caller supplies the selector and nothing else. The path is a landing directory
+services/downloads minted, the bytes are watched while they arrive and the
+download is cancelled the moment it outgrows its reservation, and what the
+caller gets back is a ticket for the finished file — never a path on this disk.
+
 Driving is the same privilege as the CDP endpoint (`create_instance` already
 hands out a `cdp_url`), so it carries the same guards: a sweep's browser is
 refused (it is mid-navigation on its own schedule), and the instance must belong
@@ -36,13 +43,20 @@ to the calling subject.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import logging
 import os
 import pathlib
 import shlex
 import tempfile
 from dataclasses import dataclass
+from typing import Awaitable, Callable
 
+import httpx
+import websockets
+
+from . import downloads as downloads_service
 from .tokens import OWNER
 from .uploads import Expired, NotStaged
 
@@ -55,12 +69,19 @@ logger = logging.getLogger("cloakbiz.agent_browser")
 # `upload` is here and SERVICE-HANDLED too (see drive): its paths are replaced
 # with the ones services/uploads.resolve_for vouched for before any argv is
 # built, so a caller-named path never reaches agent-browser.
+# `download` is SERVICE-HANDLED as well (see drive): the caller names the element
+# to click and the service names the file — the same split `screenshot` makes.
 ALLOWED_VERBS = frozenset({
     "navigate", "open", "back", "forward", "reload",
     "snapshot", "read", "get",
     "click", "dblclick", "hover", "fill", "type", "press", "select", "scroll", "wait",
-    "screenshot", "upload",
+    "screenshot", "upload", "download",
 })
+
+# Verbs that take EXACTLY this many positionals. `download` takes its selector
+# and nothing else: agent-browser's second positional is the output path, the
+# file-write surface, and it is always ours.
+_EXACT_POSITIONALS = {"download": 1}
 
 # Verbs that take NO positional arguments — only their whitelisted flags.
 # `screenshot` is service-handled: the caller may pick full/annotate, never the
@@ -90,6 +111,17 @@ _VERB_FLAGS = {
 
 _RUN_TIMEOUT = 45.0
 _SHOT_TIMEOUT = 20.0
+# A download is a transfer, not a page action: a 100 MB file over a residential
+# proxy takes minutes, and cutting it at 45s would refuse exactly the files the
+# cap was sized for.
+_DOWNLOAD_TIMEOUT = 180.0
+# How often the landing directory is measured while a download runs. At a
+# generous 50 MB/s this lets at most ~25 MB past the cap before the cancel.
+_WATCH_INTERVAL = 0.5
+# Chromium answers /json locally and instantly; a slow answer means it is wedged.
+_CDP_TIMEOUT = 5.0
+# How long a killed CLI gets to close its pipes before we stop waiting for it.
+_REAP_TIMEOUT = 2.0
 _WARM_TIMEOUT = 8.0
 _CLOSE_TIMEOUT = 5.0
 
@@ -215,6 +247,13 @@ def parse_command(command: str) -> list[str]:
                 f"{verb!r} takes no positional arguments — the service chooses the "
                 f"output path. Allowed flags: {', '.join(sorted(allowed_flags))}."
             )
+    exact = _EXACT_POSITIONALS.get(verb)
+    if exact is not None and len(argv) - 1 != exact:
+        raise AgentBrowserError(
+            f"{verb!r} takes exactly one argument — the element to click, e.g. "
+            "`download @e5` or `download \"a[href$='.pdf']\"`. The service chooses "
+            "where the file goes and hands back a link to fetch it."
+        )
     return argv
 
 
@@ -260,13 +299,72 @@ class DriveOutcome:
     ok: bool
     output: str
     screenshot: bytes | None
+    # Set only by a successful `download`. The façades turn it into a fetch URL,
+    # because only they know the address this server is reachable at.
+    download: "downloads_service.KeptDownload | None" = None
+
+
+class _Stopped(Exception):
+    """A watched run the watcher cut short."""
+
+
+class _SuggestedName:
+    """The filename the site suggested, heard from the pool's own Playwright
+    context while a download runs. Best effort by design.
+
+    agent-browser saves to the path it was given and does not say what the site
+    called the file. Chromium does, in `downloadWillBegin` — and the Playwright
+    context this server launched the browser with receives that event for a
+    download agent-browser starts. Nothing depends on it: a missed event (a test
+    double with no context, a future CLI that disables download events) costs
+    the nice name, and the file is called `download.<ext>` from its bytes.
+    """
+
+    def __init__(self, context) -> None:
+        self.name: str | None = None
+        self.url = ""
+        self._context = context
+        self._pages: list = []
+        if context is None:
+            return
+        try:
+            for page in list(context.pages):
+                self._watch(page)
+            context.on("page", self._watch)
+        except Exception as exc:  # noqa: BLE001 - a name is not worth a failure
+            logger.debug("could not listen for download names: %r", exc)
+
+    def _watch(self, page) -> None:
+        page.on("download", self._seen)
+        self._pages.append(page)
+
+    def _seen(self, download) -> None:
+        # The first one: the click this verb made. Anything later in the same
+        # window is somebody else's, and the name is cosmetic either way.
+        if self.name is None:
+            self.name = getattr(download, "suggested_filename", None) or None
+            self.url = getattr(download, "url", "") or ""
+
+    def stop(self) -> None:
+        for page in self._pages:
+            with contextlib.suppress(Exception):
+                page.remove_listener("download", self._seen)
+        if self._context is not None:
+            with contextlib.suppress(Exception):
+                self._context.remove_listener("page", self._watch)
 
 
 class AgentBrowserService:
     """Runs allow-listed `agent-browser` actions against a pool instance's CDP."""
 
-    def __init__(self, instances, uploads=None) -> None:
+    def __init__(self, instances, uploads=None, downloads=None,
+                 secret: Callable[[], str | None] | None = None) -> None:
         self._instances = instances
+        # The store behind the `download` verb, and the signing secret its fetch
+        # tickets are minted with — read per call through a callable, like
+        # everywhere else, so a rotated APP_SECRET is never captured stale.
+        self._downloads = downloads
+        self._secret = secret or (lambda: None)
         # The staging store behind the `upload` verb. Optional so a test double
         # or an embedder that never stages files can build the service without
         # one — `upload` then refuses with a message that says so, rather than
@@ -287,6 +385,9 @@ class AgentBrowserService:
             register_close(self.close)
 
     def _cdp_port(self, instance_id: str, subject: str | None) -> int:
+        return self._drivable(instance_id, subject).cdp_port
+
+    def _drivable(self, instance_id: str, subject: str | None):
         inst = self._instances.get(instance_id)
         if inst is None:
             raise InstanceNotDrivable(
@@ -304,14 +405,24 @@ class AgentBrowserService:
         owner = getattr(inst, "subject", None) or OWNER
         if subject is not None and owner != subject:
             raise InstanceNotDrivable(f"instance {instance_id!r} belongs to another subject")
-        return inst.cdp_port
+        return inst
 
-    async def _run(self, port: int, argv: list[str], *, timeout: float) -> tuple[int, str, str]:
-        """One `agent-browser --cdp <port> <argv>` invocation. exec, never a shell."""
+    async def _run(self, port: int, argv: list[str], *, timeout: float,
+                   watch: Callable[[], Awaitable[bool]] | None = None
+                   ) -> tuple[int, str, str]:
+        """One `agent-browser --cdp <port> <argv>` invocation. exec, never a shell.
+
+        `watch`, when given, is polled every `_WATCH_INTERVAL` while the CLI
+        runs; answering True kills it and raises `_Stopped`. That is how a
+        download is cut off while its bytes are still arriving rather than
+        measured after they have all landed.
+        """
         proc = await asyncio.create_subprocess_exec(
             _binary(), "--session", _session(port), "--cdp", str(port), *argv,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
+        if watch is not None:
+            return await self._watched(proc, timeout, watch)
         try:
             out, err = await asyncio.wait_for(proc.communicate(), timeout)
         except asyncio.TimeoutError:
@@ -320,8 +431,44 @@ class AgentBrowserService:
             raise TimeoutError(f"the browser did not respond within {int(timeout)}s") from None
         return proc.returncode, out.decode(errors="replace"), err.decode(errors="replace")
 
+    @staticmethod
+    async def _watched(proc, timeout: float,
+                       watch: Callable[[], Awaitable[bool]]) -> tuple[int, str, str]:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        talking = asyncio.ensure_future(proc.communicate())
+        try:
+            while not talking.done():
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"the browser did not respond within {int(timeout)}s")
+                await asyncio.wait({talking}, timeout=min(_WATCH_INTERVAL, remaining))
+                if not talking.done() and await watch():
+                    raise _Stopped()
+        except BaseException:
+            if proc.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+            # Cancelled, not drained. The `agent-browser` on PATH is a Node
+            # wrapper around the native CLI, and killing the wrapper leaves the
+            # native child holding stdout open until ITS download ends —
+            # measured: the watchdog tripped at 2s and the call still took 12s,
+            # the whole transfer. The caller cancels the download itself next,
+            # which is what makes that child exit.
+            talking.cancel()
+            with contextlib.suppress(BaseException):
+                await talking
+            with contextlib.suppress(BaseException):
+                await asyncio.wait_for(proc.wait(), _REAP_TIMEOUT)
+            raise
+        out, err = talking.result()
+        return proc.returncode, out.decode(errors="replace"), err.decode(errors="replace")
+
     async def _run_resilient(self, port: int, argv: list[str], *,
-                             timeout: float) -> tuple[int, str, str]:
+                             timeout: float,
+                             watch: Callable[[], Awaitable[bool]] | None = None
+                             ) -> tuple[int, str, str]:
         """`_run`, retrying ONLY the first-call daemon/CDP readiness race.
 
         The retry is scoped to `_is_transient_failure` — a cold agent-browser
@@ -330,14 +477,15 @@ class AgentBrowserService:
         and a timeout is left to propagate to the caller (never retried), so a
         genuinely broken action or a dead instance still fails fast. The bound is
         small, so even a permanently unreachable daemon returns promptly."""
-        rc, out, err = await self._run(port, argv, timeout=timeout)
+        extra = {"watch": watch} if watch is not None else {}
+        rc, out, err = await self._run(port, argv, timeout=timeout, **extra)
         for attempt in range(1, _RETRY_ATTEMPTS):
             if not _is_transient_failure(rc, out, err):
                 break
             logger.info("agent_browser %r transient (rc=%s), retry %d/%d",
                         argv[0], rc, attempt, _RETRY_ATTEMPTS - 1)
             await asyncio.sleep(_RETRY_BACKOFF[attempt - 1])
-            rc, out, err = await self._run(port, argv, timeout=timeout)
+            rc, out, err = await self._run(port, argv, timeout=timeout, **extra)
         return rc, out, err
 
     async def warm(self, port: int) -> None:
@@ -440,6 +588,134 @@ class AgentBrowserService:
             )
         return ["upload", argv[1], *(str(path) for path in resolved)]
 
+    async def _browser_command(self, port: int, method: str, params: dict) -> bool:
+        """One Browser-domain CDP command on the instance's own local endpoint.
+
+        Best effort and short-bounded: every caller is cleaning up after a
+        download, and cleanup must never be what fails the call. Loopback
+        only, and `trust_env=False` so an ambient HTTP proxy cannot swallow a
+        request that was never meant to leave the container.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=_CDP_TIMEOUT, trust_env=False) as client:
+                version = await client.get(f"http://127.0.0.1:{port}/json/version")
+                version.raise_for_status()
+                target = version.json()["webSocketDebuggerUrl"]
+            async with websockets.connect(
+                target, max_size=None, open_timeout=_CDP_TIMEOUT,
+                ping_interval=None, ping_timeout=None,
+            ) as ws:
+                await ws.send(json.dumps({"id": 1, "method": method, "params": params}))
+
+                async def reply() -> dict:
+                    while True:
+                        message = json.loads(await ws.recv())
+                        if message.get("id") == 1:
+                            return message
+
+                answer = await asyncio.wait_for(reply(), _CDP_TIMEOUT)
+            if "error" in answer:
+                logger.debug("cdp %s on %s answered %s", method, port, answer["error"])
+                return False
+            return True
+        except Exception as exc:  # noqa: BLE001 - see docstring
+            logger.warning("cdp %s on cdp=%s did not complete: %r", method, port, exc)
+            return False
+
+    async def _stop_downloading(self, port: int, guids: list[str]) -> None:
+        """Cancel what is still arriving, then point the browser's downloads at
+        nothing.
+
+        The second half matters as much as the first. agent-browser sets the
+        browser-wide download folder to the directory of the path it was given
+        and never sets it back, and Chromium re-creates that folder if it is
+        missing — measured: a plain `click` on a download link after one
+        `download` wrote a GUID-named file into the deleted landing directory.
+        So after every `download`, the browser is told to refuse downloads until
+        the next `download` sets its own folder again. That also means no plain
+        `click` can ever write to this volume.
+        """
+        for guid in guids:
+            await self._browser_command(port, "Browser.cancelDownload", {"guid": guid})
+        await self._browser_command(port, "Browser.setDownloadBehavior", {"behavior": "deny"})
+
+    async def _download(self, inst, command: str, selector: str,
+                        subject: str | None) -> DriveOutcome:
+        """Click `selector`, save what it downloads, and keep it for the caller.
+
+        The order in the `finally` is deliberate: cancel and deny BEFORE the
+        landing directory is removed, so nothing the browser is still writing
+        re-creates it after the store has let it go.
+        """
+        if self._downloads is None:
+            raise AgentBrowserError("this server cannot keep downloads")
+        port = inst.cdp_port
+        try:
+            landing = await self._downloads.begin()
+        except downloads_service.DownloadsError as exc:
+            return DriveOutcome(inst.id, command, False, str(exc), None)
+
+        async def outgrown() -> bool:
+            size, partial = await asyncio.to_thread(self._downloads.landed_bytes, landing)
+            if size <= landing.allowance:
+                return False
+            # Cancel in the browser BEFORE the CLI is killed: the native CLI
+            # exits once its download is cancelled, and until it does it holds
+            # the pipes the kill is waiting on.
+            for guid in partial:
+                await self._browser_command(port, "Browser.cancelDownload", {"guid": guid})
+            return True
+
+        names = _SuggestedName(getattr(inst, "context", None))
+        failure: str | None = None
+        rc, out, err = 1, "", ""
+        try:
+            try:
+                rc, out, err = await self._run_resilient(
+                    port, ["download", selector, str(landing.target)],
+                    timeout=_DOWNLOAD_TIMEOUT, watch=outgrown,
+                )
+            except _Stopped:
+                failure = str(self._downloads.too_large(landing))
+            except TimeoutError:
+                failure = (
+                    f"the download did not finish within {int(_DOWNLOAD_TIMEOUT)}s and was "
+                    "cancelled. If the element only opens a page, navigate to that page "
+                    "first."
+                )
+            finally:
+                names.stop()
+                # Whatever is still partial: a timeout's download, or one the
+                # watchdog's cancel did not reach. Cancelling twice is harmless.
+                partial = (await asyncio.to_thread(self._downloads.landed_bytes, landing))[1]
+                await self._stop_downloading(port, partial)
+        except BaseException:
+            # Anything unplanned — the CLI could not even be spawned, the call
+            # was cancelled — still gives the landing directory and its
+            # reservation back.
+            self._downloads.abort(landing)
+            raise
+        if failure is None and rc != 0:
+            failure = out.strip() or err.strip() or "the download failed"
+        if failure is not None:
+            self._downloads.abort(landing)
+            logger.info("agent_browser %s 'download' failed", inst.id)
+            return DriveOutcome(inst.id, command, False, failure, None)
+
+        try:
+            kept = await self._downloads.commit(
+                landing, subject=subject or OWNER, secret=self._secret(),
+                suggested_name=names.name, source_url=names.url,
+            )
+        except downloads_service.DownloadsError as exc:
+            return DriveOutcome(inst.id, command, False, str(exc), None)
+        logger.info("agent_browser %s 'download' kept %s", inst.id, kept.handle)
+        return DriveOutcome(
+            inst.id, command, True,
+            f"downloaded {kept.name} ({kept.bytes} bytes, {kept.content_type})",
+            None, download=kept,
+        )
+
     async def drive(self, instance_id: str, command: str, *,
                     subject: str | None = OWNER) -> DriveOutcome:
         """Run one allow-listed action against the instance.
@@ -450,7 +726,8 @@ class AgentBrowserService:
         before the instance is even resolved, so a disallowed command is refused
         without regard to who asked."""
         argv = parse_command(command)
-        port = self._cdp_port(instance_id, subject)
+        inst = self._drivable(instance_id, subject)
+        port = inst.cdp_port
 
         # `screenshot` is intercepted, never passed through: the service captures
         # to its own path with only the whitelisted display flags, so agent-browser
@@ -462,6 +739,12 @@ class AgentBrowserService:
         # one they passed in."
         if argv[0] == "upload":
             argv = self._staged_upload(argv, subject)
+
+        # `download` is intercepted like `screenshot`: the caller named an
+        # element, the service names the file, and what comes back is a ticket
+        # for the finished file rather than a path on this disk.
+        if argv[0] == "download":
+            return await self._download(inst, command, argv[1], subject)
 
         if argv[0] == "screenshot":
             flags = argv[1:]  # already validated to whitelisted flags only

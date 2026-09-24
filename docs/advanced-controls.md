@@ -115,13 +115,24 @@ tries to remove expired files when the Settings page opens.
 
 These cleanup actions cannot be undone. Do not clear all uploads during an active task.
 
+### Downloaded files
+
+Files your assistant downloaded with `download` are kept for about two hours so it — or
+you, from the link it gave you — can fetch them. Expired ones are removed when the Settings
+page opens.
+
+- **Clear expired downloads** keeps files whose links still work.
+- **Clear all downloads** removes every downloaded file; links already handed out stop
+  working.
+
 ## A conservative monthly maintenance routine
 
 1. Check **Tasks → History** and save any evidence you still need.
-2. Open **Settings → Disk space** and compare the three categories.
+2. Open **Settings → Disk space** and compare the categories.
 3. Remove old browser versions.
 4. Clear task history only after the relevant failures have been reviewed.
-5. Clear expired uploads; use **Clear all uploads** only when no upload task is active.
+5. Clear expired uploads and downloads; use **Clear all uploads** or **Clear all
+   downloads** only when no task still needs those files.
 6. Review profile sizes and clear a profile only when you are willing to lose its cookies
    and logins.
 7. Run the read-only connection test from the
