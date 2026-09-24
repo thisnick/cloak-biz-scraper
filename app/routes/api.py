@@ -46,7 +46,13 @@ from ..services.proxy import ProxyNotConfigured
 from ..services.scrape import NotASweep, NotionNotConfigured
 from ..services.tokens import OWNER
 from ..services.urls import public_base
-from ..services.views import instance_view, require_usable_base_url, upload_ticket
+from ..services.views import (
+    download_message,
+    downloaded_file,
+    instance_view,
+    require_usable_base_url,
+    upload_ticket,
+)
 from ..sources import UnsupportedURL
 from .guard import subject_of
 
@@ -303,14 +309,25 @@ async def drive_instance(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except InstanceNotDrivable as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    download = None
+    output = outcome.output
+    if outcome.download is not None:
+        from ..services.downloads import DownloadsError
+
+        try:
+            download = downloaded_file(outcome.download, base_url=_base_url(request))
+            output = download_message(download)
+        except DownloadsError as exc:
+            output = str(exc)
     return AgentBrowserResult(
         instance_id=outcome.instance_id,
         command=outcome.command,
         ok=outcome.ok,
-        output=outcome.output,
+        output=output,
         screenshot_png_base64=(
             base64.b64encode(outcome.screenshot).decode() if outcome.screenshot else None
         ),
+        download=download,
     )
 
 

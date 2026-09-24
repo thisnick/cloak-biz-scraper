@@ -321,6 +321,30 @@ class InstanceView(BaseModel):
     humanize: bool = True
 
 
+class DownloadedFile(BaseModel):
+    """A file the browser downloaded, kept on this server for the caller to fetch.
+
+    `url` carries its own short-lived ticket in the query string, so it works
+    as-is in curl or pasted into a browser — for this one file, for the subject
+    it was downloaded for, until `expires_at`. It is not the OAuth token and
+    grants nothing else.
+    """
+
+    name: str = Field(description="The site's suggested filename, sanitized; or "
+                                  "download.<ext> when the site suggested none.")
+    bytes: int
+    sha256: str
+    content_type: str = Field(description="Decided by the file's first bytes. The file "
+                                          "is always served as an attachment.")
+    source_url: str = Field(description="Where the browser fetched it from, when known.")
+    url: str = Field(description="GET this to fetch the file. Works as-is in curl or a "
+                                 "browser; send it to the user if they want the file.")
+    curl: str = Field(description="The whole fetch command, ready to run.")
+    expires_at: float = Field(description="Unix seconds. After this the link stops working "
+                                          "and the file is deleted.")
+    expires_in: int = Field(description="Seconds the link is good for, from now.")
+
+
 class AgentBrowserResult(BaseModel):
     """The result of one `agent_browser` action against a running browser."""
 
@@ -335,6 +359,10 @@ class AgentBrowserResult(BaseModel):
         default=None,
         description="A PNG screenshot of the page after the action, base64-encoded. "
         "The MCP tool returns this as an inline image instead.",
+    )
+    download: DownloadedFile | None = Field(
+        default=None,
+        description="Set by a successful `download`: the kept file and how to fetch it.",
     )
 
 

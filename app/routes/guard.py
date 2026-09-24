@@ -25,6 +25,9 @@ The rule lives here once, above both, and neither route can forget it.
 * `/uploads/{handle}` — its own short-lived ticket (services/uploads.py). The
   bytes arrive from a curl in an agent's sandbox, which cannot do an OAuth
   dance; the ticket grants "add bytes to this one staging slot" and nothing else.
+* `/downloads/{handle}/{name}` — its own short-lived ticket
+  (services/downloads.py), which may ride in the URL so a person can click it.
+  It grants "read this one downloaded file" and nothing else.
 
 **The 401 must teach the client how to fix itself.** An MCP client that gets a
 bare 401 gives up; one that gets `WWW-Authenticate` with `resource_metadata`

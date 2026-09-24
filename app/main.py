@@ -26,7 +26,7 @@ from starlette.routing import Route
 
 from . import __version__, mcp_server
 from .config import CONFIG, bootstrap_binary_cache, purge_binary_env
-from .routes import api, cdp, health, oauth, ui, uploads, vnc
+from .routes import api, cdp, downloads, health, oauth, ui, uploads, vnc
 from .routes.guard import AuthGuard
 from .routes.mcp import MCPEndpoint
 from .response_security import ResponseSecurity
@@ -43,6 +43,7 @@ from .services.ratelimit import RateLimiter
 from .services.scrape import ScrapeService
 from .services.secret import SecretService
 from .services.settings import SettingsService
+from .services.downloads import DownloadService
 from .services.uploads import StagedUploads, UploadService
 
 logging.basicConfig(
@@ -146,13 +147,28 @@ async def lifespan(app: FastAPI):
         await app.state.uploads.sweep(reclaim_incoming=True)
     except Exception:  # noqa: BLE001
         logger.exception("could not sweep expired uploads at startup")
+    # The other direction: files a site handed the browser, kept for two hours
+    # for the agent (or the person it is talking to) to fetch. Measured with the
+    # same class as uploads — the tickets have the same shape — and swept at
+    # startup for the same reason, which here also takes any landing directory
+    # a crash left mid-download.
+    app.state.downloads = DownloadService(CONFIG.downloads_dir)
+    app.state.kept_downloads = StagedUploads(lambda: app.state.downloads)
+    try:
+        await app.state.downloads.sweep(at_startup=True)
+    except Exception:  # noqa: BLE001
+        logger.exception("could not sweep expired downloads at startup")
     app.state.scrape = ScrapeService(app.state.instances, jobs, settings_service)
     # The same job store the sweeps use: one Tasks list, one retention policy,
     # one place a run's evidence is reachable from.
     app.state.archive = ArchiveService(app.state.instances, settings_service, jobs)
     # The staging store goes in here too: `upload` is the one verb that reads
     # the container's disk, and this is what decides which files exist to read.
-    app.state.agent_browser = AgentBrowserService(app.state.instances, app.state.uploads)
+    # And the downloads store, for `download`: the one verb that writes it.
+    app.state.agent_browser = AgentBrowserService(
+        app.state.instances, app.state.uploads, app.state.downloads,
+        secret=lambda: app.state.secret.current(),
+    )
     logger.info(
         "ready: secret=%s license=%s proxy=%s notion=%s pool max=%d reserve=%d "
         "jobs=%d interrupted=%d oauth_clients=%d",
@@ -211,6 +227,7 @@ app.include_router(cdp.router)
 # Outside the AuthGuard on purpose — its own short-lived ticket is the
 # credential. See routes/uploads.py and routes/guard.py.
 app.include_router(uploads.router)
+app.include_router(downloads.router)
 app.include_router(vnc.router)
 app.include_router(ui.router)
 

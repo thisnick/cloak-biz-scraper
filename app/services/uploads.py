@@ -1225,7 +1225,14 @@ class StagedUploads:
                 # Somebody else's disk. reclaim's rule: identified as a link,
                 # never followed.
                 continue
-            if not entry.is_dir():
+            if not entry.is_dir() or entry.name.startswith("."):
+                # A plain file, or a dot-named directory — which no ticket ever
+                # is. services/downloads.py measures through this class and
+                # keeps its in-flight landing directories under dot names:
+                # bytes on the volume, so counted, but not tickets.
+                if entry.is_dir():
+                    total += measure_dir(entry)[0]
+                    continue
                 try:
                     total += entry.lstat().st_size
                 except OSError:  # pragma: no cover - it vanished mid-walk
