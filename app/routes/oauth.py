@@ -78,6 +78,9 @@ def _grant_types_the_sdk_would_refuse(body: object) -> bool:
     Type."* So the SDK accepts a client that omits the field and refuses the
     client that says the identical thing out loud — same meaning, opposite
     outcome, 400 vs 201. Known upstream (fastmcp#2460) and unfixed in 1.28.1.
+    The 2.x SDK relaxed its check to "must include authorization_code", so this
+    is now belt-and-braces rather than load-bearing; kept until it is removed
+    deliberately, with its tests, rather than as a side effect of an upgrade.
 
     We only touch that exact shape. Anything else — `client_credentials`, a grant
     we cannot honour, a missing field — is left for the SDK to judge.
