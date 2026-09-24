@@ -55,6 +55,7 @@
   .screen { position: relative; background: #0b0b0d; aspect-ratio: 16 / 9; border-top: 1px solid var(--line);
             border-bottom: 1px solid var(--line); }
   .screen img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; display: block; }
+  .screen img[hidden] { display: none; }
   .screen .msg { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
                  text-align: center; padding: 16px; color: #e4e4e7; font-size: 13px; background: rgba(11,11,13,.55); }
   .screen .msg[hidden] { display: none; }
@@ -223,18 +224,13 @@
 
   function render(state, jpeg) {
     last = state;
-    if (state.status === "closed") {
-      setStatus("closed", "Closed");
-      message("This browser has closed.");
-      $("control").hidden = true;
-      $("foot-right").textContent = "";
-      return;
-    }
-    setStatus(state.status === "live" ? "live" : "connecting",
-              state.status === "live" ? "Live" : "Connecting");
+    var closed = state.status === "closed";
+    if (closed) setStatus("closed", "Closed");
+    else setStatus(state.status === "live" ? "live" : "connecting",
+                   state.status === "live" ? "Live" : "Connecting");
     $("title").textContent = state.title
       || (state.url === "about:blank" ? "Blank page" : host(state.url))
-      || "Browser";
+      || (closed ? "Browser closed" : "Browser");
     $("url").textContent = state.url || "";
     $("url").title = state.url || "";
     if (jpeg) {
@@ -242,11 +238,16 @@
       $("frame").hidden = false;
       frameId = state.frame_id || "";
     }
-    message($("frame").hidden
-      ? (state.status === "live" ? "Waiting for the page to draw…" : "Connecting to the browser…")
-      : "");
+    if (closed) {
+      message($("frame").hidden ? "This browser closed before a picture of it was taken."
+                                : "This browser has closed. This was its last picture.");
+    } else {
+      message($("frame").hidden
+        ? (state.status === "live" ? "Waiting for the page to draw…" : "Connecting to the browser…")
+        : "");
+    }
 
-    controlUrl = state.control_url || null;
+    controlUrl = closed ? null : (state.control_url || null);
     $("control").hidden = !controlUrl;
 
     var acts = (state.activity || []).slice().reverse();
@@ -274,7 +275,9 @@
     $("files-empty").hidden = files.length > 0;
     $("tab-files").textContent = files.length ? "Files (" + files.length + ")" : "Files";
 
-    if (state.closes_at) {
+    if (closed) {
+      $("foot-right").textContent = "";
+    } else if (state.closes_at) {
       var mins = Math.max(0, Math.round((state.closes_at - Date.now() / 1000) / 60));
       $("foot-right").textContent = "Closes in " + mins + " min unless it's used";
     }

@@ -61,6 +61,10 @@ _RETRY_SEC = 1.0
 _RETRY_MAX_SEC = 30.0
 # A single stream message: a JPEG frame, base64. Generous; frames are ~50-100 KB.
 _MAX_MESSAGE = 8 * 1024 * 1024
+# A closed browser's last picture, address, activity and files stay readable
+# this long — chat apps often draw the panel only after the assistant's turn,
+# by which time the browser may already be closed.
+KEEP_CLOSED_SEC = 10 * 60
 ACTIVITY_MAX = 30
 FILES_MAX = 20
 # Mirrors instances._IDLE_TTL_MIN: an interactive browser nobody drives closes then.
@@ -106,6 +110,20 @@ class _Trail:
     # stream's tab messages carry an address-like label rather than the title.
     page_url: str = ""
     page_title: str = ""
+    # Whose browser this is, noted while it runs: after it closes there is no
+    # instance left to ask, and what it showed is still only theirs to see.
+    subject: str | None = None
+
+
+@dataclass
+class _Closed:
+    at: float
+    subject: str
+    frame: _Frame | None
+    url: str
+    title: str
+    activity: list
+    files: list
 
 
 # Verbs whose output starts with "✓ <page title>" then the address it landed on.
@@ -124,6 +142,7 @@ class LiveViewService:
         self._wall = wall
         self._watches: dict[str, _Watch] = {}
         self._trails: dict[str, _Trail] = {}
+        self._closed: dict[str, _Closed] = {}
         agent_browser.add_listener(self._heard)
 
     # ── the listener ───────────────────────────────────────────────────────
@@ -132,6 +151,9 @@ class LiveViewService:
         # their trails go here instead, so this cannot grow without bound.
         self._prune(keep=instance_id)
         trail = self._trails.setdefault(instance_id, _Trail())
+        inst = self._instances.get(instance_id)
+        if inst is not None:
+            trail.subject = getattr(inst, "subject", None) or OWNER
         trail.activity.append(_Activity(self._wall(), describe(argv, outcome), outcome.ok))
         kept = getattr(outcome, "download", None)
         if kept is not None:
@@ -154,7 +176,7 @@ class LiveViewService:
         inst = self._instances.get(instance_id)
         if inst is None:
             self._forget(instance_id)
-            return {"instance_id": instance_id, "status": "closed"}, None
+            return self._closed_state(instance_id, subject, since)
         self._check(inst, subject)
 
         watch = self._watches.get(instance_id)
@@ -343,17 +365,56 @@ class LiveViewService:
                         watch.title = active["title"]
 
     # ── lifecycle ──────────────────────────────────────────────────────────
+    def _closed_state(self, instance_id: str, subject: str,
+                      since: str) -> tuple[dict[str, Any], bytes | None]:
+        state: dict[str, Any] = {"instance_id": instance_id, "status": "closed"}
+        rec = self._closed.get(instance_id)
+        # Only its owner, and nothing at all once the record has aged out: a
+        # closed id says "closed" and no more to anyone else.
+        if rec is None or rec.subject != subject:
+            return state, None
+        state.update(url=display_url(rec.url), title=rec.title,
+                     activity=[{"at": a.at, "text": a.text, "ok": a.ok} for a in rec.activity],
+                     files=[k for k in reversed(rec.files)
+                            if getattr(k, "expires_at", 0) > self._wall()])
+        jpeg = None
+        if rec.frame is not None:
+            state.update(frame_id=rec.frame.frame_id, frame_width=rec.frame.width,
+                         frame_height=rec.frame.height, captured_at=rec.frame.captured_at)
+            if rec.frame.frame_id != since:
+                jpeg = rec.frame.jpeg
+        return state, jpeg
+
     def _prune(self, keep: str | None = None) -> None:
-        """Drop what is kept for browsers that have closed."""
+        """Archive what is kept for browsers that have closed, and drop archives
+        past KEEP_CLOSED_SEC."""
         for gone in [i for i in {*self._trails, *self._watches}
                      if i != keep and not self._instances.get(i)]:
             self._forget(gone)
+        cutoff = self._clock() - KEEP_CLOSED_SEC
+        for iid in [i for i, rec in self._closed.items() if rec.at < cutoff]:
+            del self._closed[iid]
 
     def _forget(self, instance_id: str) -> None:
+        """Stop watching a browser that has closed, keeping its last state."""
         watch = self._watches.pop(instance_id, None)
         if watch and watch.task and not watch.task.done():
             watch.task.cancel()
-        self._trails.pop(instance_id, None)
+        trail = self._trails.pop(instance_id, None)
+        subject = (trail.subject if trail else None) or (watch.subject if watch else None)
+        if subject is None or instance_id in self._closed:
+            return
+        title = ""
+        if trail and trail.page_title and watch and _same_page(trail.page_url, watch.url):
+            title = trail.page_title
+        self._closed[instance_id] = _Closed(
+            at=self._clock(), subject=subject,
+            frame=watch.frame if watch else None,
+            url=(watch.url if watch else "") or (trail.page_url if trail else ""),
+            title=title or (trail.page_title if trail else ""),
+            activity=list(trail.activity) if trail else [],
+            files=list(trail.files) if trail else [],
+        )
 
     async def close(self) -> None:
         tasks = [w.task for w in self._watches.values() if w.task and not w.task.done()]

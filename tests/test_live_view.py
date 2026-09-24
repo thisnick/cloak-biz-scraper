@@ -704,3 +704,63 @@ class TestTheToolRefusesLikeDriving:
         assert result["isError"] is True
         assert "zz9" in result["content"][0]["text"]
         assert not any(c["type"] == "image" for c in result["content"])
+
+
+# ── after the browser closes ────────────────────────────────────────────────
+@pytest.mark.asyncio
+class TestAClosedBrowserStillShowsWhatHappened:
+    """Chat apps often draw the panel after the assistant's turn, when the
+    browser may already be closed; an empty "closed" says nothing."""
+
+    async def _watched_then_closed(self, clock):
+        instances = Instances(Inst())
+        driver = Driver()
+        sock = FakeSocket([{"type": "url", "url": "https://a.test/done?code=SECRET"}, frame()])
+        svc = service(instances, driver, Connector([sock]), clock)
+        driver.listeners[0]("i1", ["navigate", "https://a.test/done"],
+                            DriveOutcome("i1", "x", True, "✓ Done page\n  https://a.test/done", None))
+        await svc.state("i1", "owner")
+        await settle()
+        del instances.running["i1"]
+        return svc
+
+    async def test_the_owner_sees_the_last_picture_and_activity(self, clock):
+        svc = await self._watched_then_closed(clock)
+        state, jpeg = await svc.state("i1", "owner")
+        assert state["status"] == "closed" and jpeg == JPEG
+        assert state["title"] == "Done page" and state["url"] == "https://a.test/done"
+        assert [a["text"] for a in state["activity"]] == ["Opened a.test/done"]
+        _, again = await svc.state("i1", "owner", since=state["frame_id"])
+        assert again is None
+
+    async def test_anyone_else_sees_only_closed(self, clock):
+        svc = await self._watched_then_closed(clock)
+        state, jpeg = await svc.state("i1", "someone-else")
+        assert state == {"instance_id": "i1", "status": "closed"} and jpeg is None
+
+    async def test_it_works_when_nobody_was_watching(self, clock):
+        instances = Instances(Inst())
+        driver = Driver(port=None)
+        svc = service(instances, driver, Connector(), clock)
+        driver.listeners[0]("i1", ["reload"], outcome())
+        del instances.running["i1"]
+        state, jpeg = await svc.state("i1", "owner")
+        assert state["status"] == "closed" and jpeg is None
+        assert [a["text"] for a in state["activity"]] == ["Reloaded the page"]
+
+    async def test_it_ages_out(self, clock):
+        svc = await self._watched_then_closed(clock)
+        await svc.state("i1", "owner")
+        clock.t += lv.KEEP_CLOSED_SEC + 1
+        state, jpeg = await svc.state("i1", "owner")
+        assert state == {"instance_id": "i1", "status": "closed"} and jpeg is None
+
+
+class TestThePageHasNoBrokenImage:
+    def test_a_hidden_frame_is_really_hidden(self):
+        """`.screen img { display: block }` beats the hidden attribute unless the
+        page says otherwise — which drew a broken-image icon before any frame."""
+        from app.mcp_server import live_view_html
+        html = live_view_html()
+        assert ".screen img[hidden] { display: none; }" in html
+        assert '<img id="frame"' in html and 'hidden>' in html
