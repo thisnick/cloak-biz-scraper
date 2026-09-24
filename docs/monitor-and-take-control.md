@@ -51,13 +51,30 @@ the same server-side job. A returned job ID alone does not mean the scrape finis
 Use saved evidence when a task says a source was blocked, timed out, or returned no listings.
 It is more useful than repeatedly retrying an unknown failure.
 
+## Watch it in the chat
+
+In Claude and ChatGPT, a live view appears in the conversation when your assistant opens a
+browser. It shows the page as it changes (about once a second), what the assistant has done
+so far, and any files it downloaded, with a **Download** button for each. The view is
+watch-only: nothing you do in it reaches the browser. If it has scrolled away, ask the
+assistant to "show me the browser".
+
+![The live view in a chat: the page, its address, and what the assistant did](assets/live-view/live-view.png)
+
+![The Files tab lists anything the assistant downloaded, with a Download button](assets/live-view/live-view-files.png)
+
+The view stops fetching pictures shortly after you stop looking at it, and watching does not
+keep an idle browser open.
+
 ## Take control for a human-only step
 
 Use takeover for a legitimate login, CAPTCHA, one-time code, consent dialog, or other step
 that should not be placed in an AI prompt:
 
 1. Tell the agent to stop on the current page and keep its browser open.
-2. Open **Browsers** in Cloak Biz Scraper and match the `instance_id`.
+2. Select **Take control ↗** in the chat's live view — it opens this browser on your
+   dashboard (sign in first if asked). Or open **Browsers** in Cloak Biz Scraper and match
+   the `instance_id`.
 3. Select **Take control**. The live view becomes interactive.
 4. Use **Keyboard** if you need the on-screen keyboard controls, then complete the step.
 5. Select **Release control** when finished.

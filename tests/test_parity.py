@@ -451,7 +451,8 @@ class TestThePublishedUploadSurface:
                         json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
         names = {t["name"] for t in r.json()["result"]["tools"]}
         assert "create_upload_url" in names
-        assert len(names) == 15, sorted(names)
+        # 15 after uploads; the live view later added show_browser and live_view.
+        assert len(names) == 17, sorted(names)
         assert "stage_from_url" not in names and "release_upload" not in names
 
     def test_it_takes_no_arguments(self, client):

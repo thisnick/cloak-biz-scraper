@@ -24,13 +24,17 @@ reading:
 """
 from __future__ import annotations
 
+import base64
 import functools
 import logging
+from pathlib import Path
+from urllib.parse import quote
 
+from mcp.server.apps import Apps
 from mcp.server.mcpserver import Context, Image, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
-from mcp.types import ToolAnnotations
+from mcp.types import CallToolResult, ImageContent, TextContent, ToolAnnotations
 
 from . import __version__
 from .models import (
@@ -165,6 +169,23 @@ def _refusals_reach_the_caller(fn):
     return wrapper
 
 
+# The in-chat live view (MCP Apps). The page is one self-contained document:
+# a host's default sandbox allows inline script and style and data: images, and
+# no network at all, so everything it needs is inlined and every frame comes
+# back through the `live_view` tool. See services/live_view.py.
+LIVE_VIEW_URI = "ui://cloak-biz-scraper/live-view.html"
+_UI_DIR = Path(__file__).parent / "ui"
+_EXT_APPS = _UI_DIR / "vendor" / "ext-apps-app-2.0.0.min.js"
+
+
+@functools.lru_cache(maxsize=1)
+def live_view_html() -> str:
+    """The panel's HTML with the vendored MCP Apps bridge inlined."""
+    page = (_UI_DIR / "live_view.html").read_text(encoding="utf-8")
+    bridge = _EXT_APPS.read_text(encoding="utf-8").replace("</script", "<\\/script")
+    return page.replace("<!--EXT_APPS-->", f"<script>\n{bridge}\n</script>", 1)
+
+
 def _request(ctx: Context):
     try:
         return ctx.request_context.request
@@ -199,6 +220,143 @@ def build(app) -> MCPServer:
     Read at call time rather than captured, so the MCP app can be constructed
     before the lifespan has populated state.
     """
+    # MCP Apps. Its tools and the page are fixed when the server is
+    # constructed, so everything bound to the live view is registered here,
+    # first; the plain tools follow on `mcp` below.
+    apps = Apps()
+    apps.add_html_resource(
+        LIVE_VIEW_URI, live_view_html(),
+        name="live-view", title="Live browser",
+        description="A view-only live picture of a running browser, with its activity and files.",
+        # The page draws its own card.
+        prefers_border=False,
+    )
+
+    def ui_tool(**options):
+        """`apps.tool` bound to the live view, with refusals passed through."""
+        def register(fn):
+            return apps.tool(resource_uri=LIVE_VIEW_URI, **options)(
+                _refusals_reach_the_caller(fn))
+        return register
+
+    # Closed-world despite launching a browser: the open-world capability is
+    # exercised by agent_browser, which is annotated for it. This call reaches
+    # only the geo probe's own echo services and the CloakBrowser artifact.
+    @ui_tool(annotations=ADDITIVE)
+    async def create_instance(
+        ctx: Context, profile: str = "Default", country: str | None = None,
+        region: str | None = None, geoip: bool = True,
+    ) -> InstanceView:
+        """Launch a cloaked, anti-detection browser (CloakBrowser).
+
+        It carries a real, consistent browser fingerprint. With no CloakBrowser
+        key configured it deliberately runs the public build, which has fewer
+        bypasses and has not been tested by us against the listing sites. A
+        saved key must resolve Pro or launch fails visibly; it is never silently
+        downgraded to public. If an Evomi proxy is
+        configured, it exits through that residential IP, which is recommended
+        for listing sites that block datacenter addresses. Without a proxy it
+        launches through this server's direct datacenter connection. A proxy
+        configuration that is present but incomplete, rejected, or unreachable
+        fails visibly and is never bypassed with a direct retry.
+
+        profile: a DURABLE identity. Cookies, logins, and local storage are kept
+            in the profile's own storage and survive across relaunches, so the
+            same profile name stays logged in to sites. Default to the same
+            profile ("Default") for continuity; use a NEW name only when you
+            deliberately want a clean, logged-out identity. Each profile keeps a
+            stable fingerprint and, when a proxy is configured, a sticky exit IP.
+        country/region: where the optional proxy should exit; ignored in direct mode.
+        geoip: with a proxy, match the browser's timezone and locale to the exit
+            IP. Leave true unless proxy geo resolution is failing. Direct mode
+            does not probe or geolocate the server, so these fields remain unknown.
+
+        In chat apps that show interactive views (Claude, ChatGPT), a live view
+        of this browser appears in the conversation, so the user can watch what
+        you do; it is view-only. Tell them they can take control from its "Take
+        control" button if a site needs them (a login, a code, a CAPTCHA).
+
+        Lifecycle: the browser closes itself after 15 minutes idle or 60 minutes
+        total, freeing its slot. The returned cdp_url is a Chrome DevTools Protocol
+        websocket carrying a short-lived token (~10 min): drive it with
+        agent_browser, or attach your own client — Playwright's
+        connectOverCDP(cdp_url). The token is minted fresh on every get_instance /
+        list_instances call, so if a connection drops, re-fetch the instance to get
+        a working cdp_url rather than reusing an old one.
+        """
+        subject = _subject(ctx)
+        inst = await app.state.instances.launch(
+            InstanceCreate(profile=profile, country=country, region=region, geoip=geoip),
+            origin="interactive", subject=subject,
+        )
+        return instance_view(inst, secret=app.state.secret.current(),
+                             base_url=_base_url(ctx), subject=subject)
+
+    # get_instance, with the live view attached. It returns exactly what
+    # get_instance does, so a client that cannot show the view still gets a
+    # vnc_url to hand the user — the graceful degradation SEP-2133 asks for.
+    @ui_tool(annotations=READ_ONLY)
+    async def show_browser(ctx: Context, instance_id: str) -> InstanceView:
+        """Show the user a live, view-only picture of a running browser in the chat.
+
+        Use when the user wants to watch or check on a browser — e.g. "show me",
+        "what is it doing". In chat apps that show interactive views (Claude,
+        ChatGPT) a live view appears with its activity and any downloaded files;
+        a view appears automatically after create_instance, so call this only to
+        bring one back. Elsewhere, give the user the returned vnc_url instead: it
+        opens the same view in their own browser.
+        """
+        inst = app.state.instances.get(instance_id)
+        if inst is None:
+            raise ValueError(
+                f"No running browser with instance_id={instance_id!r}. It may have been "
+                f"closed, or reaped after going idle."
+            )
+        return instance_view(inst, secret=app.state.secret.current(),
+                             base_url=_base_url(ctx), subject=_subject(ctx))
+
+    # App-only: the page polls this. Hidden from the model by any host that
+    # honours `visibility`; a client that does not, and calls it anyway, gets
+    # one frame and a sentence telling it this is not for it.
+    @ui_tool(annotations=READ_ONLY, visibility=["app"])
+    async def live_view(ctx: Context, instance_id: str, since: str = "") -> CallToolResult:
+        """Polled by the in-chat live view panel; not useful to call directly.
+
+        Returns the browser's status, address, title, recent activity and files,
+        and its latest frame when it differs from `since` (the frame_id the
+        panel already shows).
+        """
+        state, jpeg = await app.state.live_view.state(instance_id, _subject(ctx), since=since)
+        base = _base_url(ctx)
+        if state.get("status") != "closed":
+            state["files"] = _file_links(state.get("files") or [], base)
+            state["control_url"] = (
+                f"{base}/?view=browsers&instance={quote(instance_id, safe='')}" if base else None
+            )
+        content: list = [TextContent(
+            type="text",
+            text=(f"Live view of {instance_id}: {state.get('status')}. This tool feeds the "
+                  "in-chat panel; to look at the page yourself, use agent_browser."),
+        )]
+        if jpeg is not None:
+            content.append(ImageContent(type="image", mime_type="image/jpeg",
+                                        data=base64.b64encode(jpeg).decode("ascii")))
+        return CallToolResult(content=content, structured_content=state)
+
+    def _file_links(kept_files: list, base: str) -> list[dict]:
+        from .services.downloads import DownloadsError
+
+        links = []
+        for kept in kept_files:
+            try:
+                view = downloaded_file(kept, base_url=base)
+            except DownloadsError:
+                continue
+            links.append({"name": view.name, "bytes": view.bytes,
+                          "content_type": view.content_type,
+                          "expires_at": view.expires_at, "url": view.url})
+        return links
+
     mcp = MCPServer(
         "cloak-biz-scraper",
         instructions=INSTRUCTIONS,
@@ -206,6 +364,7 @@ def build(app) -> MCPServer:
         # version (the 1.x SDK reported its OWN version, 1.28.1, as ours — a
         # wrong answer to "what am I talking to" that a client cannot detect).
         version=__version__,
+        extensions=[apps],
     )
 
     def tool(**options):
@@ -297,54 +456,6 @@ def build(app) -> MCPServer:
         else — it never creates a page or edits a property.
         """
         return await app.state.archive.archive(url, notion_page_id)
-
-    # Closed-world despite launching a browser: the open-world capability is
-    # exercised by agent_browser, which is annotated for it. This call reaches
-    # only the geo probe's own echo services and the CloakBrowser artifact.
-    @tool(annotations=ADDITIVE)
-    async def create_instance(
-        ctx: Context, profile: str = "Default", country: str | None = None,
-        region: str | None = None, geoip: bool = True,
-    ) -> InstanceView:
-        """Launch a cloaked, anti-detection browser (CloakBrowser).
-
-        It carries a real, consistent browser fingerprint. With no CloakBrowser
-        key configured it deliberately runs the public build, which has fewer
-        bypasses and has not been tested by us against the listing sites. A
-        saved key must resolve Pro or launch fails visibly; it is never silently
-        downgraded to public. If an Evomi proxy is
-        configured, it exits through that residential IP, which is recommended
-        for listing sites that block datacenter addresses. Without a proxy it
-        launches through this server's direct datacenter connection. A proxy
-        configuration that is present but incomplete, rejected, or unreachable
-        fails visibly and is never bypassed with a direct retry.
-
-        profile: a DURABLE identity. Cookies, logins, and local storage are kept
-            in the profile's own storage and survive across relaunches, so the
-            same profile name stays logged in to sites. Default to the same
-            profile ("Default") for continuity; use a NEW name only when you
-            deliberately want a clean, logged-out identity. Each profile keeps a
-            stable fingerprint and, when a proxy is configured, a sticky exit IP.
-        country/region: where the optional proxy should exit; ignored in direct mode.
-        geoip: with a proxy, match the browser's timezone and locale to the exit
-            IP. Leave true unless proxy geo resolution is failing. Direct mode
-            does not probe or geolocate the server, so these fields remain unknown.
-
-        Lifecycle: the browser closes itself after 15 minutes idle or 60 minutes
-        total, freeing its slot. The returned cdp_url is a Chrome DevTools Protocol
-        websocket carrying a short-lived token (~10 min): drive it with
-        agent_browser, or attach your own client — Playwright's
-        connectOverCDP(cdp_url). The token is minted fresh on every get_instance /
-        list_instances call, so if a connection drops, re-fetch the instance to get
-        a working cdp_url rather than reusing an old one.
-        """
-        subject = _subject(ctx)
-        inst = await app.state.instances.launch(
-            InstanceCreate(profile=profile, country=country, region=region, geoip=geoip),
-            origin="interactive", subject=subject,
-        )
-        return instance_view(inst, secret=app.state.secret.current(),
-                             base_url=_base_url(ctx), subject=subject)
 
     @tool(annotations=READ_ONLY)
     async def list_profiles() -> list[ProfileView]:
