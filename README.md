@@ -76,6 +76,15 @@ https://github.com/user-attachments/assets/3c86899d-9f1b-4946-b1ca-4b11a53514b5
      block Railway's datacenter IP.
    - **Notion** — optional; needed only to save listings into a database.
 
+### Self-hosting without building
+
+Every release is also published as a ready-made image. To run it yourself (Docker,
+Compose, anything that pulls images), use
+`ghcr.io/thisnick/cloak-biz-scraper:release` — or, to stay on one version until you
+choose to move, the `image@sha256:…` digest printed at the end of that release's
+**Publish image** run. The image serves plain HTTP on `$PORT`; put TLS in front of it and
+set `APP_SECRET` exactly as on Railway, with a volume at `/data`.
+
 ## Costs
 
 Railway charges for the plan plus resource usage above the included amount. Its Hobby
