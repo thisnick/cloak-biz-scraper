@@ -413,7 +413,8 @@ That first response is expected. `scrape_listings` is asynchronous. The agent mu
 ### A listing was not returned after a synced sweep
 
 With `sync=true`, listings already present in Notion are counted as existing and omitted from
-the returned `listings` array. The scraper does not refresh the existing row.
+the returned `listings` array. On the existing row the scraper refreshes only `Last Synced At`
+and `Excerpt` (from the live card); every other column is left as it was.
 
 ### Archive succeeded, but the AI still cannot quote the page
 

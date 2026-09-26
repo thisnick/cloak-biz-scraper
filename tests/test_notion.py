@@ -482,7 +482,7 @@ class TestUpsertNew:
 
     @respx.mock
     @pytest.mark.asyncio
-    async def test_existing_rows_get_only_last_synced_at(self):
+    async def test_existing_rows_get_only_last_synced_at_and_the_excerpt(self):
         import json
 
         mock_db(FULL_SCHEMA)
@@ -490,12 +490,62 @@ class TestUpsertNew:
         patch = respx.patch(f"{API}/pages/p1").mock(
             return_value=httpx.Response(200, json={"id": "p1"})
         )
-        await NotionStore(TOKEN).upsert_new(DB, [listing()])
+        await NotionStore(TOKEN).upsert_new(
+            DB, [listing(excerpt="Price reduced; owner retiring.", asking_price="$900,000",
+                         location="Oakland, CA")],
+        )
 
         sent = json.loads(patch.calls[0].request.read())["properties"]
         # A Status the user moved to 'Review', a First Seen At, a note in their
-        # own column: none of it may be reset by a later sweep.
+        # own column: none of it may be reset by a later sweep. The excerpt is
+        # the exception — it is the card's own text, so it follows the card.
+        assert set(sent) == {"Last Synced At", "Excerpt"}
+        assert sent["Excerpt"] == {
+            "rich_text": [{"type": "text", "text": {"content": "Price reduced; owner retiring."}}]
+        }
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_an_empty_snippet_never_blanks_a_stored_excerpt(self):
+        import json
+
+        mock_db(FULL_SCHEMA)
+        mock_query([row("p1", "2485121", "bizbuysell.com/business-opportunity/foo/2485121")])
+        patch = respx.patch(f"{API}/pages/p1").mock(
+            return_value=httpx.Response(200, json={"id": "p1"})
+        )
+        await NotionStore(TOKEN).upsert_new(DB, [listing(excerpt="")])
+
+        sent = json.loads(patch.calls[0].request.read())["properties"]
         assert list(sent) == ["Last Synced At"]
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_the_excerpt_refreshes_without_a_last_synced_at_column(self):
+        import json
+
+        # With no Last Synced At to write, a known row used to cost no request at
+        # all; the refreshed excerpt is now its one PATCH.
+        mock_db({**MINIMAL_SCHEMA, "Excerpt": FULL_SCHEMA["Excerpt"]})
+        mock_query([row("p1", "2485121", "bizbuysell.com/business-opportunity/foo/2485121")])
+        patch = respx.patch(f"{API}/pages/p1").mock(
+            return_value=httpx.Response(200, json={"id": "p1"})
+        )
+        await NotionStore(TOKEN).upsert_new(DB, [listing(excerpt="New lease signed.")])
+
+        sent = json.loads(patch.calls[0].request.read())["properties"]
+        assert list(sent) == ["Excerpt"]
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_a_known_row_with_nothing_to_refresh_costs_no_request(self):
+        # Neither refreshed column exists: the known row is counted and left alone,
+        # without a PATCH carrying no properties.
+        mock_db(MINIMAL_SCHEMA)
+        mock_query([row("p1", "2485121", "bizbuysell.com/business-opportunity/foo/2485121")])
+        result = await NotionStore(TOKEN).upsert_new(DB, [listing(excerpt="Anything.")])
+        assert (result.new, result.existing) == (0, 1)
+        assert not [c for c in respx.calls if c.request.method == "PATCH"]
 
     @respx.mock
     @pytest.mark.asyncio
@@ -972,6 +1022,41 @@ class TestMappedTouch:
         sent = json.loads(patch.calls[0].request.read())["properties"]
         assert list(sent) == ["Updated"]
         assert "start" in sent["Updated"]["date"]
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_existing_row_refreshes_the_mapped_excerpt_column(self):
+        import json
+
+        # RENAMED_MAP writes no Last Synced At, so the mapped excerpt ("Notes") is
+        # the only thing a known row gets — and nothing else the map names.
+        mock_db(RENAMED)
+        mock_query([mapped_row("p1", {
+            "Ref": ("rich_text", "2485121"),
+            "Canonical": ("rich_text", "bizbuysell.com/business-opportunity/foo/2485121"),
+        })])
+        patch = respx.patch(f"{API}/pages/p1").mock(return_value=httpx.Response(200, json={"id": "p1"}))
+        m = {**RENAMED_MAP, "excerpt": "Notes"}
+        await NotionStore(TOKEN).upsert_new(
+            DB, [listing(excerpt="Seller financing available.", asking_price="$1,000,000")],
+            column_map=m,
+        )
+        sent = json.loads(patch.calls[0].request.read())["properties"]
+        assert sent == {
+            "Notes": {"rich_text": [{"type": "text", "text": {"content": "Seller financing available."}}]}
+        }
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_an_excerpt_set_to_dont_sync_is_not_refreshed(self):
+        mock_db(RENAMED)
+        mock_query([mapped_row("p1", {
+            "Ref": ("rich_text", "2485121"),
+            "Canonical": ("rich_text", "bizbuysell.com/business-opportunity/foo/2485121"),
+        })])
+        m = {**RENAMED_MAP, "excerpt": None}
+        await NotionStore(TOKEN).upsert_new(DB, [listing(excerpt="Not for Notes.")], column_map=m)
+        assert not [c for c in respx.calls if c.request.method == "PATCH"]
 
 
 class TestMapRows:
