@@ -376,6 +376,8 @@ def build(app) -> MCPServer:
 
     # Annotated for sync=true, because an annotation cannot vary by argument:
     # sync=false only reads, but the same tool writes Notion rows when asked to.
+    # Still not destructive in the sense above: on a row it already has, it
+    # rewrites only its own Last Synced At and Excerpt, from the live card.
     @tool(annotations=ADDITIVE_OPEN_WORLD)
     async def scrape_listings(
         urls: list[str], max_pages: int = 1, sync: bool = False
