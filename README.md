@@ -225,7 +225,8 @@ A sweep is asynchronous: collect it with `get_scrape_listing_results`. With `syn
 the completed result contains every listing found and does not use Notion. With
 `sync=true`, it writes only new rows to the Notion database configured in Settings and
 returns only those newly inserted listings, each with a `synced_row_id` suitable for
-`archive_page`; existing rows are counted under `synced.existing`. Money fields are the
+`archive_page`; existing rows are counted under `synced.existing`, and only their
+`Last Synced At` and `Excerpt` columns are refreshed. Money fields are the
 verbatim strings shown on the listing card (`"$1,258,000"`, `"Not Disclosed"`) and are
 parsed into numbers only when written to Notion.
 

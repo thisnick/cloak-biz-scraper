@@ -135,10 +135,11 @@ class NotionProp:
     render: Callable[[Any], dict[str, Any] | None] | None = None
     # Read back out of a page — only needed for the dedupe keys.
     extract: Callable[[dict[str, Any]], str] | None = None
-    # Written when the row is created and never touched again, so that a user's
-    # own edits (a Status they changed, a First Seen At) are not reset by a
-    # later sweep.
-    insert_only: bool = False
+    # Rewritten on a row that is already stored, each time a sweep sees the
+    # listing again. Everything else is written when the row is created and
+    # never touched again, so that a user's own edits (a Status they changed, a
+    # First Seen At) are not reset by a later sweep.
+    refresh: bool = False
 
 
 def _plain(prop: dict[str, Any]) -> str:
@@ -226,11 +227,16 @@ KNOWN_PROPS: tuple[NotionProp, ...] = (
         "ebitda", "EBITDA", "number", False, {"number": {"format": "dollar"}},
         source="ebitda", render=_money, consequence=_MONEY_CONSEQUENCE,
     ),
+    # Refreshed, unlike the other listing fields: it is the sweep's own reading
+    # of the live card rather than anything a user types, so a known row should
+    # say what the card says now — a rewritten description, a price cut spelled
+    # out in the text. An empty snippet renders to None and never blanks one.
     NotionProp(
         "excerpt", "Excerpt", "rich_text", False, {"rich_text": {}}, source="excerpt",
-        render=lambda v: {"rich_text": _text_chunk(v)} if v else None,
+        render=lambda v: {"rich_text": _text_chunk(v)} if v else None, refresh=True,
         consequence="The card's own summary text — extracted on every sweep but only "
-                    "saved when this is mapped to a column. Everything else still syncs.",
+                    "saved when this is mapped to a column, where each sweep refreshes "
+                    "it from the live card. Everything else still syncs.",
     ),
     NotionProp(
         "status", "Status", "select", False,
@@ -239,18 +245,18 @@ KNOWN_PROPS: tuple[NotionProp, ...] = (
             {"name": "Review", "color": "yellow"},
             {"name": "Rejected", "color": "red"},
         ]}},
-        render=lambda v: {"select": {"name": "New"}}, insert_only=True,
+        render=lambda v: {"select": {"name": "New"}},
         consequence="New listings will not be marked 'New', so you lose the triage "
                     "workflow but not the listings.",
     ),
     NotionProp(
         "first_seen_at", "First Seen At", "date", False, {"date": {}},
-        render=lambda v: {"date": {"start": _now_iso()}}, insert_only=True,
+        render=lambda v: {"date": {"start": _now_iso()}},
         consequence="You will not see when a listing first appeared.",
     ),
     NotionProp(
         "last_synced_at", "Last Synced At", "date", False, {"date": {}},
-        render=lambda v: {"date": {"start": _now_iso()}},
+        render=lambda v: {"date": {"start": _now_iso()}}, refresh=True,
         consequence="You will not be able to tell a listing that is still live from one "
                     "that has come off the market.",
     ),
@@ -787,7 +793,7 @@ class NotionStore:
         """
         out: dict[str, Any] = {}
         for prop in KNOWN_PROPS:
-            if prop.insert_only and not insert:
+            if not (insert or prop.refresh):
                 continue
             col = column_map.get(prop.key)
             if not col:
@@ -816,7 +822,7 @@ class NotionStore:
         """
         out: dict[str, Any] = {}
         for prop in KNOWN_PROPS:
-            if prop.insert_only and not insert:
+            if not (insert or prop.refresh):
                 continue
             found = actual.get(prop.name)
             if found is None or found.get("type") != prop.type or prop.render is None:
@@ -827,37 +833,35 @@ class NotionStore:
                 out[prop.name] = rendered
         return out
 
-    def _touch_property(
-        self, column_map: ColumnMap | None, actual: dict[str, Any]
-    ) -> tuple[str | None, dict[str, Any] | None]:
-        """The one property written on an already-known row: Last Synced At.
+    def _properties(
+        self, listing: Listing, actual: dict[str, Any], column_map: ColumnMap | None,
+        *, insert: bool,
+    ) -> dict[str, Any]:
+        """A listing's properties for a new row (`insert`) or a known one.
 
-        Under a map, the value adapts to whatever column it lands in. Under
-        identity it stays strict — the column must be an actual Date — so the
-        legacy behaviour (skip a mistyped Last Synced At rather than write text
-        into it) is preserved for a database with no stored map."""
+        A known row gets only the `refresh` columns. Both go through the same
+        renderer, so a known row is written exactly where a new one would be:
+        under a map the value adapts to whatever column it lands in; under
+        identity the type must match, so a mistyped Last Synced At is skipped
+        rather than written as text."""
         if column_map:
-            col = column_map.get("last_synced_at")
-            if not col or col not in actual:
-                return col, None
-            payload = _format_for_type(actual[col].get("type", ""), _now_iso(), timestamp=True)
-            return col, payload
-        touch = PROPS_BY_NAME["Last Synced At"]
-        if touch.name in actual and actual[touch.name].get("type") == touch.type:
-            return touch.name, touch.render(None)
-        return touch.name, None
+            return self._properties_for_mapped(listing, actual, column_map, insert=insert)
+        return self._properties_for(listing, actual, insert=insert)
 
     async def upsert_new(
         self, db_id: str, listings: list[Listing], column_map: ColumnMap | None = None
     ) -> UpsertResult:
-        """Insert listings that are not already there; touch nothing else.
+        """Insert listings that are not already there; on known rows, refresh only
+        what the sweep owns outright.
 
-        Existing rows get exactly one property written — `Last Synced At`, which
-        the schema defines as "set on every sync" and which is the only thing
-        making a stale listing distinguishable from a live one. Every other
-        column on an existing row, ours or the user's, is left alone: a Status
-        moved to 'Review' or a note typed into a column we have never heard of
-        survives every sweep.
+        Existing rows get only the `refresh` columns written: `Last Synced At`,
+        which the schema defines as "set on every sync" and which is the only
+        thing making a stale listing distinguishable from a live one, and the
+        `Excerpt`, so the row says what the card says now. Every other column on
+        an existing row, ours or the user's, is left alone: a Status moved to
+        'Review' or a note typed into a column we have never heard of survives
+        every sweep. The refresh rides the one PATCH a known row already cost,
+        so it adds no request unless Last Synced At is not being written.
 
         A column at a type we do not write is skipped, not fought over, and the
         skip is reported. This is the common case, not an exotic one: anyone who
@@ -881,28 +885,20 @@ class NotionStore:
         # The listings actually inserted, each stamped with the page id Notion
         # minted for it, so the caller can file the fresh rows without re-querying.
         new_listings: list[Listing] = []
-        touch_col, touch_payload = self._touch_property(column_map, actual)
-        can_touch = touch_payload is not None
-
         for listing in listings:
             if index.contains(listing):
                 existing += 1
-                if not can_touch:
-                    continue
                 row = by_listing_id.get(listing.listing_id) or by_url.get(listing.normalized_url)
-                if row:
+                if not row:
+                    continue
+                refreshed = self._properties(listing, actual, column_map, insert=False)
+                if refreshed:
                     await self._client.request(
-                        "PATCH",
-                        f"/pages/{row.page_id}",
-                        json={"properties": {touch_col: touch_payload}},
+                        "PATCH", f"/pages/{row.page_id}", json={"properties": refreshed},
                     )
                 continue
 
-            props = (
-                self._properties_for_mapped(listing, actual, column_map, insert=True)
-                if column_map
-                else self._properties_for(listing, actual, insert=True)
-            )
+            props = self._properties(listing, actual, column_map, insert=True)
             created = await self._client.request(
                 "POST",
                 "/pages",
