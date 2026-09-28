@@ -104,7 +104,7 @@
    "group": [
     "sunbeltnetwork.com/"
    ],
-   "min_cards": 15,
+   "min_cards": 8,
    "next": "click"
   },
   {
@@ -128,8 +128,8 @@
    "group": [
     "synergybb.com/listings/"
    ],
-   "min_cards": 25,
-   "next": "none"
+   "min_cards": 15,
+   "next": "click"
   },
   {
    "name": "FEInternational (landing page)",

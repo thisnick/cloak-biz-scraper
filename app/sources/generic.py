@@ -10,7 +10,9 @@ adapter for, a page seen once. It reads a page in two halves.
   always, many links of one shape. Each link's card is the largest element
   around it that holds no other link of its group, and a card's text is split
   into fields: `label → value` where the card labels them, a DOM slot where it
-  does not. Next-page candidates are collected the same way.
+  does not. Next-page candidates are collected the same way. Before the probe
+  runs, the page is scrolled to its bottom and back, so lazily rendered cards
+  and pagers are there to be found.
 * **What code cannot see, the TypeSafe Classifier (e.g. Jev) decides**: which
   group is the list of businesses for sale (and not the menu, the footer, or a
   "similar listings" rail), what each field holds, which statuses mean the
@@ -18,7 +20,10 @@ adapter for, a page seen once. It reads a page in two halves.
   is ONE request per page — the classifier reads the state once and answers
   every question in it, so a request per field or per link would pay for the
   same reading many times. (Measured on 2026-09-28: bundled answers were as
-  accurate as separate ones.)
+  accurate as separate ones.) The rest of a chosen list — a second link shape
+  on the same tiles, or the detail links behind an "Unlock"/"Watch" group — is
+  then found from the probe's own evidence, without asking again
+  (`_whole_list`).
 
 **Every decision is made fresh on every page**, and nothing is kept between
 sweeps: a site that changes its layout is read by its new layout, not with last
@@ -37,9 +42,11 @@ BizBuySell's listing 1234.
 from __future__ import annotations
 
 import asyncio
+import collections
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
@@ -64,6 +71,10 @@ MIN_GROUP_LINKS = 3
 MAX_CHROME = 0.8
 # Candidate groups offered to the classifier, the biggest (links × text) first.
 MAX_CANDIDATES = 12
+# Another candidate is more of the chosen list when its cards are the same tile
+# in the same element and share at least this much of their fields (Sunbelt's
+# two link shapes: 1.0; a franchise ad slotted into BizQuest's list: 0.36).
+SAME_LIST_FIELDS = 0.75
 # A card field is asked about when at least this share of cards has it.
 FIELD_PRESENCE = 0.3
 # A field fills a Listing only at this confidence; below it the field is left
@@ -81,6 +92,21 @@ MAX_NEXT_LINKS = 12
 # blocker phrase in its body ("just a moment's walk from the beach") is only
 # believed when the page also has no list on it.
 _BLOCK_BODY_CHARS = 5000
+# Before it is read, a page is scrolled to the bottom in steps and back, so
+# cards and pagers that only render when scrolled into view are on it
+# (BusinessBroker.net showed 23 of its 53 listings unscrolled; BizQuest's page-2
+# link never appeared). A step waits for what it revealed to load; the scroll
+# stops at a bottom that no longer grows, or at the bounds, so a feed that
+# grows forever costs at most SCROLL_BUDGET_S.
+SCROLL_STEP_PX = 2500
+SCROLL_PAUSE_MS = 800
+SCROLL_MAX_STEPS = 10
+SCROLL_BUDGET_S = 10.0
+_JS_SCROLL_STATE = (
+    "() => [window.scrollY, window.innerHeight, Math.max("
+    "document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0)]"
+)
+_JS_SCROLL_TOP = "() => window.scrollTo(0, 0)"
 
 _GROUP_EXAMPLE_CHARS = 260
 _CARD_EXAMPLE_CHARS = 400
@@ -90,11 +116,15 @@ _TITLE_MAX_CHARS = 150
 # The questions, exactly as measured on 2026-09-28 (the listing-group question
 # picked the right group on 18/18 pages × 3 shuffles, "none" on the pages that
 # had no list). The state each one reads is built next to where it is asked.
+# The listing-group question's last sentence was added after the live gate,
+# where single-listing pages picked their "similar listings" rail.
 GROUP_QUESTION = (
     "This page is from a website that lists businesses for sale. The links on the page have "
     "been grouped by URL pattern, and each example is the text of the card or block around one "
     "link in that group. Which group is the page's list of businesses for sale, where each item "
-    "is a different business being offered?"
+    "is a different business being offered? A small 'similar listings', 'you may also like' or "
+    "'recently viewed' section beside a single business's details is not the page's list — "
+    "answer none for a page that is mainly about one business."
 )
 GROUP_NONE = "None of these groups is a list of businesses for sale"
 FIELD_QUESTION = (
@@ -134,7 +164,10 @@ _LISTING_FIELD = {
 #    mostly unique (slugs, ids) is a wildcard `{*}`. That is what joins a list
 #    whose slugs happen to contain digits with the rest of it (BizQuest's 37+13,
 #    Liberty's 9+3) while still keeping /listing-property/… apart from
-#    /silicon-valley/… on the same site.
+#    /silicon-valley/… on the same site. At a wildcard, ids ("12899223-…",
+#    "1012838.aspx") and plain words ("websites") are split when each side has
+#    three or more, the ids as `{id}`: Flippa's listings sit at the site root
+#    beside its menu. A link with and without its trailing slash is one link.
 # 2. A link's card is its largest ancestor holding no other link of the group
 #    (brought back down to its siblings' shape when a neighbouring tile has no
 #    link to stop it — Liberty's sold tiles). Its text is split into lines
@@ -143,19 +176,23 @@ _LISTING_FIELD = {
 #    when it sits close by. Values are keyed by their label's text — not by
 #    position, because cards drop a field when they have no value for it
 #    (FCBB), which shifts every position after it — and unlabelled lines by
-#    their DOM path.
+#    their DOM path. Each group also reports the shape most of its cards have
+#    (tag and stable classes) and the elements they sit in, which is how two
+#    groups are seen to be one list (Sunbelt's two link shapes).
 # 3. Next-page candidates: rel=next, Next/›/»/Load more, and the next page
-#    number inside a pager. Each clickable one is marked data-cbs-next="<id>" so
-#    a script-only control (href="#", a button) can be clicked from Python.
+#    number inside a pager — but not a carousel's arrows and dots. Each
+#    clickable one is marked data-cbs-next="<id>" so a script-only control
+#    (href="#", a button) can be clicked from Python.
 #
 # Called with {next_number, patterns} (the page number to look for in a pager,
 # and any pinned listing patterns). Returns JSON:
 #   {url, title, body (first 5000 chars), body_chars,
 #    groups: [{pattern, links, chrome, text_chars, varying_keys, paths_unique,
-#              examples, cards}],   biggest (links × text) first
+#              card_shape, containers, examples, cards}],   biggest (links × text) first
 #    pager:  [{id, url|null, script_only, numbered, appears_as, selector}]}
 # where `cards` is null except for the top 12 non-chrome groups and pinned ones:
-#   [{card, href, hrefs, link_text, heading, text, excerpt, labeled, slots}]
+#   [{card, pos, href, hrefs, link_text, heading, text, excerpt, labeled, slots}]
+# (`pos` is the card's link's place among the page's links: page order).
 JS_PROBE = r"""
 (args) => {
   const opts = args || {};
@@ -179,25 +216,53 @@ JS_PROBE = r"""
   };
 
   // ── 1. links, grouped by URL shape ──
+  // A link with and without a trailing slash is one link (Empire Flippers
+  // prints both on every card). Counted as two, every id would look like a
+  // value repeated across links — a literal — and each card would stop at its
+  // own second link.
+  const keyOf = (u) => u.origin + u.pathname.replace(/\/+$/, '') + u.search;
   const hrefOf = new Map();
-  const byHref = new Map();
+  const keyOfA = new Map();
+  const byLink = new Map();
+  const anchorPos = new Map();
   for (const a of document.querySelectorAll('a[href]')) {
+    anchorPos.set(a, anchorPos.size);
     const u = resolve(a.getAttribute('href'));
     if (!u || !/^https?:$/.test(u.protocol)) continue;
+    const k = keyOf(u);
     hrefOf.set(a, u.href);
+    keyOfA.set(a, k);
     if (isHere(u)) continue;
-    if (!byHref.has(u.href)) byHref.set(u.href, { u, anchors: [] });
-    byHref.get(u.href).anchors.push(a);
+    if (!byLink.has(k)) byLink.set(k, { href: u.href, u, anchors: [] });
+    byLink.get(k).anchors.push(a);
   }
   const coarse = new Map();
-  for (const [href, item] of byHref) {
+  for (const [k, item] of byLink) {
     const u = item.u;
     const segs = u.pathname.split('/').filter(Boolean).map((s) => s.toLowerCase());
-    const keys = [...new Set([...u.searchParams.keys()].filter((k) => !TRACKING.test(k)))].sort();
-    const key = `${u.host}|${segs.length}|${keys.join('&')}`;
-    if (!coarse.has(key)) coarse.set(key, { host: u.host, n: segs.length, keys, items: [] });
-    coarse.get(key).items.push({ href, u, segs, host: u.host, keys: keys.join('&') });
+    const keys = [...new Set([...u.searchParams.keys()].filter((q) => !TRACKING.test(q)))].sort();
+    const shape = `${u.host}|${segs.length}|${keys.join('&')}`;
+    if (!coarse.has(shape)) coarse.set(shape, { host: u.host, n: segs.length, keys, items: [] });
+    coarse.get(shape).items.push({ key: k, href: item.href, u, segs, host: u.host, keys: keys.join('&') });
   }
+  // At a wildcard position, ids ("12899223-a-branded-…", "1012838.aspx",
+  // "bw2452180", "…-flowing-59917") do not merge with plain words ("websites",
+  // "about") when each side has three or more: that is a site's listings next
+  // to its menu (Flippa), not one list. The ids become `{id}`. A slug that
+  // merely contains a number stays with the words — BizQuest's
+  // "3-tahoe-area-laundromats-for-sale" is the same list as "flooring-store".
+  const ID = /^(?:\d+|[a-z]{1,3}-?\d{4,}|\d{5,}[-_].*|.*[-_]\d{5,})(?:\.[a-z]{2,5})?$/;
+  const WORD = /^\D+$/;
+  const wild = (items, depth, parts, n, out) => {
+    const ids = items.filter((it) => ID.test(it.segs[depth]));
+    const words = items.filter((it) => WORD.test(it.segs[depth]));
+    if (ids.length >= 3 && words.length >= 3) {
+      refine(ids, depth + 1, parts.concat(['{id}']), n, out);
+      refine(items.filter((it) => !ID.test(it.segs[depth])), depth + 1, parts.concat(['{*}']), n, out);
+      return;
+    }
+    refine(items, depth + 1, parts.concat(['{*}']), n, out);
+  };
   const refine = (items, depth, parts, n, out) => {
     if (depth === n) { out.push({ parts, items }); return; }
     const counts = new Map();
@@ -208,10 +273,10 @@ JS_PROBE = r"""
         if (c >= 2) refine(items.filter((it) => it.segs[depth] === value), depth + 1, parts.concat([value]), n, out);
       }
       const rest = items.filter((it) => counts.get(it.segs[depth]) === 1);
-      if (rest.length) refine(rest, depth + 1, parts.concat(['{*}']), n, out);
+      if (rest.length) wild(rest, depth, parts, n, out);
       return;
     }
-    refine(items, depth + 1, parts.concat(['{*}']), n, out);
+    wild(items, depth, parts, n, out);
   };
   const raw = [];
   for (const c of coarse.values()) {
@@ -238,7 +303,8 @@ JS_PROBE = r"""
     for (const c of coarse.values()) {
       for (const it of c.items) {
         if (it.host === host && it.keys === keys && it.segs.length === segs.length
-            && segs.every((s, i) => s === '{*}' || s === it.segs[i])) items.push(it);
+            && segs.every((s, i) => s === '{*}' || (s === '{id}' && ID.test(it.segs[i]))
+                                    || s === it.segs[i])) items.push(it);
       }
     }
     if (items.length) raw.push({ pattern: p, keys: keys ? keys.split('&') : [], items });
@@ -254,13 +320,13 @@ JS_PROBE = r"""
     const h = el.closest('header');
     return !!h && !h.closest('main, article, [role=main]');
   };
-  const cardFor = (a, hrefSet, mine) => {
+  const cardFor = (a, keySet, mine) => {
     let node = a;
     for (let p = node.parentElement; p && p !== document.body && p !== document.documentElement; p = p.parentElement) {
       let other = false;
       for (const x of p.querySelectorAll('a[href]')) {
-        const h = hrefOf.get(x);
-        if (h && h !== mine && hrefSet.has(h)) { other = true; break; }
+        const h = keyOfA.get(x);
+        if (h && h !== mine && keySet.has(h)) { other = true; break; }
       }
       if (other) break;
       node = p;
@@ -284,23 +350,41 @@ JS_PROBE = r"""
       }
     }
   };
+  // The element a group's cards sit in, named so that two groups can be seen
+  // to share it (Sunbelt's one list whose cards link two ways).
+  const listIds = new Map();
+  const listOf = (el) => {
+    if (!el) return null;
+    if (!listIds.has(el)) listIds.set(el, 'l' + (listIds.size + 1));
+    return listIds.get(el);
+  };
   const groups = [];
   for (const g of raw) {
     // One link has no neighbour to bound its card, which would grow to the
     // whole page; below three, only a pinned pattern is worth reading.
     if (g.items.length < (wanted.has(g.pattern) ? 2 : 3)) continue;
-    const hrefSet = new Set(g.items.map((it) => it.href));
+    const keySet = new Set(g.items.map((it) => it.key));
     const cards = g.items.map((it) => {
-      const anchor = byHref.get(it.href).anchors[0];
-      return { href: it.href, anchor, el: cardFor(anchor, hrefSet, it.href) };
+      const anchor = byLink.get(it.key).anchors[0];
+      return { href: it.href, key: it.key, anchor, el: cardFor(anchor, keySet, it.key) };
     });
     align(cards);
     let chrome = 0, chars = 0;
+    const shapes = new Map();
     for (const c of cards) {
       c.text = clean(c.el.innerText || c.el.textContent);
       if (inChrome(c.el)) chrome++;
       chars += Math.min(c.text.length, 1000);
+      shapes.set(sig(c.el), (shapes.get(sig(c.el)) || 0) + 1);
     }
+    // The card's shape (tag and stable classes) most cards have, and the
+    // elements those cards sit in.
+    let shape = null, most = 0;
+    for (const [k, count] of shapes) if (count > most) { shape = k; most = count; }
+    if (most * 2 < cards.length) shape = null;
+    const containers = shape
+      ? [...new Set(cards.filter((c) => sig(c.el) === shape).map((c) => listOf(c.el.parentElement)))]
+      : [];
     const varying = g.keys.filter((k) => new Set(g.items.map((it) => it.u.searchParams.get(k))).size > 1);
     const paths = new Set(g.items.map((it) => it.u.host + it.u.pathname.replace(/\/+$/, '')));
     groups.push({
@@ -310,6 +394,8 @@ JS_PROBE = r"""
       text_chars: Math.round(chars / cards.length),
       varying_keys: varying,
       paths_unique: paths.size === g.items.length,
+      card_shape: shape,
+      containers: containers.filter(Boolean),
       examples: cards.slice(0, 3).map((c) => c.text.slice(0, 300)),
       _cards: cards,
     });
@@ -478,22 +564,27 @@ JS_PROBE = r"""
       let linkText = '';
       const own = c.el.matches('a[href]') ? [c.el, ...c.el.querySelectorAll('a[href]')] : [...c.el.querySelectorAll('a[href]')];
       for (const a of own) {
-        if (hrefOf.get(a) !== c.href) continue;
+        if (keyOfA.get(a) !== c.key) continue;
         const t = clean(a.innerText || a.textContent) || clean(a.getAttribute('title')) || clean(a.getAttribute('aria-label'));
         if (t.length > linkText.length) linkText = t;
       }
       const h = c.el.querySelector('h1, h2, h3, h4, h5, h6') || c.el.querySelector('[class*=title i]');
       const host = new URL(c.href).host;
       const hrefs = [];
+      const listed = new Set();
       for (const a of own) {
         const x = hrefOf.get(a);
-        if (x && new URL(x).host === host && !hrefs.includes(x)) hrefs.push(x);
+        if (x && new URL(x).host === host && !listed.has(keyOfA.get(a))) {
+          listed.add(keyOfA.get(a));
+          hrefs.push(x);
+        }
         if (hrefs.length >= 20) break;
       }
       let excerpt = c.text;
       try { if (window.__cbsMarkdown) excerpt = window.__cbsMarkdown(c.el.innerHTML).trim(); } catch (_) {}
       return {
         card: c.el.getAttribute('data-cbs-card'),
+        pos: anchorPos.get(c.anchor),
         href: c.href,
         hrefs,
         link_text: linkText.slice(0, 500),
@@ -546,9 +637,13 @@ JS_PROBE = r"""
     const note = inPager && how !== 'rel=next' ? `${how} (in a pagination block)` : how;
     if (!cand.appears_as.includes(note)) cand.appears_as.push(note);
   };
+  // A carousel's own Next arrow and numbered dots (Empire Flippers'
+  // testimonials) turn the carousel, never the page.
+  const CAROUSEL = '[class*=carousel i], [class*=slick-slider], [class*=swiper], .glide, .splide, .flickity-enabled, [aria-roledescription=carousel i]';
   for (const l of document.querySelectorAll('link[rel~=next][href], a[rel~=next]')) add(l, 'rel=next');
   for (const el of document.querySelectorAll('a, button, [role=button], [role=link]')) {
     if (pager.length >= 30) break;
+    if (el.closest(CAROUSEL)) continue;
     const t = clean(el.innerText || el.textContent);
     const aria = clean(el.getAttribute('aria-label') || el.getAttribute('title'));
     if (t && NEXT.test(t)) add(el, `text '${t.slice(0, 40)}'`);
@@ -678,6 +773,7 @@ class GenericSource:
         record: dict[str, Any] = {"page": n, "url": getattr(page, "url", "") or self.url}
         self.decisions.append(record)
 
+        await _scroll_through(page)
         await extract.inject(page)
         links = list(self.override.listing_links) if self.override else []
         raw = await page.evaluate(JS_PROBE, {"next_number": n + 1, "patterns": links})
@@ -775,12 +871,17 @@ class GenericSource:
             state, {"listing_group": {"type": "choice", "instructions": GROUP_QUESTION,
                                       "criteria": criteria}}), "listing_group")
         picked = options.get(answer.choice)
+        chosen, same, replaced = _whole_list(picked, candidates) if picked else ([], [], None)
         record["listing_links"] = {
-            "by": "jev", "patterns": [picked["pattern"]] if picked else [],
+            "by": "jev", "patterns": [g["pattern"] for g in chosen],
             "confidence": round(answer.confidence, 3), "model": answer.model,
             "candidates": len(candidates),
         }
-        return [picked] if picked else []
+        if same:
+            record["listing_links"]["same_list"] = same
+        if replaced:
+            record["listing_links"]["instead_of"] = replaced
+        return chosen
 
     async def _decide_fields(self, cards: list[_Card], title: str,
                              record: dict) -> tuple[dict[str, tuple[str, float]], set[str]]:
@@ -930,7 +1031,7 @@ class GenericSource:
             filled[target] = value
             best[target] = confidence
         if not filled.get("title"):
-            filled["title"] = _fallback_title(card.raw)
+            filled["title"] = _fallback_title(card.raw) or _described_title(card, roles)
         return Listing(
             listing_id="",
             url=card.url,
@@ -1003,6 +1104,38 @@ class GenericSource:
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 
+async def _scroll_through(page) -> int:
+    """Scroll to the bottom in steps, then back to the top; the steps taken.
+
+    Stops at a bottom that did not grow during the last step, after
+    SCROLL_MAX_STEPS steps, or once SCROLL_BUDGET_S has passed. Scrolling is a
+    help, not a requirement: a page that cannot be scrolled is read as it is.
+    """
+    started = time.monotonic()
+    steps = 0
+    try:
+        state = await page.evaluate(_JS_SCROLL_STATE)
+        if not state:
+            return 0
+        height = state[2]
+        await page.mouse.move(640, 400)
+        while steps < SCROLL_MAX_STEPS and time.monotonic() - started < SCROLL_BUDGET_S:
+            await page.mouse.wheel(0, SCROLL_STEP_PX)
+            await page.wait_for_timeout(SCROLL_PAUSE_MS)
+            steps += 1
+            state = await page.evaluate(_JS_SCROLL_STATE)
+            if not state:
+                break
+            top, view, grown = state
+            if top + view >= grown - 2 and grown == height:
+                break
+            height = grown
+        await page.evaluate(_JS_SCROLL_TOP)
+    except Exception as exc:  # noqa: BLE001 — an unscrollable page is still read
+        logger.info("generic: could not scroll %s: %s", getattr(page, "url", ""), exc)
+    return steps
+
+
 def _candidates(groups: list[dict]) -> list[dict]:
     """The groups worth offering as the page's list, biggest first."""
     usable = [g for g in groups
@@ -1011,6 +1144,132 @@ def _candidates(groups: list[dict]) -> list[dict]:
               and g.get("cards")]
     usable.sort(key=lambda g: -int(g.get("links") or 0) * int(g.get("text_chars") or 0))
     return usable[:MAX_CANDIDATES]
+
+
+def _whole_list(picked: dict, candidates: list[dict]) -> tuple[list[dict], list[str], str | None]:
+    """The chosen group and the rest of its list, read through detail links.
+
+    The classifier picks one group, but a list is not always one group:
+
+    * **One list, two link shapes** (Sunbelt: half its cards link to
+      `/business-search/business-details/…`, half to `/<office>/…/listing-details/…`).
+      A candidate whose cards are the same tile (`card_shape`), in the same
+      element, with the same fields, is the rest of the list, and is read with
+      it — decided here, without asking again.
+    * **An action link** ("Watch", "Unlock Listing") on every card is a group of
+      its own, and can be the one picked (Flippa's `watch_item?…`, whose every
+      "title" was "Watch"). When another group links the same cards, those
+      links are the listings' addresses and titles; the action group only
+      adds what they do not cover.
+
+    Returns (groups to read, patterns read as the same list, the picked pattern
+    when it was an action link replaced by the detail links).
+    """
+    same = [g for g in candidates if g is not picked and _one_list(picked, g)]
+    groups = [picked, *same]
+    if _looks_like_action(picked) and not any(
+            _covers(g, picked) >= 0.5 for g in groups if not _looks_like_action(g)):
+        partner = next((g for g in candidates
+                        if g not in groups and not _looks_like_action(g)
+                        and _covers(g, picked) >= 0.5), None)
+        if partner is not None:
+            groups.append(partner)
+    details = [g for g in groups if not _looks_like_action(g)]
+    kept = []
+    for g in groups:
+        # An action group whose every card a detail group reads adds nothing.
+        if _looks_like_action(g) and details and _covers_all(details, g):
+            continue
+        kept.append(g)
+    replaced = picked["pattern"] if picked not in kept else None
+    return kept, [g["pattern"] for g in kept[1:] if g in same], replaced
+
+
+def _one_list(group: dict, other: dict) -> bool:
+    """Whether `other`'s cards are more of `group`'s list: same tile, same place, same fields."""
+    shape = group.get("card_shape")
+    if not shape or other.get("card_shape") != shape:
+        return False
+    if not set(group.get("containers") or []) & set(other.get("containers") or []):
+        return False
+    mine, theirs = _template(group), _template(other)
+    if not mine or not theirs:
+        return False
+    return len(mine & theirs) / len(mine | theirs) >= SAME_LIST_FIELDS
+
+
+def _template(group: dict) -> set[str]:
+    """The field keys (labels and slots) on at least half of a group's cards."""
+    cards = group.get("cards") or []
+    counts: dict[str, int] = {}
+    for card in cards:
+        for bucket in ("labeled", "slots"):
+            for key in card.get(bucket) or {}:
+                counts[key] = counts.get(key, 0) + 1
+    return {k for k, n in counts.items() if n * 2 >= len(cards)}
+
+
+# Words that make a link an action on a listing rather than its page, at the
+# start of a link's text or as a literal word of its pattern.
+_ACTION = re.compile(
+    r"(?<![a-z])(?:(?:un)?watch(?:list)?|unlock|contact|save|share|compare|favou?rites?|follow|"
+    r"bookmark|wishlist|register|(?:log|sign)[\s_-]?(?:in|on|up))(?![a-z])",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_action(group: dict) -> bool:
+    """Whether a group's links do something to a listing rather than show it.
+
+    Judged by the literal words of its pattern ("watch_item", "/unlock/") and
+    by its link text when most cards share it ("Watch", "Contact Seller") —
+    never by a wildcard's values or a title, which may say anything
+    ("Save-A-Lot Grocery").
+    """
+    path = str(group.get("pattern") or "").split("?", 1)[0].partition("/")[2]
+    if _ACTION.search(path):
+        return True
+    texts = [str(c.get("link_text") or "").strip() for c in group.get("cards") or []]
+    if not texts:
+        return False
+    common, count = collections.Counter(texts).most_common(1)[0]
+    return count * 2 > len(texts) and len(common) <= 40 and bool(_ACTION.match(common))
+
+
+def _linked(card: dict, ids: set[str], hrefs: set[str], links: set[str]) -> bool:
+    """Whether `card` is one of the cards described by (ids, hrefs, links): the
+    same element, or a card that links to one of them or is linked from one."""
+    if card.get("card") and card["card"] in ids:
+        return True
+    return card.get("href") in links or bool(set(card.get("hrefs") or []) & hrefs)
+
+
+def _index(groups: list[dict]) -> tuple[set[str], set[str], set[str]]:
+    ids: set[str] = set()
+    hrefs: set[str] = set()
+    links: set[str] = set()
+    for g in groups:
+        for c in g.get("cards") or []:
+            if c.get("card"):
+                ids.add(c["card"])
+            if c.get("href"):
+                hrefs.add(c["href"])
+            links.update(c.get("hrefs") or [])
+    return ids, hrefs, links
+
+
+def _covers(group: dict, other: dict) -> float:
+    """The share of `other`'s cards that are also `group`'s cards."""
+    cards = other.get("cards") or []
+    if not cards:
+        return 0.0
+    index = _index([group])
+    return sum(1 for c in cards if _linked(c, *index)) / len(cards)
+
+
+def _covers_all(groups: list[dict], other: dict) -> bool:
+    index = _index(groups)
+    return all(_linked(c, *index) for c in other.get("cards") or [])
 
 
 def _letter(i: int) -> str:
@@ -1041,22 +1300,29 @@ def _cards_of(groups: list[dict]) -> list[_Card]:
     """The chosen groups' cards as one list, each card once, with its address.
 
     A card can belong to two chosen groups (a listing link and an "unlock" or
-    "contact" link in the same tile); it is one listing, under the shorter
-    link. Its address prefers a link in the same card whose path is a prefix of
-    the group link's (`…/listing/5` over `…/listing/5/contact`), when that link
-    belongs to this card alone.
+    "contact" link in the same tile); it is one listing. When one of the groups
+    is an action (`_looks_like_action`), the card is read through the other
+    group's link — its detail page, and the title that link carries; otherwise
+    under the shorter link. Its address prefers a link in the same card whose
+    path is a prefix of the group link's (`…/listing/5` over
+    `…/listing/5/contact`), when that link belongs to this card alone. Cards
+    come back in page order when the probe said where they were.
     """
     everywhere: dict[str, int] = {}
     for g in groups:
         for c in g.get("cards") or []:
             for h in set(c.get("hrefs") or []):
                 everywhere[h] = everywhere.get(h, 0) + 1
+    acting = [_looks_like_action(g) for g in groups]
+    details = _index([g for g, act in zip(groups, acting) if not act])
 
     by_card: dict[str, _Card] = {}
     order: list[str] = []
-    for g in groups:
+    for g, act in zip(groups, acting):
         keep = list(g.get("varying_keys") or []) if not g.get("paths_unique", True) else []
         for c in g.get("cards") or []:
+            if act and _linked(c, *details):
+                continue  # read through its detail link instead
             href = str(c.get("href") or "")
             if g.get("paths_unique", True):
                 href = _detail_href(href, c.get("hrefs") or [], everywhere)
@@ -1082,6 +1348,8 @@ def _cards_of(groups: list[dict]) -> list[_Card]:
             continue
         seen.add(card.url)
         out.append(card)
+    if len(groups) > 1 and all(isinstance(c.raw.get("pos"), int) for c in out):
+        out.sort(key=lambda c: c.raw["pos"])
     return out
 
 
@@ -1202,6 +1470,35 @@ def _fallback_title(card: dict) -> str:
     if heading and (not usable or (heading in link and heading != link)):
         return heading
     return link if usable else heading
+
+
+_DESCRIBED_CHARS = 100
+
+
+def _described_title(card: _Card, roles: dict[str, tuple[str, float]]) -> str:
+    """A title for a card with no name of its own: what it is, and which one.
+
+    Empire Flippers' tiles have no name, heading or titled link ("View
+    Listing") — only a number, a niche and a summary — so they are titled by
+    their category (or, without one, the start of their description) and their
+    listing number: "Apparel & Accessories, Home · #97637". A number alone is
+    not a title.
+    """
+    best: dict[str, tuple[str, float]] = {}
+    for key, (role, confidence) in roles.items():
+        value = card.values.get(key, "").strip()
+        if (role in ("category", "description", "listing_id") and value
+                and confidence > best.get(role, ("", -1.0))[1]):
+            best[role] = (value, confidence)
+    what = best.get("category", ("", 0.0))[0]
+    if not what:
+        what = best.get("description", ("", 0.0))[0]
+        if len(what) > _DESCRIBED_CHARS:
+            what = what[:_DESCRIBED_CHARS].rsplit(" ", 1)[0].rstrip(",;:.") + "…"
+    if not what:
+        return ""
+    number = best.get("listing_id", ("", 0.0))[0]
+    return " · ".join(p for p in (what, number) if p)[:_TITLE_MAX_CHARS]
 
 
 def _page_template(url: str, page: int) -> str | None:

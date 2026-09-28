@@ -8,15 +8,18 @@ next page is reached, what an error looks like — and, because the classifier
 reads its state once and answers every question in it, that each decision is
 ONE request per page, not one per field or per link.
 
-The last classes need a Playwright chromium: they run the real `JS_PROBE` on six
-listing pages saved on 2026-09-28 (tests/fixtures/generic), with the network
-blocked, and pin what the probe finds on markup it has never been tuned to —
-the whole point of the source.
+The last classes need a Playwright chromium: they run the real `JS_PROBE` on
+listing pages saved on 2026-09-28 (tests/fixtures/generic; the Empire Flippers,
+Flippa, BusinessBroker.net and Sunbelt pages and the QuietLight detail page
+were saved through the cloaked browser after scrolling to the bottom), with the
+network blocked, and pin what the probe finds on markup it has never been tuned
+to — the whole point of the source.
 """
 from __future__ import annotations
 
 import collections
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -370,6 +373,255 @@ class TestListingGroupOverride:
         assert "brokers.example/old/{*}" in result.error
         assert PATTERN in result.error
         assert jev.requests == []
+
+
+# ── the rest of the chosen list ──────────────────────────────────────────────
+
+OFFICE = "brokers.example/{*}/details/{*}"
+
+
+def _shaped(group: dict, shape: str = "ARTICLE.tile", containers=("l1",)) -> dict:
+    """A canned group with the card shape and containers the probe reports."""
+    for card in group["cards"]:
+        card["pos"] = int(card["href"].rsplit("-", 1)[1])
+    return {**group, "card_shape": shape, "containers": list(containers)}
+
+
+def _one_list_two_shapes(**office) -> tuple[dict, dict]:
+    """Sunbelt: one list whose odd cards link /listing/…, even ones /<office>/details/…."""
+    listing = _shaped(_group(PATTERN, [_card(n) for n in (1, 3, 5)]))
+    other = _shaped(_group(OFFICE, [_card(n, path="/reno/details/biz-{n}", card_id=f"g1c{n}")
+                                    for n in (2, 4, 6)]), **office)
+    return listing, other
+
+
+class TestTheWholeList:
+    @pytest.mark.asyncio
+    async def test_same_tiles_in_the_same_place_are_one_list_without_asking_again(self):
+        listing, office = _one_list_two_shapes()
+        result, source, jev, _ = await _read(_probe([listing, office, _nav()]))
+        # Read in page order, whichever group each card came from.
+        assert [l.url for l in result.listings] == [
+            f"{SITE}/listing/biz-1", f"{SITE}/reno/details/biz-2", f"{SITE}/listing/biz-3",
+            f"{SITE}/reno/details/biz-4", f"{SITE}/listing/biz-5", f"{SITE}/reno/details/biz-6",
+        ]
+        assert jev.kinds()["group"] == 1
+        links = source.decisions[0]["listing_links"]
+        assert links["patterns"] == [PATTERN, OFFICE]
+        assert links["same_list"] == [OFFICE]
+        assert source.suggested_override()["listing_links"] == [PATTERN, OFFICE]
+
+    @pytest.mark.parametrize("change", [
+        {"shape": "DIV.promo"},        # another kind of tile
+        {"containers": ("l9",)},       # somewhere else on the page
+    ])
+    @pytest.mark.asyncio
+    async def test_another_tile_or_another_place_is_another_list(self, change):
+        listing, office = _one_list_two_shapes(**change)
+        result, source, _, _ = await _read(_probe([listing, office]))
+        assert len(result.listings) == 3
+        assert source.decisions[0]["listing_links"]["patterns"] == [PATTERN]
+        assert "same_list" not in source.decisions[0]["listing_links"]
+
+    @pytest.mark.asyncio
+    async def test_an_ad_slotted_into_the_list_is_not_part_of_it(self):
+        """BizQuest's franchise ads: the same tile in the same list, other fields."""
+        listing, _ = _one_list_two_shapes()
+        ads = _shaped(_group("brokers.example/franchise/{*}", [
+            _card(n, path="/franchise/brand-{n}", card_id=f"g1c{n}",
+                  labeled={"Min. Cash Req": "$100,000"}, slots={"div.card>h3#0": f"Brand {n}"})
+            for n in (2, 4, 6)]))
+        result, source, _, _ = await _read(_probe([listing, ads]))
+        assert [l.url for l in result.listings] == [f"{SITE}/listing/biz-{n}" for n in (1, 3, 5)]
+        assert source.decisions[0]["listing_links"]["patterns"] == [PATTERN]
+
+    @pytest.mark.asyncio
+    async def test_an_override_is_read_as_pinned_and_never_widened(self):
+        listing, office = _one_list_two_shapes()
+        override = SiteOverride(match="brokers.example", listing_links=[PATTERN])
+        result, _, _, _ = await _read(_probe([listing, office]), override=override)
+        assert len(result.listings) == 3
+
+
+def _watch_cards(ns, *, same_tiles: bool) -> list[dict]:
+    """A "Watch" button on every tile, linking /watch_item?id=N."""
+    cards = []
+    for n in ns:
+        card = _card(n, path=f"/watch_item?id={n}&type=listing", link_text="Watch", heading="",
+                     card_id=f"g1c{n}" if same_tiles else f"g0c{n}")
+        card["hrefs"] = [f"{SITE}/listing/biz-{n}", card["href"]]
+        cards.append(card)
+    return cards
+
+
+WATCH = "brokers.example/watch_item?id&type"
+
+
+class TestActionLinks:
+    @pytest.mark.parametrize("same_tiles", [True, False])
+    @pytest.mark.asyncio
+    async def test_a_picked_action_group_is_read_through_the_detail_links(self, same_tiles):
+        """Flippa: the classifier picked the Watch buttons, and every title was "Watch"."""
+        watch = _group(WATCH, _watch_cards(range(1, 5), same_tiles=same_tiles))
+        detail = _group(PATTERN, [_card(n, card_id=f"g1c{n}") for n in range(1, 5)])
+        jev = FakeJev(group="watch_item", fields={})  # nothing confident: titles fall back
+        result, source, _, _ = await _read(_probe([watch, detail]), jev)
+        assert [l.url for l in result.listings] == [f"{SITE}/listing/biz-{n}" for n in range(1, 5)]
+        assert [l.title for l in result.listings] == [f"Business {n}" for n in range(1, 5)]
+        links = source.decisions[0]["listing_links"]
+        assert links["patterns"] == [PATTERN]
+        assert links["instead_of"] == WATCH
+        assert source.suggested_override()["listing_links"] == [PATTERN]
+
+    @pytest.mark.asyncio
+    async def test_a_tile_with_only_an_action_link_is_still_read(self):
+        watch = _group(WATCH, _watch_cards(range(1, 5), same_tiles=False))
+        detail = _group(PATTERN, [_card(n, card_id=f"g1c{n}") for n in range(1, 4)])
+        override = SiteOverride(match="brokers.example", listing_links=[PATTERN, WATCH])
+        result, _, _, _ = await _read(_probe([detail, watch]), FakeJev(fields={}), override)
+        assert [l.url for l in result.listings][-1] == f"{SITE}/watch_item?id=4&type=listing"
+        assert len(result.listings) == 4
+
+    @pytest.mark.parametrize("pattern, texts, acting", [
+        ("flippa.com/watch_item?disabled_title&id", ["Watch"] * 3, True),
+        ("app.empireflippers.com/unlock/{*}", ["Unlock Listing"] * 3, True),
+        ("brokers.example/us/{*}/contact", ["Business 1", "Business 2", "Business 3"], True),
+        ("brokers.example/{*}", ["Contact Seller", "Contact Seller", "Business 3"], True),
+        ("brokers.example/{*}", ["Sign up", "Sign up", "Sign up"], True),
+        ("empireflippers.com/listing/{*}", ["View Listing"] * 3, False),
+        ("flippa.com/{id}", ["Ecommerce | Home", "SaaS | Business", "Content | Blog"], False),
+        # Titles that merely start with an action word are titles.
+        ("brokers.example/listing/{*}", ["Save-A-Lot Grocery", "Follow-Up Clinic",
+                                         "Watchmaker Shop"], False),
+        ("brokers.example/saved-searches/{*}", ["A", "B", "C"], False),
+    ])
+    def test_looks_like_action(self, pattern, texts, acting):
+        group = {"pattern": pattern, "cards": [{"link_text": t} for t in texts]}
+        assert generic._looks_like_action(group) is acting
+
+
+class TestDescribedTitle:
+    """A tile with no name, heading or titled link (Empire Flippers)."""
+
+    FIELDS = {"#97637": ("listing_id", 0.99), "Apparel & Accessories, Home": ("category", 0.97),
+              "This listing is for an Amazon FBA business": ("description", 0.95)}
+
+    @staticmethod
+    def _tiles(**slots) -> dict:
+        cards = [_card(n, labeled={}, link_text="View Listing", heading="",
+                       slots={k: v.format(n=n) for k, v in slots.items()}) for n in range(1, 4)]
+        return _probe([_group(cards=cards)])
+
+    @pytest.mark.asyncio
+    async def test_its_category_and_number_are_its_title(self):
+        probe = self._tiles(**{"div.num#0": "#9763{n}",
+                               "div.niche#0": "Apparel & Accessories, Home"})
+        fields = {**self.FIELDS, "#97631": ("listing_id", 0.99)}
+        result, _, _, _ = await _read(probe, FakeJev(fields=fields))
+        assert result.listings[0].title == "Apparel & Accessories, Home · #97631"
+
+    @pytest.mark.asyncio
+    async def test_without_a_category_the_start_of_its_description(self):
+        summary = ("This listing is for an Amazon FBA business established in 2021, operating in "
+                   "the home niche with steady sales and a loyal customer base")
+        probe = self._tiles(**{"div.num#0": "#97637", "div.summary#0": summary})
+        fields = {**self.FIELDS, summary[:70]: ("description", 0.95)}  # as the state quotes it
+        result, _, _, _ = await _read(probe, FakeJev(fields=fields))
+        title = result.listings[0].title
+        assert title.startswith("This listing is for an Amazon FBA business")
+        assert title.endswith("… · #97637")
+        assert len(title.split(" · ")[0]) <= generic._DESCRIBED_CHARS + 1
+
+    @pytest.mark.asyncio
+    async def test_a_number_alone_is_not_a_title(self):
+        result, _, _, _ = await _read(self._tiles(**{"div.num#0": "#97637"}),
+                                      FakeJev(fields=self.FIELDS))
+        assert result.listings[0].title == ""
+
+
+# ── scrolling before reading ─────────────────────────────────────────────────
+
+
+class ScrollPage(FakePage):
+    """A page `heights[0]` tall that grows to the next height each time it is scrolled."""
+
+    def __init__(self, *probes: dict, heights, view: int = 900, broken: bool = False):
+        super().__init__(*probes)
+        self.heights = list(heights)
+        self.view = view
+        self.y = 0
+        self.broken = broken
+        self.steps: list[str] = []
+        self.waits: list[int] = []
+        self.mouse = self
+
+    async def move(self, x, y):
+        pass
+
+    async def wheel(self, dx, dy):
+        if self.broken:
+            raise RuntimeError("Target page, context or browser has been closed")
+        self.steps.append(f"wheel {dy}")
+        self.y = min(self.y + dy, max(0, self.heights[0] - self.view))
+        if len(self.heights) > 1:
+            self.heights.pop(0)  # what the step revealed has loaded
+
+    async def wait_for_timeout(self, ms):
+        self.waits.append(ms)
+
+    async def evaluate(self, script, arg=None):
+        if script == generic._JS_SCROLL_STATE:
+            return [self.y, self.view, self.heights[0]]
+        if script == generic._JS_SCROLL_TOP:
+            self.steps.append("top")
+            self.y = 0
+            return None
+        if script == JS_PROBE:
+            self.steps.append("probe")
+        return await super().evaluate(script, arg)
+
+
+class TestScrolling:
+    @pytest.mark.asyncio
+    async def test_the_page_is_scrolled_to_a_bottom_that_stops_growing_then_back_up(self):
+        page = ScrollPage(_probe(), heights=[3000, 5000, 7000, 7000])
+        result = await GenericSource(LIST_URL, FakeJev()).cards(page)
+        assert len(result.listings) == 4
+        assert page.steps == ["wheel 2500"] * 3 + ["top", "probe"]
+        assert page.waits == [generic.SCROLL_PAUSE_MS] * 3
+
+    @pytest.mark.asyncio
+    async def test_a_short_page_costs_one_step(self):
+        page = ScrollPage(_probe(), heights=[800])
+        await GenericSource(LIST_URL, FakeJev()).cards(page)
+        assert page.steps == ["wheel 2500", "top", "probe"]
+
+    @pytest.mark.asyncio
+    async def test_a_feed_that_grows_forever_stops_at_the_step_bound(self):
+        page = ScrollPage(_probe(), heights=[3000 + 2500 * i for i in range(40)])
+        assert await generic._scroll_through(page) == generic.SCROLL_MAX_STEPS == 10
+        assert page.steps[-1] == "top"
+
+    @pytest.mark.asyncio
+    async def test_slow_steps_stop_at_the_time_bound(self, monkeypatch):
+        clock = [0.0]
+
+        class Slow(ScrollPage):
+            async def wait_for_timeout(self, ms):
+                clock[0] += 4.0  # a page that takes four seconds a step
+
+        monkeypatch.setattr(generic, "time", type("T", (), {"monotonic": staticmethod(
+            lambda: clock[0])}))
+        page = Slow(_probe(), heights=[3000 + 2500 * i for i in range(40)])
+        assert await generic._scroll_through(page) == 3
+        assert clock[0] == 12.0 and generic.SCROLL_BUDGET_S == 10.0
+        assert page.steps[-1] == "top"
+
+    @pytest.mark.asyncio
+    async def test_a_page_that_cannot_be_scrolled_is_read_as_it_is(self):
+        page = ScrollPage(_probe(), heights=[9000], broken=True)
+        result = await GenericSource(LIST_URL, FakeJev()).cards(page)
+        assert len(result.listings) == 4 and page.steps == ["probe"]
 
 
 # ── fields ───────────────────────────────────────────────────────────────────
@@ -1046,7 +1298,7 @@ def _group_of(probe: dict, pattern: str) -> dict:
 
 @needs_chromium
 class TestProbeOnSavedPages:
-    """What JS_PROBE finds on six real listing pages it was never tuned to."""
+    """What JS_PROBE finds on real listing pages it was never tuned to."""
 
     @pytest.mark.parametrize("name, pattern, links", [
         ("websiteclosers_list", "www.websiteclosers.com/businesses/{*}/{*}", 12),
@@ -1059,6 +1311,8 @@ class TestProbeOnSavedPages:
         ("libertygroup_list", "www.thelibertygroupofnevada.com/listing/{*}", 12),
         ("businessteam_list",
          "www.business-team.com/buy-a-business/business-for-sale.aspx?From&LID", 88),
+        # Saved scrolled to the bottom: all 53, where the live sweep saw 23.
+        ("businessbrokernet_list", "www.businessbroker.net/business-for-sale/{*}/{*}", 53),
     ])
     @pytest.mark.asyncio
     async def test_the_listing_list_is_the_biggest_group_and_every_card_is_read(
@@ -1070,6 +1324,62 @@ class TestProbeOnSavedPages:
         assert len(top["cards"]) == links
         assert len({c["href"] for c in top["cards"]}) == links
         assert all(c["excerpt"] and c["text"] for c in top["cards"])
+
+    @pytest.mark.asyncio
+    async def test_a_link_with_and_without_its_trailing_slash_is_one_link(self):
+        """Empire Flippers prints /listing/97637/ and /listing/97637 on every tile.
+        Counted as two links, each id looked repeated — a literal — and the
+        group fell apart into groups of two."""
+        probe = await _probe_of("empireflippers_list")
+        listing = _group_of(probe, "empireflippers.com/listing/{*}")
+        unlock = _group_of(probe, "app.empireflippers.com/unlock/{*}")
+        assert listing["links"] == unlock["links"] == 13
+        assert len({c["href"].rstrip("/") for c in listing["cards"]}) == 13
+        # Each tile is one card, the same one for both of its links.
+        assert [c["card"] for c in listing["cards"]] == [c["card"] for c in unlock["cards"]]
+        assert all(len(c["hrefs"]) == 1 for c in listing["cards"])
+
+    @pytest.mark.asyncio
+    async def test_ids_at_the_site_root_are_not_merged_with_its_menu(self):
+        """Flippa's listings are flippa.com/<id>-<slug>, beside flippa.com/websites."""
+        probe = await _probe_of("flippa_list")
+        ids = _group_of(probe, "flippa.com/{id}")
+        assert ids["links"] == 5 and ids["chrome"] == 0
+        assert all(re.match(r"https://flippa\.com/\d{8}-", c["href"]) for c in ids["cards"])
+        menu = _group_of(probe, "flippa.com/{*}")
+        assert menu["links"] >= 30
+        assert "flippa.com/{id}" in [g["pattern"] for g in generic._candidates(probe["groups"])]
+
+    @pytest.mark.parametrize("name", [
+        "websiteclosers_list", "dealonomy_list", "bizquest_list", "fcbb_list",
+        "libertygroup_list", "businessteam_list", "businessbrokernet_list",
+    ])
+    @pytest.mark.asyncio
+    async def test_a_list_takes_in_no_other_group(self, name):
+        candidates = generic._candidates((await _probe_of(name))["groups"])
+        top = candidates[0]
+        assert generic._whole_list(top, candidates) == ([top], [], None)
+
+    @pytest.mark.parametrize("name, ads", [
+        ("bizquest_list", "www.bizquest.com/{*}?q"),
+        ("businessbrokernet_list", "www.businessbroker.net/franchises/franchise/{*}"),
+    ])
+    @pytest.mark.asyncio
+    async def test_franchise_ads_slotted_into_the_list_are_not_the_list(self, name, ads):
+        """Same tile, same list element — told apart only by their fields."""
+        probe = await _probe_of(name)
+        top, ad = generic._candidates(probe["groups"])[0], _group_of(probe, ads)
+        assert ad["card_shape"] == top["card_shape"]
+        assert set(ad["containers"]) & set(top["containers"])
+        assert not generic._one_list(top, ad)
+
+    @pytest.mark.asyncio
+    async def test_a_carousel_is_not_a_pager(self):
+        """Empire Flippers' testimonial slider has a Next arrow and numbered dots."""
+        probe = await _probe_of("empireflippers_list")
+        seen = [a for c in probe["pager"] for a in c["appears_as"]]
+        assert any("Load More Listings" in a for a in seen)
+        assert not any("'Next'" in a or "'2'" in a for a in seen)
 
     @pytest.mark.asyncio
     async def test_a_query_string_identity_is_reported_as_varying(self):
@@ -1155,6 +1465,18 @@ class TestProbeOnSavedPages:
         assert _group_of(probe, "brokers.example/{*}/{*}")["links"] == 6
 
     @pytest.mark.asyncio
+    async def test_a_pinned_id_pattern_matches_only_ids(self):
+        # Two ids beside three words are too few to be split off on their own.
+        html = self._tiles("/12345678-alpha-bakery", "/87654321-beta-deli", "/pricing")
+        unpinned = await self._pinned(html, [])
+        assert "brokers.example/{id}" not in [g["pattern"] for g in unpinned["groups"]]
+        probe = await self._pinned(html, ["brokers.example/{id}"])
+        assert [c["href"] for c in _group_of(probe, "brokers.example/{id}")["cards"]] == [
+            "https://brokers.example/12345678-alpha-bakery",
+            "https://brokers.example/87654321-beta-deli",
+        ]
+
+    @pytest.mark.asyncio
     async def test_a_status_badge_whose_class_names_its_value_is_one_slot(self):
         group = _group_of(await _probe_of("libertygroup_list"),
                           "www.thelibertygroupofnevada.com/listing/{*}")
@@ -1205,8 +1527,59 @@ class TestProbeOnSavedPages:
 
 
 @needs_chromium
-class TestGenericSourceOnASavedPage:
-    """GenericSource.cards end to end on FCBB, with the classifier faked."""
+class TestGenericSourceOnSavedPages:
+    """GenericSource.cards end to end on saved pages, with the classifier faked."""
+
+    @staticmethod
+    async def _cards(name: str, jev: FakeJev):
+        source = GenericSource(_captured_url(name), jev)
+        result = await _with_fixture(name, source.cards)
+        assert result.error == "" and not result.blocked
+        return result, source
+
+    @pytest.mark.asyncio
+    async def test_empire_flippers_unlock_links_are_read_through_the_listing_links(self):
+        jev = FakeJev(group="unlock/", fields={
+            "#97447": ("listing_id", 0.99), "Personal Care, Bed & Bath, Home": ("category", 0.98),
+        })
+        result, source = await self._cards("empireflippers_list", jev)
+        assert len(result.listings) == 13
+        assert all(re.fullmatch(r"https://empireflippers\.com/listing/\d+/?", l.url)
+                   for l in result.listings)
+        # No name, heading or titled link on these tiles: niche and number.
+        assert result.listings[0].title == "Personal Care, Bed & Bath, Home · #97447"
+        links = source.decisions[0]["listing_links"]
+        assert links["patterns"] == ["empireflippers.com/listing/{*}"]
+        assert links["instead_of"] == "app.empireflippers.com/unlock/{*}"
+
+    @pytest.mark.asyncio
+    async def test_flippa_watch_buttons_are_read_through_the_listing_links(self):
+        result, source = await self._cards("flippa_list", FakeJev(group="watch_item", fields={}))
+        assert len(result.listings) == 5
+        assert all(re.match(r"https://flippa\.com/\d{8}-", l.url) for l in result.listings)
+        assert all(l.title and l.title != "Watch" for l in result.listings)
+        assert source.decisions[0]["listing_links"]["patterns"] == ["flippa.com/{id}"]
+
+    @pytest.mark.asyncio
+    async def test_sunbelt_is_one_list_with_two_link_shapes(self):
+        details = "www.sunbeltnetwork.com/business-search/business-details/{*}"
+        offices = "www.sunbeltnetwork.com/{*}/buy-a-business/listings/listing-details/{*}"
+        source = GenericSource(_captured_url("sunbelt_list"),
+                               FakeJev(group="business-search/business-details", fields={}))
+
+        async def run(page):
+            result = await source.cards(page)
+            order = await page.evaluate(
+                "() => [...document.querySelectorAll('article h4')]"
+                ".map((h) => h.closest('a').href)")
+            return result, order
+
+        result, order = await _with_fixture("sunbelt_list", run)
+        assert [l.url for l in result.listings] == order and len(order) == 10
+        assert all(l.title for l in result.listings)
+        links = source.decisions[0]["listing_links"]
+        assert links["patterns"] == [details, offices] and links["same_list"] == [offices]
+        assert source.suggested_override()["listing_links"] == [details, offices]
 
     @pytest.mark.asyncio
     async def test_fcbb(self):

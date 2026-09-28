@@ -123,6 +123,23 @@ class TestCodeChecks:
         assert verdict.ok
 
     @pytest.mark.asyncio
+    async def test_a_price_with_its_currency_spelled_out_reads_as_an_amount(self):
+        """Flippa prints "USD $650,000"; the live gate failed the page on it."""
+        prices = ["USD $650,000", "US$1.2M", "USD $2,273,879", "CAD $450,000",
+                  "AUD $2,000,000", "NZD $300,000", "EUR 300,000", "GBP £1,250,000",
+                  "£1,250,000", "€300,000", "C$900,000"]
+        cards = [_card(i, asking_price=p) for i, p in enumerate(prices)]
+        verdict = await legibility.check(cards, page=1)
+        assert verdict.ok and len(verdict.listings) == len(prices)
+
+    @pytest.mark.asyncio
+    async def test_a_monthly_figure_is_not_an_asking_price(self):
+        cards = [_card(i, asking_price="USD $28,274 p/mo") for i in range(3)]
+        verdict = await legibility.check(cards, page=1)
+        assert not verdict.ok
+        assert "Only 0 of 3 asking prices" in verdict.reason
+
+    @pytest.mark.asyncio
     async def test_ranges_in_revenue_or_cash_flow_never_fail_a_page(self):
         cards = [
             _card(i, revenue="$250K - $500K", cashflow="$100K-$250K", ebitda="1-2M")

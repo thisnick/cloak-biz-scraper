@@ -65,6 +65,11 @@ _EXCERPT_CHARS = 1500
 _QUOTE_CHARS = 40
 
 _DIGIT = re.compile(r"\d")
+# A currency before an amount: a code ("USD", "CAD"), a sign ("$", "€", "£"),
+# or both ("US$", "C$", "USD $").
+_CURRENCY = re.compile(
+    r"^\s*(?:(?:USD|US|CAD|AUD|NZD|EUR|GBP)\s*)?(?:US|CA|C|AU|A|NZ)?[$€£]?\s*(?=\d)"
+)
 
 
 @dataclass(frozen=True)
@@ -183,9 +188,14 @@ def _reads_as_amount(value: str) -> bool:
     `parse_money` refuses "$81,000 + Inventory", and rightly — as a number to
     *store* it would understate the price. But the question here is only
     whether the field holds a price at all, and a qualified price is one: a
-    one-listing broker page quoting "+ Inventory" is a perfectly good page.
+    one-listing broker page quoting "+ Inventory" is a perfectly good page. So
+    is a price in another currency, or with its currency spelled out before it
+    ("USD $650,000" on Flippa, "CAD $450,000", "€300,000"): the currency is
+    read past here, where `parse_money`, which stores the number, keeps to US
+    dollars.
     """
-    return parse_money(value) is not None or parse_money(value.split("+", 1)[0]) is not None
+    amount = _CURRENCY.sub("", value, count=1)
+    return parse_money(amount) is not None or parse_money(amount.split("+", 1)[0]) is not None
 
 
 def _sample(cards: list[Listing]) -> list[Listing]:

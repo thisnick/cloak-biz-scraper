@@ -73,11 +73,13 @@ class SiteOverride(BaseModel):
     or a bare host ("bizquest.com", any page on it); `www.` never matters and
     the longest match wins. `listing_links` are link patterns as the reader
     reports them ("www.bizquest.com/business-for-sale/{*}/{*}"), where `{*}` is
-    any one path segment; several are read as one list. `fields` maps a card field — its label, or the slot
-    key the reader reports for an unlabelled one — to what it holds, or to
-    "ignore". `next_page` is a URL with `{page}` in it, "click:<css selector>",
-    or "none". `drop_status` lists status texts (matched as case-insensitive
-    substrings) that mean a listing is gone; an empty list drops nothing.
+    any one path segment and `{id}` one that is an id ("12899223-some-slug",
+    "1012838.aspx"); several are read as one list. `fields` maps a card field —
+    its label, or the slot key the reader reports for an unlabelled one — to
+    what it holds, or to "ignore". `next_page` is a URL with `{page}` in it,
+    "click:<css selector>", or "none". `drop_status` lists status texts
+    (matched as case-insensitive substrings) that mean a listing is gone; an
+    empty list drops nothing.
     """
 
     model_config = ConfigDict(extra="forbid")

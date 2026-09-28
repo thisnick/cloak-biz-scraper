@@ -31,6 +31,20 @@ class TestParses:
         assert parse_money(1_258_000) == 1_258_000.0
         assert parse_money(1258000.5) == 1_258_000.5
 
+    @pytest.mark.parametrize(
+        "text,expected",
+        [
+            ("USD $650,000", 650_000.0),     # how Flippa prints an asking price
+            ("USD$650,000", 650_000.0),
+            ("US $1,200,000", 1_200_000.0),
+            ("US$500k", 500_000.0),
+            ("USD $2.27M", 2_270_000.0),
+        ],
+    )
+    def test_a_us_dollar_code_before_the_sign(self, text, expected):
+        # "USD $" says what "$" says, only more exactly.
+        assert parse_money(text) == expected
+
 
 class TestRefusesToGuess:
     @pytest.mark.parametrize(
@@ -71,6 +85,24 @@ class TestRefusesToGuess:
         ],
     )
     def test_anything_with_more_to_it_is_empty(self, text):
+        assert parse_money(text) is None
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            # A month's profit is not a year's cash flow: stored as one, it
+            # would understate the business twelvefold.
+            "USD $28,274 p/mo",
+            "USD $1M - $2M",
+            "USD $81,000 + Inventory",
+            "CAD $450,000",       # another dollar is not a US dollar
+            "AUD $2,000,000",
+            "USD 650,000",        # the code only ever stands before a "$"
+            "USD",
+            "US$",
+        ],
+    )
+    def test_a_currency_code_does_not_loosen_anything_else(self, text):
         assert parse_money(text) is None
 
     def test_a_boolean_is_not_a_price(self):
