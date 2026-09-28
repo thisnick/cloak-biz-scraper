@@ -27,16 +27,52 @@ class CardPage:
     responses: a block means rotate the exit IP and retry, while genuinely
     zero results means stop paging. Conflating them either retries forever on
     an empty last page or gives up silently on a challenge page.
+
+    `error` is the third answer: the page loaded and was not a block, but the
+    source can see it is not something it can read ("no list of businesses for
+    sale on this page"). It fails the source loudly, with evidence, instead of
+    reporting an empty list — which an agent would read as "no listings
+    matched". `retry` says whether another attempt from a fresh exit IP could
+    change that; for most such errors it cannot, and three attempts would only
+    turn one clear failure into several minutes of the same one.
+
+    `seen_urls` exists because paging stops on a page with nothing new, and a
+    source may drop cards on purpose (a page of sold listings). Counted over
+    what was *returned*, such a page looks like the end of the feed and paging
+    stops early; counted over what was *on the page*, it does not. Same URL
+    shape as `Listing.url`. None means "the returned listings are all there
+    was".
     """
 
     listings: list[Listing]
     blocked: bool = False
     title: str = ""
+    error: str = ""
+    retry: bool = True
+    seen_urls: list[str] | None = None
 
 
 @runtime_checkable
 class Source(Protocol):
-    """One site's search-results pages."""
+    """One site's search-results pages.
+
+    Three optional members are read with `getattr` by the sweep, so a source
+    that has no use for them simply leaves them out (they are not declared
+    below, because a runtime-checkable protocol would then demand them):
+
+    * `warmup_url: str` — a page to land on before the first results page.
+    * `begin() -> None` — called at the start of every attempt. The sweep reuses
+      one source object across the attempts `scrape_with_retry` makes, so
+      anything a source remembers while reading (the page it is on, what it
+      decided about the layout) must be reset here, or a retry starts from the
+      failed attempt's state.
+    * `async advance(page, n) -> bool` — reach results page `n` (always > 1)
+      from the page that is loaded, by navigating or by clicking. Page 1 is
+      always `page_url(url, 1)`. Without it, page `n` is `page_url(url, n)`,
+      which only works for sites that page by URL; with it, a site that pages
+      with a script-only "Next" button can be swept too. Returning False means
+      there is no next page, and paging stops.
+    """
 
     # Recorded on every Listing, and the value of the Notion `Source` column.
     # This is the machine id (e.g. "bizbuysell_serp"); it is not shown to a person.
@@ -56,7 +92,8 @@ class Source(Protocol):
         ...
 
     def page_url(self, url: str, page: int) -> str:
-        """The Nth results page for a search URL."""
+        """The Nth results page for a search URL (page 1 always; later pages
+        only when the source has no `advance`)."""
         ...
 
     async def cards(self, page) -> CardPage:

@@ -170,7 +170,10 @@ async def lifespan(app: FastAPI):
         key_getter=lambda: app.state.settings.load().typesafe_openrouter_api_key,
         model_getter=lambda: app.state.settings.load().typesafe_model,
     )
-    app.state.scrape = ScrapeService(app.state.instances, jobs, settings_service)
+    # The classifier goes in so every sweep's legibility check can sample
+    # cards with it once a key is saved (it asks nothing without one).
+    app.state.scrape = ScrapeService(app.state.instances, jobs, settings_service,
+                                     typesafe=app.state.typesafe)
     # The same job store the sweeps use: one Tasks list, one retention policy,
     # one place a run's evidence is reachable from.
     app.state.archive = ArchiveService(app.state.instances, settings_service, jobs)

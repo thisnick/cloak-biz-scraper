@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -23,6 +24,7 @@ from .. import sources
 from ..config import CONFIG
 from ..models import Listing, ScrapeResult, SweepTask, SyncResult
 from ..stores.base import ListingStore
+from . import legibility
 from .blocker import text_contains_blocker
 from .browsing import capture, gesture, scrape_with_retry
 from .jobs import JobStore
@@ -99,10 +101,16 @@ def _collect_message(job_id: str) -> str:
 
 class ScrapeService:
     def __init__(self, instances, jobs: JobStore, settings: SettingsService,
-                 store_factory=None, task_profiles: TaskProfilePool | None = None) -> None:
+                 store_factory=None, task_profiles: TaskProfilePool | None = None,
+                 typesafe=None) -> None:
         self._instances = instances
         self._jobs = jobs
         self._settings = settings
+        # The shared TypeSafe Classifier client (app.state.typesafe). Optional:
+        # without it — or without a saved key, checked at sweep time so a key
+        # added in Settings applies to the next sweep — the legibility check
+        # runs its code half only.
+        self._typesafe = typesafe
         # Injected so the sweep never imports Notion. The default is resolved
         # lazily and only when sync=true, so a user with no Notion token can
         # still scrape.
@@ -483,45 +491,114 @@ class ScrapeService:
             if self._task_profiles is not None:
                 self._task_profiles.release(lease_key)
 
+    def _classifier(self):
+        """The TypeSafe client when a key is saved right now, else None."""
+        if self._typesafe is None:
+            return None
+        return self._typesafe if self._settings.load().typesafe_configured() else None
+
     async def _sweep_once(self, inst, page, job: SweepTask, url: str, source, evidence: Path) -> dict:
         listings: list[Listing] = []
-        seen: set[str] = set()
+        kept: set[str] = set()   # URLs already in `listings`
+        seen: set[str] = set()   # every listing URL any page showed, dropped ones included
+        checks: list[dict] = []  # the legibility verdict of each page that had cards
         pages_done = 0
+
+        def data() -> dict:
+            return {"listings": listings, "pages_crawled": pages_done, "legibility": checks}
+
+        async def failed(n: int, tag: str, error: str, retry: bool) -> dict:
+            # A page that loaded, was not a block, and still cannot be used. The
+            # evidence is what makes "cards don't read as listings" checkable
+            # after the fact, so it is captured before anything is returned.
+            await capture(page, evidence / f"page-{n:02d}-{tag}",
+                          {"url": page.url, "reason": tag, "error": error, "page": n,
+                           "proxy_ip": inst.proxy_ip})
+            logger.warning("job %s: %s page %d failed (%s): %s", job.id, url, n, tag, error)
+            return {"blocked": False, "error": error, "retry": retry, "data": data()}
+
+        # One source object serves every attempt scrape_with_retry makes, so
+        # whatever it learned on a failed attempt is forgotten before this one.
+        begin = getattr(source, "begin", None)
+        if begin is not None:
+            begin()
+        advance = getattr(source, "advance", None)
 
         for n in range(1, job.max_pages + 1):
             inst.touch()
-            target = source.page_url(url, n)
-            await page.goto(target, wait_until="domcontentloaded", timeout=120_000)
+            if n == 1 or advance is None:
+                await page.goto(source.page_url(url, n), wait_until="domcontentloaded",
+                                timeout=120_000)
+            elif not await advance(page, n):
+                break
             await page.wait_for_timeout(_WAIT_MS)
             await gesture(page)
 
             result = await source.cards(page)
             pages_done += 1
+            # Evidence records page.url — where the browser actually is — not
+            # page_url(url, n): after a click or a redirect they differ.
             if result.blocked or text_contains_blocker(result.title):
                 await capture(page, evidence / f"page-{n:02d}-blocked",
-                              {"url": target, "reason": "blocked", "proxy_ip": inst.proxy_ip})
-                return {"blocked": True, "error": None,
-                        "data": {"listings": listings, "pages_crawled": pages_done}}
+                              {"url": page.url, "reason": "blocked", "proxy_ip": inst.proxy_ip})
+                return {"blocked": True, "error": None, "data": data()}
+            if result.error:
+                return await failed(n, _evidence_tag(result.error), result.error,
+                                    result.retry)
+
+            page_listings = result.listings
+            if page_listings:
+                verdict = await legibility.check(page_listings, page=n,
+                                                 classifier=self._classifier())
+                checks.append(verdict.record(n))
+                if not verdict.ok:
+                    # Illegible cards are not a block: the same page from a new
+                    # exit IP reads the same way, so the failure is final.
+                    return await failed(n, "illegible", verdict.reason, retry=False)
+                page_listings = verdict.listings
 
             # Paging stops on cards this crawl has already seen, not on cards the
             # store already has: a feed whose first two pages are all known
             # listings still has new ones on page three, and dedupe is a separate
-            # question answered at the end.
+            # question answered at the end. "Seen" counts every card the page
+            # showed — including ones the source or the legibility check dropped
+            # — so a page of sold listings is not mistaken for the end.
+            on_page = [l.url for l in result.listings] + list(result.seen_urls or ())
             fresh = 0
-            for listing in result.listings:
-                if listing.url in seen:
+            for href in on_page:
+                if href and href not in seen:
+                    seen.add(href)
+                    fresh += 1
+            for listing in page_listings:
+                if listing.url in kept:
                     continue
-                seen.add(listing.url)
-                fresh += 1
+                kept.add(listing.url)
                 listings.append(listing)
             if fresh == 0 and n > 1:
                 break
 
         await capture(page, evidence / "final",
-                      {"url": url, "reason": "success", "found": len(listings),
-                       "pages_crawled": pages_done, "proxy_ip": inst.proxy_ip})
-        return {"blocked": False, "error": None,
-                "data": {"listings": listings, "pages_crawled": pages_done}}
+                      {"url": url, "page_url": page.url, "reason": "success",
+                       "found": len(listings), "pages_crawled": pages_done,
+                       "legibility": checks, "proxy_ip": inst.proxy_ip})
+        return {"blocked": False, "error": None, "data": data()}
+
+
+def _evidence_tag(reason: str, limit: int = 50) -> str:
+    """A failure reason as an evidence directory name, cut at a word boundary.
+
+    The directory is how a person finds the capture of a failed page in the
+    run's evidence, so it says what went wrong in the source's own words
+    ("page-01-no-list-of-businesses-for-sale-on-this-page") rather than a code.
+    """
+    words = re.findall(r"[a-z0-9]+", reason.lower())
+    tag = ""
+    for word in words:
+        longer = f"{tag}-{word}" if tag else word
+        if len(longer) > limit:
+            break
+        tag = longer
+    return tag or (words[0][:limit] if words else "error")
 
 
 class _RunProgress:

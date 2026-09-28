@@ -16,7 +16,7 @@ import pytest
 from app import sources
 from app.sources import UnsupportedURL
 from app.sources.bizbuysell import JS_CARDS, BizBuySellBroker, BizBuySellSerp, listing_id_from
-from app.sources.urls import canonical_url, normalize_url
+from app.sources.urls import canonical_url, listing_url, normalize_url
 
 MURALI = "https://www.bizbuysell.com/business-broker/murali-barathi/krea-business/41243/"
 RICK = "https://www.bizbuysell.com/business-broker/rick-teh-emba-cbi/accel-business-advisors/36034/"
@@ -63,6 +63,78 @@ class TestNormalization:
             canonical_url("https://www.bizbuysell.com/business-opportunity/foo/2484566/?utm=x#a")
             == "https://www.bizbuysell.com/business-opportunity/foo/2484566/"
         )
+
+
+class TestNormalizationDefaultIsUnchanged:
+    """Byte-for-byte pins on the default key. It is shared with rows already in
+    people's databases and with another codebase, so `keep_query` must not have
+    moved it by a character."""
+
+    @pytest.mark.parametrize("url,key", [
+        (BAY_AREA, "bizbuysell.com/california/san-francisco-bay-area-businesses-for-sale"),
+        (SACRAMENTO + "3/", "bizbuysell.com/california/sacramento-area-businesses-for-sale/3"),
+        (MURALI + "?bp_cfspg=2&bplt=10#bdProfileTabs",
+         "bizbuysell.com/business-broker/murali-barathi/krea-business/41243"),
+        ("https://www.bizbuysell.com/listings/Profile/?q=2484566",
+         "bizbuysell.com/listings/Profile"),
+        ("http://www.bizbuysell.com:8080//business-opportunity//foo/1/",
+         "bizbuysell.com:8080/business-opportunity/foo/1"),
+        ("https://www.bizbuysell.com/", "bizbuysell.com/"),
+    ])
+    def test_the_default_key(self, url, key):
+        assert normalize_url(url) == key
+        assert normalize_url(url, keep_query=None) == key
+
+
+class TestKeepQuery:
+    """For sites where the query names the listing (`listing.php?LID=5`)."""
+
+    def test_only_the_named_keys_are_kept_in_sorted_order(self):
+        url = "https://www.example.com/listing.php?utm_source=x&sort=price&cat=2&LID=5"
+        assert normalize_url(url, keep_query=["LID", "cat"]) == (
+            "example.com/listing.php?LID=5&cat=2"
+        )
+
+    def test_two_listings_on_one_path_stay_two(self):
+        a = normalize_url("https://example.com/listing.php?LID=5", keep_query=["LID"])
+        b = normalize_url("https://example.com/listing.php?LID=6", keep_query=["LID"])
+        assert a != b
+
+    def test_order_and_tracking_do_not_split_one_listing(self):
+        a = normalize_url("https://www.example.com/listing.php?LID=5&cat=2&utm_source=x",
+                          keep_query=("cat", "LID"))
+        b = normalize_url("http://example.com/listing.php/?cat=2&LID=5#top",
+                          keep_query=("LID", "cat"))
+        assert a == b == "example.com/listing.php?LID=5&cat=2"
+
+    @pytest.mark.parametrize("keep", [[], ["LID"]])
+    def test_nothing_to_keep_is_the_plain_key(self, keep):
+        assert normalize_url("https://example.com/listing/5/?page=2", keep_query=keep) == (
+            "example.com/listing/5"
+        )
+
+
+class TestListingUrl:
+    def test_fragment_and_tracking_go_but_the_listing_id_stays(self):
+        url = ("https://www.example.com/listing.php?utm_source=news&LID=5&gclid=abc"
+               "&ref=home&fbclid=z&mc_cid=1&mc_eid=2&_ga=3#photos")
+        assert listing_url(url) == "https://www.example.com/listing.php?LID=5"
+
+    def test_the_remaining_query_is_kept_exactly_as_written(self):
+        """A URL to open, not a key: order and encoding are the site's."""
+        url = "https://example.com/l?b=2&q=Z2lm%3D%3D&a=1&UTM_Medium=email"
+        assert listing_url(url) == "https://example.com/l?b=2&q=Z2lm%3D%3D&a=1"
+
+    def test_a_link_with_only_tracking_loses_its_question_mark(self):
+        assert listing_url("https://example.com/listings/18829322/?utm_campaign=x#top") == (
+            "https://example.com/listings/18829322/"
+        )
+
+    @pytest.mark.parametrize("href", [
+        None, "", "   ", "/listing/5", "javascript:void(0)", "mailto:a@example.com", "https://",
+    ])
+    def test_anything_that_is_not_an_absolute_web_link_is_none(self, href):
+        assert listing_url(href) is None
 
 
 class TestListingId:

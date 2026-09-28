@@ -798,3 +798,405 @@ class TestCollecting:
         release.set()
         await _drain(svc)
         assert svc.result(job.id).status == "completed"
+
+
+# ── The sweep loop itself: paging hooks, per-page failures, legibility ───────
+#
+# These run the real _sweep_once (and, where retries matter, the real
+# scrape_with_retry) against a fake browser and a scripted source, so what is
+# pinned is the loop's own behaviour: how it navigates, when it stops, and what
+# a page it cannot use leaves behind.
+
+from app.config import CONFIG  # noqa: E402
+from app.services.browsing import scrape_with_retry  # noqa: E402
+from app.services.scrape import _RunProgress  # noqa: E402
+from app.sources import CardPage  # noqa: E402
+
+LIST = "https://example.com/businesses-for-sale"
+
+
+def _gen(i: int, **fields) -> Listing:
+    base = {"url": f"https://example.com/listing/{i}", "title": f"Business {i}",
+            "asking_price": "$500,000", "source": "fake"}
+    base.update(fields)
+    return Listing(**base)
+
+
+class _FakePage:
+    """Where a real page would be: `url` follows every goto (or an advance)."""
+
+    def __init__(self):
+        self.url = "about:blank"
+        self.gotos: list[str] = []
+
+    async def goto(self, url, **kw):
+        self.gotos.append(url)
+        self.url = url
+
+    async def wait_for_timeout(self, ms):
+        pass
+
+
+class _Ctx:
+    def __init__(self, page):
+        self.pages = [page]
+
+
+class _FakeInst:
+    def __init__(self, n: int, page):
+        self.id = f"inst-{n}"
+        self.proxy_ip = "1.2.3.4"
+        self.context = _Ctx(page)
+        self.touches = 0
+
+    def touch(self):
+        self.touches += 1
+
+
+class _Profiles:
+    def __init__(self):
+        self.rotations = 0
+
+    def rotate_session(self, profile):
+        self.rotations += 1
+
+
+class _FakeInstances:
+    """Every launch hands back a fresh instance on a fresh page."""
+
+    def __init__(self):
+        self.profiles = _Profiles()
+        self.launches = 0
+        self.pages: list[_FakePage] = []
+
+    async def launch(self, req, *, origin, owner, wait):
+        self.launches += 1
+        page = _FakePage()
+        self.pages.append(page)
+        return _FakeInst(self.launches, page)
+
+    async def stop(self, iid):
+        pass
+
+
+class _Pool:
+    def acquire(self, key):
+        return "task-1"
+
+    def release(self, key):
+        pass
+
+
+class _ScriptedSource:
+    """Hands back one scripted CardPage per page read, counted from `begin`.
+
+    `attempts` is a list of scripts, one per attempt; the last is reused. With
+    `advance_to`, the source pages by its own `advance` (landing on that URL
+    and answering `advance_result`); without it, it has no `advance` at all.
+    """
+
+    name = "fake"
+    label = "Fake"
+
+    def __init__(self, *attempts: list[CardPage], advance_to: str | None = None,
+                 advance_result: bool = True):
+        self._attempts = list(attempts)
+        self.begins = 0
+        self.reads = 0
+        self.advanced: list[int] = []
+        if advance_to is not None:
+            async def advance(page, n):
+                self.advanced.append(n)
+                if advance_result:
+                    page.url = f"{advance_to}#page-{n}"
+                return advance_result
+            self.advance = advance
+
+    def begin(self):
+        self.begins += 1
+        self.reads = 0
+
+    def page_url(self, url, n):
+        return url if n == 1 else f"{url}?page={n}"
+
+    async def cards(self, page):
+        script = self._attempts[min(self.begins, len(self._attempts)) - 1]
+        self.reads += 1
+        return script[min(self.reads, len(script)) - 1]
+
+
+class _PlainSource:
+    """A source with neither `begin` nor `advance`: BizBuySell's shape."""
+
+    name = "fake"
+
+    def __init__(self, pages: list[CardPage]):
+        self._pages = pages
+        self.reads = 0
+
+    def page_url(self, url, n):
+        return url if n == 1 else f"{url}{n}/"
+
+    async def cards(self, page):
+        self.reads += 1
+        return self._pages[min(self.reads, len(self._pages)) - 1]
+
+
+def _job(jobs, max_pages=3) -> SweepTask:
+    return jobs.create(source="fake", urls=[LIST], max_pages=max_pages, status="working")
+
+
+async def _once(svc, job, source, tmp_path, page=None, inst=None):
+    page = page or _FakePage()
+    inst = inst or _FakeInst(1, page)
+    res = await svc._sweep_once(inst, page, job, LIST, source, tmp_path / "ev")
+    return res, page, inst
+
+
+def _meta(path: Path) -> dict:
+    import json
+
+    return json.loads((path / "metadata.json").read_text())
+
+
+class TestPagingHooks:
+    @pytest.mark.asyncio
+    async def test_a_source_without_advance_pages_by_url_as_before(self, settings, jobs, tmp_path):
+        source = _PlainSource([CardPage([_gen(1), _gen(2)]), CardPage([_gen(3)]),
+                               CardPage([_gen(4)])])
+        svc = ScrapeService(instances=None, jobs=jobs, settings=settings)
+        res, page, inst = await _once(svc, _job(jobs), source, tmp_path)
+
+        assert page.gotos == [LIST, f"{LIST}2/", f"{LIST}3/"], "every page is page_url(url, n)"
+        assert inst.touches == 3
+        assert res["error"] is None
+        assert [l.url for l in res["data"]["listings"]] == [_gen(i).url for i in (1, 2, 3, 4)]
+        assert res["data"]["pages_crawled"] == 3
+
+    @pytest.mark.asyncio
+    async def test_advance_is_used_for_every_page_after_the_first(self, settings, jobs, tmp_path):
+        source = _ScriptedSource([CardPage([_gen(1)]), CardPage([_gen(2)]), CardPage([_gen(3)])],
+                                 advance_to="https://example.com/clicked")
+        svc = ScrapeService(instances=None, jobs=jobs, settings=settings)
+        res, page, inst = await _once(svc, _job(jobs), source, tmp_path)
+
+        assert page.gotos == [LIST], "page 1 is page_url(url, 1); the rest are advance"
+        assert source.advanced == [2, 3]
+        assert inst.touches == 3, "the instance is kept alive on every page either way"
+        assert len(res["data"]["listings"]) == 3
+
+    @pytest.mark.asyncio
+    async def test_advance_returning_false_stops_paging(self, settings, jobs, tmp_path):
+        source = _ScriptedSource([CardPage([_gen(1)]), CardPage([_gen(2)])],
+                                 advance_to="https://example.com/x", advance_result=False)
+        svc = ScrapeService(instances=None, jobs=jobs, settings=settings)
+        res, _, _ = await _once(svc, _job(jobs), source, tmp_path)
+
+        assert source.advanced == [2]
+        assert source.reads == 1, "no next page, so nothing more is read"
+        assert res["error"] is None and res["blocked"] is False
+        assert res["data"]["pages_crawled"] == 1
+        assert [l.url for l in res["data"]["listings"]] == [_gen(1).url]
+
+    @pytest.mark.asyncio
+    async def test_evidence_records_where_the_browser_is_not_page_url(
+        self, settings, jobs, tmp_path,
+    ):
+        """After a click, page_url(url, 2) is somewhere the browser never went."""
+        source = _ScriptedSource(
+            [CardPage([_gen(1)]), CardPage([], blocked=True)],
+            advance_to="https://example.com/clicked",
+        )
+        svc = ScrapeService(instances=None, jobs=jobs, settings=settings)
+        res, _, _ = await _once(svc, _job(jobs), source, tmp_path)
+
+        assert res["blocked"] is True
+        meta = _meta(tmp_path / "ev" / "page-02-blocked")
+        assert meta["url"] == "https://example.com/clicked#page-2"
+        assert meta["reason"] == "blocked"
+
+    @pytest.mark.asyncio
+    async def test_begin_is_called_at_the_start_of_every_attempt(
+        self, settings, jobs, tmp_path, monkeypatch,
+    ):
+        """The same source object serves every attempt, so its per-attempt state
+        is reset each time — here, which page of its script it is on."""
+        async def _instant(*_a, **_k):
+            return None
+
+        monkeypatch.setattr("app.services.browsing.asyncio.sleep", _instant)
+        source = _ScriptedSource(
+            [CardPage([_gen(1)]), CardPage([], blocked=True)],   # attempt 1: blocked on page 2
+            [CardPage([_gen(1)]), CardPage([_gen(2)])],          # attempt 2: clean
+        )
+        instances = _FakeInstances()
+        svc = ScrapeService(instances=instances, jobs=jobs, settings=settings, task_profiles=_Pool())
+        job = _job(jobs, max_pages=2)
+
+        res = await scrape_with_retry(
+            instances, profile="task-1", owner="job:x", wait_ms=0, attempts=3,
+            scrape_once=lambda inst, page: svc._sweep_once(inst, page, job, LIST, source,
+                                                           tmp_path / "ev"),
+        )
+
+        assert source.begins == 2, "once per attempt"
+        assert instances.launches == 2 and instances.profiles.rotations == 1
+        assert res["error"] is None and res["blocked"] is False
+        assert [l.url for l in res["data"]["listings"]] == [_gen(1).url, _gen(2).url], (
+            "the second attempt started from page 1 of its own script"
+        )
+
+
+class TestSeenUrls:
+    @pytest.mark.asyncio
+    async def test_a_page_of_dropped_cards_does_not_end_paging(self, settings, jobs, tmp_path):
+        """Page 2 is all sold listings: nothing returned, but four new cards were
+        on it, so it is not the end of the feed."""
+        sold = [f"https://example.com/listing/sold-{i}" for i in range(4)]
+        source = _PlainSource([
+            CardPage([_gen(1), _gen(2)]),
+            CardPage([], seen_urls=sold),
+            CardPage([_gen(3)]),
+        ])
+        svc = ScrapeService(instances=None, jobs=jobs, settings=settings)
+        res, _, _ = await _once(svc, _job(jobs), source, tmp_path)
+
+        assert source.reads == 3
+        assert [l.url for l in res["data"]["listings"]] == [_gen(i).url for i in (1, 2, 3)]
+        assert res["data"]["pages_crawled"] == 3
+
+    @pytest.mark.asyncio
+    async def test_without_seen_urls_an_empty_later_page_still_stops(
+        self, settings, jobs, tmp_path,
+    ):
+        """BizBuySell's empty last page: unchanged, and never judged illegible."""
+        source = _PlainSource([CardPage([_gen(1)]), CardPage([]), CardPage([_gen(9)])])
+        svc = ScrapeService(instances=None, jobs=jobs, settings=settings)
+        res, _, _ = await _once(svc, _job(jobs), source, tmp_path)
+
+        assert source.reads == 2
+        assert res["error"] is None
+        assert [c["page"] for c in res["data"]["legibility"]] == [1], "page 2 was not judged"
+
+    @pytest.mark.asyncio
+    async def test_already_seen_cards_still_end_paging(self, settings, jobs, tmp_path):
+        """seen_urls widens what counts as seen; it does not make a repeat fresh."""
+        source = _PlainSource([
+            CardPage([_gen(1)], seen_urls=[_gen(1).url, "https://example.com/listing/sold"]),
+            CardPage([], seen_urls=["https://example.com/listing/sold"]),
+            CardPage([_gen(5)]),
+        ])
+        svc = ScrapeService(instances=None, jobs=jobs, settings=settings)
+        res, _, _ = await _once(svc, _job(jobs), source, tmp_path)
+        assert source.reads == 2
+
+
+class TestPageFailures:
+    """A page that loaded, was not a block, and still cannot be used."""
+
+    def _svc(self, settings, jobs, instances, typesafe=None):
+        return ScrapeService(instances=instances, jobs=jobs, settings=settings,
+                             store_factory=FakeStore, task_profiles=_Pool(), typesafe=typesafe)
+
+    @pytest.mark.asyncio
+    async def test_a_source_error_fails_the_source_once_with_evidence(
+        self, settings, jobs, monkeypatch,
+    ):
+        source = _ScriptedSource([CardPage([], error="No list of businesses for sale on this page",
+                                           retry=False)])
+        monkeypatch.setattr("app.sources.for_url", lambda url: source)
+        instances = _FakeInstances()
+        svc = self._svc(settings, jobs, instances)
+        job = svc.start([LIST])
+        await _drain(svc)
+
+        assert instances.launches == 1, "retry=False: no second attempt"
+        assert instances.profiles.rotations == 0, "and no new exit IP"
+        result = svc.result(job.id)
+        assert result.status == "failed"
+        assert "No list of businesses for sale on this page" in result.error
+        assert "example.com" in result.error
+        evidence = (CONFIG.evidence_dir / job.id / "source-01"
+                    / "page-01-no-list-of-businesses-for-sale-on-this-page")
+        assert evidence.is_dir(), sorted(p.name for p in evidence.parent.iterdir())
+        meta = _meta(evidence)
+        assert meta["error"] == "No list of businesses for sale on this page"
+        assert meta["url"] == LIST and meta["page"] == 1
+
+    @pytest.mark.asyncio
+    async def test_an_illegible_page_fails_without_retry(self, settings, jobs, monkeypatch):
+        untitled = [_gen(i, title="") for i in range(5)]
+        source = _ScriptedSource([CardPage([_gen(1), _gen(2)]), CardPage(untitled)])
+        monkeypatch.setattr("app.sources.for_url", lambda url: source)
+        instances = _FakeInstances()
+        svc = self._svc(settings, jobs, instances)
+        job = svc.start([LIST], max_pages=2)
+        await _drain(svc)
+
+        assert instances.launches == 1 and instances.profiles.rotations == 0
+        result = svc.result(job.id)
+        assert result.status == "failed"
+        assert "0 of 5 cards on page 2" in result.error
+        assert "nothing from this page was kept" in result.error
+        evidence = CONFIG.evidence_dir / job.id / "source-01" / "page-02-illegible"
+        assert _meta(evidence)["reason"] == "illegible"
+        assert _meta(evidence)["url"] == f"{LIST}?page=2"
+
+    @pytest.mark.asyncio
+    async def test_the_classifier_is_asked_only_once_a_key_is_saved(
+        self, settings, jobs, tmp_path,
+    ):
+        class Fake:
+            def __init__(self):
+                self.calls = 0
+
+            async def noul(self, state, instructions):
+                self.calls += 1
+                return 0.05
+
+        fake = Fake()
+        svc = self._svc(settings, jobs, None, typesafe=fake)
+        source = _PlainSource([CardPage([_gen(1), _gen(2)])])
+
+        res, _, _ = await _once(svc, _job(jobs, max_pages=1), source, tmp_path)
+        assert fake.calls == 0, "no key saved: the code checks alone decide"
+        assert res["error"] is None
+
+        settings.update(typesafe_openrouter_api_key="sk-or-test")
+        res, _, _ = await _once(svc, _job(jobs, max_pages=1), _PlainSource(
+            [CardPage([_gen(1), _gen(2)])]), tmp_path)
+        assert fake.calls == 2
+        assert res["retry"] is False
+        assert "don't read as business listings" in res["error"]
+        assert (tmp_path / "ev" / "page-01-illegible").is_dir()
+
+    @pytest.mark.asyncio
+    async def test_a_classifier_outage_keeps_the_page(self, settings, jobs, tmp_path):
+        from app.services.typesafe import TypeSafeUnavailable
+
+        class Down:
+            async def noul(self, state, instructions):
+                raise TypeSafeUnavailable("The TypeSafe Classifier did not answer.")
+
+        settings.update(typesafe_openrouter_api_key="sk-or-test")
+        svc = self._svc(settings, jobs, None, typesafe=Down())
+        res, _, _ = await _once(svc, _job(jobs, max_pages=1),
+                                _PlainSource([CardPage([_gen(1), _gen(2)])]), tmp_path)
+
+        assert res["error"] is None
+        assert len(res["data"]["listings"]) == 2
+        assert "did not answer" in res["data"]["legibility"][0]["classifier_error"]
+        assert "did not answer" in _meta(tmp_path / "ev" / "final")["legibility"][0][
+            "classifier_error"], "recorded in the run's evidence"
+
+    @pytest.mark.asyncio
+    async def test_cards_without_a_title_are_dropped_but_the_page_is_kept(
+        self, settings, jobs, tmp_path,
+    ):
+        cards = [_gen(i) for i in range(9)] + [_gen(9, title="")]
+        svc = ScrapeService(instances=None, jobs=jobs, settings=settings)
+        res, _, _ = await _once(svc, _job(jobs, max_pages=1), _PlainSource([CardPage(cards)]),
+                                tmp_path)
+        assert res["error"] is None
+        assert len(res["data"]["listings"]) == 9
+        assert res["data"]["legibility"][0]["dropped"] == 1
