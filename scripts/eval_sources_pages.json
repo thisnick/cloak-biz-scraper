@@ -95,8 +95,8 @@
     "empireflippers.com/listing/",
     "app.empireflippers.com/unlock/"
    ],
-   "min_cards": 15,
-   "next": "none"
+   "min_cards": 12,
+   "next": "click"
   },
   {
    "name": "Sunbelt",
