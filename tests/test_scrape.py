@@ -1146,13 +1146,15 @@ class TestPageFailures:
     async def test_the_classifier_is_asked_only_once_a_key_is_saved(
         self, settings, jobs, tmp_path,
     ):
+        from app.services.typesafe import Noul
+
         class Fake:
             def __init__(self):
                 self.calls = 0
 
-            async def noul(self, state, instructions):
+            async def ask(self, state, questions):
                 self.calls += 1
-                return 0.05
+                return {name: Noul(probability=0.05) for name in questions}
 
         fake = Fake()
         svc = self._svc(settings, jobs, None, typesafe=fake)
@@ -1165,7 +1167,7 @@ class TestPageFailures:
         settings.update(typesafe_openrouter_api_key="sk-or-test")
         res, _, _ = await _once(svc, _job(jobs, max_pages=1), _PlainSource(
             [CardPage([_gen(1), _gen(2)])]), tmp_path)
-        assert fake.calls == 2
+        assert fake.calls == 1, "one request for the page's sample"
         assert res["retry"] is False
         assert "don't read as business listings" in res["error"]
         assert (tmp_path / "ev" / "page-01-illegible").is_dir()
@@ -1175,7 +1177,7 @@ class TestPageFailures:
         from app.services.typesafe import TypeSafeUnavailable
 
         class Down:
-            async def noul(self, state, instructions):
+            async def ask(self, state, questions):
                 raise TypeSafeUnavailable("The TypeSafe Classifier did not answer.")
 
         settings.update(typesafe_openrouter_api_key="sk-or-test")

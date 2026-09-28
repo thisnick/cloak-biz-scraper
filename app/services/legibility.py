@@ -20,7 +20,10 @@ Two layers, both conservative:
   ranges on some sites ("$250K - $500K"), which is not a sign of anything.
 * **The TypeSafe Classifier (e.g. Jev)**, when a key is saved: a yes/no on a
   few sampled cards. It catches what the code cannot see — well-formed cards
-  that are blog posts, franchise ads, or a site's own navigation.
+  that are blog posts, franchise ads, or a site's own navigation. The sample
+  goes in ONE request — every card in one state, one question per card —
+  because the classifier reads the state once and answers every question in
+  it; a request per card would pay for the reading three times.
 
 The classifier half is best-effort here. BizBuySell pages do not depend on it,
 so a classifier outage must not fail them: the error is logged and recorded on
@@ -32,7 +35,6 @@ it means is the sweep's business, exactly as before.
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
 from dataclasses import dataclass
@@ -40,12 +42,13 @@ from typing import Any
 
 from ..models import Listing
 from ..stores.money import parse_money
-from .typesafe import TypeSafeError
+from .typesafe import Noul, TypeSafeError
 
 logger = logging.getLogger("cloakbiz.legibility")
 
-# The statement put to the classifier about each sampled card.
-QUESTION = "This is a legible listing of a business for sale."
+# The statement put to the classifier about each sampled card, by its key in
+# the state ("card_1", "card_2", …).
+QUESTION = "{card} in the state is a legible listing of a business for sale."
 
 # At least this share of cards must have both a title and a link.
 MIN_COMPLETE = 0.7
@@ -102,7 +105,7 @@ class Verdict:
 async def check(listings: list[Listing], *, page: int, classifier=None) -> Verdict:
     """Judge one page's cards. Never raises for a classifier failure.
 
-    `classifier` is a TypeSafe client (anything with `noul(state, instructions)`),
+    `classifier` is a TypeSafe client (anything with `ask(state, questions)`),
     passed only when a key is saved; None skips that half.
     """
     if not listings:
@@ -140,19 +143,26 @@ async def check(listings: list[Listing], *, page: int, classifier=None) -> Verdi
         return Verdict(listings=complete, dropped=dropped)
 
     sample = _sample(complete)
-    answers = await asyncio.gather(
-        *(classifier.noul(_state(card), QUESTION) for card in sample),
-        return_exceptions=True,
-    )
-    failed = next((a for a in answers if isinstance(a, BaseException)), None)
-    if failed is not None:
-        if not isinstance(failed, TypeSafeError):
-            raise failed
+    names = [f"card_{i}" for i in range(1, len(sample) + 1)]
+    state = {"cards": {name: _state(card) for name, card in zip(names, sample)}}
+    questions = {name: {"type": "noul", "instructions": QUESTION.format(card=name)}
+                 for name in names}
+    try:
+        replies = await classifier.ask(state, questions)
+        answers = []
+        for name in names:
+            reply = replies.get(name)
+            if not isinstance(reply, Noul):
+                raise TypeSafeError(
+                    f"The TypeSafe Classifier did not answer the yes/no question about {name}."
+                )
+            answers.append(reply.probability)
+    except TypeSafeError as exc:
         # Best-effort: the code checks above have already passed this page.
-        logger.warning("legibility: classifier skipped on page %d: %s", page, failed)
-        return Verdict(listings=complete, dropped=dropped, classifier_error=str(failed))
+        logger.warning("legibility: classifier skipped on page %d: %s", page, exc)
+        return Verdict(listings=complete, dropped=dropped, classifier_error=str(exc))
 
-    mean = sum(float(a) for a in answers) / len(answers)
+    mean = sum(answers) / len(answers)
     if mean < MIN_CLASSIFIER_MEAN:
         return Verdict(
             listings=[], ok=False, dropped=dropped,

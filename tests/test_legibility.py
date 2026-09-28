@@ -15,11 +15,13 @@ import json
 import logging
 from pathlib import Path
 
+import httpx
 import pytest
+import respx
 
 from app.models import Listing
 from app.services import legibility
-from app.services.typesafe import TypeSafeUnavailable
+from app.services.typesafe import API, Noul, RawAnswer, TypeSafeClient, TypeSafeUnavailable
 from app.sources.bizbuysell import JS_BROKER, JS_CARDS, BizBuySellBroker, BizBuySellSerp
 
 
@@ -38,18 +40,20 @@ def _card(i: int, **fields) -> Listing:
 
 
 class FakeClassifier:
-    """Answers `noul` from a list (one per call, in order) or raises `error`."""
+    """Answers every question in one `ask` from a list of probabilities (one per
+    question, in order), or raises `error`. `calls` is one entry per request."""
 
     def __init__(self, answers=None, error: Exception | None = None):
         self._answers = list(answers or [])
         self._error = error
-        self.calls: list[tuple[dict, str]] = []
+        self.calls: list[tuple[dict, dict]] = []
 
-    async def noul(self, state, instructions):
-        self.calls.append((state, instructions))
+    async def ask(self, state, questions):
+        self.calls.append((state, questions))
         if self._error is not None:
             raise self._error
-        return self._answers[len(self.calls) - 1] if self._answers else 0.95
+        return {name: Noul(probability=self._answers[i] if self._answers else 0.95)
+                for i, name in enumerate(questions)}
 
 
 class TestCodeChecks:
@@ -136,31 +140,42 @@ class TestClassifier:
         assert "classifier_mean" not in verdict.record(1)
 
     @pytest.mark.asyncio
-    async def test_three_cards_spread_across_the_page_are_asked_about(self):
+    async def test_three_cards_spread_across_the_page_go_in_one_request(self):
+        """One state holding the sample, one yes/no per card: the classifier
+        reads the state once and answers every question in it."""
         cards = [_card(i) for i in range(10)]
         fake = FakeClassifier([0.9, 0.8, 0.95])
         verdict = await legibility.check(cards, page=1, classifier=fake)
 
         assert verdict.ok
+        assert len(fake.calls) == 1, "one request for the whole sample"
         assert verdict.classifier_samples == 3
         assert verdict.classifier_mean == pytest.approx((0.9 + 0.8 + 0.95) / 3)
-        titles = [state["title"] for state, _ in fake.calls]
+
+        state, questions = fake.calls[0]
+        assert list(state["cards"]) == ["card_1", "card_2", "card_3"]
+        titles = [card["title"] for card in state["cards"].values()]
         assert titles == ["Profitable Business 0", "Profitable Business 4",
                           "Profitable Business 9"], "first, middle and last"
-        state, question = fake.calls[0]
-        assert question == legibility.QUESTION
-        assert "business for sale" in question
-        assert state["asking_price"] == "$1,250,000"
-        assert state["cash_flow"] == "$300,000"
-        assert state["location"] == "Sacramento, CA"
-        assert "loyal customers" in state["excerpt"]
-        assert "revenue" not in state, "blank fields are left out"
+        assert list(questions) == ["card_1", "card_2", "card_3"]
+        for name, question in questions.items():
+            assert question["type"] == "noul"
+            assert question["instructions"] == legibility.QUESTION.format(card=name)
+            assert name in question["instructions"]
+            assert "business for sale" in question["instructions"]
+        first = state["cards"]["card_1"]
+        assert first["asking_price"] == "$1,250,000"
+        assert first["cash_flow"] == "$300,000"
+        assert first["location"] == "Sacramento, CA"
+        assert "loyal customers" in first["excerpt"]
+        assert "revenue" not in first, "blank fields are left out"
 
     @pytest.mark.asyncio
     async def test_a_short_page_is_asked_about_every_card(self):
         fake = FakeClassifier()
         await legibility.check([_card(1), _card(2)], page=1, classifier=fake)
-        assert len(fake.calls) == 2
+        assert len(fake.calls) == 1
+        assert list(fake.calls[0][1]) == ["card_1", "card_2"]
 
     @pytest.mark.asyncio
     async def test_a_low_mean_fails_the_page_in_plain_words(self):
@@ -189,6 +204,16 @@ class TestClassifier:
         assert "classifier skipped" in caplog.text
 
     @pytest.mark.asyncio
+    async def test_an_answer_of_the_wrong_kind_is_skipped_like_an_outage(self):
+        class Odd:
+            async def ask(self, state, questions):
+                return {name: RawAnswer(type="score") for name in questions}
+
+        verdict = await legibility.check([_card(1), _card(2)], page=1, classifier=Odd())
+        assert verdict.ok and len(verdict.listings) == 2
+        assert "card_1" in verdict.classifier_error
+
+    @pytest.mark.asyncio
     async def test_a_bug_is_not_mistaken_for_an_outage(self):
         with pytest.raises(KeyError):
             await legibility.check([_card(1)], page=1,
@@ -201,6 +226,28 @@ class TestClassifier:
                                          classifier=fake)
         assert not verdict.ok
         assert fake.calls == []
+
+
+class TestOneRequestOnTheWire:
+    """The real client against a faked endpoint: the sample is one POST."""
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_the_sample_is_a_single_request_with_a_question_per_card(self):
+        route = respx.post(API).mock(return_value=httpx.Response(200, json={
+            "model": "typesafe/jev-test",
+            "answers": {f"card_{i}": {"type": "noul", "noul": 0.9} for i in (1, 2, 3)},
+        }))
+        client = TypeSafeClient(lambda: "sk-or-test", lambda: "jev-latest")
+        verdict = await legibility.check([_card(i) for i in range(7)], page=1,
+                                         classifier=client)
+
+        assert verdict.ok and verdict.classifier_mean == pytest.approx(0.9)
+        assert route.call_count == 1
+        body = json.loads(route.calls.last.request.content)
+        assert sorted(body["state"]["cards"]) == ["card_1", "card_2", "card_3"]
+        assert sorted(body["questions"]) == ["card_1", "card_2", "card_3"]
+        assert all(q["type"] == "noul" for q in body["questions"].values())
 
 
 class TestZeroCards:
