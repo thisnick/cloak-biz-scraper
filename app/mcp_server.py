@@ -381,12 +381,14 @@ def build(app) -> MCPServer:
     # Annotated for sync=true, because an annotation cannot vary by argument:
     # sync=false only reads, but the same tool writes Notion rows when asked to.
     # Still not destructive in the sense above: on a row it already has, it
-    # rewrites only its own Last Synced At and Excerpt, from the live card. Open
-    # world because the caller names the site: any listings page, not only
+    # rewrites only its own Last Synced At and Excerpt, from the live card, and
+    # triage fills a Bot Triage that is blank — never one that holds a value.
+    # Open world because the caller names the site: any listings page, not only
     # BizBuySell, once the classifier key is saved.
     @tool(annotations=ADDITIVE_OPEN_WORLD)
     async def scrape_listings(
-        urls: list[str], max_pages: int = 1, sync: bool = False
+        urls: list[str], max_pages: int = 1, sync: bool = False,
+        triage_prompt: str | None = None,
     ) -> ScrapeResult:
         """Start sweeping one or more listings pages for business listings.
 
@@ -443,8 +445,27 @@ def build(app) -> MCPServer:
             sync=true here, plus archive_page to file a page's full content into a
             Notion page.) Sync always targets the Notion database configured under
             Settings — there is no per-call database override.
+        triage_prompt: optional. Your triage criteria as plain text — what makes a
+            listing one to reject. When given, the sweep also decides REVIEW or
+            REJECT for every row it saves, and for every row it sees whose Bot
+            Triage is still blank; a row that already has a Bot Triage is never
+            re-triaged. It writes Bot Triage, Triage Reason, Triaged At and
+            Criteria Version where those columns exist or are mapped under Settings.
+            A REVIEW row also gets its detail page's Source Content appended (as
+            archive_page does), so there is no need to call archive_page for them.
+            Needs sync=true and the TypeSafe Classifier (e.g. Jev) key in the
+            server's Settings; without either, or if the key fails its check or the
+            database has no Bot Triage column, the call is refused before anything
+            starts. The collected result's `triage` holds the counts, the earlier
+            rows it decided (`backlog`), and `failures`; each new listing carries
+            its `bot_triage`. A row that could not be decided (its detail page
+            would not load, the classifier stopped answering) stays blank, is
+            listed in `triage.failures` or `triage.error`, and is triaged by a
+            later sweep — the job still completes, because the rows were saved.
+            Leave it out to sweep exactly as without triage.
         """
-        job = await app.state.scrape.submit(urls, max_pages=max_pages, sync=sync)
+        job = await app.state.scrape.submit(urls, max_pages=max_pages, sync=sync,
+                                            triage_prompt=triage_prompt)
         return ScrapeResult.of(job)
 
     @tool(annotations=READ_ONLY)
@@ -458,7 +479,8 @@ def build(app) -> MCPServer:
         synced_row_id empty); a sync=true sweep returns only the ones it newly
         added to Notion, each carrying the synced_row_id of its new row (pass it to
         archive_page). Rows already in the database are omitted from `listings` but
-        counted in `synced.existing`.
+        counted in `synced.existing`. A sweep started with a triage_prompt stays
+        "working" until triage has finished; `triage` then holds what it decided.
         """
         result = app.state.scrape.result(job_id)
         if result is None:

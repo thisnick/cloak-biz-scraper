@@ -28,7 +28,8 @@ gate, pooled identity, retries, extraction; no Notion and no task record) and
 **Appending is idempotent.** A page that already carries the section `prelude`
 writes (a "Source Content" heading) is left alone, so a repeated call — or a
 triage run over a row someone archived by hand earlier — never files the page
-twice.
+twice. `archive` looks for the section before it opens a browser at all, so a
+repeat call costs one Notion read instead of a minute of page loading.
 
 **The guard.** A page can load "successfully" and still be a login wall, a
 cookie screen, a 404, a "this listing has been removed" notice or an anti-bot
@@ -232,7 +233,8 @@ class ArchiveService:
     async def archive(self, url: str, notion_page_id: str,
                       heading: str = DEFAULT_HEADING) -> ArchiveResult:
         """Read `url`, check it is the real page, and append it to the Notion
-        page `notion_page_id` — unless that page already has its `heading`."""
+        page `notion_page_id` — unless that page already has its `heading`,
+        which is checked first, before any browser work."""
         url = (url or "").strip()
         notion_page_id = (notion_page_id or "").strip()
         if not url or not notion_page_id:
@@ -369,12 +371,34 @@ class ArchiveService:
 
     async def _archive(self, url: str, notion_page_id: str, heading: str,
                        host: str, evidence: Path) -> ArchiveResult:
+        result = ArchiveResult(url=url, notion_page_id=notion_page_id,
+                               evidence_dir=str(evidence))
+        # The Notion page first, before a minute of browser work: a page that
+        # already has its section needs nothing read (a repeat call returns in
+        # a second), and a page that can't be opened would refuse the append
+        # anyway. `append` checks again — this is only the fast path.
+        try:
+            client = self._notion_client(self._settings.load().notion_api_token)
+            already = await has_section(client, notion_page_id, heading)
+        except Exception as exc:  # noqa: BLE001
+            result.error = (
+                f"Couldn't open the Notion page to archive into, so {host} was not read and "
+                f"nothing was written. {exc}"
+            )
+            result.summary = "Could not open the Notion page; nothing read or written."
+            return result
+        if already:
+            result.ok = True
+            result.summary = (
+                f"Nothing appended: the Notion page already has a '{heading}' section, so "
+                f"{url} is already archived there."
+            )
+            return result
+
         read = await self.read(url, evidence)
-        result = ArchiveResult(
-            url=url, notion_page_id=notion_page_id, title=read.title,
-            used_path=read.used_path, attempts_used=read.attempts_used,
-            evidence_dir=str(evidence),
-        )
+        result.title = read.title
+        result.used_path = read.used_path
+        result.attempts_used = read.attempts_used
         if read.blocked:
             result.error = (
                 f"{host} served an anti-bot page instead of the listing, on every attempt "
@@ -422,7 +446,6 @@ class ArchiveService:
         # failure is not a browser block, and re-scraping would risk appending
         # the page twice for a problem re-scraping cannot fix.
         try:
-            client = self._notion_client(self._settings.load().notion_api_token)
             appended = await self.append(client, notion_page_id, markdown, url, heading)
         except Exception as exc:  # noqa: BLE001
             result.error = str(exc)

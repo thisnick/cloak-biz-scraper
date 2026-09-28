@@ -1496,6 +1496,49 @@ class TestArchiveTasksInTheDashboard:
         assert row["kind"] == "sweep" and row["listings"] == 1 and row["pages_crawled"] == 2
 
 
+class TestTriageInTheDashboard:
+    """A triaging sweep keeps working after its sources are done, so the row
+    under Running now says what it is doing; and its result says how many rows
+    now wait for review."""
+
+    SERP = "https://www.bizbuysell.com/california/businesses-for-sale/"
+
+    @pytest.fixture(autouse=True)
+    def _leave_the_store_as_it_was_found(self):
+        before = {j.id for j in app.state.jobs.all()}
+        yield
+        for job in app.state.jobs.all():
+            if job.id in before:
+                continue
+            if job.status == "working":
+                job.status = "completed"
+                app.state.jobs.save(job)
+            app.state.jobs.drop(job.id)
+
+    def test_a_running_sweep_shows_its_phase(self, auth):
+        app.state.jobs.create(url=self.SERP, source="bizbuysell_serp", max_pages=2,
+                              summary="Reading 3 detail pages… (1 of 3 done)")
+        page = shown(auth.get("/"))
+        assert "Reading 3 detail pages… (1 of 3 done)" in page
+        assert "page 0 / 2" not in page
+
+    def test_the_result_counts_the_rows_left_for_review(self):
+        from app.models import SyncResult, TriageSummary
+        from app.routes.ui import _job_result
+
+        triaged = app.state.jobs.create(
+            url=self.SERP, source="bizbuysell_serp", status="completed", sync=True,
+            synced=SyncResult(new=15, existing=4, db_id="db"),
+            triage=TriageSummary(ok=True, review=3, reject=12),
+        )
+        assert _job_result(triaged) == ("ok", "15 new, 4 known · 3 review")
+        plain = app.state.jobs.create(
+            url=self.SERP, source="bizbuysell_serp", status="completed", sync=True,
+            synced=SyncResult(new=15, existing=4, db_id="db"),
+        )
+        assert _job_result(plain) == ("ok", "15 new, 4 known")
+
+
 class TestSessionsControls:
     """The full-control actions on the dashboard: new instance, run sweep, close.
 

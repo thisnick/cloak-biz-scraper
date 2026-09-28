@@ -19,30 +19,51 @@ when the TypeSafe Classifier (e.g. Jev) key is saved, since the reader cannot
 decide anything without it, and with that site's override if one is pinned. A
 URL on a site that HAS an adapter, which the adapter does not read, is refused:
 it never falls through.
+
+**Triage** runs after a synced sweep when the call carries a `triage_prompt`:
+every row this sweep inserted, plus every row it saw whose Bot Triage is still
+blank, gets REVIEW or REJECT from the TypeSafe Classifier (e.g. Jev) — on the
+card first, then (for a card REVIEW) on the listing's detail page, which is
+archived into the row when the verdict stays REVIEW. A row that already has a
+decision is never judged again. See `_TriagePhase` for the order of writes, and
+services/triage.py for the question itself. Without a prompt none of it runs.
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 from .. import sources
 from ..config import CONFIG
-from ..models import Listing, ScrapeResult, SweepTask, SyncResult
+from ..models import (
+    Listing,
+    ScrapeResult,
+    SweepTask,
+    SyncResult,
+    TriagedRow,
+    TriageFailure,
+    TriageSummary,
+)
 from ..sources.generic import GenericSource
 from ..sources.overrides import OverridesInvalid, SiteOverride, override_for, parse_overrides
-from ..stores.base import ListingStore
+from ..stores.base import ListingStore, TriageUnavailable, UpsertResult
 from . import legibility
+from .archive import GUARD_THRESHOLD
+from .archive import guard as archive_guard
 from .blocker import text_contains_blocker
 from .browsing import capture, gesture, scrape_with_retry
-from .jobs import JobStore
+from .jobs import JobStore, interrupted
 from .settings import SettingsService
 from .task_profiles import TaskProfilePool
+from .triage import REJECT, REVIEW, TriageDecision, Triager, criteria_version
 from .typesafe import TypeSafeError, TypeSafeUnavailable
 
 logger = logging.getLogger("cloakbiz.scrape")
@@ -72,6 +93,44 @@ NEEDS_CLASSIFIER = (
 
 class NotionNotConfigured(RuntimeError):
     """sync=true was asked for without a database to sync into."""
+
+
+class TriageNotConfigured(NotionNotConfigured):
+    """A `triage_prompt` was given, and triage cannot run — said before anything starts.
+
+    A NotionNotConfigured, so every façade already refuses it as a setup problem
+    (the MCP tool's answer, a 409 over REST, a banner in the dashboard): the
+    prompt is blank, sync is off, no classifier key is saved or the saved one
+    failed its check, or the Notion database has nowhere to record a decision.
+    Raised for the whole call — even a BizBuySell-only one — because a sweep
+    asked to triage that cannot would save rows and leave every one of them
+    undecided. `cause` is the classifier check's exception when that is the
+    reason, so REST can answer an outage with 503 like ClassifierNotReady.
+    """
+
+    def __init__(self, message: str, cause: TypeSafeError | None = None) -> None:
+        super().__init__(message)
+        self.cause = cause
+
+    @property
+    def transient(self) -> bool:
+        return isinstance(self.cause, TypeSafeUnavailable)
+
+
+@dataclass
+class _TriagePlan:
+    """A sweep's triage, from the call that asked for it to the end of the run.
+
+    `store` and `target` are filled by `submit`'s preflight — the database was
+    read once there to prove Bot Triage has somewhere to go — and reused by the
+    run, so the save and every triage write share the store's one client. A
+    sweep started with `start` directly has neither, and the run prepares them.
+    """
+
+    prompt: str
+    version: str
+    store: Any = None
+    target: Any = None
 
 
 class ClassifierNotReady(RuntimeError):
@@ -167,10 +226,15 @@ def _collect_message(job_id: str) -> str:
 class ScrapeService:
     def __init__(self, instances, jobs: JobStore, settings: SettingsService,
                  store_factory=None, task_profiles: TaskProfilePool | None = None,
-                 typesafe=None) -> None:
+                 typesafe=None, archive=None) -> None:
         self._instances = instances
         self._jobs = jobs
         self._settings = settings
+        # The ArchiveService (app.state.archive): triage reads a listing's
+        # detail page with its `read` — the same gate and pooled identities an
+        # archive_page call uses — and files it with its idempotent `append`.
+        # Optional: without it a triage_prompt is refused up front.
+        self._archive = archive
         # The shared TypeSafe Classifier client (app.state.typesafe). Optional:
         # without it — or without a saved key, checked at sweep time so a key
         # added in Settings applies to the next sweep — the legibility check
@@ -215,27 +279,50 @@ class ScrapeService:
         return len(self._running)
 
     async def submit(self, urls: list[str], *, max_pages: int = 1,
-                     sync: bool = False) -> SweepTask:
+                     sync: bool = False, triage_prompt: str | None = None) -> SweepTask:
         """Start a sweep the way the tools and the dashboard do: preflight, then `start`.
+
+        With a `triage_prompt`, `start`'s own refusals (an empty list, nothing
+        readable, a sync with no database) and triage's (see `_triage_plan`)
+        come first, because they cost nothing to find out.
 
         The preflight is the classifier's key. A URL read by the generic reader
         asks the TypeSafe Classifier (e.g. Jev) about every page, so a key that
         OpenRouter rejects, an account out of credits, or a service that is not
         answering would fail each such source on its first question — minutes
         into a job the caller has already been told is running. One tiny check
-        now turns that into an answer now, and it is asked only when some URL
-        needs it (a BizBuySell-only call never pays for it).
+        now turns that into an answer now, and it is asked only when something
+        needs it: a generic URL, or a `triage_prompt` (a BizBuySell-only call
+        without one never pays for it).
 
-        When it fails: if every readable URL needs the classifier, the whole
-        call is refused (`ClassifierNotReady`, with the check's own message);
-        in a mixed batch the generic URLs become their own sources' failures
-        with that message, and the BizBuySell ones still run.
+        When it fails: a call with a `triage_prompt` is refused whole
+        (`TriageNotConfigured`) — even a BizBuySell-only one, since it would
+        save rows it then cannot decide. Otherwise, if every readable URL needs
+        the classifier, the call is refused (`ClassifierNotReady`, with the
+        check's own message); in a mixed batch the generic URLs become their
+        own sources' failures with that message, and the BizBuySell ones run.
+
+        With a `triage_prompt`, the Notion database is read once more to find
+        where Bot Triage goes (`prepare_triage`); a database with nowhere to
+        record a decision refuses the call before anything starts.
         """
+        plan = None
+        if triage_prompt is not None:
+            self._admit(urls, max_pages, sync)
+            plan = self._triage_plan(triage_prompt, sync)
+
         refused: dict[str, str] = {}
         targets, _ = self._resolve(urls or [])
         generic = [t for t in targets if isinstance(t.source, GenericSource)]
-        if generic and self._typesafe is not None:
+        if (generic or plan is not None) and self._typesafe is not None:
             check = await self._typesafe.check()
+            if not check.ok and plan is not None:
+                raise TriageNotConfigured(
+                    "Can't start this sweep with triage: triage asks the TypeSafe Classifier "
+                    "(e.g. Jev) about every new listing, and it failed its check just now. "
+                    f"{check.message}",
+                    check.error,
+                )
             if not check.ok:
                 readable = [t for t in targets if t.source is not None]
                 if len(generic) == len(readable):
@@ -248,12 +335,18 @@ class ScrapeService:
                 reason = ("needs the TypeSafe Classifier (e.g. Jev), which failed its check "
                           f"just now: {check.message}")
                 refused = {t.url: reason for t in generic}
+        if plan is not None:
+            await self._prepare_triage(plan)
+            return self.start(urls, max_pages=max_pages, sync=sync, refused=refused or None,
+                              triage_plan=plan)
         if refused:
             return self.start(urls, max_pages=max_pages, sync=sync, refused=refused)
         return self.start(urls, max_pages=max_pages, sync=sync)
 
     def start(self, urls: list[str], *, max_pages: int = 1, sync: bool = False,
-              refused: Mapping[str, str] | None = None) -> SweepTask:
+              refused: Mapping[str, str] | None = None,
+              triage_prompt: str | None = None,
+              triage_plan: _TriagePlan | None = None) -> SweepTask:
         """Validate, write the job down, and return without waiting for it.
 
         Everything that can be known to be wrong before the browser starts is
@@ -268,7 +361,38 @@ class ScrapeService:
         when *nothing* in it is readable (there would be no sweep to run).
         `refused` names URLs a caller already knows cannot be read, each with
         its reason (`submit`'s preflight); they are failed the same way.
+
+        `triage_prompt` gets the checks that cost nothing (see `_triage_plan`);
+        the classifier's check and the Notion column are `submit`'s, which
+        hands over what it prepared as `triage_plan`. A run started here with
+        only a prompt prepares its triage target itself.
         """
+        max_pages, targets, target_db = self._admit(urls, max_pages, sync, refused)
+        plan = triage_plan
+        if plan is None and triage_prompt is not None:
+            plan = self._triage_plan(triage_prompt, sync)
+
+        # The representative source for the batch (each Listing still records its
+        # own). The instruction names the job id, and the id is minted by
+        # create(), so the summary is filled in by the same write rather than a
+        # second one.
+        source_name = next(t.source.name for t in targets if t.source is not None)
+        job = self._jobs.create(
+            source=source_name, urls=urls, max_pages=max_pages, sync=sync, db_id=target_db,
+            status="working", summary=_collect_message,
+            triage=TriageSummary(criteria_version=plan.version) if plan is not None else None,
+        )
+
+        task = asyncio.create_task(self._run(job, targets, plan))
+        self._running.add(task)
+        task.add_done_callback(self._running.discard)
+        return job
+
+    def _admit(self, urls: list[str], max_pages: int, sync: bool,
+               refused: Mapping[str, str] | None = None,
+               ) -> tuple[int, list[_Target], str]:
+        """`start`'s refusals, and what it needs once they pass: the clamped
+        page count, each URL's source, and the database a sync writes to."""
         if not urls:
             raise ValueError(
                 "scrape_listings needs at least one URL in 'urls', but the list was empty. "
@@ -297,21 +421,56 @@ class ScrapeService:
                     "Settings, or call this with sync=false to just read the listings back "
                     "without saving them."
                 )
+        return max_pages, targets, target_db
 
-        # The representative source for the batch (each Listing still records its
-        # own). The instruction names the job id, and the id is minted by
-        # create(), so the summary is filled in by the same write rather than a
-        # second one.
-        source_name = next(t.source.name for t in targets if t.source is not None)
-        job = self._jobs.create(
-            source=source_name, urls=urls, max_pages=max_pages, sync=sync, db_id=target_db,
-            status="working", summary=_collect_message,
-        )
+    def _triage_plan(self, prompt: str | None, sync: bool) -> _TriagePlan:
+        """The checks a `triage_prompt` needs that cost nothing, or raise
+        TriageNotConfigured saying what to change."""
+        text = (prompt or "").strip()
+        if not text:
+            raise TriageNotConfigured(
+                "triage_prompt is empty. Pass the text of your triage criteria (what makes a "
+                "listing one to reject), or leave triage_prompt out to sweep without triage."
+            )
+        if not sync:
+            raise TriageNotConfigured(
+                "Triage writes each decision into the listing's Notion row, so it needs "
+                "sync=true. Call again with sync=true, or leave triage_prompt out to just read "
+                "the listings."
+            )
+        if self._classifier() is None:
+            raise TriageNotConfigured(
+                "Triage needs the TypeSafe Classifier (e.g. Jev), and no OpenRouter key is "
+                "saved for it. Add one under Settings → TypeSafe Classifier (e.g. Jev), or "
+                "leave triage_prompt out."
+            )
+        if self._archive is None:
+            raise TriageNotConfigured(
+                "This server was started without its page reader, so it can't open listings' "
+                "detail pages to triage them. Leave triage_prompt out."
+            )
+        return _TriagePlan(prompt=text, version=criteria_version(text))
 
-        task = asyncio.create_task(self._run(job, targets))
-        self._running.add(task)
-        task.add_done_callback(self._running.discard)
-        return job
+    async def _prepare_triage(self, plan: _TriagePlan) -> None:
+        """Find where Bot Triage is recorded, once, or refuse the call.
+
+        The store built here is the one the run saves with, so the save and
+        every triage write share its client (one pace for Notion's rate limit).
+        """
+        settings = self._settings.load()
+        store: ListingStore = self._store_factory(settings)
+        try:
+            target = await store.prepare_triage(
+                (settings.notion_db_id or "").strip(), settings.notion_column_map or None,
+            )
+        except TriageUnavailable as exc:
+            raise TriageNotConfigured(f"Can't triage into your Notion database: {exc}") from exc
+        except Exception as exc:  # noqa: BLE001 — any failure to read it is a refusal
+            raise TriageNotConfigured(
+                "Can't start this sweep with triage: reading your Notion database to find "
+                f"where Bot Triage goes failed. {exc}"
+            ) from exc
+        plan.store, plan.target = store, target
 
     def _resolve(self, urls: list[str], refused: Mapping[str, str] | None = None,
                  ) -> tuple[list[_Target], sources.UnsupportedURL | None]:
@@ -426,7 +585,8 @@ class ScrapeService:
             self._past_gate -= 1
             self._gate.notify_all()
 
-    async def _run(self, job: SweepTask, targets: list[_Target]) -> None:
+    async def _run(self, job: SweepTask, targets: list[_Target],
+                   plan: _TriagePlan | None = None) -> None:
         # Fan the URLs out concurrently, but never past the pool's task budget.
         # Two bounds hold at once: a per-job Semaphore(task_budget) — the ported
         # run_targets pattern — caps how many of THIS job's sources are in flight,
@@ -448,6 +608,12 @@ class ScrapeService:
                 return await self._sweep_url(job, i, target.url, target.source, prog,
                                              refusal=target.refusal)
 
+        # The job's final state is kept here and written to the record only at
+        # the very end (the `finally`). Until then the record says "working":
+        # a poll that read "completed" while triage was still deciding rows
+        # would hand an agent listings without their decisions, and the
+        # progress summary (which only renders a working job) would freeze.
+        status, error, summary = "failed", None, "Sweep failed."
         try:
             outcomes = await asyncio.gather(
                 *(worker(i, target) for i, target in enumerate(targets))
@@ -458,54 +624,91 @@ class ScrapeService:
             job.pages_crawled = pages
             if ok == 0:
                 # Every source failed — only now is the whole job a failure.
-                job.status = "failed"
-                job.error = self._failure_text(failures, total)
-                job.summary = f"All {total} source(s) failed."
-            else:
-                job.status = "completed"
-                found = len(listings)
-                if job.sync:
-                    # Dedupe+upsert the MERGED set ONCE, not per source. Under
-                    # sync the caller keeps only the NEWLY-inserted rows, each
-                    # carrying its store page id — the already-known ones stay in
-                    # `synced.existing` but drop out of `listings`.
-                    try:
-                        job.synced, job.listings = await self._sync(job, listings)
-                    except Exception as exc:  # noqa: BLE001 — a save failure is the job's own
-                        # The scrape SUCCEEDED; only the Notion write broke. This is
-                        # distinct from a scrape failure (where sources failed) and
-                        # must read that way. Drop the scraped listings on purpose:
-                        # handing back scraped-but-unsaved rows looks like success
-                        # and is worse than a clean failure. The message says the
-                        # scrape worked, saving failed, nothing was saved — and
-                        # carries the underlying store error verbatim.
-                        logger.exception("saving sweep %s to Notion failed", job.id)
-                        job.status = "failed"
-                        job.listings = []
-                        job.synced = None
-                        job.error = (
-                            f"Scraped {found} listing(s) from {ok} source(s), but saving to "
-                            f"your Notion database failed — nothing was saved. {exc}"
-                        )
-                        job.summary = (
-                            f"Scraped {found} listing(s), but saving to Notion failed — "
-                            f"nothing saved."
-                        )
-                        return
-                if failures:
-                    job.error = self._failure_text(failures, total)
-                job.summary = self._summarize(job, ok, total, failures, found)
+                error = self._failure_text(failures, total)
+                summary = f"All {total} source(s) failed."
+                _triage_not_run(job, "Nothing was triaged: every source failed.")
+                return
+            found = len(listings)
+            store = plan.store if plan is not None else None
+            upsert: UpsertResult | None = None
+            if job.sync:
+                # Dedupe+upsert the MERGED set ONCE, not per source. Under
+                # sync the caller keeps only the NEWLY-inserted rows, each
+                # carrying its store page id — the already-known ones stay in
+                # `synced.existing` but drop out of `listings`.
+                try:
+                    store, upsert = await self._sync(job, listings, store)
+                except Exception as exc:  # noqa: BLE001 — a save failure is the job's own
+                    # The scrape SUCCEEDED; only the Notion write broke. This is
+                    # distinct from a scrape failure (where sources failed) and
+                    # must read that way. Drop the scraped listings on purpose:
+                    # handing back scraped-but-unsaved rows looks like success
+                    # and is worse than a clean failure. The message says the
+                    # scrape worked, saving failed, nothing was saved — and
+                    # carries the underlying store error verbatim.
+                    logger.exception("saving sweep %s to Notion failed", job.id)
+                    job.listings = []
+                    job.synced = None
+                    error = (
+                        f"Scraped {found} listing(s) from {ok} source(s), but saving to "
+                        f"your Notion database failed — nothing was saved. {exc}"
+                    )
+                    summary = (
+                        f"Scraped {found} listing(s), but saving to Notion failed — "
+                        f"nothing saved."
+                    )
+                    _triage_not_run(job, "Nothing was triaged: saving to Notion failed.")
+                    return
+                job.synced = SyncResult(
+                    new=upsert.new, existing=upsert.existing, db_id=upsert.db_id,
+                    skipped=upsert.skipped_names,
+                )
+                job.listings = upsert.new_listings
+                # The rows exist in the store from here on, so the record says
+                # so now, while the job is still working: a restart during
+                # triage then reports what was saved (JobStore.adopt), not
+                # "nothing was saved".
+                self._jobs.save(job)
+            status = "completed"
+            if failures:
+                error = self._failure_text(failures, total)
+            if plan is not None and upsert is not None:
+                # A triage that stops part-way (the classifier going down, a
+                # detail page that will not load) leaves those rows blank for a
+                # later sweep. The scrape and the save succeeded, so the job
+                # still completes, with the reason alongside.
+                await _TriagePhase(self, job, plan, store, upsert).run()
+                note = _triage_note(job.triage)
+                if note:
+                    error = f"{error} {note}" if error else note
+            summary = self._summarize(job, ok, total, failures, found)
+        except asyncio.CancelledError:
+            # Cancelled: the server is shutting down under this job. Whatever
+            # is written now is what every later poll reads, so it must say
+            # what actually happened — including rows saved before it stopped.
+            logger.warning("sweep %s was cancelled", job.id)
+            status = "failed"
+            error, summary = interrupted(job)
+            if job.triage is not None and not job.triage.ok and not job.triage.error:
+                job.triage.error = "Interrupted before triage finished."
+            raise
         except Exception as exc:  # noqa: BLE001 — the job must record its own failure
             logger.exception("sweep %s failed", job.id)
-            job.status = "failed"
-            job.error = str(exc)
-            job.summary = "Sweep failed."
+            status, error, summary = "failed", str(exc), "Sweep failed."
+            _triage_not_run(job, f"Triage did not finish: {exc}")
         finally:
+            job.status, job.error, job.summary = status, error, summary
             self._jobs.save(job)
             logger.info(
                 "job %s -> %s (%d listings across %d source(s))",
                 job.id, job.status, len(job.listings), total,
             )
+
+    def _phase(self, job: SweepTask, text: str) -> None:
+        """Say what a still-working sweep is doing now, where a poll and the
+        dashboard can see it (the sources' own progress is over by then)."""
+        job.summary = text
+        self._jobs.save(job)
 
     def _merge(self, targets, outcomes) -> tuple[list[Listing], int, int, list[tuple[str, str]]]:
         """Fold every source's outcome into one deduped result.
@@ -592,30 +795,36 @@ class ScrapeService:
                     f" — see Settings for why"
                 )
             parts.append(seg)
+            if job.triage is not None:
+                t = job.triage
+                seg = f"triaged: {t.review} review, {t.reject} reject"
+                if t.undecided:
+                    seg += f", {t.undecided} left blank for a later sweep"
+                parts.append(seg)
         if failures:
             parts.append(f"{len(failures)} source(s) failed")
         return " · ".join(parts)
 
-    async def _sync(self, job: SweepTask, listings: list[Listing]) -> tuple[SyncResult, list[Listing]]:
-        """Upsert the merged set and report the counts alongside the NEW rows.
+    async def _sync(self, job: SweepTask, listings: list[Listing],
+                    store: ListingStore | None = None) -> tuple[ListingStore, UpsertResult]:
+        """Upsert the merged set; return the store used and what it did.
 
-        Returns the aggregate `SyncResult` and the newly-inserted listings, each
-        carrying the store page id it was written to. The caller swaps these in
-        for `job.listings`, so an agent collecting a synced sweep gets exactly the
-        rows this sweep added, ready to hand to `archive_page`.
+        The result's `new_listings` are the newly-inserted rows, each carrying
+        the store page id it was written to — the caller swaps them in for
+        `job.listings`, so an agent collecting a synced sweep gets exactly the
+        rows this sweep added, ready to hand to `archive_page`. Its `untriaged`
+        are the known rows whose Bot Triage is blank, for triage. `store` is the
+        one triage's preflight already built, when there is one, so the save
+        and the triage writes share its client.
         """
         settings = self._settings.load()
-        store: ListingStore = self._store_factory(settings)
+        if store is None:
+            store = self._store_factory(settings)
         # The sweep always targets the configured database (job.db_id is set to
         # settings.notion_db_id at start), so the configured column map always
         # applies.
         column_map = settings.notion_column_map or None
-        result = await store.upsert_new(job.db_id, listings, column_map=column_map)
-        synced = SyncResult(
-            new=result.new, existing=result.existing, db_id=result.db_id,
-            skipped=result.skipped_names,
-        )
-        return synced, result.new_listings
+        return store, await store.upsert_new(job.db_id, listings, column_map=column_map)
 
     def _evidence_dir(self, job: SweepTask, i: int) -> Path:
         """Where source `i`'s screenshots and snapshots land.
@@ -886,6 +1095,284 @@ class _RunProgress:
         self._sweeping.discard(i)
         self._done.add(i)
         self.render()
+
+
+def _triage_not_run(job: SweepTask, reason: str) -> None:
+    """Record why a sweep asked to triage decided nothing (first reason wins)."""
+    if job.triage is not None and not job.triage.error:
+        job.triage.error = reason
+
+
+def _triage_note(triage: TriageSummary | None) -> str:
+    """The sentence a completed job's error carries when triage left rows blank."""
+    if triage is None or triage.ok:
+        return ""
+    if triage.error:
+        return (f"Triage stopped before deciding every row: {triage.error} Rows without a "
+                f"decision stay blank and are triaged on a later sweep.")
+    n = triage.undecided or len(triage.failures)
+    return (f"Triage couldn't decide {n} row{'' if n == 1 else 's'} (see triage.failures); "
+            f"they stay blank and are triaged on a later sweep.")
+
+
+def _plural(n: int, word: str) -> str:
+    return f"{n} {word}{'' if n == 1 else 's'}"
+
+
+class _TriagePhase:
+    """One sweep's triage: decide every row, write each decision, archive the REVIEWs.
+
+    The rows are the ones this sweep inserted plus the known rows it saw whose
+    Bot Triage is blank (`UpsertResult.untriaged`) — a row holding a decision,
+    anyone's, is never judged again. Two stages:
+
+    1. **The card**, for every row at once (the TypeSafe client's own ceiling
+       bounds the fan-out). REJECT is written straight away.
+    2. **The detail page**, for each card REVIEW, read through the archive's
+       gate and pooled identities. Then, in this order:
+       - the page could not be read (blocked, failed to load) → nothing is
+         written and the row is reported as a failure; its Bot Triage stays
+         blank, so a later sweep tries again;
+       - the guard — asked on its own, never bundled with the triage question:
+         bundled with the card and page text its score on real pages fell from
+         0.95 to 0.55–0.68 — says the page is not the listing's real content
+         (a login or NDA wall, a removed listing, an error page) → REVIEW is
+         written as decided on the card, with nothing archived, so a site that
+         always gates its detail pages is not retried forever;
+       - otherwise the question is asked again on the card and the page. REVIEW
+         → the page is appended to the row (idempotently) and THEN REVIEW is
+         written, so every REVIEW with a readable page has its Source Content;
+         REJECT → REJECT is written and nothing is archived.
+
+    A TypeSafeError (after the client's own retries) stops the phase: no more
+    questions are asked and the rows not yet decided stay blank. A failed
+    Notion write fails that row only. Neither is raised — the scrape and the
+    save succeeded, and the job says so (`_triage_note`). Only a cancellation
+    propagates, after the record has been brought up to date.
+    """
+
+    def __init__(self, service: ScrapeService, job: SweepTask, plan: _TriagePlan,
+                 store: ListingStore, upsert: UpsertResult) -> None:
+        self._svc = service
+        self._job = job
+        self._plan = plan
+        self._store = store
+        self._target = plan.target
+        self._triager = Triager(service._typesafe, plan.prompt)
+        if job.triage is None:
+            job.triage = TriageSummary(criteria_version=plan.version)
+        self._summary = job.triage
+        # (listing carrying its row id, is it backlog), each row once.
+        self._rows: list[tuple[Listing, bool]] = []
+        seen: set[str] = set()
+        for listing, backlog in ([(l, False) for l in upsert.new_listings]
+                                 + [(l, True) for l in upsert.untriaged]):
+            row_id = listing.synced_row_id
+            if row_id and row_id not in seen:
+                seen.add(row_id)
+                self._rows.append((listing, backlog))
+        self._decided: dict[str, TriageDecision] = {}
+        self._failed: dict[str, TriageFailure] = {}
+        self._stopped: str | None = None
+        # What each row went through, for the run's evidence (triage.json).
+        self._records: dict[str, dict[str, Any]] = {}
+        self._evidence = CONFIG.evidence_dir / job.id
+
+    async def run(self) -> None:
+        try:
+            if not self._rows:
+                return
+            if self._target is None and not await self._prepare():
+                return
+            new = sum(1 for _, backlog in self._rows if not backlog)
+            old = len(self._rows) - new
+            what = _plural(new, "new listing") if new else ""
+            if old:
+                earlier = _plural(old, "earlier row")
+                what = f"{what} and {earlier}" if what else earlier
+            self._svc._phase(self._job, f"Triaging {what}…")
+
+            cards = await asyncio.gather(*(self._card(listing) for listing, _ in self._rows))
+            reviews = [(i, listing, card)
+                       for i, ((listing, _), card) in enumerate(zip(self._rows, cards), 1)
+                       if card is not None and card.decision == REVIEW]
+            if reviews and not self._stopped:
+                await self._details(reviews)
+        finally:
+            self._finish()
+
+    async def _prepare(self) -> bool:
+        """Resolve the triage target when `submit`'s preflight did not."""
+        settings = self._svc._settings.load()
+        try:
+            self._target = await self._store.prepare_triage(
+                self._job.db_id, settings.notion_column_map or None,
+            )
+        except Exception as exc:  # noqa: BLE001 — TriageUnavailable or a store failure
+            self._stopped = f"couldn't find where to record decisions: {exc}"
+            return False
+        return True
+
+    # -- the two stages --
+
+    async def _card(self, listing: Listing) -> TriageDecision | None:
+        if self._stopped:
+            return None
+        try:
+            decision = await self._triager.card(listing)
+        except TypeSafeError as exc:
+            self._stop(exc)
+            return None
+        except Exception as exc:  # noqa: BLE001 — one row's trouble is that row's
+            logger.exception("triage of %s failed", listing.url)
+            self._fail(listing, f"The classifier's answer could not be used: {exc}")
+            return None
+        self._note(listing, card=decision.record())
+        if decision.decision == REJECT:
+            await self._write(listing, decision)
+        return decision
+
+    async def _details(self, reviews: list[tuple[int, Listing, TriageDecision]]) -> None:
+        total = len(reviews)
+        done = 0
+        pages = _plural(total, "detail page")
+        self._svc._phase(self._job, f"Reading {pages}…")
+        # The archive's gate bounds the browsers; this bounds how many rows are
+        # between "read" and "written" at once, so progress reads in order.
+        sem = asyncio.Semaphore(max(1, self._svc._settings.load().task_budget))
+
+        async def one(i: int, listing: Listing, card: TriageDecision) -> None:
+            nonlocal done
+            async with sem:
+                await self._detail(i, listing, card)
+            done += 1
+            if done < total:
+                self._svc._phase(self._job, f"Reading {pages}… ({done} of {total} done)")
+
+        await asyncio.gather(*(one(i, listing, card) for i, listing, card in reviews))
+
+    async def _detail(self, i: int, listing: Listing, card: TriageDecision) -> None:
+        if self._stopped:
+            return
+        evidence = self._evidence / f"detail-{i:02d}"
+        try:
+            read = await self._svc._archive.read(listing.url, evidence,
+                                                 owner=f"job:{self._job.id}")
+        except Exception as exc:  # noqa: BLE001 — a launch failure is this row's
+            logger.warning("reading the detail page %s failed: %s", listing.url, exc)
+            self._fail(listing, f"Couldn't read the detail page: {exc}")
+            return
+        if not read.ok:
+            self._fail(listing, f"Couldn't read the detail page: {read.failure}")
+            return
+        if self._stopped:
+            return
+        try:
+            p_real = await archive_guard(self._svc._typesafe, read.markdown)
+        except TypeSafeError as exc:
+            self._stop(exc)
+            return
+        self._note(listing, guard=round(p_real, 4))
+        if p_real < GUARD_THRESHOLD:
+            # Not the listing's content (a wall, a removed listing, an error
+            # page): decided on the card, and nothing is archived.
+            await self._write(listing, card.on_card_only(p_real))
+            return
+        try:
+            decision = await self._triager.detail(listing, read.markdown)
+        except TypeSafeError as exc:
+            self._stop(exc)
+            return
+        self._note(listing, detail=decision.record())
+        if decision.decision == REVIEW:
+            client = getattr(self._target, "client", None)
+            try:
+                await self._svc._archive.append(client, listing.synced_row_id,
+                                                read.markdown, listing.url)
+            except Exception as exc:  # noqa: BLE001 — REVIEW waits for its archive
+                logger.warning("archiving %s into row %s failed: %s",
+                               listing.url, listing.synced_row_id, exc)
+                self._fail(listing, "Archiving the detail page into the row failed, so REVIEW "
+                                    f"was not written: {exc}")
+                return
+        await self._write(listing, decision)
+
+    # -- bookkeeping --
+
+    async def _write(self, listing: Listing, decision: TriageDecision) -> None:
+        row_id = listing.synced_row_id
+        try:
+            await self._store.write_triage(
+                self._target, row_id, decision.decision, decision.reason,
+                datetime.now(timezone.utc), decision.criteria_version,
+            )
+        except Exception as exc:  # noqa: BLE001 — a decision not saved is this row's failure
+            logger.warning("writing triage for row %s failed: %s", row_id, exc)
+            self._fail(listing, f"Saving the decision ({decision.decision}) to Notion "
+                                f"failed: {exc}")
+            return
+        self._decided[row_id] = decision
+        self._note(listing, final=decision.record())
+
+    def _fail(self, listing: Listing, error: str) -> None:
+        row_id = listing.synced_row_id
+        self._failed[row_id] = TriageFailure(row_id=row_id, url=listing.url, error=error)
+        self._note(listing, error=error)
+
+    def _stop(self, exc: Exception) -> None:
+        if self._stopped is None:
+            logger.warning("triage for sweep %s stopped: %s", self._job.id, exc)
+            self._stopped = str(exc)
+
+    def _note(self, listing: Listing, **fields: Any) -> None:
+        record = self._records.setdefault(listing.synced_row_id, {
+            "row_id": listing.synced_row_id, "url": listing.url, "title": listing.title,
+        })
+        record.update(fields)
+
+    def _finish(self) -> None:
+        """Bring the job's record up to date with what was decided. Runs on
+        every exit, a cancellation included."""
+        summary = self._summary
+        summary.criteria_version = self._plan.version
+        decisions = [d.decision for d in self._decided.values()]
+        summary.review = decisions.count(REVIEW)
+        summary.reject = decisions.count(REJECT)
+        summary.undecided = len(self._rows) - len(self._decided)
+        summary.failures = list(self._failed.values())
+        summary.backlog = [
+            TriagedRow(row_id=listing.synced_row_id, url=listing.url,
+                       decision=getattr(self._decided.get(listing.synced_row_id), "decision", ""))
+            for listing, backlog in self._rows if backlog
+        ]
+        summary.error = self._stopped or summary.error
+        summary.ok = summary.undecided == 0 and summary.error is None
+        # The new rows are the job's listings; each carries what was written to
+        # it. (Backlog rows are not listings — they are reported above.)
+        listings = []
+        for listing in self._job.listings:
+            decision = self._decided.get(listing.synced_row_id)
+            if decision is not None:
+                listing = listing.model_copy(update={
+                    "bot_triage": decision.decision, "triage_p_review": decision.p_review,
+                })
+            listings.append(listing)
+        self._job.listings = listings
+        if self._records:
+            _write_json(self._evidence / "triage.json", {
+                "criteria_version": self._plan.version,
+                "stopped": self._stopped,
+                "rows": list(self._records.values()),
+            })
+
+
+def _write_json(path: Path, data: dict) -> None:
+    """Keep a record with the run's evidence; never fails the run over it."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        logger.warning("could not write %s", path)
 
 
 def _default_store(settings) -> ListingStore:

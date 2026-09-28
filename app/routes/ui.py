@@ -144,7 +144,12 @@ def _job_result(job) -> tuple[str, str]:
         # so its length is the new count, not the whole find — say so explicitly
         # rather than let a re-sweep that added nothing read as "0 listings".
         if job.synced is not None:
-            return "ok", f"{job.synced.new} new, {job.synced.existing} known"
+            label = f"{job.synced.new} new, {job.synced.existing} known"
+            # A triaging sweep's result is also how many rows now wait for a
+            # person — the number the triage exists to produce.
+            if getattr(job, "triage", None) is not None:
+                label += f" · {job.triage.review} review"
+            return "ok", label
         return "ok", f"{len(job.listings)} listings"
     if job.status == "failed":
         if _blocked(job):
@@ -170,11 +175,14 @@ def _blocked(job) -> bool:
 def _job_where(job) -> str:
     """The one line under a running task's name: what it is doing right now.
 
-    A sweep counts pages; an archive has a single page to read, so it names it.
+    A sweep says its own phase — waiting for a browser, sweeping N sources,
+    triaging, reading detail pages — from its summary, which it keeps current
+    while it works; the page count is only the fallback. An archive has a
+    single page to read, so it names it.
     """
     if job.kind == "archive":
         return job.urls[0] if job.urls else ""
-    return f"page {job.pages_crawled} / {job.max_pages}"
+    return job.summary or f"page {job.pages_crawled} / {job.max_pages}"
 
 
 def _job_label(job) -> str:

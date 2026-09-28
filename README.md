@@ -31,8 +31,9 @@ https://github.com/user-attachments/assets/8bc957ef-130d-4516-a356-9efdcedeb60d
   profile is using on disk.
 - **Built-in listing tasks** — sweep BizBuySell search or broker pages, or any other
   site's listings page once a TypeSafe Classifier (e.g. Jev) key is saved, into structured
-  listings, dedupe into a Notion database, and append readable page content to a listing's
-  existing Notion page.
+  listings, dedupe into a Notion database, triage each new row REVIEW or REJECT against
+  your written criteria, and append readable page content to a listing's existing Notion
+  page.
 - **Connect your own driver over CDP** — every instance hands back a short-lived CDP URL
   you can attach Playwright, or any other browser driver, to.
 - **`agent_browser` MCP tool** — your assistant (ChatGPT, Claude) can open, browse, and
@@ -78,8 +79,9 @@ https://github.com/user-attachments/assets/3c86899d-9f1b-4946-b1ca-4b11a53514b5
      block Railway's datacenter IP.
    - **Notion** — optional; needed only to save listings into a database.
    - **TypeSafe Classifier (e.g. Jev)** — optional; an OpenRouter key lets sweeps read
-     listing sites other than BizBuySell. **Site overrides** pin how one of those sites is
-     read when the automatic reading keeps getting it wrong.
+     listing sites other than BizBuySell, and triage the listings they save. **Site
+     overrides** pin how one of those sites is read when the automatic reading keeps
+     getting it wrong.
 
 ### Self-hosting without building
 
@@ -183,7 +185,7 @@ any behavioural change.
 | Tool | What it does |
 | --- | --- |
 | `server_info()` | Read proxy, browser-build, pool-capacity, Notion connection, and TypeSafe Classifier status without exposing secrets. |
-| `scrape_listings(urls, max_pages=1, sync=false)` | Start one asynchronous sweep across one or more listings pages — BizBuySell search results and broker profiles natively, any other site's listings page with a TypeSafe Classifier (e.g. Jev) key saved; results are merged and de-duplicated. |
+| `scrape_listings(urls, max_pages=1, sync=false, triage_prompt=null)` | Start one asynchronous sweep across one or more listings pages — BizBuySell search results and broker profiles natively, any other site's listings page with a TypeSafe Classifier (e.g. Jev) key saved; results are merged and de-duplicated. With `sync=true` and your criteria as `triage_prompt`, every saved row is also decided REVIEW or REJECT, and REVIEW rows get their detail page archived. |
 | `get_scrape_listing_results(job_id)` | Poll a sweep without blocking. Completed results are retained for two weeks. |
 | `archive_page(url, notion_page_id)` | Read a page and append its readable content to an existing Notion page. It takes roughly a minute; a page that already has a Source Content section gets nothing appended, so a repeat call is safe. With a TypeSafe Classifier (e.g. Jev) key saved, a login wall, error, removed listing or anti-bot page is not written. |
 | `create_instance(profile="Default", country=null, region=null, geoip=true)` | Launch a browser with a durable profile and return a short-lived CDP URL plus a live-view URL when available. In chat apps that support MCP Apps, a live view appears in the conversation. It closes after 15 minutes idle or 60 minutes total. |
@@ -210,8 +212,8 @@ Tools also publish MCP safety hints so a client can make a better approval decis
 `server_info`, `get_scrape_listing_results`, `list_profiles`, `list_instances`,
 `get_instance`, `show_browser`, and `live_view` are marked read-only. `agent_browser`, `close_instance`, and
 `delete_profile` are marked destructive; `close_instance` is also marked safe to retry.
-`scrape_listings` is marked write-capable because `sync=true` writes to Notion, even though
-its default `sync=false` mode does not.
+`scrape_listings` is marked write-capable because `sync=true` writes to Notion (and a
+`triage_prompt` fills blank triage columns), even though its default `sync=false` mode does not.
 
 `create_upload_url` takes no arguments. MCP cannot carry local file bytes, so the client
 must run the returned `curl` command or make the equivalent multipart HTTP request. The
@@ -236,6 +238,19 @@ returns only those newly inserted listings, each with a `synced_row_id` suitable
 `Last Synced At` and `Excerpt` columns are refreshed. Money fields are the
 verbatim strings shown on the listing card (`"$1,258,000"`, `"Not Disclosed"`) and are
 parsed into numbers only when written to Notion.
+
+A synced sweep given a `triage_prompt` — your screening criteria as plain text — also
+triages, in the server: every new row, and every row it saw whose Bot Triage is still blank,
+is decided REVIEW or REJECT by the TypeSafe Classifier (e.g. Jev), first on the card and then,
+for a REVIEW, on the listing's detail page. A REVIEW row gets that page appended as a Source
+Content section before REVIEW is written; the decision, a templated reason, the time and a
+Criteria Version (a fingerprint of the text) go to the Bot Triage, Triage Reason, Triaged At
+and Criteria Version columns where they exist or are mapped. A row that already has a Bot
+Triage is never judged again. A missing key, a key that fails its check, `sync=false` or a
+database with no Bot Triage column refuses the call up front; a row that could not be
+decided stays blank and is reported in the result's `triage.failures`, and a later sweep
+decides it. Without `triage_prompt` a sweep behaves exactly as before — see
+[triage prompt](docs/advanced-controls.md#triage-prompt).
 
 BizBuySell pages are read by their own adapters. A page on any other site is read
 generically: the list of listings is found by grouping the page's links, and the TypeSafe

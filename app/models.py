@@ -49,6 +49,17 @@ class Listing(BaseModel):
         "Empty unless this sweep synced and inserted the row (so it is empty for sync=false "
         "and for listings already in the store).",
     )
+    bot_triage: str = Field(
+        default="",
+        description="REVIEW or REJECT: the decision this sweep's triage wrote to the row's "
+        "Bot Triage. Empty when the sweep was not given a triage_prompt, or when this row "
+        "got no decision (see triage.failures) — a later triaging sweep decides it.",
+    )
+    triage_p_review: float | None = Field(
+        default=None,
+        description="The classifier's probability, 0–1, that the listing should be kept for "
+        "review — the number behind bot_triage. Null when the row was not triaged.",
+    )
 
 
 class SyncResult(BaseModel):
@@ -61,6 +72,60 @@ class SyncResult(BaseModel):
     skipped: list[str] = Field(
         default_factory=list,
         description="Columns the database could not hold, so their values were not written.",
+    )
+
+
+class TriagedRow(BaseModel):
+    """A row this sweep triaged that was already in the store: its Bot Triage was
+    still blank, so this sweep decided it."""
+
+    row_id: str
+    url: str = ""
+    decision: str = Field(
+        default="",
+        description="REVIEW or REJECT as written; empty when it still got no decision "
+        "(see failures).",
+    )
+
+
+class TriageFailure(BaseModel):
+    """A row triage could not decide. Its Bot Triage stays blank, so a later
+    triaging sweep that sees it decides it."""
+
+    row_id: str = ""
+    url: str = ""
+    error: str
+
+
+class TriageSummary(BaseModel):
+    """What triage did in this sweep. Null on the result when no triage_prompt
+    was given."""
+
+    ok: bool = Field(
+        default=False,
+        description="True when every row this sweep had to triage got a decision. False "
+        "while the sweep is still running.",
+    )
+    criteria_version: str = Field(
+        default="",
+        description="First 8 hex characters of the sha256 of the triage_prompt text — "
+        "written to each row's Criteria Version.",
+    )
+    review: int = Field(default=0, description="Rows decided REVIEW.")
+    reject: int = Field(default=0, description="Rows decided REJECT.")
+    undecided: int = Field(
+        default=0, description="Rows left without a decision, each triaged on a later sweep.",
+    )
+    backlog: list[TriagedRow] = Field(
+        default_factory=list,
+        description="Rows already in the store, seen by this sweep with a blank Bot Triage, "
+        "and what this sweep decided for them. They are not in `listings`.",
+    )
+    failures: list[TriageFailure] = Field(default_factory=list)
+    error: str | None = Field(
+        default=None,
+        description="Why triage stopped before deciding every row, e.g. the classifier "
+        "stopped answering. The saved rows are unaffected.",
     )
 
 
@@ -132,6 +197,10 @@ class SweepTask(TaskBase):
     # only), and `error` when the source failed. For a person diagnosing a run
     # (/runs/{id}); deliberately not in ScrapeResult, which an agent polls.
     decisions: list[dict] = Field(default_factory=list)
+    # Set when the sweep was given a triage prompt (None otherwise), from the
+    # moment the job is written, so a record interrupted mid-run still says
+    # triage was asked for (JobStore.adopt words its message on that).
+    triage: TriageSummary | None = None
 
 
 class ArchiveTask(TaskBase):
@@ -160,8 +229,8 @@ Task = Annotated[SweepTask | ArchiveTask, Field(discriminator="kind")]
 class ScrapeResult(BaseModel):
     """The result of a sweep.
 
-    While status is "working" the sweep is still running and `listings` is
-    empty — collect it with get_scrape_listing_results. `synced` is null when
+    While status is "working" the sweep is still running and `listings` is not
+    final — collect it again with get_scrape_listing_results. `synced` is null when
     sync was false, which means nothing was saved rather than nothing was found.
 
     What `listings` holds once completed depends on how the sweep was started.
@@ -170,6 +239,10 @@ class ScrapeResult(BaseModel):
     carrying the `synced_row_id` of the row it was written to (hand straight to
     archive_page). Already-stored listings are left out of `listings` but counted
     in `synced.existing`.
+
+    `triage` is null unless the sweep was given a triage_prompt. Then each new
+    listing's `bot_triage` holds the decision written to its row, and rows that
+    were already stored with a blank Bot Triage are reported in `triage.backlog`.
     """
 
     # Both tools return this one shape so an agent never has to learn two:
@@ -185,6 +258,7 @@ class ScrapeResult(BaseModel):
     error: str | None = None
     synced: SyncResult | None = None
     listings: list[Listing] = Field(default_factory=list)
+    triage: TriageSummary | None = None
     # Where this sweep's screenshots and page snapshots were written. A sweep
     # that finds nothing is the failure users hit first, and "it didn't work and
     # you can't see why" is where they give up: the pictures of the blocked page
@@ -203,6 +277,7 @@ class ScrapeResult(BaseModel):
             error=job.error,
             synced=job.synced,
             listings=job.listings,
+            triage=job.triage,
             evidence_dir=str(CONFIG.evidence_dir / job.id),
         )
 

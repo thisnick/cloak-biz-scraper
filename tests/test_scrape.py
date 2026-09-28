@@ -1580,3 +1580,623 @@ class TestDecisions:
         assert entry["pages"] == [{"page": 1, "error": "the page could not be read"}]
         assert entry["error"] == "page crashed"
         assert entry["suggested_override"] == {"match": "websiteclosers.com"}
+
+
+# ── triage ───────────────────────────────────────────────────────────────────
+#
+# The pipeline after a synced sweep that was given a triage_prompt, with every
+# collaborator faked: the classifier answers by listing title, the archive's
+# `read` serves a page per URL and its `append` records the write, and the store
+# records each decision. They share one `events` log, so the ORDER of writes —
+# the part of this that matters most — is asserted directly.
+
+import dataclasses  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+from app.services.archive import GUARD_QUESTION, PageRead, guard_state  # noqa: E402
+from app.services.triage import criteria_version  # noqa: E402
+from app.services.typesafe import (  # noqa: E402
+    Choice,
+    TypeSafeAuthError,
+    TypeSafeCheck,
+    TypeSafeCreditError,
+    TypeSafeUnavailable,
+)
+from app.stores.base import TriageTarget, TriageUnavailable  # noqa: E402
+
+PROMPT = "Reject restaurants.\nReject if the asking price is below $1M."
+OUTAGE = "The TypeSafe Classifier did not answer after 4 attempts (HTTP 503)."
+
+
+def _tl(n: int, title: str) -> Listing:
+    return Listing(
+        listing_id=f"t{n}", url=f"https://www.bizbuysell.com/business-opportunity/x/{n}/",
+        normalized_url=f"bizbuysell.com/business-opportunity/x/{n}", title=title,
+        location="Oakland, CA", asking_price="$2,000,000", cashflow="$500,000",
+        source="bizbuysell_serp",
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class _TriageTarget(TriageTarget):
+    client: object = None
+
+
+class TriageStore:
+    """The store as a triaging sweep uses it.
+
+    `existing` maps a listing id already in the store to its Bot Triage ("" =
+    blank, which makes it backlog — exactly what the real store reports as
+    `untriaged`). Every write records which job statuses were on disk at that
+    moment, so "never completed before triage ends" is checked where it matters.
+    """
+
+    def __init__(self, events, jobs, *, existing=None, fail_writes=(), prepare_error=None):
+        self.events = events
+        self.jobs = jobs
+        self.existing = dict(existing or {})
+        self.fail_writes = set(fail_writes)
+        self.prepare_error = prepare_error
+        self.prepared = 0
+        self.client = object()
+        self.writes: list[dict] = []
+        self.statuses: list[str] = []
+
+    async def upsert_new(self, db_id, listings, column_map=None):
+        new, untriaged, existing = [], [], 0
+        for listing in listings:
+            row = listing.model_copy(update={"synced_row_id": f"row-{listing.listing_id}"})
+            if listing.listing_id in self.existing:
+                existing += 1
+                if self.existing[listing.listing_id] == "":
+                    untriaged.append(row)
+                continue
+            new.append(row)
+        self.events.append(("upsert",))
+        return UpsertResult(new=len(new), existing=existing, db_id=db_id,
+                            new_listings=new, untriaged=untriaged)
+
+    async def prepare_triage(self, db_id, column_map=None):
+        self.prepared += 1
+        if self.prepare_error is not None:
+            raise self.prepare_error
+        return _TriageTarget(db_id=db_id, fields={"bot_triage": "Bot Triage"},
+                             client=self.client)
+
+    async def write_triage(self, target, row_id, decision, reason, triaged_at, criteria_version):
+        assert target.client is self.client, "the prepared target, every time"
+        self.statuses.extend(j.status for j in self.jobs.all())
+        if row_id in self.fail_writes:
+            raise RuntimeError("Notion refused this request (409 conflict_error)")
+        self.writes.append({"row_id": row_id, "decision": decision, "reason": reason,
+                            "at": triaged_at, "version": criteria_version})
+        self.events.append(("write", row_id, decision))
+
+
+class TriageClassifier:
+    """Answers by listing title: `card`/`detail` give P(review) per title
+    (default 0.9), `guard` gives P(real content) per title (default 0.96).
+    A title in `down` makes the classifier fail at that question."""
+
+    def __init__(self, events, *, card=None, detail=None, guard=None, down=(), check_error=None):
+        self.events = events
+        self.card = dict(card or {})
+        self.detail = dict(detail or {})
+        self.guard = dict(guard or {})
+        self.down = set(down)
+        self.check_error = check_error
+        self.checks = 0
+        self.asked: list[tuple[str, str]] = []
+
+    async def check(self, key=None, model=None):
+        self.checks += 1
+        if self.check_error is None:
+            return TypeSafeCheck(ok=True, message="Working: jev answered in 90 ms.")
+        return TypeSafeCheck(ok=False, message=str(self.check_error), error=self.check_error)
+
+    async def choice(self, state, instructions, criteria):
+        stage = "detail" if "detail_page_text" in state else "card"
+        title = state["title"]
+        self.asked.append((stage, title))
+        self.events.append(("ask", stage, title))
+        if (stage, title) in self.down:
+            raise TypeSafeUnavailable(OUTAGE)
+        p = (self.card if stage == "card" else self.detail).get(title, 0.9)
+        return Choice(choice="REVIEW" if p > 0.5 else "REJECT",
+                      probabilities={"REVIEW": p, "REJECT": round(1 - p, 6)},
+                      confidence=max(p, 1 - p), model="typesafe/jev-test")
+
+    async def noul(self, state, instructions):
+        # The guard is its own question: only the page's text, only the guard.
+        assert instructions == GUARD_QUESTION
+        assert set(state) == {"page_text"}, "not bundled with the card or the triage question"
+        title = state["page_text"].splitlines()[0].lstrip("# ")
+        self.asked.append(("guard", title))
+        self.events.append(("guard", title))
+        if ("guard", title) in self.down:
+            raise TypeSafeUnavailable(OUTAGE)
+        return self.guard.get(title, 0.96)
+
+
+class TriageArchive:
+    """The archive's two halves as triage calls them. `pages` maps a URL to its
+    PageRead; by default a URL reads as a real page headed by its title."""
+
+    def __init__(self, events, jobs, titles, *, pages=None, fail_appends=(), hang=None):
+        self.events = events
+        self.jobs = jobs
+        self.titles = titles
+        self.pages = dict(pages or {})
+        self.fail_appends = set(fail_appends)
+        self.hang = hang
+        self.reads: list[tuple[str, Path, str | None]] = []
+        self.appends: list[tuple[object, str, str, str]] = []
+        self.summaries: list[str] = []
+        self.statuses: list[str] = []
+
+    async def read(self, url, evidence_dir, *, owner=None):
+        self.reads.append((url, Path(evidence_dir), owner))
+        self.summaries.extend(j.summary for j in self.jobs.all())
+        if self.hang is not None:
+            self.hang[0].set()
+            await self.hang[1].wait()
+        if url in self.pages:
+            return self.pages[url]
+        title = self.titles[url]
+        return PageRead(url=url, title=title, markdown=f"# {title}\n\nThe whole listing.",
+                        attempts_used=1, evidence_dir=str(evidence_dir))
+
+    async def append(self, client, page_id, markdown, url, heading="Source Content"):
+        self.statuses.extend(j.status for j in self.jobs.all())
+        if page_id in self.fail_appends:
+            raise RuntimeError("Notion accepted 0 block(s) and then refused the rest")
+        self.appends.append((client, page_id, markdown, url))
+        self.events.append(("append", page_id))
+
+
+class Rig:
+    """A ScrapeService wired for triage, with every collaborator above."""
+
+    def __init__(self, settings, jobs, listings, *, key=True, notion=True, archive=True,
+                 existing=None, fail_writes=(), prepare_error=None, card=None, detail=None,
+                 guard=None, down=(), check_error=None, pages=None, fail_appends=(), hang=None):
+        if notion:
+            settings.update(notion_api_token="ntn_x", notion_db_id="db-1")
+        if key:
+            settings.update(typesafe_openrouter_api_key="sk-or-test")
+        self.events: list[tuple] = []
+        self.jobs = jobs
+        self.listings = listings
+        self.store = TriageStore(self.events, jobs, existing=existing, fail_writes=fail_writes,
+                                 prepare_error=prepare_error)
+        self.stores_built = 0
+
+        def factory(_settings):
+            self.stores_built += 1
+            return self.store
+
+        self.classifier = TriageClassifier(self.events, card=card, detail=detail, guard=guard,
+                                           down=down, check_error=check_error)
+        self.archive = TriageArchive(self.events, jobs, {l.url: l.title for l in listings},
+                                     pages=pages, fail_appends=fail_appends, hang=hang)
+        self.svc = ScrapeService(instances=None, jobs=jobs, settings=settings,
+                                 store_factory=factory, typesafe=self.classifier,
+                                 archive=self.archive if archive else None)
+        self.swept = 0
+
+        async def sweep(job, i, url, source, prog):
+            self.swept += 1
+            return {"blocked": False, "error": None,
+                    "data": {"listings": list(self.listings), "pages_crawled": 1}}
+
+        self.svc._sweep = sweep
+
+    async def run(self, prompt=PROMPT, urls=(SERP,), sync=True):
+        job = await self.svc.submit(list(urls), sync=sync, triage_prompt=prompt)
+        await _drain(self.svc)
+        return self.svc.result(job.id), self.jobs.get(job.id)
+
+    def writes(self) -> dict[str, str]:
+        return {w["row_id"]: w["decision"] for w in self.store.writes}
+
+
+class TestTriageDecisions:
+    @pytest.mark.asyncio
+    async def test_a_card_reject_is_written_and_no_page_is_read(self, settings, jobs):
+        rig = Rig(settings, jobs, [_tl(1, "Taqueria")], card={"Taqueria": 0.04})
+        result, _ = await rig.run()
+
+        assert rig.writes() == {"row-t1": "REJECT"}
+        (write,) = rig.store.writes
+        assert write["reason"] == "REJECT · P(review)=0.04 · card"
+        assert write["version"] == criteria_version(PROMPT)
+        assert write["at"].tzinfo is not None
+        assert rig.archive.reads == [] and rig.archive.appends == []
+        assert result.status == "completed" and result.error is None
+        (listing,) = result.listings
+        assert listing.bot_triage == "REJECT" and listing.triage_p_review == pytest.approx(0.04)
+        assert result.triage.ok and (result.triage.review, result.triage.reject) == (0, 1)
+
+    @pytest.mark.asyncio
+    async def test_review_then_a_detail_reject_writes_reject_and_archives_nothing(
+        self, settings, jobs,
+    ):
+        rig = Rig(settings, jobs, [_tl(1, "Consultancy")], card={"Consultancy": 0.7},
+                  detail={"Consultancy": 0.1})
+        result, _ = await rig.run()
+
+        assert [q for q in rig.classifier.asked] == [
+            ("card", "Consultancy"), ("guard", "Consultancy"), ("detail", "Consultancy")]
+        assert rig.archive.appends == [], "a REJECT is never archived"
+        assert rig.writes() == {"row-t1": "REJECT"}
+        assert rig.store.writes[0]["reason"] == "REJECT · P(review)=0.10 · card + detail page"
+        assert result.listings[0].bot_triage == "REJECT"
+
+    @pytest.mark.asyncio
+    async def test_review_then_review_archives_the_page_then_writes_review(self, settings, jobs):
+        rig = Rig(settings, jobs, [_tl(1, "Taqueria"), _tl(2, "HVAC Services")],
+                  card={"Taqueria": 0.04, "HVAC Services": 0.8}, detail={"HVAC Services": 0.91})
+        result, job = await rig.run()
+
+        # The order that makes "every REVIEW has its Source Content" true.
+        assert rig.events.index(("append", "row-t2")) < rig.events.index(
+            ("write", "row-t2", "REVIEW"))
+        ((client, page_id, markdown, url),) = rig.archive.appends
+        assert client is rig.store.client, "the one client the whole phase shares"
+        assert page_id == "row-t2" and url == _tl(2, "").url
+        assert markdown == "# HVAC Services\n\nThe whole listing."
+        assert rig.store.writes[-1]["reason"] == "REVIEW · P(review)=0.91 · card + detail page"
+        # Read through the archive, under this job's evidence, as this job.
+        ((read_url, evidence, owner),) = rig.archive.reads
+        assert read_url == _tl(2, "").url
+        assert evidence.parts[-2:] == (job.id, "detail-02")
+        assert owner == f"job:{job.id}"
+        assert result.triage.ok and (result.triage.review, result.triage.reject) == (1, 1)
+        assert [l.bot_triage for l in result.listings] == ["REJECT", "REVIEW"]
+        assert "triaged: 1 review, 1 reject" in result.summary
+        # What each row went through is kept with the run's evidence.
+        import json
+
+        record = json.loads((Path(evidence).parent / "triage.json").read_text())
+        rows = {r["row_id"]: r for r in record["rows"]}
+        assert rows["row-t2"]["guard"] == 0.96 and rows["row-t2"]["final"]["decision"] == "REVIEW"
+        assert record["criteria_version"] == criteria_version(PROMPT)
+
+    @pytest.mark.asyncio
+    async def test_a_wall_is_review_on_the_card_with_nothing_archived(self, settings, jobs):
+        """An NDA or login wall, a removed listing, an error page: decided on the
+        card and written, so a site that always gates its pages is not retried
+        on every sweep — and nothing that is not the listing gets archived."""
+        rig = Rig(settings, jobs, [_tl(1, "Gated Deal")], card={"Gated Deal": 0.88},
+                  guard={"Gated Deal": 0.03})
+        result, _ = await rig.run()
+
+        assert ("detail", "Gated Deal") not in rig.classifier.asked
+        assert rig.archive.appends == []
+        assert rig.writes() == {"row-t1": "REVIEW"}
+        assert rig.store.writes[0]["reason"] == (
+            "REVIEW · P(review)=0.88 · card only — detail page not readable (P=0.03)")
+        assert result.triage.ok and result.error is None
+
+    @pytest.mark.asyncio
+    async def test_a_page_that_will_not_load_leaves_the_row_blank_and_says_so(
+        self, settings, jobs,
+    ):
+        blocked = _tl(1, "Blocked Listing")
+        rig = Rig(settings, jobs, [blocked, _tl(2, "Fine Listing")],
+                  pages={blocked.url: PageRead(url=blocked.url, blocked=True, attempts_used=3)})
+        result, _ = await rig.run()
+
+        assert rig.writes() == {"row-t2": "REVIEW"}, "the blocked row stays blank"
+        (failure,) = result.triage.failures
+        assert failure.row_id == "row-t1" and failure.url == blocked.url
+        assert "served an anti-bot page" in failure.error
+        assert result.triage.undecided == 1 and not result.triage.ok
+        assert result.status == "completed"
+        assert "Triage couldn't decide 1 row (see triage.failures)" in result.error
+        assert "triaged on a later sweep" in result.error
+        assert result.listings[0].bot_triage == "" and result.listings[0].triage_p_review is None
+        assert "1 left blank for a later sweep" in result.summary
+
+
+class TestWhichRowsAreTriaged:
+    @pytest.mark.asyncio
+    async def test_a_row_that_already_has_a_decision_is_never_touched(self, settings, jobs):
+        rig = Rig(settings, jobs, [_tl(1, "Decided Before"), _tl(2, "Brand New")],
+                  existing={"t1": "REJECT"})
+        result, _ = await rig.run()
+
+        assert all(title != "Decided Before" for _, title in rig.classifier.asked)
+        assert "row-t1" not in rig.writes()
+        assert rig.writes() == {"row-t2": "REVIEW"}
+        assert result.triage.backlog == []
+
+    @pytest.mark.asyncio
+    async def test_a_blank_existing_row_is_healed_and_reported_in_the_backlog(
+        self, settings, jobs,
+    ):
+        rig = Rig(settings, jobs, [_tl(1, "Left Blank Earlier"), _tl(2, "Brand New")],
+                  existing={"t1": ""}, card={"Left Blank Earlier": 0.02})
+        result, _ = await rig.run()
+
+        assert rig.writes() == {"row-t1": "REJECT", "row-t2": "REVIEW"}
+        assert [l.synced_row_id for l in result.listings] == ["row-t2"], "backlog is not new"
+        (healed,) = result.triage.backlog
+        assert (healed.row_id, healed.decision) == ("row-t1", "REJECT")
+        assert healed.url == _tl(1, "").url
+        assert result.synced.new == 1 and result.synced.existing == 1
+
+    @pytest.mark.asyncio
+    async def test_without_a_prompt_nothing_is_asked_prepared_or_read(self, settings, jobs):
+        rig = Rig(settings, jobs, [_tl(1, "Anything")], existing={"t9": ""})
+        job = await rig.svc.submit([SERP], sync=True)
+        await _drain(rig.svc)
+        result = rig.svc.result(job.id)
+
+        assert rig.classifier.checks == 0, "a BizBuySell-only call never pays for a check"
+        assert rig.classifier.asked == [] and rig.store.prepared == 0
+        assert rig.archive.reads == [] and rig.store.writes == []
+        assert result.triage is None and job.triage is None
+        assert result.listings[0].bot_triage == "" and "triaged" not in result.summary
+
+
+class TestTriageFailures:
+    @pytest.mark.asyncio
+    async def test_an_outage_mid_run_completes_the_job_and_leaves_the_rest_blank(
+        self, settings, jobs,
+    ):
+        rows = [_tl(1, "First"), _tl(2, "Second"), _tl(3, "Third")]
+        rig = Rig(settings, jobs, rows, card={"First": 0.05}, down={("card", "Second")})
+        result, _ = await rig.run()
+
+        assert rig.writes() == {"row-t1": "REJECT"}, "what was decided before it went down stays"
+        assert ("card", "Third") not in rig.classifier.asked, "no question after the outage"
+        assert rig.archive.reads == []
+        assert result.status == "completed", "the scrape and the save succeeded"
+        assert result.triage.error == OUTAGE and not result.triage.ok
+        assert result.triage.undecided == 2
+        assert "Triage stopped before deciding every row" in result.error and OUTAGE in result.error
+        assert [l.bot_triage for l in result.listings] == ["REJECT", "", ""]
+
+    @pytest.mark.asyncio
+    async def test_an_outage_at_the_guard_stops_triage_too(self, settings, jobs):
+        rig = Rig(settings, jobs, [_tl(1, "Only")], down={("guard", "Only")})
+        result, _ = await rig.run()
+        assert rig.store.writes == [] and rig.archive.appends == []
+        assert result.status == "completed" and result.triage.error == OUTAGE
+
+    @pytest.mark.asyncio
+    async def test_a_failed_write_is_that_row_s_failure_and_the_rest_continue(
+        self, settings, jobs,
+    ):
+        rig = Rig(settings, jobs, [_tl(1, "Will Fail"), _tl(2, "Will Pass")],
+                  card={"Will Fail": 0.01, "Will Pass": 0.02}, fail_writes={"row-t1"})
+        result, _ = await rig.run()
+
+        assert rig.writes() == {"row-t2": "REJECT"}
+        (failure,) = result.triage.failures
+        assert failure.row_id == "row-t1"
+        assert "Saving the decision (REJECT) to Notion failed" in failure.error
+        assert "409 conflict_error" in failure.error
+        assert result.status == "completed" and result.triage.reject == 1
+        assert result.listings[0].bot_triage == "", "not written, so not reported as written"
+
+    @pytest.mark.asyncio
+    async def test_a_failed_archive_leaves_review_unwritten(self, settings, jobs):
+        """REVIEW is written only once the page is on the row; a row whose
+        archive failed stays blank and a later sweep tries it again."""
+        rig = Rig(settings, jobs, [_tl(1, "Good Business")], fail_appends={"row-t1"})
+        result, _ = await rig.run()
+
+        assert rig.store.writes == []
+        (failure,) = result.triage.failures
+        assert "Archiving the detail page into the row failed, so REVIEW was not written" \
+            in failure.error
+
+
+class TestTriageLifecycle:
+    @pytest.mark.asyncio
+    async def test_the_job_is_never_completed_on_disk_until_triage_ends(self, settings, jobs):
+        rig = Rig(settings, jobs, [_tl(1, "Taqueria"), _tl(2, "HVAC"), _tl(3, "Plumbing")],
+                  card={"Taqueria": 0.04})
+        result, _ = await rig.run()
+
+        assert rig.store.statuses and set(rig.store.statuses) == {"working"}
+        assert rig.archive.statuses and set(rig.archive.statuses) == {"working"}
+        assert result.status == "completed"
+        # And while it worked, the record said what it was doing.
+        assert "Reading 2 detail pages…" in rig.archive.summaries
+        assert result.triage.ok
+
+    @pytest.mark.asyncio
+    async def test_the_phase_is_saved_where_a_poll_can_see_it(self, settings, jobs):
+        seen: list[str] = []
+        rig = Rig(settings, jobs, [_tl(1, "Brand New"), _tl(2, "Left Blank")],
+                  existing={"t2": ""}, card={"Brand New": 0.01, "Left Blank": 0.01})
+
+        async def write(target, row_id, *args):
+            seen.extend(j.summary for j in jobs.all())
+            rig.store.writes.append({"row_id": row_id, "decision": args[0]})
+
+        rig.store.write_triage = write
+        await rig.run()
+        assert "Triaging 1 new listing and 1 earlier row…" in seen
+
+    @pytest.mark.asyncio
+    async def test_the_saved_rows_are_on_the_record_before_triage_starts(self, settings, jobs):
+        on_disk = []
+        rig = Rig(settings, jobs, [_tl(1, "Taqueria")], card={"Taqueria": 0.04})
+        real = rig.store.write_triage
+
+        async def write(*args):
+            job = jobs.all()[0]
+            on_disk.append((job.status, job.synced, [l.synced_row_id for l in job.listings]))
+            await real(*args)
+
+        rig.store.write_triage = write
+        await rig.run()
+        ((status, synced, row_ids),) = on_disk
+        assert status == "working" and synced is not None and synced.new == 1
+        assert row_ids == ["row-t1"]
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_sweep_records_what_it_saved(self, settings, jobs):
+        reading, release = asyncio.Event(), asyncio.Event()
+        rig = Rig(settings, jobs, [_tl(1, "Taqueria"), _tl(2, "HVAC")],
+                  card={"Taqueria": 0.04}, hang=(reading, release))
+        job = await rig.svc.submit([SERP], sync=True, triage_prompt=PROMPT)
+        await asyncio.wait_for(reading.wait(), 2)
+
+        (task,) = rig.svc._running
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        record = jobs.get(job.id)
+        assert record.status == "failed", "not left 'working' for a poll to wait on forever"
+        assert "Saved 2 new rows; triage was interrupted" in record.error
+        assert "rows without a decision are triaged on a later sweep" in record.error
+        assert record.triage.reject == 1 and record.triage.undecided == 1
+        assert record.triage.error and not record.triage.ok
+        assert record.listings[0].bot_triage == "REJECT"
+
+    @pytest.mark.asyncio
+    async def test_the_preflight_s_store_saves_and_triages(self, settings, jobs):
+        """Prepared once, in submit; the run reuses that store (one client)."""
+        rig = Rig(settings, jobs, [_tl(1, "Anything")])
+        await rig.run()
+        assert rig.stores_built == 1 and rig.store.prepared == 1
+        assert rig.events[0] == ("upsert",)
+
+    @pytest.mark.asyncio
+    async def test_start_with_a_prompt_prepares_the_target_in_the_run(self, settings, jobs):
+        rig = Rig(settings, jobs, [_tl(1, "Taqueria")], card={"Taqueria": 0.04})
+        job = rig.svc.start([SERP], sync=True, triage_prompt=PROMPT)
+        assert job.triage is not None and job.triage.criteria_version == criteria_version(PROMPT)
+        await _drain(rig.svc)
+        assert rig.store.prepared == 1 and rig.writes() == {"row-t1": "REJECT"}
+
+    @pytest.mark.asyncio
+    async def test_a_target_the_run_cannot_prepare_leaves_every_row_blank(self, settings, jobs):
+        rig = Rig(settings, jobs, [_tl(1, "Taqueria")],
+                  prepare_error=TriageUnavailable("This database has no 'Bot Triage' column."))
+        rig.svc.start([SERP], sync=True, triage_prompt=PROMPT)
+        await _drain(rig.svc)
+        result = rig.svc.result(jobs.all()[0].id)
+        assert result.status == "completed" and rig.classifier.asked == []
+        assert "no 'Bot Triage' column" in result.triage.error
+        assert result.triage.undecided == 1
+
+    @pytest.mark.asyncio
+    async def test_a_sweep_that_saved_nothing_says_triage_did_not_run(self, settings, jobs):
+        rig = Rig(settings, jobs, [])
+
+        async def blocked(job, i, url, source, prog):
+            return {"blocked": True, "error": None, "data": {"listings": [], "pages_crawled": 1}}
+
+        rig.svc._sweep = blocked
+        result, _ = await rig.run()
+        assert result.status == "failed"
+        assert result.triage.error == "Nothing was triaged: every source failed."
+
+
+class TestTriageRefusals:
+    """Everything that would leave a triaging sweep unable to decide is said
+    before the job exists — including for a BizBuySell-only batch."""
+
+    async def _refused(self, rig, **kw):
+        from app.services.scrape import TriageNotConfigured
+
+        kw.setdefault("sync", True)
+        kw.setdefault("triage_prompt", PROMPT)
+        with pytest.raises(TriageNotConfigured) as exc:
+            await rig.svc.submit([SERP], **kw)
+        assert rig.jobs.all() == [] and rig.swept == 0
+        assert rig.store.writes == []
+        return exc.value
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("prompt", ["", "   \n\t "])
+    async def test_a_blank_prompt(self, settings, jobs, prompt):
+        rig = Rig(settings, jobs, [_tl(1, "x")])
+        exc = await self._refused(rig, triage_prompt=prompt)
+        assert "triage_prompt is empty" in str(exc)
+        assert rig.classifier.checks == 0
+
+    @pytest.mark.asyncio
+    async def test_sync_false(self, settings, jobs):
+        rig = Rig(settings, jobs, [_tl(1, "x")])
+        exc = await self._refused(rig, sync=False)
+        assert "needs sync=true" in str(exc)
+        assert rig.classifier.checks == 0
+
+    @pytest.mark.asyncio
+    async def test_no_notion_database_is_the_sync_refusal(self, settings, jobs):
+        rig = Rig(settings, jobs, [_tl(1, "x")], notion=False)
+        with pytest.raises(NotionNotConfigured) as exc:
+            await rig.svc.submit([SERP], sync=True, triage_prompt=PROMPT)
+        assert "no Notion database is set up" in str(exc.value)
+
+    @pytest.mark.asyncio
+    async def test_no_classifier_key(self, settings, jobs):
+        rig = Rig(settings, jobs, [_tl(1, "x")], key=False)
+        exc = await self._refused(rig)
+        assert "no OpenRouter key is saved" in str(exc)
+        assert "Add one under Settings → TypeSafe Classifier (e.g. Jev)" in str(exc)
+        assert rig.classifier.checks == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("error,transient", [
+        (TypeSafeAuthError("OpenRouter rejected the key (HTTP 401)."), False),
+        (TypeSafeCreditError("The OpenRouter account is out of credits (HTTP 402)."), False),
+        (TypeSafeUnavailable("The TypeSafe Classifier could not answer."), True),
+    ])
+    async def test_a_key_that_fails_its_check_even_for_bizbuysell_only(
+        self, settings, jobs, error, transient,
+    ):
+        """Decision 5: the whole call, BizBuySell or not — otherwise it would
+        save rows and leave every one of them undecided."""
+        rig = Rig(settings, jobs, [_tl(1, "x")], check_error=error)
+        exc = await self._refused(rig)
+        assert str(error) in str(exc) and "Can't start this sweep with triage" in str(exc)
+        assert exc.transient is transient and exc.cause is error
+        assert rig.classifier.checks == 1 and rig.store.prepared == 0
+
+    @pytest.mark.asyncio
+    async def test_a_database_with_nowhere_to_record_a_decision(self, settings, jobs):
+        rig = Rig(settings, jobs, [_tl(1, "x")], prepare_error=TriageUnavailable(
+            "This database has no 'Bot Triage' column, so there is nowhere to record triage "
+            "decisions."))
+        exc = await self._refused(rig)
+        assert str(exc).startswith("Can't triage into your Notion database: This database has "
+                                   "no 'Bot Triage' column")
+        assert not exc.transient
+
+    @pytest.mark.asyncio
+    async def test_a_database_that_cannot_be_read(self, settings, jobs):
+        rig = Rig(settings, jobs, [_tl(1, "x")],
+                  prepare_error=RuntimeError("Notion rejected the API token."))
+        exc = await self._refused(rig)
+        assert "Notion rejected the API token." in str(exc)
+
+    @pytest.mark.asyncio
+    async def test_a_server_without_its_page_reader(self, settings, jobs):
+        rig = Rig(settings, jobs, [_tl(1, "x")], archive=False)
+        exc = await self._refused(rig)
+        assert "detail pages" in str(exc)
+
+    @pytest.mark.asyncio
+    async def test_start_s_own_refusals_come_first_and_cost_nothing(self, settings, jobs):
+        rig = Rig(settings, jobs, [_tl(1, "x")])
+        with pytest.raises(ValueError):
+            await rig.svc.submit([], sync=True, triage_prompt=PROMPT)
+        with pytest.raises(UnsupportedURL):
+            await rig.svc.submit([DETAIL], sync=True, triage_prompt=PROMPT)
+        assert rig.classifier.checks == 0 and rig.store.prepared == 0
+
+    def test_it_is_a_notion_refusal_to_every_facade(self):
+        from app.mcp_server import REFUSALS
+        from app.services.scrape import TriageNotConfigured
+
+        assert issubclass(TriageNotConfigured, NotionNotConfigured)
+        assert issubclass(TriageNotConfigured, REFUSALS)

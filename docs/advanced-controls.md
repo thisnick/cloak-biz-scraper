@@ -102,6 +102,8 @@ With a key saved:
 - Every sweep page, BizBuySell included, also gets a quick check that its cards read as
   business listings. A page that fails it (or a page with no list on it at all) fails that
   source with screenshots, instead of filing garbage or reporting "no listings".
+- A synced sweep can triage the rows it saves: pass your criteria as `triage_prompt` (see
+  [Triage prompt](#triage-prompt)).
 
 To set it up:
 
@@ -118,11 +120,69 @@ this setting, and the rest of the batch still runs.
 A key that stops working is caught before a sweep starts. If OpenRouter rejects the key,
 the account is out of credits, or the service is not answering, a call whose URLs all need
 the classifier is refused with that reason. In a batch that also has BizBuySell URLs, only
-the other sites fail and the BizBuySell ones still run.
+the other sites fail and the BizBuySell ones still run. A call with a `triage_prompt` is
+refused whole, BizBuySell or not, because it would save rows it then could not decide.
 
 Cost: a page takes a handful of small classifier requests — which list, the fields, the
 statuses, the next page, the listing check — which together come to fractions of a cent
-per page, billed to your OpenRouter account.
+per page, billed to your OpenRouter account. Triage adds one request per new listing, and
+two more for each one that is read on its detail page.
+
+## Triage prompt
+
+`scrape_listings(urls, max_pages, sync=true, triage_prompt="…")` saves the new listings
+and then decides **REVIEW** or **REJECT** for each one, in the server, with the TypeSafe
+Classifier (e.g. Jev). It needs `sync=true` and a working classifier key; a call without
+either is refused before anything starts.
+
+What it does, for every row the sweep inserted and every row it saw whose Bot Triage is
+still blank:
+
+1. It asks one question — your text, behind a fixed lead-in — about the card: title,
+   location, asking price, cash flow, EBITDA, revenue and excerpt. **REJECT** is written
+   straight away.
+2. A **REVIEW** is checked again on the listing's detail page. If the page is the real
+   listing, the same question is asked about the card plus the page: REVIEW appends the
+   page as a Source Content section to the row (exactly as `archive_page` does) and then
+   writes REVIEW; REJECT is written with nothing archived. If the page is a login or NDA
+   wall, a removed listing or an error page, REVIEW is written as decided on the card, with
+   nothing archived. If the page will not load at all, the row stays blank and is reported,
+   and a later sweep tries it again.
+
+A row that already has a Bot Triage value — the bot's or yours — is never judged again.
+
+The decision goes to the **Bot Triage** column (Select or Text); a database without one
+refuses the call. **Triage Reason** (e.g. `REVIEW · P(review)=0.91 · card + detail page`),
+**Triaged At** and **Criteria Version** are written where the database has those columns,
+or where **Settings → Notion** maps them to columns of your own — Triage Reason to an
+existing "Why Review", say. Nothing else on the row is touched.
+
+If the classifier stops answering part-way, the sweep still completes (the rows are saved);
+the rows it had not decided stay blank, the result's `triage.error` says why, and the next
+sweep that sees them decides them.
+
+**Writing the text.** The classifier judges; it cannot follow a procedure or write an
+explanation. So:
+
+- **State the reject conditions plainly**, one per line or bullet: "Reject restaurants,
+  retail, franchises." "Reject if the asking price is below $1M or above $7.5M." Say what
+  happens when a fact is missing ("Continue if the price is not disclosed") — the question
+  already leans towards REVIEW when the evidence is missing or ambiguous.
+- **Leave out tool and procedure steps** — "open the detail page", "call archive_page",
+  "write a reason". The server does those; in the text they are only noise.
+- **You do not need to compute the multiple.** When the asking price and the cash flow (or
+  EBITDA) are each one exact amount, the card is given a `price_to_earnings_multiple` such
+  as `4.25x`, so "Reject if asking price / SDE > 6.0" works as written.
+- **Changing the text changes the Criteria Version**, the first 8 characters of its
+  sha256, written on every row it decides. Rows decided under earlier text keep theirs;
+  clear a row's Bot Triage to have the next sweep decide it again under the current text.
+
+Keeping the criteria on a Notion page works well: the scheduled agent reads the page and
+passes its text. `scripts/triage_prompt_from_notion.py <page id or URL>` prints a page's
+plain text, the same way, to check what the classifier will be given; and
+`scripts/eval_triage.py` runs a prompt over your Listings database's existing rows and
+reports how often it agrees with the Bot Triage values already there, without writing
+anything.
 
 ## Site overrides
 

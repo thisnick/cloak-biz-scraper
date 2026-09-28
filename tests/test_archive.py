@@ -715,6 +715,46 @@ class TestAppendingIsIdempotent:
         assert task.status == "completed" and task.summary == result.summary
 
     @pytest.mark.asyncio
+    async def test_a_repeat_call_is_answered_before_any_browser_work(
+        self, manager, settings, jobs, monkeypatch,
+    ):
+        """The section is looked for first, so a repeat call costs one Notion
+        read instead of a minute of page loading — and no pooled identity."""
+        async def never(*args, **kw):
+            raise AssertionError("an archived page must not be read again")
+
+        notion = FakeNotion([_heading("Source Content")])
+        svc = _service(manager, settings, jobs, monkeypatch, never, notion=notion)
+
+        result = await svc.archive(URL, "page-1")
+
+        assert result.ok and result.blocks_appended == 0 and result.attempts_used == 0
+        assert f"{URL} is already archived there" in result.summary
+        assert [c[0] for c in notion.calls] == ["GET"] and notion.patches == []
+        assert svc._past_gate == 0
+        assert _names(manager) == [], "no identity was leased for it"
+
+    @pytest.mark.asyncio
+    async def test_a_notion_page_that_cannot_be_opened_stops_it_before_reading(
+        self, manager, settings, jobs, monkeypatch,
+    ):
+        async def never(*args, **kw):
+            raise AssertionError("no point reading a page there is nowhere to put")
+
+        class Unshared(FakeNotion):
+            async def request(self, method, path, **kw):
+                raise RuntimeError("Notion could not find that page or database.")
+
+        svc = _service(manager, settings, jobs, monkeypatch, never, notion=Unshared())
+
+        result = await svc.archive(URL, "page-1")
+
+        assert not result.ok and "Notion could not find that page" in result.error
+        assert "was not read and nothing was written" in result.error
+        (task,) = jobs.all()
+        assert task.status == "failed" and task.error == result.error
+
+    @pytest.mark.asyncio
     async def test_a_second_archive_of_the_same_page_appends_nothing(
         self, manager, settings, jobs, monkeypatch,
     ):
@@ -822,7 +862,8 @@ class TestTheGuard:
             "The page doesn't look like its real content (P=0.03: a login wall, error, "
             "removed listing or anti-bot page?) — nothing was written."
         )
-        assert notion.calls == [], "Notion is not even asked"
+        assert notion.patches == [], "nothing is written"
+        assert [c[0] for c in notion.calls] == ["GET"], "only the look for an earlier section"
         (task,) = jobs.all()
         assert task.status == "failed" and task.error == result.error
         # With evidence: the verdict sits beside the page capture.
