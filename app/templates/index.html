@@ -113,6 +113,12 @@
               <div class="g"><b>Notion <span class="opt-tag">optional</span></b><span>{{ 'Connected.' if has_notion_token else 'Only needed to save listings into a database.' }}</span></div>
               {% if not has_notion_token %}<a data-nav="settings" href="#">Add →</a>{% endif %}
             </li>
+            <li class="{{ 'done' if has_typesafe_key else 'opt' }}">
+              {% if has_typesafe_key %}<svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M20 6 9 17l-5-5"/></svg>
+              {% else %}<svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/></svg>{% endif %}
+              <div class="g"><b>TypeSafe Classifier (e.g. Jev) <span class="opt-tag">optional</span></b><span>{{ 'Key saved.' if has_typesafe_key else 'Only needed to read listing sites other than BizBuySell, and for triage.' }}</span></div>
+              {% if not has_typesafe_key %}<a data-nav="settings" href="#">Add →</a>{% endif %}
+            </li>
           </ul>
         </div>
         {% endif %}
@@ -617,6 +623,48 @@
                   <div class="btnrow"><button class="btn" type="submit">Create database</button></div>
                 </form>
               {% endif %}
+            </div>
+          </div>
+
+          {# TypeSafe Classifier (e.g. Jev). Same shape as the proxy: the key is
+             write-only, Test checks what was typed before saving it, and the
+             chip comes from the remembered verdict, not from the form. #}
+          {% set ts = s.typesafe_status() %}
+          {% set ts_chip = {'working': ('ok', 'Working'), 'broken': ('bad', 'Broken'),
+                            'untested': ('warn', 'Untested'), 'unset': ('', 'Not set')}[ts] %}
+          <div class="acc-item {{ 'open' if result and result.section=='typesafe' }}">
+            <button class="acc-head">
+              <svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M3 4h18l-7 8.5V19l-4 2v-8.5L3 4Z"/></svg>
+              <span class="h-title">TypeSafe Classifier (e.g. Jev)</span>
+              <div class="h-right">
+                <span class="chip{% if ts_chip[0] %} {{ ts_chip[0] }}{% endif %}">{{ ts_chip[1] }}</span>
+                <svg class="chev" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M9 6l6 6-6 6"/></svg>
+              </div>
+            </button>
+            <div class="acc-body">
+              <p class="lead-help">Optional. With an OpenRouter key, this server can read listing sites other than BizBuySell, triage listings, and stop <code>archive_page</code> saving login walls or removed listings. Without one, everything else works as it does today. <a href="https://openrouter.ai/settings/keys" target="_blank" rel="noreferrer">Get an OpenRouter key →</a></p>
+              {% if ts == 'broken' %}
+                <div class="banner bad"><strong>This key did not work when it was last tested.</strong>
+                  Anything that needs the classifier will be refused until it does.<br><span class="hint">{{ s.typesafe_last_check_summary }} (tested {{ typesafe_checked_at }})</span></div>
+              {% elif ts == 'untested' %}
+                <div class="banner warn">Saved, but never tested. Click <em>Save &amp; test</em> to check OpenRouter accepts the key.</div>
+              {% elif ts == 'working' %}
+                <p class="lead-help">Last tested {{ typesafe_checked_at }}: <span class="mono">{{ s.typesafe_last_check_summary }}</span></p>
+              {% endif %}
+              {{ banner('typesafe') }}
+              <form method="post" action="/settings/typesafe">
+                <div class="field"><label>OpenRouter API key</label>
+                  <input type="password" name="typesafe_openrouter_api_key" autocomplete="off"
+                         placeholder="{{ '•••••••••• (saved — leave blank to keep it)' if has_typesafe_key else 'sk-or-...' }}"></div>
+                <div class="field"><label>Model</label>
+                  <input type="text" name="typesafe_model" value="{{ s.typesafe_model }}" placeholder="jev-latest">
+                  <div class="help">Leave as <span class="mono">jev-latest</span> (the default) unless you want a specific TypeSafe model.</div></div>
+                <div class="btnrow">
+                  <button class="btn" type="submit" name="action" value="save">Save</button>
+                  <button class="btn primary" type="submit" name="action" value="test">Save &amp; test</button>
+                  {% if has_typesafe_key %}<button class="btn" type="submit" name="action" value="clear" title="Removes the saved key; the classifier is then off">Remove key</button>{% endif %}
+                </div>
+              </form>
             </div>
           </div>
 

@@ -227,8 +227,10 @@ def _render(request: Request, result: Result | None = None, status: int = 200,
             "browser": browser_info(settings, request.app.state.instances),
             "has_proxy_password": bool(settings.proxy_password),
             "has_notion_token": bool(settings.notion_api_token),
+            "has_typesafe_key": settings.typesafe_configured(),
             "connected_apps": request.app.state.oauth.list_clients(),
             "proxy_checked_at": _when(settings.proxy_last_check_at),
+            "typesafe_checked_at": _when(settings.typesafe_last_check_at),
             # dashboard sections
             "instances": instances,
             "running_jobs": running,
@@ -1624,6 +1626,118 @@ async def create_database(
     )
     return _render(request, Result("notion", report.complete, message, report),
                    notion_mapping=mapping)
+
+
+# ── TypeSafe Classifier (e.g. Jev) ────────────────────────────────────────────
+
+
+# What turning it off costs, said wherever it is turned off.
+_TYPESAFE_OFF = (
+    "reading listing sites other than BizBuySell, triage, and the archive guard are "
+    "off; everything else works as before."
+)
+
+
+@router.post("/settings/typesafe", response_class=HTMLResponse)
+async def save_typesafe(
+    request: Request,
+    action: str = Form("save"),
+    typesafe_openrouter_api_key: str = Form(""),
+    typesafe_model: str = Form(""),
+) -> Response:
+    """Save, test, or remove the OpenRouter key the classifier is asked with.
+
+    The proxy's rules, for the proxy's reasons: Test checks what was typed
+    before anything is written, so a typo cannot replace a key that works; the
+    verdict is remembered, so a revoked key or an empty account still reads as
+    broken tomorrow; and editing the key or model retires the old verdict,
+    because it measured something else.
+    """
+    _require(request)
+    _require_same_origin(request)
+    store = request.app.state.settings
+    current = store.load()
+    no_verdict = dict(
+        typesafe_last_check_at=0.0, typesafe_last_check_ok=None, typesafe_last_check_summary="",
+    )
+
+    if action == "clear":
+        # The key field is write-only and blank keeps it, so removing a key needs
+        # its own button — as the licence key's "Clear" does.
+        store.update(typesafe_openrouter_api_key="", **no_verdict)
+        return _render(
+            request, Result("typesafe", True, f"Key removed. Without it, {_TYPESAFE_OFF}")
+        )
+
+    try:
+        candidate = Settings.model_validate({
+            **current.model_dump(),
+            "typesafe_openrouter_api_key": _keep(
+                typesafe_openrouter_api_key, current.typesafe_openrouter_api_key),
+            "typesafe_model": typesafe_model,
+        })
+    except ValueError as exc:
+        return _render(request, Result("typesafe", False, _first_error(exc)), status=400)
+    changes = dict(
+        typesafe_openrouter_api_key=candidate.typesafe_openrouter_api_key,
+        typesafe_model=candidate.typesafe_model,
+    )
+    unchanged = (
+        candidate.typesafe_openrouter_api_key == current.typesafe_openrouter_api_key
+        and candidate.typesafe_model == current.typesafe_model
+    )
+
+    if action != "test":
+        # A save that changes nothing keeps its verdict; one that changes the key
+        # or model has not been measured yet, so it must not inherit a "working".
+        settings = store.update(**changes, **({} if unchanged else no_verdict))
+        status = settings.typesafe_status()
+        if status == "unset":
+            return _render(
+                request, Result("typesafe", True, f"Saved. Without a key, {_TYPESAFE_OFF}")
+            )
+        if status == "untested":
+            return _render(request, Result(
+                "typesafe", True,
+                "Saved — but not tested. Use 'Save & test' to check OpenRouter accepts the key.",
+                level="warn",
+            ))
+        return _render(request, Result("typesafe", True, "Saved."))
+
+    # action == "test": ask with the SUBMITTED values before writing anything.
+    if not candidate.typesafe_configured():
+        return _render(
+            request, Result("typesafe", False, "Enter an OpenRouter API key first."), status=400
+        )
+    check = await request.app.state.typesafe.check(
+        key=candidate.typesafe_openrouter_api_key, model=candidate.typesafe_model
+    )
+    if not check.ok:
+        if current.typesafe_last_check_ok and not unchanged:
+            # A working key is at stake and this failure measured something else:
+            # keep what works rather than replace it with the typo.
+            return _render(
+                request,
+                Result("typesafe", False,
+                       check.message + " Your previously working key and model were kept "
+                       "unchanged."),
+                status=400,
+            )
+        store.update(
+            **changes,
+            typesafe_last_check_at=time.time(),
+            typesafe_last_check_ok=False,
+            typesafe_last_check_summary=_first_sentence(check.message),
+        )
+        return _render(request, Result("typesafe", False, check.message), status=400)
+
+    store.update(
+        **changes,
+        typesafe_last_check_at=time.time(),
+        typesafe_last_check_ok=True,
+        typesafe_last_check_summary=check.message,
+    )
+    return _render(request, Result("typesafe", True, check.message))
 
 
 # ── Connected apps ────────────────────────────────────────────────────────────

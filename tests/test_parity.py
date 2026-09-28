@@ -156,8 +156,9 @@ class TestServerInfoParity:
     def test_the_two_facades_return_the_same_snapshot(self, client):
         rest = _rest_info(client)
         mcp = _mcp_info(client)
-        # Control: a real snapshot with the four sections, not two empty/error bodies.
-        assert set(rest) == {"proxy", "browser", "pool", "notion"} and rest["pool"]["max"] >= 1, rest
+        # Control: a real snapshot with the five sections, not two empty/error bodies.
+        assert set(rest) == {"proxy", "browser", "pool", "notion", "typesafe"} \
+            and rest["pool"]["max"] >= 1, rest
         assert rest == mcp, (
             "MCP and REST disagree about server_info. A field added at one façade "
             "instead of in views.server_info is how it shows up.\n"

@@ -26,7 +26,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.routing import Route
 
 from . import __version__, mcp_server
-from .config import CONFIG, bootstrap_binary_cache, purge_binary_env
+from .config import CONFIG, bootstrap_binary_cache, purge_binary_env, purge_secret_env
 from .routes import api, cdp, downloads, health, oauth, ui, uploads, vnc
 from .routes.guard import AuthGuard
 from .routes.mcp import MCPEndpoint
@@ -45,6 +45,7 @@ from .services.ratelimit import RateLimiter
 from .services.scrape import ScrapeService
 from .services.secret import SecretService
 from .services.settings import SettingsService
+from .services.typesafe import TypeSafeClient
 from .services.downloads import DownloadService
 from .services.uploads import StagedUploads, UploadService
 
@@ -73,6 +74,7 @@ async def lifespan(app: FastAPI):
     settings_service = SettingsService(CONFIG.settings_path, CONFIG.dek_path)
     settings = settings_service.load()  # first boot seeds from env; volume wins after
     purge_binary_env()  # only after seeding, or the seed would find nothing
+    purge_secret_env()  # likewise; keeps the OpenRouter key out of subprocess envs
 
     # APP_SECRET is read straight from the environment every boot — the Railway
     # variable is the one source of truth. Never fatal when absent: the login
@@ -160,6 +162,14 @@ async def lifespan(app: FastAPI):
         await app.state.downloads.sweep(at_startup=True)
     except Exception:  # noqa: BLE001
         logger.exception("could not sweep expired downloads at startup")
+    # One classifier client for the whole process, so its concurrency ceiling is
+    # really shared. It reads the key and model through app.state on every call:
+    # a key saved in Settings applies to the next question without a restart,
+    # and a swapped settings store (tests) is never left behind.
+    app.state.typesafe = TypeSafeClient(
+        key_getter=lambda: app.state.settings.load().typesafe_openrouter_api_key,
+        model_getter=lambda: app.state.settings.load().typesafe_model,
+    )
     app.state.scrape = ScrapeService(app.state.instances, jobs, settings_service)
     # The same job store the sweeps use: one Tasks list, one retention policy,
     # one place a run's evidence is reachable from.
@@ -175,12 +185,13 @@ async def lifespan(app: FastAPI):
     # watches, and the activity/files it hears from agent_browser.
     app.state.live_view = LiveViewService(app.state.instances, app.state.agent_browser)
     logger.info(
-        "ready: secret=%s license=%s proxy=%s notion=%s pool max=%d reserve=%d "
+        "ready: secret=%s license=%s proxy=%s notion=%s typesafe=%s pool max=%d reserve=%d "
         "jobs=%d interrupted=%d oauth_clients=%d",
         "set" if secret else "MISSING",
         "pro-key-saved" if settings.cloakbrowser_license_key else "public",
         settings.proxy_status(),
         "set" if settings.notion_configured() else "MISSING",
+        settings.typesafe_status(),
         settings.max_instances,
         settings.interactive_reserve,
         len(jobs.all()),

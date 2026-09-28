@@ -470,14 +470,27 @@ class NotionInfo(BaseModel):
     connected: bool = Field(description="Whether a Notion token and database are set.")
 
 
+class TypeSafeInfo(BaseModel):
+    configured: bool = Field(
+        description="Whether an OpenRouter key is saved for the optional TypeSafe Classifier "
+                    "(e.g. Jev). Says nothing about whether it works; see status."
+    )
+    status: Literal["unset", "untested", "working", "broken"] = Field(
+        description="unset / untested / working / broken, as of the last test in Settings."
+    )
+    model: str = Field(description="The TypeSafe model asked, e.g. 'jev-latest'.")
+
+
 class ServerInfo(BaseModel):
     """A read-only status snapshot of the server's setup. Never carries a secret —
-    no proxy password, no licence key, no Notion token; status and version only."""
+    no proxy password, no licence key, no Notion token, no OpenRouter key; status
+    and version only."""
 
     proxy: ProxyInfo
     browser: BrowserInfo
     pool: PoolInfo
     notion: NotionInfo
+    typesafe: TypeSafeInfo
 
 
 class Health(BaseModel):

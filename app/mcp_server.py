@@ -715,13 +715,14 @@ def build(app) -> MCPServer:
     # Closed-world: proxy status comes from saved settings, not a live probe.
     @tool(annotations=READ_ONLY)
     async def server_info() -> ServerInfo:
-        """How this server is set up: proxy, browser, pool, and Notion status.
+        """How this server is set up: proxy, browser, pool, Notion, and TypeSafe status.
 
         Read-only, and carries no secrets — status and versions only. Useful to
         check before a sweep or a browser launch: whether the optional residential
         proxy is direct/configured/working, whether the selected CloakBrowser build
         is public, resolved Pro, or has an unverified Pro key, how many browser slots
-        are free, and whether Notion is connected.
+        are free, whether Notion is connected, and whether the optional TypeSafe
+        Classifier (e.g. Jev) has a key and passed its last test.
         """
         from .services.views import server_info as build_server_info
 

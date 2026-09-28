@@ -18,6 +18,8 @@ logger = logging.getLogger("cloakbiz.config")
 # Read from settings and passed to launch as arguments instead. Left in the
 # process env they would silently outrank the user's settings — see purge_binary_env().
 _BINARY_ENV_VARS = ("CLOAKBROWSER_LICENSE_KEY", "CLOAKBROWSER_VERSION")
+# Seed-only secrets with no reason to outlive seeding — see purge_secret_env().
+_SEED_SECRET_ENV_VARS = ("OPENROUTER_API_KEY",)
 
 
 def _int(name: str, default: int) -> int:
@@ -121,5 +123,20 @@ def purge_binary_env() -> None:
     first-boot seeding has already copied them into the store.
     """
     for name in _BINARY_ENV_VARS:
+        if os.environ.pop(name, None) is not None:
+            logger.info("%s consumed into settings; removed from process env", name)
+
+
+def purge_secret_env() -> None:
+    """Drop seed-only secrets from the process env once settings have been seeded.
+
+    Nothing reads these after first boot — the settings store is authoritative
+    — but the process env is not private to this process: agent-browser is run
+    with a copy of it (services/agent_browser.py), so a key left here would be
+    handed to every CLI invocation and anything it spawns. Once the value is in
+    the encrypted store there is no reason for a second copy to exist. Call
+    after first-boot seeding, exactly like purge_binary_env().
+    """
+    for name in _SEED_SECRET_ENV_VARS:
         if os.environ.pop(name, None) is not None:
             logger.info("%s consumed into settings; removed from process env", name)

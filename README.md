@@ -175,7 +175,7 @@ any behavioural change.
 
 | Tool | What it does |
 | --- | --- |
-| `server_info()` | Read proxy, browser-build, pool-capacity, and Notion connection status without exposing secrets. |
+| `server_info()` | Read proxy, browser-build, pool-capacity, Notion connection, and TypeSafe Classifier status without exposing secrets. |
 | `scrape_listings(urls, max_pages=1, sync=false)` | Start one asynchronous BizBuySell sweep across one or more search-results or broker-profile URLs; results are merged and de-duplicated. |
 | `get_scrape_listing_results(job_id)` | Poll a sweep without blocking. Completed results are retained for two weeks. |
 | `archive_page(url, notion_page_id)` | Read a page and append its readable content to an existing Notion page. It takes roughly a minute and repeated successful calls append the content again. |
