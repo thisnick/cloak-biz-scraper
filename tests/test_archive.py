@@ -54,12 +54,19 @@ def manager(settings, tmp_path):
     return instances
 
 
-def _service(manager, settings, jobs, monkeypatch, retry, appender=None) -> ArchiveService:
+def _service(manager, settings, jobs, monkeypatch, retry, notion=None,
+             typesafe=None) -> ArchiveService:
+    """An ArchiveService with the browser and Notion both stood in for.
+
+    `notion` is one FakeNotion shared by every archive the service makes (so a
+    second archive of the same page sees the first one's section); without it
+    each archive gets a fresh, empty page."""
     monkeypatch.setattr("app.services.archive.scrape_with_retry", retry)
     # The real converter shells out to node+md2blocks, which lives in the image
     # and not in CI. Which identity we launched on is independent of it.
     monkeypatch.setattr("app.services.archive.md_to_blocks", _blocks)
-    return ArchiveService(manager, settings, jobs, appender=appender or _appender())
+    factory = (lambda token: notion) if notion is not None else (lambda token: FakeNotion())
+    return ArchiveService(manager, settings, jobs, notion_client=factory, typesafe=typesafe)
 
 
 async def _blocks(markdown: str, base_url: str) -> list[dict]:
@@ -67,13 +74,61 @@ async def _blocks(markdown: str, base_url: str) -> list[dict]:
              "paragraph": {"rich_text": [{"type": "text", "text": {"content": markdown}}]}}]
 
 
-def _appender(counted: list | None = None):
-    async def append(token, page_id, blocks):
-        if counted is not None:
-            counted.append((page_id, len(blocks)))
-        return len(blocks)
+def _heading(text: str, level: int = 1) -> dict:
+    """A heading block as Notion RETURNS it — with plain_text, unlike the
+    blocks this app sends."""
+    kind = f"heading_{level}"
+    return {"object": "block", "type": kind,
+            kind: {"rich_text": [{"type": "text", "text": {"content": text},
+                                  "plain_text": text}]}}
 
-    return append
+
+def _para(text: str) -> dict:
+    return {"object": "block", "type": "paragraph",
+            "paragraph": {"rich_text": [{"type": "text", "text": {"content": text},
+                                         "plain_text": text}]}}
+
+
+class FakeNotion:
+    """A NotionClient stand-in holding each page's top-level blocks.
+
+    Every page starts with `blocks`. Serves GET /blocks/{id}/children in pages
+    of `page_size` with Notion's cursor fields, appends PATCHed children to that
+    page, and records every call. `refuse` is raised from any PATCH, like Notion
+    refusing the write.
+    """
+
+    def __init__(self, blocks: list[dict] | None = None, *, page_size: int = 100,
+                 refuse: Exception | None = None) -> None:
+        self._initial = list(blocks or [])
+        self.pages: dict[str, list[dict]] = {}
+        self.page_size = page_size
+        self.refuse = refuse
+        self.calls: list[tuple[str, str, dict]] = []
+
+    def _page(self, path: str) -> list[dict]:
+        page_id = path.split("/")[2]
+        return self.pages.setdefault(page_id, list(self._initial))
+
+    async def request(self, method: str, path: str, **kw):
+        self.calls.append((method, path, kw))
+        blocks = self._page(path)
+        if method == "GET":
+            start = int((kw.get("params") or {}).get("start_cursor") or 0)
+            nxt = start + self.page_size
+            more = nxt < len(blocks)
+            return {"results": blocks[start:nxt], "has_more": more,
+                    "next_cursor": str(nxt) if more else None}
+        if method == "PATCH":
+            if self.refuse is not None:
+                raise self.refuse
+            blocks.extend(kw["json"]["children"])
+            return {"results": kw["json"]["children"]}
+        raise AssertionError(f"unexpected Notion call {method} {path}")
+
+    @property
+    def patches(self) -> list[tuple[str, str, dict]]:
+        return [c for c in self.calls if c[0] == "PATCH"]
 
 
 def _ok(profile_seen: list | None = None):
@@ -154,10 +209,8 @@ class TestTheLeaseIsAlwaysReturned:
 
     @pytest.mark.asyncio
     async def test_after_the_notion_write_fails(self, manager, settings, jobs, monkeypatch):
-        async def refuse(token, page_id, blocks):
-            raise RuntimeError("Notion said no")
-
-        svc = _service(manager, settings, jobs, monkeypatch, _ok(), appender=refuse)
+        refuse = FakeNotion(refuse=RuntimeError("Notion said no"))
+        svc = _service(manager, settings, jobs, monkeypatch, _ok(), notion=refuse)
         result = await svc.archive(URL, "page-1")
 
         assert not result.ok and "could not write it to Notion" in result.summary
@@ -387,10 +440,8 @@ class TestTheArchiveRecordsItself:
     async def test_a_refused_notion_write_records_a_failed_task(
         self, manager, settings, jobs, monkeypatch,
     ):
-        async def refuse(token, page_id, blocks):
-            raise RuntimeError("Notion said no")
-
-        svc = _service(manager, settings, jobs, monkeypatch, _ok(), appender=refuse)
+        refuse = FakeNotion(refuse=RuntimeError("Notion said no"))
+        svc = _service(manager, settings, jobs, monkeypatch, _ok(), notion=refuse)
         result = await svc.archive(URL, "page-1")
 
         (task,) = jobs.all()
@@ -495,3 +546,368 @@ class TestTheArchiveLabel:
 
     def test_a_task_with_no_url_at_all_still_renders(self):
         assert describe(ArchiveTask(id="d")) == "Archive · a page"
+
+
+# ── read / append: the two halves a sweep's triage reuses ───────────────────
+
+
+class FakeTypeSafe:
+    """The guard's classifier: one noul answer, or an error, recorded."""
+
+    def __init__(self, p: float = 0.96, error: Exception | None = None) -> None:
+        self.p = p
+        self.error = error
+        self.calls: list[tuple[object, str]] = []
+
+    async def noul(self, state, instructions):
+        self.calls.append((state, instructions))
+        if self.error is not None:
+            raise self.error
+        return self.p
+
+
+def _with_key(settings):
+    settings.update(typesafe_openrouter_api_key="sk-or-v1-archive-guard-test")
+    return settings
+
+
+def _reads(markdown: str, title: str = "A Laundromat"):
+    async def retry(instances, *, profile, owner, **kw):
+        return {"blocked": False, "error": None, "attempts_used": 1,
+                "data": {"title": title, "used_path": "readability", "markdown": markdown}}
+
+    return retry
+
+
+class TestTheReadHalf:
+    """`read` is the browser and nothing else: a sweep's triage reads detail
+    pages with it under its own job, so it must not write to Notion, record an
+    archive task, or keep the pooled identity."""
+
+    @pytest.mark.asyncio
+    async def test_it_reads_without_notion_or_a_task_record(
+        self, manager, settings, jobs, monkeypatch, tmp_path,
+    ):
+        def no_notion(token):
+            raise AssertionError("read must never reach for Notion")
+
+        monkeypatch.setattr("app.services.archive.scrape_with_retry", _ok())
+        svc = ArchiveService(manager, settings, jobs, notion_client=no_notion)
+
+        read = await svc.read(URL, tmp_path / "evidence" / "job-1" / "detail-01")
+
+        assert read.ok and read.failure is None
+        assert read.title == "A Laundromat" and read.used_path == "readability"
+        assert "Cash flow $120,000." in read.markdown
+        assert read.attempts_used == 1
+        assert read.evidence_dir.endswith("job-1/detail-01"), "the caller's evidence dir"
+        assert jobs.all() == [], "no ArchiveTask for a read"
+        assert manager.task_profiles.acquire("next") == "task-1", "the lease came back"
+        assert svc._past_gate == 0
+
+    @pytest.mark.asyncio
+    async def test_a_blocked_read_is_a_failure_in_plain_words(
+        self, manager, settings, jobs, monkeypatch, tmp_path,
+    ):
+        async def blocked(instances, *, profile, owner, **kw):
+            return {"blocked": True, "error": None, "attempts_used": 3, "data": {}}
+
+        svc = _service(manager, settings, jobs, monkeypatch, blocked)
+        read = await svc.read(URL, tmp_path / "ev")
+
+        assert read.blocked and not read.ok
+        assert "www.bizbuysell.com served an anti-bot page" in read.failure
+        assert read.attempts_used == 3
+
+    @pytest.mark.asyncio
+    async def test_an_error_or_an_empty_page_is_a_failure_too(
+        self, manager, settings, jobs, monkeypatch, tmp_path,
+    ):
+        async def errored(instances, *, profile, owner, **kw):
+            return {"blocked": False, "error": "Timed out loading the page.",
+                    "attempts_used": 3, "data": {}}
+
+        svc = _service(manager, settings, jobs, monkeypatch, errored)
+        assert (await svc.read(URL, tmp_path / "a")).failure == "Timed out loading the page."
+
+        svc = _service(manager, settings, jobs, monkeypatch, _reads("   \n"))
+        read = await svc.read(URL, tmp_path / "b")
+        assert not read.ok and "no readable content" in read.failure
+
+    @pytest.mark.asyncio
+    async def test_the_owner_label_can_be_the_callers(
+        self, manager, settings, jobs, monkeypatch, tmp_path,
+    ):
+        owners: list[str] = []
+
+        async def retry(instances, *, profile, owner, **kw):
+            owners.append(owner)
+            return await _ok()(instances, profile=profile, owner=owner, **kw)
+
+        svc = _service(manager, settings, jobs, monkeypatch, retry)
+        await svc.read(URL, tmp_path / "a")
+        await svc.read(URL, tmp_path / "b", owner="job:abc:detail")
+        assert owners[0].startswith("archive:") and owners[1] == "job:abc:detail"
+
+
+class TestTheAppendHalf:
+    @pytest.mark.asyncio
+    async def test_it_writes_the_prelude_then_the_content(
+        self, manager, settings, jobs, monkeypatch,
+    ):
+        notion = FakeNotion()
+        svc = _service(manager, settings, jobs, monkeypatch, _ok(), notion=notion)
+
+        done = await svc.append(notion, "page-9", "# Title\n\nBody.", URL)
+
+        assert not done.already_archived and done.blocks_appended == 4
+        (patch,) = notion.patches
+        assert patch[1] == "/blocks/page-9/children"
+        kinds = [b["type"] for b in patch[2]["json"]["children"]]
+        assert kinds == ["divider", "heading_1", "callout", "paragraph"]
+        heading = patch[2]["json"]["children"][1]["heading_1"]["rich_text"][0]["text"]["content"]
+        assert heading == "Source Content"
+
+    @pytest.mark.asyncio
+    async def test_it_writes_on_the_client_it_is_given(self, manager, settings, jobs, monkeypatch):
+        """Triage shares one client (one pace) across the whole phase, so append
+        must use it rather than making its own."""
+        def no_factory(token):
+            raise AssertionError("append must use the client it was handed")
+
+        monkeypatch.setattr("app.services.archive.md_to_blocks", _blocks)
+        svc = ArchiveService(manager, settings, jobs, notion_client=no_factory)
+        shared = FakeNotion()
+        await svc.append(shared, "page-1", "one", URL)
+        await svc.append(shared, "page-2", "two", URL)
+        assert [c[1] for c in shared.patches] == ["/blocks/page-1/children",
+                                                  "/blocks/page-2/children"]
+
+
+class TestAppendingIsIdempotent:
+    """A page that already carries the "Source Content" section is left alone —
+    whether this server archived it or an agent did before triage existed."""
+
+    @pytest.mark.asyncio
+    async def test_a_page_with_the_section_gets_nothing(self, manager, settings, jobs, monkeypatch):
+        notion = FakeNotion([_para("My notes."), _heading("Source Content"), _para("old copy")])
+        svc = _service(manager, settings, jobs, monkeypatch, _ok(), notion=notion)
+
+        done = await svc.append(notion, "page-1", "Body.", URL)
+
+        assert done.already_archived and done.blocks_appended == 0
+        assert notion.patches == [], "nothing appended"
+
+    @pytest.mark.asyncio
+    async def test_archive_page_reports_it_already_archived(
+        self, manager, settings, jobs, monkeypatch,
+    ):
+        notion = FakeNotion([_heading("Source Content")])
+        svc = _service(manager, settings, jobs, monkeypatch, _ok(), notion=notion)
+
+        result = await svc.archive(URL, "page-1")
+
+        assert result.ok and result.error is None, "the page IS archived"
+        assert result.blocks_appended == 0
+        assert "already has a 'Source Content' section" in result.summary
+        assert notion.patches == []
+        (task,) = jobs.all()
+        assert task.status == "completed" and task.summary == result.summary
+
+    @pytest.mark.asyncio
+    async def test_a_second_archive_of_the_same_page_appends_nothing(
+        self, manager, settings, jobs, monkeypatch,
+    ):
+        notion = FakeNotion()
+        svc = _service(manager, settings, jobs, monkeypatch, _ok(), notion=notion)
+
+        first = await svc.archive(URL, "page-1")
+        second = await svc.archive(URL, "page-1")
+
+        assert first.blocks_appended > 0
+        assert second.ok and second.blocks_appended == 0
+        assert len(notion.patches) == 1, "the content is on the page once"
+
+    @pytest.mark.asyncio
+    async def test_the_section_is_found_past_the_first_page_of_blocks(
+        self, manager, settings, jobs, monkeypatch,
+    ):
+        """Someone's own notes can run to hundreds of blocks above an archived
+        section; stopping at the first page of children would miss it."""
+        blocks = [_para(f"note {n}") for n in range(150)] + [_heading("Source Content")]
+        notion = FakeNotion(blocks, page_size=100)
+        svc = _service(manager, settings, jobs, monkeypatch, _ok(), notion=notion)
+
+        done = await svc.append(notion, "page-1", "Body.", URL)
+
+        assert done.already_archived
+        gets = [c for c in notion.calls if c[0] == "GET"]
+        assert [c[2]["params"].get("start_cursor") for c in gets] == [None, "100"]
+        assert all(c[1] == "/blocks/page-1/children" for c in gets)
+
+    @pytest.mark.asyncio
+    async def test_a_lookalike_is_not_the_section(self, manager, settings, jobs, monkeypatch):
+        """Only the Heading 1 prelude writes counts — a smaller heading or a
+        paragraph that happens to say the words is someone's own content."""
+        notion = FakeNotion([_heading("Source Content", level=2), _para("Source Content"),
+                             _heading("Source Contents")])
+        svc = _service(manager, settings, jobs, monkeypatch, _ok(), notion=notion)
+
+        done = await svc.append(notion, "page-1", "Body.", URL)
+
+        assert not done.already_archived and len(notion.patches) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_custom_heading_is_its_own_section(self, manager, settings, jobs, monkeypatch):
+        notion = FakeNotion([_heading("Source Content")])
+        svc = _service(manager, settings, jobs, monkeypatch, _ok(), notion=notion)
+
+        done = await svc.append(notion, "page-1", "Body.", URL, heading="Detail Page")
+
+        assert not done.already_archived and done.blocks_appended > 0
+
+
+class TestTheGuard:
+    """With a TypeSafe key saved, a page that is not its real content — a login
+    wall, a 404, a removed listing, an anti-bot check — is never written."""
+
+    @pytest.mark.asyncio
+    async def test_no_key_means_no_guard(self, manager, settings, jobs, monkeypatch):
+        classifier = FakeTypeSafe(p=0.01)
+        notion = FakeNotion()
+        svc = _service(manager, settings, jobs, monkeypatch, _ok(), notion=notion,
+                       typesafe=classifier)
+
+        result = await svc.archive(URL, "page-1")
+
+        assert classifier.calls == [], "nothing is asked without a key"
+        assert result.ok and result.blocks_appended > 0, "exactly as before the guard"
+
+    @pytest.mark.asyncio
+    async def test_no_classifier_means_no_guard(self, manager, settings, jobs, monkeypatch):
+        svc = _service(manager, _with_key(settings), jobs, monkeypatch, _ok())
+        assert (await svc.archive(URL, "page-1")).ok
+
+    @pytest.mark.asyncio
+    async def test_the_real_page_passes_and_is_archived(self, manager, settings, jobs, monkeypatch):
+        from app.services.archive import GUARD_QUESTION
+
+        classifier = FakeTypeSafe(p=0.96)
+        notion = FakeNotion()
+        svc = _service(manager, _with_key(settings), jobs, monkeypatch, _ok(), notion=notion,
+                       typesafe=classifier)
+
+        result = await svc.archive(URL, "page-1")
+
+        assert result.ok and result.blocks_appended > 0
+        ((state, instructions),) = classifier.calls
+        assert instructions == GUARD_QUESTION
+        assert state == {"page_text": "# A Laundromat\n\nCash flow $120,000.\n"}
+        assert "could not run" not in result.summary
+
+    @pytest.mark.asyncio
+    async def test_a_page_below_the_threshold_writes_nothing(
+        self, manager, settings, jobs, monkeypatch,
+    ):
+        classifier = FakeTypeSafe(p=0.03)
+        notion = FakeNotion()
+        svc = _service(manager, _with_key(settings), jobs, monkeypatch,
+                       _reads("This listing is no longer available."), notion=notion,
+                       typesafe=classifier)
+
+        result = await svc.archive(URL, "page-1")
+
+        assert not result.ok and result.blocks_appended == 0
+        assert result.error == (
+            "The page doesn't look like its real content (P=0.03: a login wall, error, "
+            "removed listing or anti-bot page?) — nothing was written."
+        )
+        assert notion.calls == [], "Notion is not even asked"
+        (task,) = jobs.all()
+        assert task.status == "failed" and task.error == result.error
+        # With evidence: the verdict sits beside the page capture.
+        import json
+        from pathlib import Path
+
+        verdict = json.loads((Path(result.evidence_dir) / "guard.json").read_text())
+        assert verdict["p_real_content"] == 0.03 and verdict["threshold"] == 0.3
+
+    @pytest.mark.asyncio
+    async def test_the_threshold_itself_passes(self, manager, settings, jobs, monkeypatch):
+        svc = _service(manager, _with_key(settings), jobs, monkeypatch, _ok(),
+                       typesafe=FakeTypeSafe(p=0.3))
+        assert (await svc.archive(URL, "page-1")).ok
+
+    @pytest.mark.asyncio
+    async def test_it_reads_only_the_top_of_the_page(self, manager, settings, jobs, monkeypatch):
+        classifier = FakeTypeSafe()
+        svc = _service(manager, _with_key(settings), jobs, monkeypatch,
+                       _reads("x" * 3990 + "y" * 5000), typesafe=classifier)
+
+        await svc.archive(URL, "page-1")
+
+        ((state, _),) = classifier.calls
+        assert state["page_text"] == "x" * 3990 + "y" * 10
+
+    @pytest.mark.asyncio
+    async def test_a_classifier_outage_never_stops_an_archive(
+        self, manager, settings, jobs, monkeypatch, caplog,
+    ):
+        from app.services.typesafe import TypeSafeUnavailable
+
+        classifier = FakeTypeSafe(error=TypeSafeUnavailable(
+            "The TypeSafe Classifier (e.g. Jev) did not answer after 4 attempts."))
+        notion = FakeNotion()
+        svc = _service(manager, _with_key(settings), jobs, monkeypatch, _ok(), notion=notion,
+                       typesafe=classifier)
+
+        with caplog.at_level("WARNING", logger="cloakbiz.archive"):
+            result = await svc.archive(URL, "page-1")
+
+        assert result.ok and result.blocks_appended > 0, "archived as if there were no guard"
+        assert "could not run" in result.summary and "archived unchecked" in result.summary
+        assert "did not answer" in result.summary
+        assert len(notion.patches) == 1
+        assert any("guard unavailable" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_a_page_that_was_never_read_is_never_asked_about(
+        self, manager, settings, jobs, monkeypatch,
+    ):
+        async def blocked(instances, *, profile, owner, **kw):
+            return {"blocked": True, "error": None, "attempts_used": 3, "data": {}}
+
+        classifier = FakeTypeSafe()
+        svc = _service(manager, _with_key(settings), jobs, monkeypatch, blocked,
+                       typesafe=classifier)
+        result = await svc.archive(URL, "page-1")
+        assert "anti-bot" in result.error and classifier.calls == []
+
+
+class TestTheGuardHelpers:
+    """The guard, reusable: a sweep's triage asks it in the same request as its
+    detail-page question."""
+
+    @pytest.mark.asyncio
+    async def test_guard_asks_one_noul_about_the_page_text(self):
+        from app.services.archive import GUARD_QUESTION, guard
+
+        classifier = FakeTypeSafe(p=0.5)
+        assert await guard(classifier, "Hello") == 0.5
+        assert classifier.calls == [({"page_text": "Hello"}, GUARD_QUESTION)]
+
+    def test_the_question_bundles_as_an_api_question(self):
+        from app.services.archive import GUARD_QUESTION, guard_question, guard_state
+
+        assert guard_question() == {"type": "noul", "instructions": GUARD_QUESTION}
+        assert guard_state("a" * 5000) == {"page_text": "a" * 4000}
+
+    def test_the_wording_is_the_one_validated_live(self):
+        from app.services.archive import GUARD_QUESTION, GUARD_THRESHOLD
+
+        assert GUARD_QUESTION == (
+            "The text is the real content of the page — for example a business listing's "
+            "details — not a login or sign-up wall, a cookie or consent screen, an error or "
+            "not-found page, a removed or no-longer-available notice, or an anti-bot check."
+        )
+        assert GUARD_THRESHOLD == 0.3

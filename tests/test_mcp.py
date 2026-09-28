@@ -136,7 +136,11 @@ class TestStateless:
             "archive_page",
             "agent_browser",
         }
-        assert {n for n, h in hints.items() if h.get("idempotentHint")} == {"close_instance"}
+        # archive_page skips a page that already has its Source Content section,
+        # so the same call twice leaves the page as the first call did.
+        assert {n for n, h in hints.items() if h.get("idempotentHint")} == {
+            "close_instance", "archive_page",
+        }
 
     def test_the_async_pair_is_described_as_a_pair(self, client):
         """A model that does not know to call back reports zero listings for a
@@ -158,6 +162,15 @@ class TestStateless:
         assert "don't read as business listings" in description
         assert "site override" in description and "Settings" in description
         assert "archive_page" in description
+
+    def test_archive_page_describes_the_guard_and_the_repeat(self, client):
+        """Behaviour only: what a repeat call does, and what happens to a page
+        that turns out to be a wall or an error."""
+        description = " ".join({t["name"]: t for t in rpc(client, "tools/list").json()[
+            "result"]["tools"]}["archive_page"]["description"].split())
+        assert "already has a Source Content section gets nothing appended" in description
+        assert "TypeSafe Classifier (e.g. Jev)" in description
+        assert "login wall, error, removed listing or anti-bot page is not written" in description
 
     def test_money_is_advertised_as_a_string_not_a_number(self, client):
         """The contract an agent reads. Money is quoted, never interpreted."""

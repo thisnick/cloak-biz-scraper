@@ -795,6 +795,11 @@ class TestTypeSafeUi:
         assert "Key removed" in shown(response)
         assert '<span class="chip">Not set</span>' in response.text
 
+    def test_archive_page_shares_the_one_classifier(self, client):
+        """The archive guard asks through the process's one client, so its
+        concurrency ceiling is shared and a key saved here applies at once."""
+        assert app.state.archive._typesafe is app.state.typesafe
+
     def test_a_foreign_origin_is_refused(self, auth):
         response = auth.post("/settings/typesafe",
                              data={"typesafe_openrouter_api_key": self.KEY},
@@ -855,7 +860,8 @@ class TestNotionUi:
                         "Normalized URL": text(),
                         "Listing ID": text(),
                         "Asking Price": text(),  # the hand-built reality
-                        "Bot Triage": text(),    # a column we know nothing about
+                        "Key Risks": text(),     # a column we know nothing about
+                        "Bot Triage": text(),    # written by triage, and only by triage
                     },
                 },
             )
@@ -875,7 +881,13 @@ class TestNotionUi:
         # A column we know nothing about is not mapped, so it is left untouched.
         map_ = app.state.settings.load().notion_column_map
         assert map_["asking_price"] == "Asking Price"
-        assert "Bot Triage" not in map_.values()
+        assert "Key Risks" not in map_.values()
+        assert "Your other 1 column is never touched" in page
+        # Bot Triage is no longer "a column we know nothing about": it maps by
+        # name to the triage field, which only a triaging sweep ever writes —
+        # and it costs this non-triaging database nothing (still "is ready").
+        assert map_["bot_triage"] == "Bot Triage"
+        assert [k for k, v in map_.items() if v == "Bot Triage"] == ["bot_triage"]
 
     @respx.mock
     def test_create_is_only_ever_explicit(self, auth):
@@ -1052,6 +1064,84 @@ class TestNotionMapping:
         saved = app.state.settings.load().notion_column_map
         # Not a real column -> treated as "don't sync", never stored as a target.
         assert saved["asking_price"] is None
+
+
+class TestTriageMapping:
+    """The triage fields in the mapping table: under their own subheading, so
+    nobody expects an ordinary sweep to fill them, and saved like any other
+    field — Nick maps Triage Reason onto his "Why Review" column here."""
+
+    _REQUIRED = {"map_listing_title": "Deal", "map_url": "Link",
+                 "map_normalized_url": "Canonical", "map_listing_id": "Ref"}
+
+    def _db(self):
+        body = {**_RENAMED_DB, "properties": {
+            **_RENAMED_DB["properties"],
+            "Bot Triage": {"id": "bt", "type": "select", "select": {}},
+            "Why Review": {"id": "wr", "type": "rich_text", "rich_text": {}},
+        }}
+        respx.get(f"{API}/databases/db-1").mock(return_value=httpx.Response(200, json=body))
+
+    @respx.mock
+    def test_the_triage_rows_sit_under_their_own_subheading(self, auth):
+        self._db()
+        auth.post("/settings/notion", data={"notion_api_token": "ntn_x"})
+        page = shown(auth.post("/settings/notion/select", data={"db_id": "db-1"}))
+
+        heading = page.index("Written only by triage")
+        assert page.index('name="map_last_synced_at"') < heading < page.index('name="map_bot_triage"')
+        for key in ("bot_triage", "triage_reason", "triaged_at", "criteria_version"):
+            assert page.index(f'name="map_{key}"') > heading
+        assert "— don't write —" in page
+        # The same-named Bot Triage column is picked up without being chosen.
+        bot = page[page.index('name="map_bot_triage"'):page.index('name="map_triage_reason"')]
+        assert '<option value="Bot Triage" selected>' in bot
+        reason = page[page.index('name="map_triage_reason"'):page.index('name="map_triaged_at"')]
+        assert "selected>" not in reason.replace("<option value=\"\" selected>", "")
+
+    @respx.mock
+    def test_saving_maps_the_triage_fields(self, auth):
+        self._db()
+        auth.post("/settings/notion", data={"notion_api_token": "ntn_x"})
+        auth.post("/settings/notion/select", data={"db_id": "db-1"})
+
+        response = auth.post("/settings/notion/mapping", data={
+            **self._REQUIRED, "map_asking_price": "Ask", "map_bot_triage": "Bot Triage",
+            "map_triage_reason": "Why Review", "map_triaged_at": "", "map_criteria_version": "",
+        })
+
+        saved = app.state.settings.load().notion_column_map
+        assert saved["bot_triage"] == "Bot Triage"
+        assert saved["triage_reason"] == "Why Review"
+        # No column of that name exists, so an empty choice stores nothing and a
+        # "Triaged At" column added later is still found by its name.
+        assert "triaged_at" not in saved and "criteria_version" not in saved
+        page = shown(response)
+        assert "is ready" in page, "triage fields never block or nag"
+        assert "Your other 1 column is never touched" in page  # Notes; not Why Review
+
+    @respx.mock
+    def test_an_empty_choice_switches_off_a_same_named_column(self, auth):
+        self._db()
+        auth.post("/settings/notion", data={"notion_api_token": "ntn_x"})
+        auth.post("/settings/notion/select", data={"db_id": "db-1"})
+
+        response = auth.post("/settings/notion/mapping", data={
+            **self._REQUIRED, "map_bot_triage": ""})
+
+        assert app.state.settings.load().notion_column_map["bot_triage"] is None
+        bot = shown(response)
+        bot = bot[bot.index('name="map_bot_triage"'):bot.index('name="map_triage_reason"')]
+        assert '<option value="" selected>— don\'t write —' in bot
+
+    @respx.mock
+    def test_a_triage_column_that_does_not_exist_is_ignored(self, auth):
+        self._db()
+        auth.post("/settings/notion", data={"notion_api_token": "ntn_x"})
+        auth.post("/settings/notion/select", data={"db_id": "db-1"})
+        auth.post("/settings/notion/mapping", data={
+            **self._REQUIRED, "map_bot_triage": "Bot Triage", "map_triage_reason": "Nope"})
+        assert "triage_reason" not in app.state.settings.load().notion_column_map
 
 
 # APP_SECRET is managed in Railway rather than this settings page. The

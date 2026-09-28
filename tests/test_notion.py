@@ -195,10 +195,24 @@ class TestVerifySchema:
     @pytest.mark.asyncio
     async def test_lists_user_columns_it_will_never_touch(self):
         schema = {**FULL_SCHEMA, "Key Risks / Notes": prop("rich_text", "k1"),
+                  "Owner Call": prop("select", "o1")}
+        mock_db(schema)
+        report = await NotionStore(TOKEN).verify_schema(DB)
+        assert report.untouched == ["Key Risks / Notes", "Owner Call"]
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_a_bot_triage_column_is_written_by_triage_so_not_untouched(self):
+        """Bot Triage used to be a column we never touched. Triage now writes it —
+        only triage, and only when asked to — so claiming "never touched" would
+        be false. It still costs a non-triaging database nothing: no problem, no
+        change to complete/usable."""
+        schema = {**FULL_SCHEMA, "Key Risks / Notes": prop("rich_text", "k1"),
                   "Bot Triage": prop("select", "b1")}
         mock_db(schema)
         report = await NotionStore(TOKEN).verify_schema(DB)
-        assert report.untouched == ["Bot Triage", "Key Risks / Notes"]
+        assert report.untouched == ["Key Risks / Notes"]
+        assert report.complete and report.problems == []
 
     @respx.mock
     @pytest.mark.asyncio
@@ -587,7 +601,17 @@ class TestCreateDatabase:
 
         body = json.loads(route.calls[0].request.read())
         assert body["parent"] == {"type": "page_id", "page_id": "page-1"}
-        assert set(body["properties"]) == set(notion_module.PROPS_BY_NAME)
+        # The listing columns, plus the triage columns so a database made here
+        # can be triaged with no further setup.
+        assert set(body["properties"]) == set(notion_module.PROPS_BY_NAME) | {
+            "Bot Triage", "Triage Reason", "Triaged At", "Criteria Version",
+        }
+        assert body["properties"]["Bot Triage"] == {"select": {"options": [
+            {"name": "REVIEW", "color": "yellow"}, {"name": "REJECT", "color": "red"},
+        ]}}
+        assert body["properties"]["Triage Reason"] == {"rich_text": {}}
+        assert body["properties"]["Triaged At"] == {"date": {}}
+        assert body["properties"]["Criteria Version"] == {"rich_text": {}}
         assert body["properties"]["Listing Title"] == {"title": {}}
         assert body["properties"]["Asking Price"] == {"number": {"format": "dollar"}}
         assert body["properties"]["Normalized URL"] == {"rich_text": {}}
@@ -1073,3 +1097,412 @@ class TestMapRows:
         rows = {r.key: r for r in build_map_rows(m, {"Deal": "title"})}
         assert rows["revenue"].selected == ""
         assert rows["revenue"].dont_sync is True
+
+
+# ── triage columns ──────────────────────────────────────────────────────────
+#
+# Bot Triage, Triage Reason, Triaged At and Criteria Version are written by
+# triage and nothing else. A user who never triages must see no change at all:
+# no write on insert or refresh, no nag in the schema report.
+
+import json  # noqa: E402
+from datetime import datetime, timezone  # noqa: E402
+
+from app.stores.base import TriageUnavailable  # noqa: E402
+from app.stores.notion import TRIAGE_PROPS, NotionError  # noqa: E402
+
+TRIAGE_SCHEMA = {
+    "Bot Triage": {"id": "bt", "type": "select", "select": {"options": []}},
+    "Triage Reason": prop("rich_text", "tr"),
+    "Triaged At": prop("date", "ta"),
+    "Criteria Version": prop("rich_text", "cv"),
+}
+TRIAGE_NAMES = set(TRIAGE_SCHEMA)
+
+
+def triage_row(page_id: str, listing_id: str, normalized_url: str, decision: str | None,
+               *, col: str = "Bot Triage", kind: str = "select") -> dict:
+    """A row as a query returns it with Bot Triage requested. `decision` None
+    is a blank cell."""
+    page = row(page_id, listing_id, normalized_url)
+    if kind == "select":
+        page["properties"][col] = {"type": "select",
+                                   "select": {"name": decision} if decision else None}
+    else:
+        page["properties"][col] = {"type": "rich_text",
+                                   "rich_text": [{"plain_text": decision}] if decision else []}
+    return page
+
+
+def _url(n: int) -> str:
+    return f"bizbuysell.com/business-opportunity/x/{n}"
+
+
+def known(n: int) -> Listing:
+    return listing(listing_id=str(n), normalized_url=_url(n))
+
+
+class TestTriageColumnsAreSeparate:
+    def test_they_are_not_known_props(self):
+        """Everything that walks KNOWN_PROPS — insert, refresh, the report,
+        `skipped` — would otherwise start writing or nagging about them."""
+        assert {p.name for p in TRIAGE_PROPS} == TRIAGE_NAMES
+        assert not TRIAGE_NAMES & set(notion_module.PROPS_BY_NAME)
+        assert not {p.key for p in TRIAGE_PROPS} & set(notion_module.PROPS_BY_KEY)
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_an_insert_never_writes_them(self):
+        mock_db({**FULL_SCHEMA, **TRIAGE_SCHEMA})
+        mock_query([])
+        route = respx.post(f"{API}/pages").mock(return_value=httpx.Response(200, json={"id": "n"}))
+        await NotionStore(TOKEN).upsert_new(DB, [listing()])
+        sent = json.loads(route.calls[0].request.read())["properties"]
+        assert not set(sent) & TRIAGE_NAMES
+        assert "First Seen At" in sent, "the listing's own dates still land"
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_a_mapped_insert_never_stamps_triaged_at(self):
+        """The mapped insert renders any date field as "now". Were Triaged At a
+        KNOWN_PROP, every new row would claim it was triaged the moment it was
+        created."""
+        schema = {**RENAMED, "When Triaged": prop("date", "wt"), "Decision": prop("select", "d"),
+                  "Why Review": prop("rich_text", "wr")}
+        mock_db(schema)
+        mock_query([])
+        route = respx.post(f"{API}/pages").mock(return_value=httpx.Response(200, json={"id": "n"}))
+        m = {**RENAMED_MAP, "triaged_at": "When Triaged", "bot_triage": "Decision",
+             "triage_reason": "Why Review"}
+        await NotionStore(TOKEN).upsert_new(DB, [listing()], column_map=m)
+        sent = json.loads(route.calls[0].request.read())["properties"]
+        assert not {"When Triaged", "Decision", "Why Review"} & set(sent)
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_a_refresh_never_writes_them(self):
+        mock_db({**FULL_SCHEMA, **TRIAGE_SCHEMA})
+        mock_query([triage_row("p1", "2485121", "bizbuysell.com/business-opportunity/foo/2485121",
+                               None)])
+        patch = respx.patch(f"{API}/pages/p1").mock(return_value=httpx.Response(200, json={}))
+        await NotionStore(TOKEN).upsert_new(DB, [listing(excerpt="Fresh text.")])
+        sent = json.loads(patch.calls[0].request.read())["properties"]
+        assert set(sent) == {"Last Synced At", "Excerpt"}
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_missing_triage_columns_are_never_a_problem(self):
+        """No triage columns at all, or a map pointing triage at a column that is
+        gone: the report and `skipped` say nothing, and complete stays true."""
+        mock_db(FULL_SCHEMA)
+        mock_query([])
+        respx.post(f"{API}/pages").mock(return_value=httpx.Response(200, json={"id": "n"}))
+        store = NotionStore(TOKEN)
+        report = await store.verify_schema(DB)
+        assert report.complete and report.problems == []
+        result = await store.upsert_new(DB, [listing()])
+        assert result.skipped == []
+
+        mock_db(RENAMED)
+        m = {**RENAMED_MAP, "bot_triage": "Gone", "triaged_at": "Also Gone"}
+        report = await store.verify_schema(DB, m)
+        assert report.complete and report.missing_recommended == []
+        result = await store.upsert_new(DB, [listing(listing_id="7", normalized_url="u/7")],
+                                        column_map=m)
+        assert result.skipped == []
+
+
+class TestTriageResolution:
+    def test_the_default_map_takes_same_named_columns(self):
+        m = default_column_map({"Listing Title", "URL", "Normalized URL", "Listing ID",
+                                "Bot Triage", "Triage Reason"})
+        assert m["bot_triage"] == "Bot Triage"
+        assert m["triage_reason"] == "Triage Reason"
+
+    def test_the_default_map_leaves_absent_triage_columns_out_not_off(self):
+        """Left out (not None), so a Bot Triage column added in Notion later is
+        found by its name without a visit to Settings."""
+        m = default_column_map({"Listing Title", "URL", "Normalized URL", "Listing ID"})
+        assert not {"bot_triage", "triage_reason", "triaged_at", "criteria_version"} & set(m)
+
+    def test_a_key_the_map_does_not_mention_resolves_by_name(self):
+        rows = {r.key: r for r in build_map_rows(RENAMED_MAP, {"Deal": "title",
+                                                               "Bot Triage": "select"})}
+        assert rows["bot_triage"].selected == "Bot Triage"
+        assert rows["bot_triage"].saved_type == "Select"
+        assert rows["triage_reason"].selected == ""
+
+    def test_an_explicit_none_switches_it_off(self):
+        rows = {r.key: r for r in build_map_rows({**RENAMED_MAP, "bot_triage": None},
+                                                 {"Deal": "title", "Bot Triage": "select"})}
+        assert rows["bot_triage"].selected == "" and rows["bot_triage"].dont_sync
+
+    def test_triage_rows_follow_the_listing_rows(self):
+        rows = build_map_rows(None, {"Why Review": "rich_text"})
+        assert [r.key for r in rows if r.triage] == [
+            "bot_triage", "triage_reason", "triaged_at", "criteria_version"]
+        first_triage = next(i for i, r in enumerate(rows) if r.triage)
+        assert all(not r.triage for r in rows[:first_triage])
+        assert all(r.triage for r in rows[first_triage:])
+        assert not any(r.required for r in rows if r.triage)
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_resolved_triage_columns_are_not_untouched(self):
+        schema = {**RENAMED, "Bot Triage": prop("select", "bt"), "Why Review": prop("rich_text", "wr")}
+        mock_db(schema)
+        report = await NotionStore(TOKEN).verify_schema(
+            DB, {**RENAMED_MAP, "triage_reason": "Why Review"})
+        assert report.untouched == ["Notes"]
+        assert report.complete
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_a_switched_off_triage_column_is_untouched_again(self):
+        mock_db({**RENAMED, "Bot Triage": prop("select", "bt")})
+        report = await NotionStore(TOKEN).verify_schema(DB, {**RENAMED_MAP, "bot_triage": None})
+        assert report.untouched == ["Bot Triage", "Notes"]
+
+
+class TestTheSyncReadsBotTriage:
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_it_asks_for_the_column_only_when_it_resolves(self):
+        store = NotionStore(TOKEN)
+        mock_db({**FULL_SCHEMA, **TRIAGE_SCHEMA})
+        mock_query([])
+        await store.index(DB)
+        query = [c for c in respx.calls if "query" in c.request.url.path][-1]
+        assert sorted(query.request.url.params.get_list("filter_properties")) == ["bt", "i1", "n1"]
+
+        mock_db(FULL_SCHEMA)
+        await store.index(DB)
+        query = [c for c in respx.calls if "query" in c.request.url.path][-1]
+        assert sorted(query.request.url.params.get_list("filter_properties")) == ["i1", "n1"]
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_a_switched_off_or_status_column_is_not_read(self):
+        store = NotionStore(TOKEN)
+        mock_query([])
+        m = default_column_map(set(FULL_SCHEMA) | TRIAGE_NAMES)
+        mock_db({**FULL_SCHEMA, **TRIAGE_SCHEMA})
+        await store.index(DB, {**m, "bot_triage": None})
+        mock_db({**FULL_SCHEMA, "Bot Triage": prop("status", "bt")})
+        await store.index(DB)
+        for query in [c for c in respx.calls if "query" in c.request.url.path]:
+            assert "bt" not in query.request.url.params.get_list("filter_properties")
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_untriaged_is_the_blank_known_rows_only(self):
+        mock_db({**FULL_SCHEMA, **TRIAGE_SCHEMA})
+        mock_query([
+            triage_row("p1", "1", _url(1), None),        # blank: backlog
+            triage_row("p2", "2", _url(2), "REVIEW"),    # triaged already
+            triage_row("p3", "3", _url(3), "Maybe"),     # a person's own call
+            triage_row("p4", "4", _url(4), None),        # blank, but not in this sweep
+        ])
+        respx.patch(url__startswith=f"{API}/pages/").mock(return_value=httpx.Response(200, json={}))
+        respx.post(f"{API}/pages").mock(return_value=httpx.Response(200, json={"id": "new-9"}))
+
+        result = await NotionStore(TOKEN).upsert_new(
+            DB, [known(1), known(2), known(3), known(9), known(1)])
+
+        assert [(l.listing_id, l.synced_row_id) for l in result.untriaged] == [("1", "p1")], (
+            "blank rows seen this sweep, once each; never a row holding a value"
+        )
+        assert [l.synced_row_id for l in result.new_listings] == ["new-9"]
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_a_column_that_was_not_read_never_reads_as_blank(self):
+        """Unmapped Bot Triage means "not read", which must not become "every
+        known row is blank" — that would triage (and overwrite) them all."""
+        mock_db(FULL_SCHEMA)
+        mock_query([row("p1", "1", _url(1))])
+        respx.patch(url__startswith=f"{API}/pages/").mock(return_value=httpx.Response(200, json={}))
+        result = await NotionStore(TOKEN).upsert_new(DB, [known(1)])
+        assert result.existing == 1 and result.untriaged == []
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_a_value_notion_did_not_return_is_not_blank(self):
+        mock_db({**FULL_SCHEMA, **TRIAGE_SCHEMA})
+        mock_query([row("p1", "1", _url(1))])  # no Bot Triage in the page at all
+        respx.patch(url__startswith=f"{API}/pages/").mock(return_value=httpx.Response(200, json={}))
+        result = await NotionStore(TOKEN).upsert_new(DB, [known(1)])
+        assert result.untriaged == []
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_a_text_decision_column_under_a_map(self):
+        schema = {**RENAMED, "Decision": prop("rich_text", "dc")}
+        m = {**RENAMED_MAP, "bot_triage": "Decision"}
+        mock_db(schema)
+        mock_query([
+            mapped_row("p1", {"Ref": ("rich_text", "1"), "Canonical": ("rich_text", _url(1)),
+                              "Decision": ("rich_text", "")}),
+            mapped_row("p2", {"Ref": ("rich_text", "2"), "Canonical": ("rich_text", _url(2)),
+                              "Decision": ("rich_text", "REJECT")}),
+        ])
+        result = await NotionStore(TOKEN).upsert_new(DB, [known(1), known(2)], column_map=m)
+        query = [c for c in respx.calls if "query" in c.request.url.path][0]
+        assert "dc" in query.request.url.params.get_list("filter_properties")
+        assert [l.synced_row_id for l in result.untriaged] == ["p1"]
+
+
+class TestPrepareTriage:
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_resolves_all_four_by_name(self):
+        mock_db({**FULL_SCHEMA, **TRIAGE_SCHEMA})
+        store = NotionStore(TOKEN)
+        target = await store.prepare_triage(DB)
+        assert target.fields == {"bot_triage": "Bot Triage", "triage_reason": "Triage Reason",
+                                 "triaged_at": "Triaged At", "criteria_version": "Criteria Version"}
+        assert target.types["bot_triage"] == "select" and target.types["triaged_at"] == "date"
+        assert target.notes == ()
+        assert target.client is store._client, "one client, one pace, for the whole phase"
+        assert [c.request.method for c in respx.calls] == ["GET"], "reads only"
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_honours_the_map_and_skips_what_does_not_resolve(self):
+        mock_db({**RENAMED, "Bot Triage": prop("select", "bt"), "Why Review": prop("rich_text", "wr")})
+        target = await NotionStore(TOKEN).prepare_triage(
+            DB, {**RENAMED_MAP, "triage_reason": "Why Review", "criteria_version": None})
+        assert target.fields == {"bot_triage": "Bot Triage", "triage_reason": "Why Review"}
+        assert target.notes == ()
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_no_bot_triage_column_is_refused_with_the_fix(self):
+        mock_db(FULL_SCHEMA)
+        with pytest.raises(TriageUnavailable, match="no 'Bot Triage' column") as exc:
+            await NotionStore(TOKEN).prepare_triage(DB)
+        assert "Add a Select column named Bot Triage" in str(exc.value)
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_switched_off_or_mapped_to_a_deleted_column_is_refused(self):
+        mock_db({**FULL_SCHEMA, **TRIAGE_SCHEMA})
+        with pytest.raises(TriageUnavailable, match="don't write"):
+            await NotionStore(TOKEN).prepare_triage(DB, {**RENAMED_MAP, "bot_triage": None})
+        with pytest.raises(TriageUnavailable, match="'Decision', which this database no longer has"):
+            await NotionStore(TOKEN).prepare_triage(DB, {**RENAMED_MAP, "bot_triage": "Decision"})
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_a_status_column_is_refused(self):
+        """A Status column's options are fixed and the API cannot add one, so
+        REVIEW would fail every write — refuse before judging anything."""
+        mock_db({**FULL_SCHEMA, "Bot Triage": prop("status", "bt")})
+        with pytest.raises(TriageUnavailable, match="'Bot Triage' is a Status column") as exc:
+            await NotionStore(TOKEN).prepare_triage(DB)
+        assert "Select or Text" in str(exc.value)
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_any_other_wrong_type_is_refused(self):
+        mock_db({**FULL_SCHEMA, "Bot Triage": prop("number", "bt")})
+        with pytest.raises(TriageUnavailable, match="is a Number column, but Bot Triage needs a "
+                                                    "Select or Text column"):
+            await NotionStore(TOKEN).prepare_triage(DB)
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_an_optional_column_of_the_wrong_kind_is_left_out_with_a_note(self):
+        mock_db({**FULL_SCHEMA, **TRIAGE_SCHEMA, "Triage Reason": prop("number", "tr")})
+        target = await NotionStore(TOKEN).prepare_triage(DB)
+        assert "triage_reason" not in target.fields
+        (note,) = target.notes
+        assert "'Triage Reason' is a Number column" in note
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_triage_never_takes_a_column_a_listing_field_writes(self):
+        mock_db({**FULL_SCHEMA, **TRIAGE_SCHEMA})
+        m = default_column_map(set(FULL_SCHEMA) | TRIAGE_NAMES)
+        target = await NotionStore(TOKEN).prepare_triage(DB, {**m, "triage_reason": "Excerpt"})
+        assert "triage_reason" not in target.fields
+        assert "overwrite the listing's own data" in target.notes[0]
+        with pytest.raises(TriageUnavailable, match="'Status' is where Status is saved"):
+            await NotionStore(TOKEN).prepare_triage(DB, {**m, "bot_triage": "Status"})
+
+
+class TestWriteTriage:
+    WHEN = datetime(2026, 9, 28, 12, 0, tzinfo=timezone.utc)
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_writes_the_four_columns_by_name(self):
+        mock_db({**FULL_SCHEMA, **TRIAGE_SCHEMA})
+        patch = respx.patch(f"{API}/pages/row-1").mock(return_value=httpx.Response(200, json={}))
+        store = NotionStore(TOKEN)
+        target = await store.prepare_triage(DB)
+
+        await store.write_triage(target, "row-1", "REVIEW", "REVIEW · P(review)=0.91 · card",
+                                 self.WHEN, "a1b2c3d4")
+
+        assert json.loads(patch.calls[0].request.read()) == {"properties": {
+            "Bot Triage": {"select": {"name": "REVIEW"}},
+            "Triage Reason": {"rich_text": [{"type": "text", "text": {
+                "content": "REVIEW · P(review)=0.91 · card"}}]},
+            "Triaged At": {"date": {"start": "2026-09-28T12:00:00+00:00"}},
+            "Criteria Version": {"rich_text": [{"type": "text", "text": {"content": "a1b2c3d4"}}]},
+        }}
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_writes_only_the_mapped_columns_under_a_map(self):
+        schema = {**RENAMED, "Decision": prop("rich_text", "dc"), "Why Review": prop("rich_text", "wr")}
+        mock_db(schema)
+        patch = respx.patch(f"{API}/pages/row-1").mock(return_value=httpx.Response(200, json={}))
+        store = NotionStore(TOKEN)
+        target = await store.prepare_triage(
+            DB, {**RENAMED_MAP, "bot_triage": "Decision", "triage_reason": "Why Review"})
+
+        await store.write_triage(target, "row-1", "REJECT", "REJECT · P(review)=0.04 · card",
+                                 self.WHEN, "a1b2c3d4")
+
+        sent = json.loads(patch.calls[0].request.read())["properties"]
+        assert sent == {
+            "Decision": {"rich_text": [{"type": "text", "text": {"content": "REJECT"}}]},
+            "Why Review": {"rich_text": [{"type": "text", "text": {
+                "content": "REJECT · P(review)=0.04 · card"}}]},
+        }, "no listing column, no Notes, no unresolved triage field"
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_a_naive_time_is_taken_as_utc(self):
+        mock_db({**FULL_SCHEMA, **TRIAGE_SCHEMA})
+        patch = respx.patch(f"{API}/pages/row-1").mock(return_value=httpx.Response(200, json={}))
+        store = NotionStore(TOKEN)
+        target = await store.prepare_triage(DB)
+        await store.write_triage(target, "row-1", "REVIEW", "r", datetime(2026, 9, 28, 12, 0), "v")
+        sent = json.loads(patch.calls[0].request.read())["properties"]
+        assert sent["Triaged At"] == {"date": {"start": "2026-09-28T12:00:00+00:00"}}
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_a_failed_write_raises(self):
+        """A decision that was not saved is a failure the sweep reports, never a
+        quiet skip."""
+        mock_db({**FULL_SCHEMA, **TRIAGE_SCHEMA})
+        respx.patch(f"{API}/pages/row-1").mock(return_value=httpx.Response(
+            400, json={"code": "validation_error", "message": "Bot Triage is not a property"}))
+        store = NotionStore(TOKEN)
+        target = await store.prepare_triage(DB)
+        with pytest.raises(NotionError, match="Bot Triage is not a property"):
+            await store.write_triage(target, "row-1", "REVIEW", "r", self.WHEN, "v")
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_a_blank_decision_is_refused_before_writing(self):
+        mock_db({**FULL_SCHEMA, **TRIAGE_SCHEMA})
+        store = NotionStore(TOKEN)
+        target = await store.prepare_triage(DB)
+        with pytest.raises(ValueError):
+            await store.write_triage(target, "row-1", "  ", "r", self.WHEN, "v")
+        assert not [c for c in respx.calls if c.request.method == "PATCH"]

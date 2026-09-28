@@ -579,13 +579,22 @@
                     <table class="hist">
                       <thead><tr><th>Field</th><th>Your column</th><th>Saved as</th></tr></thead>
                       <tbody>
+                        {# The listing fields, then the triage fields under their
+                           own subheading: an ordinary sweep never fills those in,
+                           and the table should not suggest it does. #}
                         {% for row in notion_mapping.rows %}
+                        {% if row.triage and loop.previtem is defined and not loop.previtem.triage %}
+                        <tr class="map-subhead"><th colspan="3">Written only by triage
+                          <span class="hint">— filled in only when a sweep is given a triage prompt; nothing else writes them</span></th></tr>
+                        {% endif %}
                         <tr>
                           <td><b>{{ row.label }}</b>{% if row.required %} <span class="chip bad">required</span>{% endif %}</td>
                           <td>
                             <select name="map_{{ row.key }}">
                               {% if row.required %}
                                 <option value="" {{ 'selected' if not row.selected }} disabled>— choose a column —</option>
+                              {% elif row.triage %}
+                                <option value="" {{ 'selected' if not row.selected }}>— don't write —</option>
                               {% else %}
                                 <option value="" {{ 'selected' if not row.selected }}>— don't sync —</option>
                               {% endif %}

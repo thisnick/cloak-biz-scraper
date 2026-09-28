@@ -8,7 +8,8 @@ database belongs to the user, not to us.
    creates one on first sync trains people not to trust it with their workspace.
 2. **Never clobber a column we do not own.** We write only the properties in
    KNOWN_PROPS, and only where the user's database already has that name at that
-   type. Everything else is invisible to us. That is precisely what makes
+   type — plus the TRIAGE_PROPS columns, and those only when a sweep was asked to
+   triage. Everything else is invisible to us. That is precisely what makes
    "add your own columns and they will survive" a promise rather than a hope.
 3. **Never mutate while verifying.** `verify_schema` reports; the user decides.
 
@@ -22,14 +23,21 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable
 
 import httpx
 
 from ..models import Listing
-from .base import DedupeIndex, PropIssue, SchemaReport, UpsertResult
+from .base import (
+    DedupeIndex,
+    PropIssue,
+    SchemaReport,
+    TriageTarget,
+    TriageUnavailable,
+    UpsertResult,
+)
 from .money import parse_money
 
 logger = logging.getLogger("cloakbiz.notion")
@@ -267,6 +275,59 @@ PROPS_BY_KEY = {p.key: p for p in KNOWN_PROPS}
 REQUIRED_PROPS = tuple(p for p in KNOWN_PROPS if p.required)
 
 
+# ── the triage columns ──────────────────────────────────────────────────────
+# Written by triage and by nothing else: a sweep given a triage prompt records
+# its REVIEW/REJECT decision here after the rows are saved. They are a separate
+# table rather than more KNOWN_PROPS on purpose, because everything that walks
+# KNOWN_PROPS would otherwise pick them up for people who never triage: the
+# insert and the refresh would write them (and the mapped insert renders ANY
+# date field as "now", so every new row would be stamped Triaged At the moment
+# it was created, before anything had judged it), and the schema report and
+# `skipped` would nag about four missing columns nobody asked for.
+#
+# How a triage field finds its column is also different, and more forgiving:
+# see _resolve_triage.
+
+TRIAGE_PROPS: tuple[NotionProp, ...] = (
+    NotionProp(
+        "bot_triage", "Bot Triage", "select", False,
+        {"select": {"options": [
+            {"name": "REVIEW", "color": "yellow"},
+            {"name": "REJECT", "color": "red"},
+        ]}},
+        consequence="A sweep asked to triage has nowhere to record REVIEW or REJECT, so "
+                    "it cannot triage.",
+    ),
+    NotionProp(
+        "triage_reason", "Triage Reason", "rich_text", False, {"rich_text": {}},
+        consequence="Why a row was marked REVIEW or REJECT will not be recorded.",
+    ),
+    NotionProp(
+        "triaged_at", "Triaged At", "date", False, {"date": {}},
+        consequence="When a row was triaged will not be recorded.",
+    ),
+    NotionProp(
+        "criteria_version", "Criteria Version", "rich_text", False, {"rich_text": {}},
+        consequence="Which version of the criteria judged a row will not be recorded.",
+    ),
+)
+
+TRIAGE_BY_KEY = {p.key: p for p in TRIAGE_PROPS}
+
+# The column types each triage field can be written into. Narrower than what an
+# upsert field adapts to, because these values have a shape: the decision is one
+# word (a Select option or text), the time is a date (or its text), the reason is
+# prose. A reason in a Select would mint a new option for every row. A Status
+# column is deliberately absent: its options are fixed and the API cannot add
+# one, so REVIEW written to a Status lacking it would fail the whole write.
+_TRIAGE_WRITABLE: dict[str, tuple[str, ...]] = {
+    "bot_triage": ("select", "rich_text"),
+    "triage_reason": ("rich_text",),
+    "triaged_at": ("date", "rich_text"),
+    "criteria_version": ("rich_text", "select"),
+}
+
+
 # ── the column MAPPING ──────────────────────────────────────────────────────
 # The map is {field-key -> the user's column NAME, or None ("don't sync")}. A
 # missing key means "unmapped": harmless for an optional field, blocking for a
@@ -285,6 +346,11 @@ def default_column_map(column_names: set[str]) -> ColumnMap:
     column for them; default unmatched OPTIONAL fields to None ("don't sync").
     The result is always non-empty, so it never collides with the empty-map
     sentinel and is always treated as an explicit map from here on.
+
+    A triage field is mapped to its same-named column when there is one and
+    otherwise left ABSENT rather than set to None: absent means "whichever column
+    has its name" (see _resolve_triage), so a Bot Triage column added in Notion
+    later is picked up without a trip back to Settings. None would switch it off.
     """
     out: ColumnMap = {}
     for prop in KNOWN_PROPS:
@@ -293,6 +359,9 @@ def default_column_map(column_names: set[str]) -> ColumnMap:
         elif not prop.required:
             out[prop.key] = None
         # required + unmatched -> left absent (unmapped), the user must set it.
+    for prop in TRIAGE_PROPS:
+        if prop.name in column_names:
+            out[prop.key] = prop.name
     return out
 
 
@@ -302,6 +371,44 @@ def _resolve(column_map: ColumnMap | None, key: str) -> str | None:
     if not column_map:
         return PROPS_BY_KEY[key].name
     return column_map.get(key)
+
+
+def _resolve_triage(column_map: ColumnMap | None, key: str, columns) -> str | None:
+    """The column a triage field writes to, or None when it is not written.
+
+    A key the map does not mention resolves to the same-named column when the
+    database has one — which is every stored map made before triage existed, so
+    a database that already has a "Bot Triage" column works with no visit to
+    Settings. An explicit None is the person switching the field off, and wins.
+    A column the database does not (or no longer) have never resolves: triage
+    writes only into columns that exist, exactly like the upsert.
+    """
+    if column_map and key in column_map:
+        col = column_map[key]
+    else:
+        col = TRIAGE_BY_KEY[key].name
+    return col if col and col in columns else None
+
+
+def _triage_columns(column_map: ColumnMap | None, columns) -> dict[str, str]:
+    """Every triage field that resolves, as key -> column name."""
+    out: dict[str, str] = {}
+    for prop in TRIAGE_PROPS:
+        col = _resolve_triage(column_map, prop.key, columns)
+        if col:
+            out[prop.key] = col
+    return out
+
+
+def _decision_column(column_map: ColumnMap | None, actual: dict[str, Any]) -> str | None:
+    """The Bot Triage column, when it resolves AND is a type triage can write.
+
+    Only such a column is worth reading during a sync: a row reported blank in a
+    column triage cannot write would be judged every sweep and saved never."""
+    col = _resolve_triage(column_map, "bot_triage", actual)
+    if col and (actual[col] or {}).get("type") in _TRIAGE_WRITABLE["bot_triage"]:
+        return col
+    return None
 
 
 def _required_compatible(expected: str, actual: str | None) -> bool:
@@ -388,11 +495,18 @@ class MapRow:
     selected: str      # the column currently mapped, "" when unmapped or "don't sync"
     dont_sync: bool     # True only when an optional field is explicitly set to None
     saved_type: str     # display type of the mapped column, "" when none/missing
+    # A field written only by triage, shown under its own subheading so nobody
+    # expects an ordinary sweep to fill it in.
+    triage: bool = False
 
 
 def build_map_rows(column_map: ColumnMap | None, columns: dict[str, str]) -> list[MapRow]:
     """The mapping table view: one row per field, its current selection, and the
-    display type of the column it lands in. `columns` is name -> notion type."""
+    display type of the column it lands in. `columns` is name -> notion type.
+
+    The listing fields come first, then the triage fields (`triage=True`), each
+    showing the column it would really write to — for a triage field that
+    includes a same-named column picked up without being mapped."""
     rows: list[MapRow] = []
     for prop in KNOWN_PROPS:
         target = _resolve(column_map, prop.key)
@@ -405,6 +519,19 @@ def build_map_rows(column_map: ColumnMap | None, columns: dict[str, str]) -> lis
                 selected=selected,
                 dont_sync=(bool(column_map) and prop.key in column_map and column_map[prop.key] is None),
                 saved_type=_display(columns.get(selected)) or "" if selected else "",
+            )
+        )
+    for prop in TRIAGE_PROPS:
+        selected = _resolve_triage(column_map, prop.key, columns) or ""
+        rows.append(
+            MapRow(
+                key=prop.key,
+                label=prop.name,
+                required=False,
+                selected=selected,
+                dont_sync=bool(column_map) and prop.key in column_map and column_map[prop.key] is None,
+                saved_type=_display(columns.get(selected)) or "" if selected else "",
+                triage=True,
             )
         )
     return rows
@@ -511,6 +638,25 @@ class _Row:
     page_id: str
     listing_id: str
     normalized_url: str
+    # The row's Bot Triage value: None when the column was not read (not
+    # resolved, or a type triage cannot write), "" when it was read and is blank.
+    # The difference is the whole point — only "" makes a row triage backlog.
+    triage: str | None = None
+
+
+@dataclass(frozen=True)
+class NotionTriageTarget(TriageTarget):
+    """Where triage writes in one Notion database, for one sweep.
+
+    `types` is each resolved field's actual column type, read once so every
+    write renders for the column it lands in. `client` is the ONE NotionClient
+    the whole triage phase shares — the row writes and the archive appends alike.
+    Each NotionClient paces itself separately, so a client per call would let a
+    burst of writes run at several times Notion's rate and earn 429s mid-sweep.
+    """
+
+    types: dict[str, str] = field(default_factory=dict)
+    client: "NotionClient | None" = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -593,6 +739,10 @@ class NotionStore:
 
         Only ever called from an explicit click. Nothing in the sync path may
         call this — see rule 1 at the top of this module.
+
+        The triage columns are created too, so a database made here can be
+        triaged with no further setup. They stay empty until a sweep is asked to
+        triage; nothing else ever writes them.
         """
         data = await self._client.request(
             "POST",
@@ -600,7 +750,7 @@ class NotionStore:
             json={
                 "parent": {"type": "page_id", "page_id": parent_page_id},
                 "title": [{"type": "text", "text": {"content": title}}],
-                "properties": {p.name: p.create for p in KNOWN_PROPS},
+                "properties": {p.name: p.create for p in (*KNOWN_PROPS, *TRIAGE_PROPS)},
             },
         )
         return DatabaseRef(
@@ -674,6 +824,12 @@ class NotionStore:
                         PropIssue(prop.name, _display(prop.type), None, False, prop.consequence)
                     )
 
+        # A column triage writes is no longer one we never touch. The triage
+        # fields are otherwise invisible to this report — they neither block nor
+        # count against "complete" — because only a triaging sweep needs them,
+        # and it checks them itself (prepare_triage).
+        mapped_targets.update(_triage_columns(column_map, actual).values())
+
         return SchemaReport(
             db_id=db_id,
             title=title,
@@ -706,6 +862,9 @@ class NotionStore:
                 )
                 (mismatched_required if prop.required else mismatched_recommended).append(issue)
 
+        # Same-named triage columns are ours to write (only when triaging), so
+        # they are not "untouched" either.
+        triage_cols = set(_triage_columns(None, actual).values())
         return SchemaReport(
             db_id=db_id,
             title=title,
@@ -713,7 +872,7 @@ class NotionStore:
             mismatched_required=mismatched_required,
             missing_recommended=missing_recommended,
             mismatched_recommended=mismatched_recommended,
-            untouched=sorted(n for n in actual if n not in PROPS_BY_NAME),
+            untouched=sorted(n for n in actual if n not in PROPS_BY_NAME and n not in triage_cols),
         )
 
     async def _scan(
@@ -726,10 +885,17 @@ class NotionStore:
         only those two properties. On a database with forty columns and a thousand
         rows that is the difference between a few hundred KB and tens of MB per
         sweep.
+
+        When Bot Triage resolves to a column triage can write, that one column is
+        asked for too, so the same pass says which known rows are still blank —
+        the triage backlog — at the cost of one small property per row rather
+        than a second scan. Otherwise it is not read, and every row's `triage`
+        stays None ("not read"), never "" ("blank").
         """
         id_col = _resolve(column_map, "listing_id")
         url_col = _resolve(column_map, "normalized_url")
-        wanted = [c for c in (id_col, url_col) if c and c in actual]
+        triage_col = _decision_column(column_map, actual)
+        wanted = list(dict.fromkeys(c for c in (id_col, url_col, triage_col) if c and c in actual))
         params = [("filter_properties", actual[c]["id"]) for c in wanted]
 
         rows: list[_Row] = []
@@ -748,11 +914,28 @@ class NotionStore:
                         page_id=page["id"],
                         listing_id=self._read_key(props, id_col, actual),
                         normalized_url=self._read_key(props, url_col, actual),
+                        triage=self._read_decision(props, triage_col, actual),
                     )
                 )
             if not data.get("has_more"):
                 return rows
             cursor = data.get("next_cursor")
+
+    @staticmethod
+    def _read_decision(props: dict[str, Any], col: str | None, actual: dict[str, Any]) -> str | None:
+        """A row's Bot Triage as text: the Select option's name, or the Text.
+
+        None when the column was not read, or when the page came back without it
+        at all. That second case is deliberately not "blank": treating a value
+        Notion simply did not return as empty would re-triage the row and write
+        over a decision someone already made.
+        """
+        if not col or col not in props:
+            return None
+        prop = props[col] or {}
+        if (actual.get(col) or {}).get("type") == "select":
+            return ((prop.get("select") or {}).get("name") or "").strip()
+        return _plain(prop).strip()
 
     @staticmethod
     def _read_key(props: dict[str, Any], col: str | None, actual: dict[str, Any]) -> str:
@@ -885,12 +1068,19 @@ class NotionStore:
         # The listings actually inserted, each stamped with the page id Notion
         # minted for it, so the caller can file the fresh rows without re-querying.
         new_listings: list[Listing] = []
+        # Known rows whose Bot Triage was read and is blank — the backlog a
+        # triaging sweep heals. Only ever "" qualifies: None means the column
+        # was not read, and must never read as "every row is blank". Keyed by
+        # page so a card seen twice in one sweep is one row of backlog.
+        untriaged: dict[str, Listing] = {}
         for listing in listings:
             if index.contains(listing):
                 existing += 1
                 row = by_listing_id.get(listing.listing_id) or by_url.get(listing.normalized_url)
                 if not row:
                     continue
+                if row.triage == "" and row.page_id not in untriaged:
+                    untriaged[row.page_id] = listing.model_copy(update={"synced_row_id": row.page_id})
                 refreshed = self._properties(listing, actual, column_map, insert=False)
                 if refreshed:
                     await self._client.request(
@@ -925,5 +1115,134 @@ class NotionStore:
         )
         return UpsertResult(
             new=new, existing=existing, db_id=db_id, skipped=skipped,
-            new_listings=new_listings,
+            new_listings=new_listings, untriaged=list(untriaged.values()),
+        )
+
+    # ── triage ──────────────────────────────────────────────────────────────
+    async def prepare_triage(
+        self, db_id: str, column_map: ColumnMap | None = None
+    ) -> NotionTriageTarget:
+        """Resolve the four triage columns and their types, once per sweep.
+
+        Reads the database and nothing else. Bot Triage must resolve to a Select
+        or Text column, or this raises TriageUnavailable saying which fix applies
+        (add the column, map one, or change its type) — before anything is
+        judged. The three optional columns are written when they resolve to a
+        type that can hold them and quietly left out when they do not resolve;
+        one that resolves to the wrong kind of column, or to a column a listing
+        field already writes (triage would overwrite the listing's own data), is
+        left out with a note saying so.
+        """
+        data = await self._client.request("GET", f"/databases/{db_id}")
+        actual = data.get("properties", {})
+        taken = self._listing_columns(column_map, actual)
+
+        fields: dict[str, str] = {}
+        types: dict[str, str] = {}
+        notes: list[str] = []
+        for prop in TRIAGE_PROPS:
+            col = _resolve_triage(column_map, prop.key, actual)
+            if col is None:
+                if prop.key == "bot_triage":
+                    raise TriageUnavailable(self._no_decision_column(column_map, actual))
+                continue
+            col_type = (actual[col] or {}).get("type", "")
+            if col in taken:
+                problem = (
+                    f"'{col}' is where {taken[col]} is saved, so triage won't write "
+                    f"{prop.name} there — it would overwrite the listing's own data. "
+                    f"Pick another column for {prop.name} under Settings → Notion."
+                )
+            elif col_type not in _TRIAGE_WRITABLE[prop.key]:
+                problem = self._wrong_triage_type(prop, col, col_type)
+            else:
+                fields[prop.key] = col
+                types[prop.key] = col_type
+                continue
+            if prop.key == "bot_triage":
+                raise TriageUnavailable(problem)
+            notes.append(problem)
+
+        return NotionTriageTarget(
+            db_id=db_id, fields=fields, notes=tuple(notes), types=types, client=self._client,
+        )
+
+    async def write_triage(
+        self, target: TriageTarget, row_id: str, decision: str, reason: str,
+        triaged_at: datetime, criteria_version: str,
+    ) -> None:
+        """Write one row's decision into the columns `target` resolved — and no
+        other column, the listing's included. One PATCH, on the target's shared
+        client; any refusal from Notion propagates as a NotionError, because a
+        decision that was not saved is a failure, not a skip."""
+        if not isinstance(target, NotionTriageTarget):
+            raise TypeError("write_triage needs the target prepare_triage returned")
+        if not decision.strip():
+            # Rendering a blank decision writes nothing to Bot Triage, leaving the
+            # row looking untriaged while its reason and time say otherwise.
+            raise ValueError("A triage decision is required.")
+        when = triaged_at if triaged_at.tzinfo else triaged_at.replace(tzinfo=timezone.utc)
+        values = {
+            "bot_triage": decision.strip(),
+            "triage_reason": reason,
+            "triaged_at": when.isoformat(),
+            "criteria_version": criteria_version,
+        }
+        properties: dict[str, Any] = {}
+        for key, col in target.fields.items():
+            rendered = _format_for_type(
+                target.types.get(key, ""), values[key], timestamp=(key == "triaged_at"),
+            )
+            if rendered is not None:
+                properties[col] = rendered
+        client = target.client or self._client
+        await client.request("PATCH", f"/pages/{row_id}", json={"properties": properties})
+
+    @staticmethod
+    def _listing_columns(column_map: ColumnMap | None, actual: dict[str, Any]) -> dict[str, str]:
+        """The columns the upsert writes, as column -> the field's name. Triage
+        stays out of these, so it never overwrites a listing's own data."""
+        out: dict[str, str] = {}
+        for prop in KNOWN_PROPS:
+            col = _resolve(column_map, prop.key)
+            if col and col in actual:
+                out.setdefault(col, prop.name)
+        return out
+
+    @staticmethod
+    def _no_decision_column(column_map: ColumnMap | None, actual: dict[str, Any]) -> str:
+        """Why Bot Triage resolves to nothing, as the one fix that applies."""
+        name = TRIAGE_BY_KEY["bot_triage"].name
+        if column_map and "bot_triage" in column_map:
+            chosen = column_map["bot_triage"]
+            if chosen is None:
+                return (
+                    f"{name} is set to \"don't write\" in Settings → Notion, so there is "
+                    f"nowhere to record triage decisions. Pick a column for it there."
+                )
+            return (
+                f"{name} is mapped to '{chosen}', which this database no longer has. Pick "
+                f"another column for it under Settings → Notion."
+            )
+        return (
+            f"This database has no '{name}' column, so there is nowhere to record triage "
+            f"decisions. Add a Select column named {name} in Notion, or map one under "
+            f"Settings → Notion."
+        )
+
+    @staticmethod
+    def _wrong_triage_type(prop: NotionProp, col: str, col_type: str) -> str:
+        """Why `col` cannot hold this triage field, in the words on the screen."""
+        allowed = " or ".join(_display(t) for t in _TRIAGE_WRITABLE[prop.key])
+        if col_type == "status":
+            return (
+                f"'{col}' is a Status column. Notion doesn't let this app add options to "
+                f"a Status column, so triage can't write {prop.name} there. Change it to "
+                f"a {allowed} column in Notion, or pick another column under "
+                f"Settings → Notion."
+            )
+        return (
+            f"'{col}' is a {_display(col_type) or 'different kind of'} column, but "
+            f"{prop.name} needs a {allowed} column. Change it in Notion, or pick another "
+            f"column under Settings → Notion."
         )

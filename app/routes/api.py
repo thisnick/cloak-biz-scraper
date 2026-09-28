@@ -152,7 +152,12 @@ async def get_scrape_listing_results(request: Request, job_id: str) -> ScrapeRes
 
 @router.post("/archive", response_model=ArchiveResult)
 async def archive_page(request: Request, body: ArchiveRequest) -> ArchiveResult:
-    """Read a page and append it to a Notion page. Blocking, ~40-60s."""
+    """Read a page and append it to a Notion page. Blocking, ~40-60s.
+
+    Appends nothing when the page already has a Source Content section, so a
+    repeat call is safe. With a TypeSafe Classifier (e.g. Jev) key set, a page
+    that is a login wall, error, removed listing or anti-bot page is not written
+    and the result says so."""
     return await request.app.state.archive.archive(body.url, body.notion_page_id)
 
 

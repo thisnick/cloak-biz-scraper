@@ -125,6 +125,9 @@ ADDITIVE = ToolAnnotations(
 ADDITIVE_OPEN_WORLD = ToolAnnotations(
     read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=True,
 )
+ADDITIVE_OPEN_WORLD_IDEMPOTENT = ToolAnnotations(
+    read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=True,
+)
 DESTRUCTIVE = ToolAnnotations(
     read_only_hint=False, destructive_hint=True, idempotent_hint=False, open_world_hint=False,
 )
@@ -465,15 +468,20 @@ def build(app) -> MCPServer:
             )
         return result
 
-    # Not idempotent: it appends, so a second call with the same arguments
-    # leaves the page holding the content twice.
-    @tool(annotations=ADDITIVE_OPEN_WORLD)
+    # Idempotent: the append is skipped when the page already has its "Source
+    # Content" section, so a second call with the same arguments leaves the page
+    # exactly as the first one did.
+    @tool(annotations=ADDITIVE_OPEN_WORLD_IDEMPOTENT)
     async def archive_page(url: str, notion_page_id: str) -> ArchiveResult:
         """Read a page and append its content to an existing Notion page.
 
         Blocking: takes roughly a minute. Works on any URL, including a single
         listing's own page. Appends to the page you name and touches nothing
-        else — it never creates a page or edits a property.
+        else — it never creates a page or edits a property. A page that already
+        has a Source Content section gets nothing appended, so calling this again
+        for the same page is safe. When a TypeSafe Classifier (e.g. Jev) key is
+        set, a page that turns out to be a login wall, error, removed listing or
+        anti-bot page is not written, and the result says so.
         """
         return await app.state.archive.archive(url, notion_page_id)
 

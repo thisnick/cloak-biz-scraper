@@ -20,13 +20,34 @@ the caller already named, and does nothing else. No page is created, no property
 is set, no parent is chosen. The caller decided where this goes; we only fill it
 in — and only if the extraction fully succeeded, so a blocked page can never
 append a header announcing content that is not there.
+
+It comes in two halves a sweep's triage reuses separately: `read` (the browser —
+gate, pooled identity, retries, extraction; no Notion and no task record) and
+`append` (the Notion write). `archive` is read, then the guard, then append.
+
+**Appending is idempotent.** A page that already carries the section `prelude`
+writes (a "Source Content" heading) is left alone, so a repeated call — or a
+triage run over a row someone archived by hand earlier — never files the page
+twice.
+
+**The guard.** A page can load "successfully" and still be a login wall, a
+cookie screen, a 404, a "this listing has been removed" notice or an anti-bot
+interstitial that the blocker's phrase list does not know. When a TypeSafe
+Classifier key is saved, one yes/no question about the first few thousand
+characters decides whether this is the page's real content, and below
+GUARD_THRESHOLD nothing is written. Without a key there is no guard, and an
+unreachable classifier never stops an archive: the guard protects the Notion
+page from junk; it is not allowed to become the reason nothing gets archived.
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 from ..config import CONFIG
@@ -37,14 +58,105 @@ from .extract import extract, md_to_blocks, prelude
 from .jobs import JobStore
 from .settings import SettingsService
 from .task_profiles import TaskProfilePool
+from .typesafe import TypeSafeError
 
 logger = logging.getLogger("cloakbiz.archive")
 
 _WAIT_MS = 12_000
 _ATTEMPTS = 3
-_DEFAULT_HEADING = "Source Content"
+DEFAULT_HEADING = "Source Content"
 # Notion's hard cap per request.
 _BLOCKS_PER_REQUEST = 100
+
+
+# ── the guard ───────────────────────────────────────────────────────────────
+# Kept generic — "is this the page's real content?", not "is this a listing?" —
+# because archive_page archives any page. The wording was checked live against
+# real pages: a listing's own text scores ~0.96; a 404, a removed listing, a login
+# wall, a cookie screen, an anti-bot check and an NDA gate all score 0.02–0.04.
+# The threshold sits far from both clusters on purpose.
+GUARD_QUESTION = (
+    "The text is the real content of the page — for example a business listing's "
+    "details — not a login or sign-up wall, a cookie or consent screen, an error or "
+    "not-found page, a removed or no-longer-available notice, or an anti-bot check."
+)
+GUARD_THRESHOLD = 0.3
+# What the question reads: the top of the page, where every wall and notice
+# above is. More would cost tokens without changing the answer.
+GUARD_CHARS = 4000
+
+
+def guard_state(markdown: str) -> dict[str, str]:
+    """The state the guard question is asked about. Exposed so a caller can
+    bundle the guard into a request that asks other questions about the page."""
+    return {"page_text": (markdown or "")[:GUARD_CHARS]}
+
+
+def guard_question() -> dict[str, str]:
+    """The guard as a TypeSafe question, for bundling into a wider `ask`."""
+    return {"type": "noul", "instructions": GUARD_QUESTION}
+
+
+async def guard(typesafe, markdown: str) -> float:
+    """P(the page is its real content), from one classifier question.
+
+    Raises TypeSafeError when the classifier cannot answer; what that means is
+    the caller's decision (archive_page archives anyway)."""
+    return await typesafe.noul(guard_state(markdown), GUARD_QUESTION)
+
+
+def guard_refusal(probability: float) -> str:
+    """What a page the guard stopped is reported as."""
+    return (
+        f"The page doesn't look like its real content (P={probability:.2f}: a login "
+        f"wall, error, removed listing or anti-bot page?) — nothing was written."
+    )
+
+
+@dataclass
+class PageRead:
+    """What reading one page produced — the browser half of an archive.
+
+    No Notion and no task record: a sweep's triage reads detail pages with this
+    too, under its own job's evidence. `failure` says in plain words why the read
+    is unusable, or None when `markdown` is the page.
+    """
+
+    url: str = ""
+    title: str = ""
+    markdown: str = ""
+    used_path: str = ""
+    blocked: bool = False
+    error: str | None = None
+    attempts_used: int = 0
+    evidence_dir: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.failure is None
+
+    @property
+    def failure(self) -> str | None:
+        if self.blocked:
+            host = urlparse(self.url).hostname or "The site"
+            return (
+                f"{host} served an anti-bot page instead of the page's content, on every "
+                f"attempt and each from a different exit IP."
+            )
+        if self.error:
+            return self.error
+        if not self.markdown.strip():
+            return "The page loaded but no readable content came out of it."
+        return None
+
+
+@dataclass(frozen=True)
+class AppendResult:
+    """What `append` did to the Notion page: blocks written, or nothing because
+    the page already had its archived section."""
+
+    blocks_appended: int = 0
+    already_archived: bool = False
 
 
 def describe(task: ArchiveTask) -> str:
@@ -67,7 +179,8 @@ def describe(task: ArchiveTask) -> str:
 
 class ArchiveService:
     def __init__(self, instances, settings: SettingsService, jobs: JobStore,
-                 appender=None, task_profiles: TaskProfilePool | None = None) -> None:
+                 task_profiles: TaskProfilePool | None = None, *,
+                 notion_client=None, typesafe=None) -> None:
         self._instances = instances
         self._settings = settings
         # An archive is a task in every sense the dashboard means — a pooled
@@ -76,7 +189,13 @@ class ArchiveService:
         # optional: a store that could be absent would make "did it show up?"
         # depend on how the service happened to be built.
         self._jobs = jobs
-        self._append = appender or _notion_append
+        # token -> a Notion client, for archive_page's own per-call writes (a
+        # sweep's triage passes its shared one to `append` instead). Injectable,
+        # so tests can stand in for Notion without a network.
+        self._notion_client = notion_client or _default_notion_client
+        # The process's TypeSafe client, asked the guard question only while a
+        # key is saved (see _classifier). None: never asked.
+        self._typesafe = typesafe
         # The instance manager's pool, shared with sweeps. Archiving used to mint
         # a durable ``archive-<host+path>`` profile per URL, which is the same
         # unbounded accumulation task_profiles.py was written to end for sweeps:
@@ -111,7 +230,9 @@ class ArchiveService:
             self._gate.notify_all()
 
     async def archive(self, url: str, notion_page_id: str,
-                      heading: str = _DEFAULT_HEADING) -> ArchiveResult:
+                      heading: str = DEFAULT_HEADING) -> ArchiveResult:
+        """Read `url`, check it is the real page, and append it to the Notion
+        page `notion_page_id` — unless that page already has its `heading`."""
         url = (url or "").strip()
         notion_page_id = (notion_page_id or "").strip()
         if not url or not notion_page_id:
@@ -122,9 +243,7 @@ class ArchiveService:
                 summary="Nothing to do.",
             )
 
-        parsed = urlparse(url)
-        host = parsed.hostname or "unknown"
-        key = slug((host + parsed.path) or host)
+        host = urlparse(url).hostname or "unknown"
 
         # Write the task down BEFORE the browser starts, so the minute it spends
         # running is a minute it is visible under "Running now" rather than a
@@ -142,7 +261,7 @@ class ArchiveService:
         self._jobs.save(task)
 
         try:
-            result = await self._archive(url, notion_page_id, heading, host, key, evidence)
+            result = await self._archive(url, notion_page_id, heading, host, evidence)
         except BaseException as exc:  # noqa: BLE001 — the task must record its own end
             # Including CancelledError: a caller that disconnects mid-archive
             # leaves a task nothing is advancing, and a record stuck on "working"
@@ -180,12 +299,29 @@ class ArchiveService:
         task.summary = "Archive stopped early." if cancelled else "Archive failed."
         self._jobs.save(task)
 
-    async def _archive(self, url: str, notion_page_id: str, heading: str,
-                       host: str, key: str, evidence: Path) -> ArchiveResult:
+    def _classifier(self):
+        """The TypeSafe client while a key is saved right now, else None — so a
+        key added or removed in Settings applies to the next archive."""
+        if self._typesafe is None:
+            return None
+        return self._typesafe if self._settings.load().typesafe_configured() else None
+
+    async def read(self, url: str, evidence_dir: Path, *, owner: str | None = None) -> PageRead:
+        """Load `url` on a pooled identity and extract its readable content.
+
+        The browser half of an archive, and all of it: the admission gate, a
+        leased ``task-N`` identity, retries past blocks on fresh exit IPs, and
+        the extraction, with evidence under `evidence_dir`. Nothing is written
+        to Notion and no task is recorded — the caller owns both (archive_page
+        records an ArchiveTask; a sweep keeps it under its own job).
+        """
+        parsed = urlparse(url)
+        host = parsed.hostname or "unknown"
+        key = slug((host + parsed.path) or host)
         # Lease a pooled task-N identity. The lease key is per CALL, not per URL:
-        # what has to stay distinct is two archives running at once, and two
-        # archives of the SAME url are exactly the case the old per-URL profile
-        # name could not keep apart — they shared a user-data-dir and collided on
+        # what has to stay distinct is two reads running at once, and two reads
+        # of the SAME url are exactly the case the old per-URL profile name
+        # could not keep apart — they shared a user-data-dir and collided on
         # Chromium's singleton lock. The pool is the sole lease authority, so
         # distinct leases mean distinct profiles. Acquired before any launch and
         # released in the finally, so a launch failure returns it too.
@@ -195,25 +331,51 @@ class ArchiveService:
             profile = self._task_profiles.acquire(lease_key)
             try:
                 res = await scrape_with_retry(
-                    self._instances, profile=profile, owner=f"archive:{key}",
+                    self._instances, profile=profile, owner=owner or f"archive:{key}",
                     wait_ms=_WAIT_MS, attempts=_ATTEMPTS,
-                    scrape_once=lambda inst, page: self._extract_once(inst, page, url, evidence),
+                    scrape_once=lambda inst, page: self._extract_once(inst, page, url, evidence_dir),
                 )
             finally:
                 self._task_profiles.release(lease_key)
         finally:
             # Shielded for the same reason the sweep gate is: a caller that
-            # disconnects mid-archive must not leave the gate counter permanently
-            # short, or later archives queue behind a slot nobody holds.
+            # disconnects mid-read must not leave the gate counter permanently
+            # short, or later reads queue behind a slot nobody holds.
             await asyncio.shield(self._leave_gate())
 
         data = res.get("data") or {}
+        return PageRead(
+            url=url, title=data.get("title") or "", markdown=data.get("markdown") or "",
+            used_path=data.get("used_path") or "", blocked=bool(res.get("blocked")),
+            error=res.get("error") or None, attempts_used=res.get("attempts_used", 0),
+            evidence_dir=str(evidence_dir),
+        )
+
+    async def append(self, client, page_id: str, markdown: str, url: str,
+                     heading: str = DEFAULT_HEADING) -> AppendResult:
+        """Append `markdown` to a Notion page under the `prelude` header — once.
+
+        When the page already has that header's `heading` among its blocks it is
+        left exactly as it is and `already_archived` says so: the section is
+        there, whether this server or an earlier agent put it there. `client` is
+        the caller's: archive_page makes one per call, a sweep's triage passes the
+        one it shares for its whole phase. A Notion failure raises; one part-way
+        through says how many blocks had already landed.
+        """
+        if await has_section(client, page_id, heading):
+            return AppendResult(already_archived=True)
+        blocks = prelude(url, heading) + await md_to_blocks(markdown, url)
+        return AppendResult(blocks_appended=await _append_blocks(client, page_id, blocks))
+
+    async def _archive(self, url: str, notion_page_id: str, heading: str,
+                       host: str, evidence: Path) -> ArchiveResult:
+        read = await self.read(url, evidence)
         result = ArchiveResult(
-            url=url, notion_page_id=notion_page_id, title=data.get("title") or "",
-            used_path=data.get("used_path") or "", attempts_used=res.get("attempts_used", 0),
+            url=url, notion_page_id=notion_page_id, title=read.title,
+            used_path=read.used_path, attempts_used=read.attempts_used,
             evidence_dir=str(evidence),
         )
-        if res.get("blocked"):
+        if read.blocked:
             result.error = (
                 f"{host} served an anti-bot page instead of the listing, on every attempt "
                 f"and each from a different exit IP. Nothing was written to Notion. This "
@@ -221,12 +383,12 @@ class ArchiveService:
             )
             result.summary = "Blocked by the site; nothing written."
             return result
-        if res.get("error"):
-            result.error = res["error"]
+        if read.error:
+            result.error = read.error
             result.summary = "Could not read the page; nothing written."
             return result
 
-        markdown = data.get("markdown") or ""
+        markdown = read.markdown
         if not markdown.strip():
             result.error = (
                 "The page loaded but no readable content came out of it, so there was "
@@ -235,24 +397,51 @@ class ArchiveService:
             result.summary = "Empty extraction; nothing written."
             return result
 
+        note = ""
+        classifier = self._classifier()
+        if classifier is not None:
+            try:
+                p_real = await guard(classifier, markdown)
+            except Exception as exc:  # noqa: BLE001 — the guard must never stop an archive
+                if isinstance(exc, TypeSafeError):
+                    logger.warning("archive guard unavailable for %s: %s", host, exc)
+                else:
+                    logger.exception("archive guard failed unexpectedly for %s", host)
+                note = (
+                    f" The check that this is the page's real content could not run "
+                    f"({exc}), so it was archived unchecked."
+                )
+            else:
+                _record_guard(evidence, p_real, len(markdown))
+                if p_real < GUARD_THRESHOLD:
+                    result.error = guard_refusal(p_real)
+                    result.summary = "Not the page's real content; nothing written."
+                    return result
+
         # The Notion write sits OUTSIDE the retry loop on purpose: a Notion
         # failure is not a browser block, and re-scraping would risk appending
         # the page twice for a problem re-scraping cannot fix.
         try:
-            blocks = prelude(url, heading) + await md_to_blocks(markdown, url)
-            appended = await self._append(self._settings.load().notion_api_token,
-                                          notion_page_id, blocks)
+            client = self._notion_client(self._settings.load().notion_api_token)
+            appended = await self.append(client, notion_page_id, markdown, url, heading)
         except Exception as exc:  # noqa: BLE001
             result.error = str(exc)
             result.summary = "Read the page, but could not write it to Notion."
             return result
 
         result.ok = True
-        result.blocks_appended = appended
         result.markdown_chars = len(markdown)
-        result.summary = (
-            f"Archived '{result.title or url}' into Notion ({appended} blocks)."
-        )
+        if appended.already_archived:
+            result.summary = (
+                f"Nothing appended: the Notion page already has a '{heading}' section, "
+                f"so '{result.title or url}' is already archived there."
+            )
+        else:
+            result.blocks_appended = appended.blocks_appended
+            result.summary = (
+                f"Archived '{result.title or url}' into Notion ({appended.blocks_appended} blocks)."
+            )
+        result.summary += note
         return result
 
     async def _extract_once(self, inst, page, url: str, evidence: Path) -> dict:
@@ -291,16 +480,67 @@ class ArchiveService:
         }
 
 
-async def _notion_append(token: str, page_id: str, blocks: list[dict]) -> int:
+def _default_notion_client(token: str):
+    """A fresh client per archive_page call. Imported here, not at the top, so
+    the browser half of this module never needs the Notion store loaded."""
+    from ..stores.notion import NotionClient
+
+    return NotionClient(token)
+
+
+def _record_guard(evidence: Path, probability: float, chars: int) -> None:
+    """Keep the guard's verdict with the run's other evidence, so a page it
+    stopped can be checked against what it actually said."""
+    try:
+        evidence.mkdir(parents=True, exist_ok=True)
+        (evidence / "guard.json").write_text(json.dumps({
+            "question": GUARD_QUESTION, "p_real_content": round(probability, 4),
+            "threshold": GUARD_THRESHOLD, "chars_read": min(chars, GUARD_CHARS),
+            "chars_total": chars,
+        }, indent=2, ensure_ascii=False))
+    except OSError:
+        logger.warning("could not record the archive guard's verdict under %s", evidence)
+
+
+def _plain_text(block: dict[str, Any]) -> str:
+    body = block.get(block.get("type") or "", {}) or {}
+    return "".join(
+        part.get("plain_text") or (part.get("text") or {}).get("content", "")
+        for part in body.get("rich_text") or []
+    )
+
+
+async def has_section(client, page_id: str, heading: str = DEFAULT_HEADING) -> bool:
+    """Whether a Notion page already carries the archived section `prelude`
+    writes: a top-level Heading 1 whose text is `heading`.
+
+    Pages through every top-level block, because an archived section can sit
+    below a hundred blocks of someone's own notes. Stops at the first match.
+    """
+    wanted = heading.strip()
+    cursor: str | None = None
+    while True:
+        params: dict[str, Any] = {"page_size": 100}
+        if cursor:
+            params["start_cursor"] = cursor
+        data = await client.request("GET", f"/blocks/{page_id}/children", params=params)
+        for block in data.get("results", []):
+            if block.get("type") == "heading_1" and _plain_text(block).strip() == wanted:
+                return True
+        if not data.get("has_more") or not data.get("next_cursor"):
+            return False
+        cursor = data["next_cursor"]
+
+
+async def _append_blocks(client, page_id: str, blocks: list[dict]) -> int:
     """Append children to a page — the only Notion mutation this module makes.
 
     Chunked to Notion's 100-block cap. A failure mid-way reports how many blocks
     already landed, because the page is then genuinely half-written and saying
     otherwise would send someone looking for content that is not there.
     """
-    from ..stores.notion import NotionClient, NotionError
+    from ..stores.notion import NotionError
 
-    client = NotionClient(token)
     appended = 0
     for i in range(0, len(blocks), _BLOCKS_PER_REQUEST):
         chunk = blocks[i:i + _BLOCKS_PER_REQUEST]

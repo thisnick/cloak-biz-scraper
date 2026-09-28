@@ -1551,10 +1551,16 @@ async def save_mapping(request: Request) -> Response:
     column name, or empty for "don't sync" (optional fields) / unset (required).
     A submitted name is only kept if the database really has that column, so a
     stale form can never make us believe in a column that is not there.
+
+    The triage fields save the same way, with one difference in what an empty
+    choice stores: None ("don't write") only when that switches something off —
+    when the database has a same-named column that would otherwise be used —
+    and nothing at all otherwise, so a Bot Triage column added in Notion later
+    is still found by its name.
     """
     _require(request)
     _require_same_origin(request)
-    from ..stores.notion import KNOWN_PROPS, NotionError, NotionStore
+    from ..stores.notion import KNOWN_PROPS, TRIAGE_PROPS, NotionError, NotionStore
 
     settings = request.app.state.settings.load()
     if not settings.notion_db_id:
@@ -1576,6 +1582,13 @@ async def save_mapping(request: Request) -> Response:
             continue  # unmapped — the user must still choose a column
         else:
             new_map[prop.key] = None  # "don't sync"
+    for prop in TRIAGE_PROPS:
+        chosen = str(form.get(f"map_{prop.key}", "")).strip()
+        if chosen and chosen in columns:
+            new_map[prop.key] = chosen
+        elif prop.name in columns:
+            new_map[prop.key] = None  # "don't write", overriding the same-named column
+        # else: left out, so a same-named column added later is still found
 
     request.app.state.settings.update(notion_column_map=new_map)
     try:

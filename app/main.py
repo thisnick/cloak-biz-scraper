@@ -175,8 +175,11 @@ async def lifespan(app: FastAPI):
     app.state.scrape = ScrapeService(app.state.instances, jobs, settings_service,
                                      typesafe=app.state.typesafe)
     # The same job store the sweeps use: one Tasks list, one retention policy,
-    # one place a run's evidence is reachable from.
-    app.state.archive = ArchiveService(app.state.instances, settings_service, jobs)
+    # one place a run's evidence is reachable from. The classifier goes in for
+    # the guard that keeps a login wall or a removed-listing notice out of the
+    # Notion page (it asks nothing without a key).
+    app.state.archive = ArchiveService(app.state.instances, settings_service, jobs,
+                                       typesafe=app.state.typesafe)
     # The staging store goes in here too: `upload` is the one verb that reads
     # the container's disk, and this is what decides which files exist to read.
     # And the downloads store, for `download`: the one verb that writes it.

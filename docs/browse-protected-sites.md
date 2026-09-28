@@ -144,7 +144,8 @@ read the archived page body and confirm a Source Content section was appended.
 ```
 
 `archive_page` takes roughly a minute, appends to the page, and does not edit its properties.
-Do not call it twice just because it is slow: another successful call appends another copy.
+A page that already has a Source Content section gets nothing appended, so a repeat call
+does not add a second copy — it only spends another minute reading the page.
 
 ## Logins, CAPTCHAs, and blocked IPs
 

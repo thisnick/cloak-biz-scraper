@@ -185,7 +185,7 @@ any behavioural change.
 | `server_info()` | Read proxy, browser-build, pool-capacity, Notion connection, and TypeSafe Classifier status without exposing secrets. |
 | `scrape_listings(urls, max_pages=1, sync=false)` | Start one asynchronous sweep across one or more listings pages — BizBuySell search results and broker profiles natively, any other site's listings page with a TypeSafe Classifier (e.g. Jev) key saved; results are merged and de-duplicated. |
 | `get_scrape_listing_results(job_id)` | Poll a sweep without blocking. Completed results are retained for two weeks. |
-| `archive_page(url, notion_page_id)` | Read a page and append its readable content to an existing Notion page. It takes roughly a minute and repeated successful calls append the content again. |
+| `archive_page(url, notion_page_id)` | Read a page and append its readable content to an existing Notion page. It takes roughly a minute; a page that already has a Source Content section gets nothing appended, so a repeat call is safe. With a TypeSafe Classifier (e.g. Jev) key saved, a login wall, error, removed listing or anti-bot page is not written. |
 | `create_instance(profile="Default", country=null, region=null, geoip=true)` | Launch a browser with a durable profile and return a short-lived CDP URL plus a live-view URL when available. In chat apps that support MCP Apps, a live view appears in the conversation. It closes after 15 minutes idle or 60 minutes total. |
 | `list_instances()` | List running browsers with fresh CDP and live-view URLs. |
 | `get_instance(instance_id)` | Get one running browser and refresh its short-lived connection URLs. |
