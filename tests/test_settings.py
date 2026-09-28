@@ -266,3 +266,26 @@ class TestTypeSafeSettings:
         monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-v1-boot")
         with TestClient(app, base_url="https://testserver"):
             assert "OPENROUTER_API_KEY" not in os.environ
+
+
+class TestSiteOverridesSetting:
+    """Stored as the raw text, and never able to stop the app from booting."""
+
+    def test_the_text_is_kept_exactly(self, store):
+        doc = '[\n  {"match": "bizquest.com",   "next_page": "none"}\n]\n'
+        store().update(site_overrides_json=doc)
+        assert store().load().site_overrides_json == doc
+
+    def test_a_document_that_does_not_parse_still_loads(self, store):
+        """`_read` refuses a settings file with any invalid field, so validating
+        the document there would let one site's pins stop the whole app. It is
+        checked on save and when a sweep uses it instead."""
+        store().update(site_overrides_json='[{"match": "a.com", "retired_key": 1}')
+        assert store().load().site_overrides_json.startswith('[{"match"')
+
+    def test_not_a_secret_and_not_seeded_from_the_environment(self, store, monkeypatch):
+        from app.services.settings import _ENV_SEEDS
+
+        assert "site_overrides_json" not in _ENV_SEEDS
+        s = store().update(site_overrides_json='[{"match": "a.com"}]')
+        assert s.redacted()["site_overrides_json"] == '[{"match": "a.com"}]'

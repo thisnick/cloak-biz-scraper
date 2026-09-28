@@ -4,9 +4,10 @@
 
 A **cloaked cloud browser your AI assistant can drive** — patched Chromium designed to
 reduce anti-bot blocks, with optional routing through your own residential proxy. On top
-of it are built-in tasks that scrape BizBuySell search results and archive listings into
-your Notion. Your server, your data: one-click deploy, everything else configured in a
-web UI. Core setup needs no terminal.
+of it are built-in tasks that scrape business-for-sale listings pages — BizBuySell out of
+the box, any other broker or marketplace with the optional TypeSafe Classifier (e.g. Jev)
+— and archive listings into your Notion. Your server, your data: one-click deploy,
+everything else configured in a web UI. Core setup needs no terminal.
 
 [![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/a7IwW8?referralCode=aXB6nz&utm_medium=integration&utm_source=template&utm_campaign=generic)
 
@@ -28,7 +29,8 @@ https://github.com/user-attachments/assets/8bc957ef-130d-4516-a356-9efdcedeb60d
   losing its cookies — or clear one to sign it out of everything and start over,
   including the Default profile, which cannot be deleted. Settings shows what each
   profile is using on disk.
-- **Built-in listing tasks** — sweep BizBuySell search or broker pages into structured
+- **Built-in listing tasks** — sweep BizBuySell search or broker pages, or any other
+  site's listings page once a TypeSafe Classifier (e.g. Jev) key is saved, into structured
   listings, dedupe into a Notion database, and append readable page content to a listing's
   existing Notion page.
 - **Connect your own driver over CDP** — every instance hands back a short-lived CDP URL
@@ -75,6 +77,9 @@ https://github.com/user-attachments/assets/3c86899d-9f1b-4946-b1ca-4b11a53514b5
    - **Evomi proxy** — required for the documented workflows because target sites commonly
      block Railway's datacenter IP.
    - **Notion** — optional; needed only to save listings into a database.
+   - **TypeSafe Classifier (e.g. Jev)** — optional; an OpenRouter key lets sweeps read
+     listing sites other than BizBuySell. **Site overrides** pin how one of those sites is
+     read when the automatic reading keeps getting it wrong.
 
 ### Self-hosting without building
 
@@ -130,6 +135,8 @@ Once it's connected, just ask:
 - *"Open my cloaked scraper, go to this listing, and tell me the asking price and cash flow."*
 - *"Search BizBuySell for California businesses with an asking price under $2M, then sweep the first five pages using cloaked scraper."*
 - *"Sweep this search and save new listings to my Notion, skipping ones already there."*
+- *"Scrape the first two pages of https://www.websiteclosers.com/businesses-for-sale/."* —
+  any broker's or marketplace's listings page, once the TypeSafe Classifier key is saved.
 - *"Archive this listing's readable page content into its Notion page."*
 - *"Upload this photo to the listing form on that page."* — this requires an assistant
   that can send the file to the temporary HTTP upload URL before controlling the browser.
@@ -176,7 +183,7 @@ any behavioural change.
 | Tool | What it does |
 | --- | --- |
 | `server_info()` | Read proxy, browser-build, pool-capacity, Notion connection, and TypeSafe Classifier status without exposing secrets. |
-| `scrape_listings(urls, max_pages=1, sync=false)` | Start one asynchronous BizBuySell sweep across one or more search-results or broker-profile URLs; results are merged and de-duplicated. |
+| `scrape_listings(urls, max_pages=1, sync=false)` | Start one asynchronous sweep across one or more listings pages — BizBuySell search results and broker profiles natively, any other site's listings page with a TypeSafe Classifier (e.g. Jev) key saved; results are merged and de-duplicated. |
 | `get_scrape_listing_results(job_id)` | Poll a sweep without blocking. Completed results are retained for two weeks. |
 | `archive_page(url, notion_page_id)` | Read a page and append its readable content to an existing Notion page. It takes roughly a minute and repeated successful calls append the content again. |
 | `create_instance(profile="Default", country=null, region=null, geoip=true)` | Launch a browser with a durable profile and return a short-lived CDP URL plus a live-view URL when available. In chat apps that support MCP Apps, a live view appears in the conversation. It closes after 15 minutes idle or 60 minutes total. |
@@ -229,6 +236,21 @@ returns only those newly inserted listings, each with a `synced_row_id` suitable
 `Last Synced At` and `Excerpt` columns are refreshed. Money fields are the
 verbatim strings shown on the listing card (`"$1,258,000"`, `"Not Disclosed"`) and are
 parsed into numbers only when written to Notion.
+
+BizBuySell pages are read by their own adapters. A page on any other site is read
+generically: the list of listings is found by grouping the page's links, and the TypeSafe
+Classifier (e.g. Jev) decides which group is the list, what each card field holds, which
+statuses mean a business is gone, and how to reach the next page — fresh on every page.
+Without a key such a URL is refused with a pointer to Settings; a key that OpenRouter
+rejects or that is out of credits refuses the call before a job starts (in a batch that
+also has BizBuySell URLs, only the other sites fail). A page with no list of businesses on
+it, or whose cards don't read as listings, fails that source with evidence rather than
+returning nothing. A BizBuySell page other than a search or broker profile never falls
+through to the generic reader. Listings from other sites carry their site as `source` and
+an empty `listing_id`. **Settings → Site overrides** pins any part of those decisions for
+one site, and each sweep's **Details** (Tasks → History, or `/runs/<job_id>`) shows what
+was decided with a paste-ready suggested override — see
+[advanced controls](docs/advanced-controls.md#site-overrides).
 
 **How do I pin the browser version?** Settings has an optional version pin. Leave it empty
 for the latest build. To pin, use a **full dotted version** (`148.0.7778.215.5`); a partial

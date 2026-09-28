@@ -289,7 +289,7 @@
                     <td class="mono">{{ ago(j.created_at) }}</td>
                     <td class="mono">{{ dur(j.updated_at - j.created_at) }}</td>
                     <td>{% if r[0]=='ok' %}<span class="res">{{ r[1] }}</span>{% else %}<span class="statepill {{ r[0] }}"><span class="dot {{ r[0] }}"></span>{{ r[1] }}</span>{% endif %}</td>
-                    <td class="mono"><a href="/runs/{{ j.id }}/results" target="_blank" rel="noopener">View</a></td>
+                    <td class="mono"><a href="/runs/{{ j.id }}/results" target="_blank" rel="noopener">View</a>{% if j.kind == 'sweep' %} · <a href="/runs/{{ j.id }}" target="_blank" rel="noopener" title="How each page was read, with a suggested site override">Details</a>{% endif %}</td>
                   </tr>
                 {% else %}
                   <tr><td colspan="5" class="mono" style="color:var(--muted)">No finished tasks yet.</td></tr>
@@ -400,6 +400,7 @@
             <ul class="uc-ex">
               <li><i>“Scrape this BizBuySell search:”</i> — paste the URL from your address bar after applying your filters.</li>
               <li><i>“Search BizBuySell for California businesses under $1M cash flow and scrape the results.”</i></li>
+              <li><i>“Scrape the listings on https://www.websiteclosers.com/businesses-for-sale/, two pages.”</i> — any broker’s or marketplace’s listings page works once the TypeSafe Classifier (e.g. Jev) key is saved in Settings.</li>
             </ul>
 
             <div class="uc-sub">
@@ -663,6 +664,46 @@
                   <button class="btn" type="submit" name="action" value="save">Save</button>
                   <button class="btn primary" type="submit" name="action" value="test">Save &amp; test</button>
                   {% if has_typesafe_key %}<button class="btn" type="submit" name="action" value="clear" title="Removes the saved key; the classifier is then off">Remove key</button>{% endif %}
+                </div>
+              </form>
+            </div>
+          </div>
+
+          {# Site overrides: the app's first free-form editor. The document is
+             stored as typed; a save that does not validate re-renders the
+             person's own text (overrides_text) with the error's location. #}
+          {% set ov_chip = ('bad', 'Invalid') if overrides_count is none else
+                           (('ok', overrides_count ~ ' site' ~ ('' if overrides_count == 1 else 's')) if overrides_count else ('', 'None')) %}
+          <div class="acc-item {{ 'open' if result and result.section=='overrides' }}">
+            <button class="acc-head">
+              <svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5M9 10.8V4h6v6.8l3 3.2v3H6v-3l3-3.2Z"/></svg>
+              <span class="h-title">Site overrides</span>
+              <div class="h-right">
+                <span class="chip{% if ov_chip[0] %} {{ ov_chip[0] }}{% endif %}">{{ ov_chip[1] }}</span>
+                <svg class="chev" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M9 6l6 6-6 6"/></svg>
+              </div>
+            </button>
+            <div class="acc-body">
+              <p class="lead-help">Sites other than BizBuySell are read fresh on every page: the TypeSafe Classifier (e.g. Jev) decides which links are the listings, what each field on a card holds, which statuses mean a business is gone, and how to reach the next page. When one of those keeps coming out wrong for a site, pin it here. Anything you leave out is still decided by the classifier.</p>
+              <ul class="lead-help">
+                <li><code>match</code> — the site: a host (<code>bizquest.com</code>) or a URL prefix. <code>www.</code> never matters; the longest match wins.</li>
+                <li><code>listing_links</code> — the link patterns that are the listings, as a run reports them, e.g. <code>www.bizquest.com/business-for-sale/{*}/{*}</code>.</li>
+                <li><code>fields</code> — a card field’s label → what it holds (<code>asking_price</code>, <code>cash_flow_sde</code>, <code>revenue</code>, <code>ebitda</code>, <code>location</code>, <code>title</code>, <code>status</code>, …) or <code>ignore</code>.</li>
+                <li><code>next_page</code> — a URL with <code>{page}</code> in it, <code>click:&lt;css selector&gt;</code> for a button, or <code>none</code>.</li>
+                <li><code>drop_status</code> — status texts that mean a listing is gone, e.g. <code>["sold", "under contract"]</code>.</li>
+              </ul>
+              <p class="lead-help">Easiest start: in <b>Tasks → History</b>, open a sweep’s <b>Details</b>. Each site read this way has a <code>suggested_override</code> pinning what was decided — paste it here and change the part that was wrong. <a href="https://thisnick.github.io/cloak-biz-scraper/advanced-controls/#site-overrides" target="_blank" rel="noreferrer">Examples →</a></p>
+              {% if overrides_count is none and not (result and result.section == 'overrides') %}
+                <div class="banner bad">The saved overrides can’t be read, so sites other than BizBuySell are refused until they are fixed or cleared.</div>
+              {% endif %}
+              {{ banner('overrides') }}
+              <form method="post" action="/settings/overrides">
+                <div class="field"><label for="site_overrides_json">Overrides (JSON)</label>
+                  <textarea id="site_overrides_json" name="site_overrides_json" rows="12" spellcheck="false" autocomplete="off"
+                            placeholder='[{"match": "bizquest.com", "next_page": "none"}]'>{{ overrides_text }}</textarea>
+                  <div class="help">A JSON list, one entry per site. Leave it empty for no overrides.</div></div>
+                <div class="btnrow">
+                  <button class="btn primary" type="submit">Save</button>
                 </div>
               </form>
             </div>

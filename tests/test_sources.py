@@ -167,6 +167,19 @@ class TestSourceLabels:
         assert sources.label_for("craigslist_biz") == "craigslist_biz"
         assert sources.label_for("") == ""
 
+    def test_the_generic_reader_has_a_label_without_being_registered(self):
+        """It is not in SOURCES (it is built per URL, and it is not a site the
+        "what is supported" list could name), but a sweep it ran still needs a
+        name on the dashboard."""
+        from app.sources.generic import GenericSource
+
+        assert sources.label_for("generic") == "Any site"
+        assert GenericSource.name == "generic" and GenericSource.label == "Any site"
+        assert all(s.name != "generic" for s in sources.SOURCES)
+
+    def test_a_generically_read_listing_is_labelled_by_its_site(self):
+        assert sources.label_for("websiteclosers.com") == "websiteclosers.com"
+
 
 class TestDispatch:
     @pytest.mark.parametrize("url", [BAY_AREA, SACRAMENTO])
@@ -183,10 +196,11 @@ class TestDispatch:
             "not a url",
         ],
     )
-    def test_an_unsupported_url_is_a_hard_error(self, url):
-        """Never a best-effort attempt: a generic scrape of a page we do not
-        understand returns an empty result that looks exactly like "no listings
-        matched", and an agent would report that as fact."""
+    def test_only_the_site_adapters_answer_for_url(self, url):
+        """`for_url` is the site adapters' answer, and it stays a hard error for
+        anything they do not read. Whether some other site is read generically
+        is the sweep's decision — it depends on a saved classifier key and the
+        site overrides — and is pinned in tests/test_scrape.py."""
         with pytest.raises(UnsupportedURL):
             sources.for_url(url)
 
@@ -217,6 +231,55 @@ class TestDispatch:
 
     def test_a_lookalike_domain_does_not_match(self):
         assert not BizBuySellSerp().matches("https://bizbuysell.com.evil.example/x-businesses-for-sale/")
+
+
+class TestOwnerOf:
+    """A site with an adapter never falls through to the generic reader."""
+
+    DETAIL = "https://www.bizbuysell.com/business-opportunity/premier-restoration/2515728/"
+
+    @pytest.mark.parametrize("url", [
+        DETAIL,
+        "https://bizbuysell.com/business-opportunity/premier-restoration/2515728/",
+        "http://m.bizbuysell.com/anything",
+        SACRAMENTO,
+        MURALI,
+    ])
+    def test_every_page_on_an_adapter_s_site_is_owned(self, url):
+        """Right site, wrong job: a listing's own page is still BizBuySell's, so
+        the sweep refuses it instead of reading its "similar listings" rail."""
+        assert sources.owner_of(url) is not None
+        assert sources.owner_of(url).label.startswith("BizBuySell")
+
+    @pytest.mark.parametrize("url", [
+        "https://www.websiteclosers.com/businesses-for-sale/",
+        "https://bizbuysell.com.evil.example/x-businesses-for-sale/",
+        "https://notbizbuysell.com/x",
+        "", "not a url", "https://",
+    ])
+    def test_other_sites_and_non_urls_have_no_owner(self, url):
+        assert sources.owner_of(url) is None
+
+    def test_every_site_adapter_names_the_hosts_it_owns(self):
+        for source in sources.SOURCES:
+            assert source.hosts and all("/" not in h and not h.startswith("www.")
+                                        for h in source.hosts), source.name
+
+
+class TestUnsupportedUrl:
+    def test_a_hint_leads_the_message_and_is_the_one_line_reason(self):
+        exc = UnsupportedURL("https://x.example/", sources.SOURCES, hint="add a key.")
+        message = str(exc)
+        assert message.startswith("Can't read listings from 'https://x.example/': add a key.")
+        assert "bizbuysell.com" in message, "the adapter-read pages still follow"
+        assert exc.reason == "add a key."
+
+    def test_a_reason_can_be_shorter_than_the_hint(self):
+        exc = UnsupportedURL("u", sources.SOURCES, hint="a long explanation.", reason="short")
+        assert exc.reason == "short" and "a long explanation." in str(exc)
+
+    def test_without_a_hint_the_reason_is_generic(self):
+        assert UnsupportedURL("u", sources.SOURCES).reason == "not a supported listings page"
 
 
 class TestPaging:

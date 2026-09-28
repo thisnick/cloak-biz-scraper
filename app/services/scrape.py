@@ -11,18 +11,31 @@ The other constraint is that the scrape half must not know where listings land.
 nothing is written. That is not a flag on a Notion code path, it is the absence
 of one — which is what makes this usable by someone who has not configured
 Notion at all.
+
+Which source reads a URL is decided here too, because only this service knows
+what the Settings say. A URL a site adapter matches is read by it. A URL on a
+site with no adapter is read by the generic reader (`sources/generic.py`) —
+when the TypeSafe Classifier (e.g. Jev) key is saved, since the reader cannot
+decide anything without it, and with that site's override if one is pinned. A
+URL on a site that HAS an adapter, which the adapter does not read, is refused:
+it never falls through.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import re
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 from .. import sources
 from ..config import CONFIG
 from ..models import Listing, ScrapeResult, SweepTask, SyncResult
+from ..sources.generic import GenericSource
+from ..sources.overrides import OverridesInvalid, SiteOverride, override_for, parse_overrides
 from ..stores.base import ListingStore
 from . import legibility
 from .blocker import text_contains_blocker
@@ -30,6 +43,7 @@ from .browsing import capture, gesture, scrape_with_retry
 from .jobs import JobStore
 from .settings import SettingsService
 from .task_profiles import TaskProfilePool
+from .typesafe import TypeSafeError, TypeSafeUnavailable
 
 logger = logging.getLogger("cloakbiz.scrape")
 
@@ -48,9 +62,52 @@ _MAX_PAGES_CEILING = 20
 _WAITING_SUMMARY = "Waiting for a free browser slot…"
 _SCRAPING_SUMMARY = "Sweeping the search results…"
 
+# Why a site with no adapter is refused when no classifier key is saved. Says
+# where the key goes, because that is the whole fix.
+NEEDS_CLASSIFIER = (
+    "Reading sites other than BizBuySell needs the TypeSafe Classifier (e.g. Jev) — add an "
+    "OpenRouter key under Settings → TypeSafe Classifier (e.g. Jev)."
+)
+
 
 class NotionNotConfigured(RuntimeError):
     """sync=true was asked for without a database to sync into."""
+
+
+class ClassifierNotReady(RuntimeError):
+    """The sweep needs the TypeSafe Classifier (e.g. Jev), and it failed its check.
+
+    Raised by `submit` before anything starts, when every readable URL in the
+    call is read by the generic reader: each would fail on its first question,
+    so a job id would be a promise of a result that cannot come. The message is
+    the check's own — OpenRouter rejected the key, the account is out of
+    credits, the service is not answering — because each is fixed somewhere
+    different. `cause` is the check's exception, so a façade can tell an outage
+    (`transient`: try again later) from a key problem (fix Settings first).
+    """
+
+    def __init__(self, message: str, cause: TypeSafeError | None = None) -> None:
+        super().__init__(message)
+        self.cause = cause
+
+    @property
+    def transient(self) -> bool:
+        return isinstance(self.cause, TypeSafeUnavailable)
+
+
+@dataclass(frozen=True)
+class _Target:
+    """One URL of a sweep, with the source that reads it — or why none can.
+
+    The reason travels with the URL because a batch is not refused for one bad
+    URL: that URL becomes its own source's failure, and the job's error should
+    say what was wrong with it ("needs the TypeSafe Classifier…"), not a
+    generic "not supported".
+    """
+
+    url: str
+    source: Any = None
+    refusal: str = ""
 
 
 class NotASweep(ValueError):
@@ -79,6 +136,14 @@ def describe(job: SweepTask) -> str:
     here. A single-URL sweep drops the count — "1 sources" would be noise.
     """
     label = sources.label_for(job.source)
+    if job.source == sources.GENERIC_NAME:
+        # "Any site" says nothing about which one; the site is the label. The
+        # URLs a generic sweep read are the ones no adapter owns.
+        sites = list(dict.fromkeys(
+            site for u in job.urls if sources.owner_of(u) is None and (site := _site(u))
+        ))
+        if sites:
+            label = sites[0] if len(sites) == 1 else f"{sites[0]} and {len(sites) - 1} more"
     n = len(job.urls)
     if n > 1:
         return f"Listing sweep · {label} · {n} sources"
@@ -125,6 +190,10 @@ class ScrapeService:
         if self._task_profiles is None and instances is not None:
             self._task_profiles = instances.task_profiles
         self._running: set[asyncio.Task] = set()
+        # The parsed site overrides, keyed by the text they were parsed from, so
+        # a sweep start re-parses only after the document was edited.
+        self._overrides_text: str | None = None
+        self._overrides_parsed: list[SiteOverride] = []
         # Admission gate: at most task_budget sweeps run past this point at once.
         # The instance pool's cap only bites INSIDE launch, but start() spawns an
         # unbounded background task per call, so without this every concurrent
@@ -145,7 +214,46 @@ class ScrapeService:
         machine must be kept awake."""
         return len(self._running)
 
-    def start(self, urls: list[str], *, max_pages: int = 1, sync: bool = False) -> SweepTask:
+    async def submit(self, urls: list[str], *, max_pages: int = 1,
+                     sync: bool = False) -> SweepTask:
+        """Start a sweep the way the tools and the dashboard do: preflight, then `start`.
+
+        The preflight is the classifier's key. A URL read by the generic reader
+        asks the TypeSafe Classifier (e.g. Jev) about every page, so a key that
+        OpenRouter rejects, an account out of credits, or a service that is not
+        answering would fail each such source on its first question — minutes
+        into a job the caller has already been told is running. One tiny check
+        now turns that into an answer now, and it is asked only when some URL
+        needs it (a BizBuySell-only call never pays for it).
+
+        When it fails: if every readable URL needs the classifier, the whole
+        call is refused (`ClassifierNotReady`, with the check's own message);
+        in a mixed batch the generic URLs become their own sources' failures
+        with that message, and the BizBuySell ones still run.
+        """
+        refused: dict[str, str] = {}
+        targets, _ = self._resolve(urls or [])
+        generic = [t for t in targets if isinstance(t.source, GenericSource)]
+        if generic and self._typesafe is not None:
+            check = await self._typesafe.check()
+            if not check.ok:
+                readable = [t for t in targets if t.source is not None]
+                if len(generic) == len(readable):
+                    what = "this page" if len(generic) == 1 else f"these {len(generic)} pages"
+                    raise ClassifierNotReady(
+                        f"Can't start this sweep: reading {what} needs the TypeSafe Classifier "
+                        f"(e.g. Jev), and it failed its check just now. {check.message}",
+                        check.error,
+                    )
+                reason = ("needs the TypeSafe Classifier (e.g. Jev), which failed its check "
+                          f"just now: {check.message}")
+                refused = {t.url: reason for t in generic}
+        if refused:
+            return self.start(urls, max_pages=max_pages, sync=sync, refused=refused)
+        return self.start(urls, max_pages=max_pages, sync=sync)
+
+    def start(self, urls: list[str], *, max_pages: int = 1, sync: bool = False,
+              refused: Mapping[str, str] | None = None) -> SweepTask:
         """Validate, write the job down, and return without waiting for it.
 
         Everything that can be known to be wrong before the browser starts is
@@ -154,32 +262,28 @@ class ScrapeService:
         with nowhere to sync to. A job record is only created once the sweep is
         genuinely going to run.
 
-        `urls` fan out concurrently into ONE job. A single URL that isn't a
-        supported listings page is not fatal — it is recorded as that source's
-        failure and the rest still run — so `start` only refuses the batch when
-        *nothing* in it is readable (there would be no sweep to run).
+        `urls` fan out concurrently into ONE job. A single URL that can't be
+        read is not fatal — it is recorded as that source's failure, with its
+        own reason, and the rest still run — so `start` only refuses the batch
+        when *nothing* in it is readable (there would be no sweep to run).
+        `refused` names URLs a caller already knows cannot be read, each with
+        its reason (`submit`'s preflight); they are failed the same way.
         """
         if not urls:
             raise ValueError(
                 "scrape_listings needs at least one URL in 'urls', but the list was empty. "
-                "Pass one or more search-results (SERP) or broker-profile URLs to sweep."
+                "Pass one or more URLs of pages that list businesses for sale."
             )
         max_pages = max(1, min(int(max_pages), _MAX_PAGES_CEILING))
 
-        # Resolve each URL's adapter up front, keeping None for the unreadable
-        # ones so they can be reported per-source rather than sinking the batch.
-        targets: list[tuple[str, object | None]] = []
-        first_unsupported: sources.UnsupportedURL | None = None
-        for url in urls:
-            try:
-                targets.append((url, sources.for_url(url)))
-            except sources.UnsupportedURL as exc:
-                first_unsupported = first_unsupported or exc
-                targets.append((url, None))
-        if all(source is None for _, source in targets):
+        # Resolve each URL's source up front, keeping the unreadable ones (with
+        # their reasons) so they can be reported per-source rather than sinking
+        # the batch.
+        targets, first_unsupported = self._resolve(urls, refused)
+        if all(t.source is None for t in targets):
             # Not one URL is a page we can read: there is no sweep to start, so
-            # fail loudly with the message that names what IS supported rather
-            # than mint a job that can only fail.
+            # fail loudly with the first URL's own reason rather than mint a job
+            # that can only fail.
             raise first_unsupported
 
         target_db = ""
@@ -198,7 +302,7 @@ class ScrapeService:
         # own). The instruction names the job id, and the id is minted by
         # create(), so the summary is filled in by the same write rather than a
         # second one.
-        source_name = next(s.name for _, s in targets if s is not None)
+        source_name = next(t.source.name for t in targets if t.source is not None)
         job = self._jobs.create(
             source=source_name, urls=urls, max_pages=max_pages, sync=sync, db_id=target_db,
             status="working", summary=_collect_message,
@@ -208,6 +312,84 @@ class ScrapeService:
         self._running.add(task)
         task.add_done_callback(self._running.discard)
         return job
+
+    def _resolve(self, urls: list[str], refused: Mapping[str, str] | None = None,
+                 ) -> tuple[list[_Target], sources.UnsupportedURL | None]:
+        """Each URL's source, or the reason it has none; plus the first refusal."""
+        targets: list[_Target] = []
+        first: sources.UnsupportedURL | None = None
+        for url in urls:
+            try:
+                if refused and url in refused:
+                    raise sources.UnsupportedURL(url, sources.SOURCES, hint=refused[url])
+                targets.append(_Target(url, self._source_for(url)))
+            except sources.UnsupportedURL as exc:
+                first = first or exc
+                targets.append(_Target(url, None, exc.reason))
+        return targets, first
+
+    def _source_for(self, url: str):
+        """The source that reads `url`, or raise `UnsupportedURL` saying why none can.
+
+        A site adapter first; else the generic reader, unless the URL is not a
+        web address, its site already has an adapter (which chose not to read
+        this page), no classifier key is saved, or the saved site overrides
+        cannot be read. A GenericSource is built per URL: it remembers what it
+        decided on the page it is reading, and two URLs must not share that.
+        """
+        try:
+            return sources.for_url(url)
+        except sources.UnsupportedURL:
+            pass
+        supported = sources.SOURCES
+        try:
+            p = urlparse((url or "").strip())
+            web = p.scheme.lower() in ("http", "https") and bool(p.hostname)
+        except ValueError:
+            web = False
+        if not web:
+            raise sources.UnsupportedURL(
+                url, supported,
+                hint="it is not a web address. Pass the http(s) URL of a page that lists "
+                     "businesses for sale.",
+                reason="not a web address — it must start with http:// or https://",
+            )
+        owner = sources.owner_of(url)
+        if owner is not None:
+            site = _site(url)
+            owned = set(getattr(owner, "hosts", ()))
+            pages = "; ".join(s.describes for s in supported
+                              if owned & set(getattr(s, "hosts", ())))
+            raise sources.UnsupportedURL(
+                url, supported,
+                hint=f"{site} is read by this app's own adapter, which sweeps only the pages "
+                     f"below — not a single listing's page, or any other page on the site.",
+                reason=f"on {site}, only these pages are swept: {pages}",
+            )
+        if self._classifier() is None:
+            raise sources.UnsupportedURL(url, supported, hint=NEEDS_CLASSIFIER)
+        try:
+            overrides = self._overrides()
+        except OverridesInvalid as exc:
+            raise sources.UnsupportedURL(
+                url, supported,
+                hint="the Site overrides saved under Settings → Site overrides can't be read "
+                     f"({exc}). Fix or clear them to read sites other than BizBuySell.",
+            ) from None
+        return GenericSource(url, self._typesafe, override_for(url, overrides))
+
+    def _overrides(self) -> list[SiteOverride]:
+        """The saved site overrides, parsed once per edit. Raises OverridesInvalid.
+
+        Parsed here, when a generic sweep starts, and not when settings load: a
+        document that no longer parses must refuse the URLs that would use it,
+        never stop the app from booting (see `Settings.site_overrides_json`).
+        """
+        text = self._settings.load().site_overrides_json
+        if text != self._overrides_text:
+            parsed = parse_overrides(text)
+            self._overrides_text, self._overrides_parsed = text, parsed
+        return self._overrides_parsed
 
     def result(self, job_id: str) -> ScrapeResult | None:
         """The sweep as it stands. Never blocks, never waits, never launches anything.
@@ -244,7 +426,7 @@ class ScrapeService:
             self._past_gate -= 1
             self._gate.notify_all()
 
-    async def _run(self, job: SweepTask, targets: list[tuple[str, object | None]]) -> None:
+    async def _run(self, job: SweepTask, targets: list[_Target]) -> None:
         # Fan the URLs out concurrently, but never past the pool's task budget.
         # Two bounds hold at once: a per-job Semaphore(task_budget) — the ported
         # run_targets pattern — caps how many of THIS job's sources are in flight,
@@ -261,15 +443,17 @@ class ScrapeService:
         parallel = max(1, self._settings.load().task_budget)
         sem = asyncio.Semaphore(parallel)
 
-        async def worker(i: int, url: str, source) -> dict:
+        async def worker(i: int, target: _Target) -> dict:
             async with sem:
-                return await self._sweep_url(job, i, url, source, prog)
+                return await self._sweep_url(job, i, target.url, target.source, prog,
+                                             refusal=target.refusal)
 
         try:
             outcomes = await asyncio.gather(
-                *(worker(i, url, source) for i, (url, source) in enumerate(targets))
+                *(worker(i, target) for i, target in enumerate(targets))
             )
             listings, pages, ok, failures = self._merge(targets, outcomes)
+            job.decisions = self._decisions(targets, outcomes)
             job.listings = listings
             job.pages_crawled = pages
             if ok == 0:
@@ -337,7 +521,8 @@ class ScrapeService:
         pages = 0
         ok = 0
         failures: list[tuple[str, str]] = []
-        for (url, _source), res in zip(targets, outcomes):
+        for target, res in zip(targets, outcomes):
+            url = target.url
             data = res.get("data") or {}
             pages += data.get("pages_crawled", 0) or 0
             if res.get("blocked"):
@@ -355,6 +540,24 @@ class ScrapeService:
                     seen.add(key)
                 listings.append(listing)
         return listings, pages, ok, failures
+
+    def _decisions(self, targets: list[_Target], outcomes: list[dict]) -> list[dict]:
+        """How each URL was read, for the run's detail (see `SweepTask.decisions`)."""
+        entries: list[dict] = []
+        for target, res in zip(targets, outcomes):
+            data = res.get("data") or {}
+            entry: dict[str, Any] = {
+                "url": target.url,
+                "adapter": getattr(target.source, "name", None),
+                "pages": list(data.get("pages") or []),
+                "legibility": list(data.get("legibility") or []),
+                "suggested_override": data.get("suggested_override"),
+            }
+            error = "blocked by the site" if res.get("blocked") else res.get("error")
+            if error:
+                entry["error"] = error
+            entries.append(entry)
+        return entries
 
     def _failure_text(self, failures: list[tuple[str, str]], total: int) -> str:
         bits = []
@@ -424,7 +627,8 @@ class ScrapeService:
         """
         return CONFIG.evidence_dir / job.id / f"source-{i + 1:02d}"
 
-    async def _sweep_url(self, job: SweepTask, i: int, url: str, source, prog: "_RunProgress") -> dict:
+    async def _sweep_url(self, job: SweepTask, i: int, url: str, source, prog: "_RunProgress",
+                         refusal: str = "") -> dict:
         """Sweep one URL. Never raises: a single source failing is recorded and
         returned so the batch (see _run's gather) survives it.
 
@@ -438,7 +642,7 @@ class ScrapeService:
             prog.mark_done(i)
             return {
                 "url": url, "blocked": False,
-                "error": f"not a supported listings page: {url}",
+                "error": refusal or "not a supported listings page",
                 "data": {"listings": [], "pages_crawled": 0},
             }
         # Admission first: a source leases its profile only once it is past the
@@ -457,6 +661,13 @@ class ScrapeService:
             # take the freed slot.
             await asyncio.shield(self._leave_gate())
         res["url"] = url
+        # An attempt that raised mid-page returns no data, but what the source
+        # decided before it did is still the best clue to why.
+        data = res.get("data")
+        if not isinstance(data, dict):
+            data = res["data"] = {}
+        if "pages" not in data:
+            data.update(_diagnostics(source))
         return res
 
     async def _sweep(self, job: SweepTask, i: int, url: str, source, prog: "_RunProgress") -> dict:
@@ -505,7 +716,8 @@ class ScrapeService:
         pages_done = 0
 
         def data() -> dict:
-            return {"listings": listings, "pages_crawled": pages_done, "legibility": checks}
+            return {"listings": listings, "pages_crawled": pages_done, "legibility": checks,
+                    **_diagnostics(source)}
 
         async def failed(n: int, tag: str, error: str, retry: bool) -> dict:
             # A page that loaded, was not a block, and still cannot be used. The
@@ -582,6 +794,36 @@ class ScrapeService:
                        "found": len(listings), "pages_crawled": pages_done,
                        "legibility": checks, "proxy_ip": inst.proxy_ip})
         return {"blocked": False, "error": None, "data": data()}
+
+
+def _site(url: str) -> str:
+    """A URL's host without `www.` — how a site is named to a person."""
+    try:
+        host = (urlparse((url or "").strip()).hostname or "").lower()
+    except ValueError:
+        return ""
+    return host[4:] if host.startswith("www.") else host
+
+
+def _diagnostics(source) -> dict:
+    """What a source decided on its last attempt: `pages` and `suggested_override`.
+
+    Only the generic reader decides anything worth reporting (a site adapter's
+    choices are its code), so a source without `decisions` reports nothing.
+    Never raises: a diagnostic that fails must not fail the sweep it describes.
+    """
+    decisions = getattr(source, "decisions", None)
+    if decisions is None:
+        return {}
+    out: dict[str, Any] = {"pages": list(decisions), "suggested_override": None}
+    suggest = getattr(source, "suggested_override", None)
+    if callable(suggest):
+        try:
+            out["suggested_override"] = suggest()
+        except Exception:  # noqa: BLE001 — see docstring
+            logger.exception("could not build a suggested override for %s",
+                             getattr(source, "url", "?"))
+    return out
 
 
 def _evidence_tag(reason: str, limit: int = 50) -> str:

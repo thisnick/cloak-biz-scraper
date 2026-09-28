@@ -5,13 +5,19 @@ worth checking against a real socket and not only through a test client: a
 proxy, a server, or an SDK upgrade can each break them without a unit test
 noticing.
 
-    python scripts/verify_mcp.py --base http://127.0.0.1:18830
+    python scripts/verify_mcp.py --base http://127.0.0.1:18830 --token <access token>
+
+/mcp is behind OAuth, so every call carries a bearer access token (`--token`,
+or MCP_ACCESS_TOKEN in the environment). The unsupported-URL check uses a
+BizBuySell listing's own page, which is refused whatever else is configured:
+a site with an adapter never falls through to the generic reader.
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
 import json
+import os
 import sys
 
 import httpx
@@ -21,7 +27,13 @@ HEADERS = {"Content-Type": "application/json", "Accept": "application/json, text
 EXPECTED_TOOLS = {
     "scrape_listings", "get_scrape_listing_results", "archive_page",
     "create_instance", "close_instance", "list_instances", "get_instance",
+    "agent_browser", "create_upload_url", "server_info",
+    "list_profiles", "create_profile", "update_profile", "new_proxy_session", "delete_profile",
+    "show_browser", "live_view",
 }
+
+# Right site, wrong job: refused with or without a classifier key.
+BIZBUYSELL_LISTING = "https://www.bizbuysell.com/business-opportunity/premier-restoration/2515728/"
 
 ok = True
 
@@ -45,10 +57,13 @@ INIT = rpc("initialize", {
 async def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default="http://127.0.0.1:18830")
+    ap.add_argument("--token", default=os.environ.get("MCP_ACCESS_TOKEN", ""),
+                    help="an OAuth access token for this server (or MCP_ACCESS_TOKEN)")
     args = ap.parse_args()
     url = args.base.rstrip("/") + "/mcp"
+    auth = {"Authorization": f"Bearer {args.token}"} if args.token else {}
 
-    async with httpx.AsyncClient(timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30, headers=auth) as c:
         print("\n── stateless ──")
         r = await c.post(url, json=INIT, headers=HEADERS)
         check("initialize returns 200", r.status_code == 200, f"got {r.status_code}")
@@ -72,19 +87,21 @@ async def main() -> int:
         print("\n── Origin is validated ──")
         r = await c.post(url, json=INIT, headers={**HEADERS, "Origin": "https://evil.example"})
         check("foreign Origin -> 403", r.status_code == 403, f"got {r.status_code}")
-        r = await c.post(url, json=INIT, headers={**HEADERS, "Origin": "http://127.0.0.1:18830"})
+        r = await c.post(url, json=INIT, headers={**HEADERS, "Origin": args.base.rstrip("/")})
         check("our own Origin is allowed", r.status_code == 200, f"got {r.status_code}")
         r = await c.post(url, json=INIT, headers=HEADERS)
         check("absent Origin is allowed (every server-side client)", r.status_code == 200)
 
-        print("\n── unsupported URL ──")
+        print("\n── a page its site's adapter does not read ──")
         r = await c.post(url, json=rpc("tools/call", {
-            "name": "scrape_listings", "arguments": {"url": "https://abc.xyz/investor/"},
+            "name": "scrape_listings", "arguments": {"urls": [BIZBUYSELL_LISTING]},
         }), headers=HEADERS)
         body = r.json()
-        text = json.dumps(body)
-        check("scrape_listings on an unsupported URL is an error",
+        text = json.dumps(body, ensure_ascii=False)
+        check("scrape_listings on a BizBuySell listing page is an error",
               body.get("result", {}).get("isError") is True or "error" in body)
+        check("the error says the site has its own adapter",
+              "read by this app's own adapter" in text)
         check("the error names the supported pattern", "businesses-for-sale" in text)
         check("the error points at archive_page for a single page", "archive_page" in text)
         print("    " + text[:300])

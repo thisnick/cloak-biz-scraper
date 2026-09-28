@@ -157,12 +157,17 @@ The existing setup looks like this. Each row is one reusable search, and `Active
 
 ![Seed URLs stored in a Notion database](assets/setup-tutorial/notion-seed-urls.png)
 
-The current built-in sweep accepts BizBuySell search-results pages and BizBuySell broker
-profile pages. It does not accept a single listing detail URL as a seed.
+The built-in sweep reads BizBuySell search-results pages and BizBuySell broker profile
+pages with its own adapter. Listings pages on other sites — a broker's own site, or a
+marketplace such as WebsiteClosers or Dealonomy — can be seeds too once a
+[TypeSafe Classifier (e.g. Jev) key](advanced-controls.md#typesafe-classifier-eg-jev) is
+saved in Settings; without one, those seeds fail with a message pointing there. A seed must
+be a page that lists many businesses: a single listing's page fails with "found no list of
+businesses for sale" (on BizBuySell it is refused outright).
 
 To make a seed:
 
-1. Open BizBuySell and run a normal search.
+1. Open BizBuySell (or the other listing site) and run a normal search.
 2. Apply the marketplace's useful filters first: location, asking-price range, category, and
    any other filter it supports.
 3. Copy the resulting URL from the address bar.

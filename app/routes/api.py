@@ -43,7 +43,7 @@ from ..services.geo import GeoUnresolved, ProxyUnreachable
 from ..services.instances import BrowserUnavailable, CapExceeded
 from ..services.license import LicenseNotPro
 from ..services.proxy import ProxyNotConfigured
-from ..services.scrape import NotASweep, NotionNotConfigured
+from ..services.scrape import ClassifierNotReady, NotASweep, NotionNotConfigured
 from ..services.tokens import OWNER
 from ..services.urls import public_base
 from ..services.views import (
@@ -110,7 +110,7 @@ async def scrape_listings(request: Request, body: ScrapeRequest) -> ScrapeResult
     archive_page); rows already present are omitted but counted in
     synced.existing."""
     try:
-        job = request.app.state.scrape.start(
+        job = await request.app.state.scrape.submit(
             body.urls, max_pages=body.max_pages, sync=body.sync
         )
     except UnsupportedURL as exc:
@@ -121,6 +121,12 @@ async def scrape_listings(request: Request, body: ScrapeRequest) -> ScrapeResult
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except NotionNotConfigured as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ClassifierNotReady as exc:
+        # A key the server holds that does not work is the server's state, not
+        # the request's: 409 like a missing Notion database. An outage is 503 —
+        # the same call can succeed later without anyone changing anything.
+        raise HTTPException(status_code=503 if exc.transient else 409,
+                            detail=str(exc)) from exc
     return ScrapeResult.of(job)
 
 

@@ -26,7 +26,15 @@ from app.services import extract
 from app.services.typesafe import Choice, Noul, TypeSafeAuthError
 from app.sources import generic
 from app.sources.generic import JS_PROBE, GenericSource
-from app.sources.overrides import MONEY_ROLES, ROLES, Role, SiteOverride, override_for
+from app.sources.overrides import (
+    MONEY_ROLES,
+    ROLES,
+    OverridesInvalid,
+    Role,
+    SiteOverride,
+    override_for,
+    parse_overrides,
+)
 
 SITE = "https://brokers.example"
 LIST_URL = f"{SITE}/businesses-for-sale/"
@@ -945,6 +953,40 @@ class TestOverrideFor:
     def test_a_tie_goes_to_the_first(self):
         a, b = SiteOverride(match="x.com"), SiteOverride(match="www.x.com")
         assert override_for("https://x.com/list", [a, b]) is a
+
+
+class TestParseOverrides:
+    """The document a person types into Settings → Site overrides."""
+
+    @pytest.mark.parametrize("blank", ["", "   \n", None])
+    def test_blank_is_no_overrides(self, blank):
+        assert parse_overrides(blank) == []
+
+    def test_a_valid_document_parses_in_order(self):
+        doc = '[{"match": "a.com"}, {"match": "b.com", "next_page": "none"}]'
+        assert [o.match for o in parse_overrides(doc)] == ["a.com", "b.com"]
+
+    def test_broken_json_names_its_line_and_column(self):
+        with pytest.raises(OverridesInvalid) as exc:
+            parse_overrides('[\n  {"match": "a.com",}\n]')
+        assert str(exc.value).startswith("Line 2, column 21: Expecting property name")
+
+    def test_only_the_first_problem_is_spelled_out_and_the_rest_counted(self):
+        with pytest.raises(OverridesInvalid) as exc:
+            parse_overrides('[{"match": ""}, {"match": "b.com", "x": 1}, {"y": 2}]')
+        message = str(exc.value)
+        assert message.startswith("Override 1 → match: match must be a URL prefix or a host")
+        assert message.endswith("(and 3 more problems)")
+
+    def test_a_suggested_override_round_trips(self):
+        """What a run suggests must be pasteable as it is."""
+        source = GenericSource(LIST_URL, FakeJev())
+        source.decisions = [{"page": 1, "listing_links": {"by": "jev", "patterns": [PATTERN]},
+                             "fields": [{"key": "Asking Price", "role": "asking_price",
+                                         "by": "jev", "used": True}],
+                             "next_page": {"by": "jev", "rule": "none"}}]
+        doc = json.dumps([source.suggested_override()])
+        assert parse_overrides(doc)[0].listing_links == [PATTERN]
 
 
 # ── the probe, in a real browser ─────────────────────────────────────────────

@@ -15,15 +15,17 @@ pattern string, a field's label, a next-page URL), which is why the pattern
 format and field keys are human-readable and stable: an override is meant to be
 pasted, not written from scratch.
 
-This module is only the shape and the matching. Where overrides are stored and
-edited belongs to Settings.
+This module is the shape, the matching, and reading the document a person
+wrote. Where that document is stored and edited belongs to Settings
+(`site_overrides_json`, kept as the raw text so their formatting survives).
 """
 from __future__ import annotations
 
-from typing import Literal, get_args
+import json
+from typing import Any, Literal, get_args
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError, field_validator
 
 # What a field on a listing card can hold. The descriptions are the option
 # wording the classifier is asked with, so they are written for it, and they are
@@ -177,3 +179,70 @@ def override_for(url: str, overrides: list[SiteOverride] | None) -> SiteOverride
         if len(prefix) > best_len:
             best, best_len = override, len(prefix)
     return best
+
+
+# ── the document ─────────────────────────────────────────────────────────────
+
+
+class OverridesInvalid(ValueError):
+    """The saved overrides document cannot be read; the message says where."""
+
+
+_DOCUMENT = TypeAdapter(list[SiteOverride])
+
+EXAMPLE = '[{"match": "bizquest.com", "next_page": "none"}]'
+
+
+def parse_overrides(text: str | None) -> list[SiteOverride]:
+    """The overrides in a document a person typed. Blank means none.
+
+    Raises `OverridesInvalid` with the first problem and where it is: a line
+    and column for broken JSON (which is where an editor puts the cursor), and
+    the override and field for a value that is not allowed ("Override 2
+    (bizquest.com) → next_page: …"). A person fixing a document in a text box
+    needs to know which line to look at more than they need every problem at
+    once, so only the first is spelled out and the rest are counted.
+    """
+    if not (text or "").strip():
+        return []
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise OverridesInvalid(
+            f"Line {exc.lineno}, column {exc.colno}: {exc.msg}. The overrides must be "
+            f"JSON, e.g. {EXAMPLE}."
+        ) from None
+    try:
+        return _DOCUMENT.validate_python(data)
+    except ValidationError as exc:
+        errors = exc.errors()
+        first = _located(errors[0], data)
+        more = len(errors) - 1
+        if more:
+            first += f" (and {more} more problem{'' if more == 1 else 's'})"
+        raise OverridesInvalid(first) from None
+
+
+def _located(error: dict[str, Any], data: Any) -> str:
+    loc = tuple(error.get("loc") or ())
+    msg = str(error.get("msg") or "is not valid").removeprefix("Value error, ")
+    if not loc:
+        return (f"The overrides must be a JSON list with one entry per site, "
+                f"e.g. {EXAMPLE}.")
+    index, path = loc[0], [str(part) for part in loc[1:]]
+    where = f"Override {index + 1}" if isinstance(index, int) else str(index)
+    if isinstance(index, int) and isinstance(data, list) and index < len(data):
+        entry = data[index]
+        if isinstance(entry, dict) and isinstance(entry.get("match"), str) and entry["match"]:
+            where += f" ({entry['match']})"
+    kind = error.get("type")
+    if kind == "extra_forbidden":
+        msg = ("is not something an override can set (it takes "
+               + ", ".join(SiteOverride.model_fields) + ")")
+    elif kind == "missing":
+        msg = "is required"
+    elif kind == "model_type":
+        msg = 'must be an object like {"match": "example.com", …}'
+    if path:
+        return f"{where} → {' → '.join(path)}: {msg}"
+    return f"{where}: {msg}"

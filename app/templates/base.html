@@ -129,7 +129,10 @@
   .field:last-child{margin-bottom:0}
   .field label{display:block;font-size:12px;font-weight:600;margin-bottom:5px;color:var(--muted)}
   .field input,.field select{width:100%;padding:9px 11px;border:1px solid var(--border);border-radius:var(--r-sm);background:var(--bg);color:var(--text);font:13px var(--mono)}
-  .field input:focus,.field select:focus{outline:2px solid var(--accent);outline-offset:1px}
+  .field input:focus,.field select:focus,.field textarea:focus{outline:2px solid var(--accent);outline-offset:1px}
+  /* The one free-form editor (Site overrides): code, so monospace, and tall
+     enough to read a few overrides without scrolling inside the box. */
+  .field textarea{width:100%;min-height:180px;padding:9px 11px;border:1px solid var(--border);border-radius:var(--r-sm);background:var(--bg);color:var(--text);font:12.5px/1.5 var(--mono);resize:vertical;tab-size:2}
   /* A box that is shown for context but cannot be edited — the profile name in
      Default's Edit dialog — has to look uneditable before it is clicked. */
   .field input:disabled{opacity:.55;cursor:not-allowed}
@@ -143,6 +146,8 @@
   .dlg .btnrow{margin-top:18px;justify-content:flex-end}
   .lead-help{color:var(--muted);font-size:12.5px;margin:0 0 14px}
   .lead-help a{color:var(--accent-strong)}
+  ul.lead-help{padding-left:18px}
+  ul.lead-help li{margin:3px 0}
   .selrow{display:flex;align-items:center;gap:12px;padding:10px 0;border-top:1px solid var(--border);margin-top:8px;font-size:13px}
   .selrow .k{color:var(--muted)}
   .selrow .v{font:12.5px var(--mono)}

@@ -1,8 +1,8 @@
 # Advanced controls
 
 The default settings work for an initial test. Use this page when you need a fresh proxy exit,
-more or fewer simultaneous browsers, a separate browser identity, or space back on the
-Railway volume.
+more or fewer simultaneous browsers, a separate browser identity, listing sites other than
+BizBuySell, a fix for a site that is read wrong, or space back on the Railway volume.
 
 Complete [Set up Cloak Biz Scraper for your AI](set-up-scraper-for-ai.md) before changing
 these controls. Change one setting at a time and run a small read-only test afterward.
@@ -85,6 +85,125 @@ shows saved data size for each profile so you can find unusually large identitie
 An AI can use `list_profiles`, `create_profile`, `update_profile`, `new_proxy_session`, and
 `delete_profile`. Make destructive intent explicit. For example, do not ask an agent to
 “clean profiles”; name the profile and whether you mean rotate, clear, or delete.
+
+## TypeSafe Classifier (e.g. Jev)
+
+The sweep reads BizBuySell with adapters written for its pages. Every other listing site —
+a broker's own site, WebsiteClosers, Dealonomy, BizQuest, and so on — is read generically:
+the app groups the page's links by their shape, and the **TypeSafe Classifier (e.g. Jev)**
+decides which group is the list of businesses for sale, what each field on a card holds
+(asking price, cash flow, revenue, location…), which statuses mean a business is gone, and
+which link or button is the next page. It is a classifier, not a chat model: it answers
+those questions and nothing else.
+
+With a key saved:
+
+- `scrape_listings` accepts any site's listings page, alongside BizBuySell URLs.
+- Every sweep page, BizBuySell included, also gets a quick check that its cards read as
+  business listings. A page that fails it (or a page with no list on it at all) fails that
+  source with screenshots, instead of filing garbage or reporting "no listings".
+
+To set it up:
+
+1. Create a key at [openrouter.ai/settings/keys](https://openrouter.ai/settings/keys) and
+   add a few dollars of credit to the account.
+2. Open **Settings → TypeSafe Classifier (e.g. Jev)**, paste the key into
+   **OpenRouter API key**, leave **Model** as `jev-latest`, and select **Save & test**.
+3. The section shows **Working** once OpenRouter answers.
+
+Without a key, everything else works exactly as before: BizBuySell sweeps, Notion sync and
+`archive_page`. A URL on another site is refused for that URL, with a message pointing at
+this setting, and the rest of the batch still runs.
+
+A key that stops working is caught before a sweep starts. If OpenRouter rejects the key,
+the account is out of credits, or the service is not answering, a call whose URLs all need
+the classifier is refused with that reason. In a batch that also has BizBuySell URLs, only
+the other sites fail and the BizBuySell ones still run.
+
+Cost: a page takes a handful of small classifier requests — which list, the fields, the
+statuses, the next page, the listing check — which together come to fractions of a cent
+per page, billed to your OpenRouter account.
+
+## Site overrides
+
+A generic page is decided fresh every time, so a site that changes its layout is read by
+its new layout. When one decision keeps coming out wrong for one site — the wrong list, a
+field left empty, paging that stops early or never stops, sold listings kept — pin that
+part in **Settings → Site overrides**. Anything you leave out is still decided by the
+classifier.
+
+The setting is a JSON list with one entry per site. It is saved only when every entry is
+valid; otherwise the page shows where the problem is (a line and column for broken JSON,
+or the override and field for a bad value) and keeps your text in the box. Leave it empty
+for no overrides.
+
+| Key | What it pins |
+|---|---|
+| `match` | The site: a host (`bizquest.com`, any page on it) or a URL prefix (`https://www.bizquest.com/businesses-for-sale-in-`). `www.` and http/https never matter; the longest match wins; `fcbb.com` does not cover `sfbay.fcbb.com`. Required. |
+| `listing_links` | The link patterns that are the listings, exactly as a run reports them, e.g. `www.bizquest.com/business-for-sale/{*}/{*}` (`{*}` is any one path segment). Several patterns are read as one list. |
+| `fields` | A card field — its label, or the slot key a run reports for an unlabelled one — mapped to what it holds, or to `ignore`. |
+| `next_page` | How to reach the next page: see below. |
+| `drop_status` | Status texts that mean a listing is gone, matched as case-insensitive substrings, e.g. `["sold", "under contract"]`. An empty list drops nothing. |
+
+`next_page` takes one of three forms:
+
+- **A URL with `{page}` in it** — `"https://example.com/listings?page={page}"` — for a site
+  that pages by address. Page 2 is that URL with `2`, and so on.
+- **`click:<css selector>`** — `"click:a.pagination-next"` — for a Next or Load more
+  button with no address of its own.
+- **`none`** — the site has one page; stop after page 1.
+
+The values for `fields` are `title`, `location`, `asking_price`, `cash_flow_sde`, `ebitda`,
+`revenue`, `status`, `category`, `description`, `listing_id`, `other` and `ignore`. The first
+six fill the listing's columns; the rest stay in the listing's excerpt only. Money is always
+kept exactly as the card printed it.
+
+The easiest way to write one is to copy it. In **Tasks → History**, select **Details** on a
+sweep of the site. Each generically read URL in `decisions` has:
+
+- `pages` — what was decided on each page and by whom (`jev` or `override`): the chosen
+  `listing_links` pattern with its confidence, each field's role and whether it was
+  confident enough to use, the `next_page` rule, and how many cards were dropped as sold.
+- `legibility` — whether each page's cards read as business listings.
+- `suggested_override` — a ready-to-paste override that pins what was decided on page 1.
+
+Paste the `suggested_override` into the list, change the part that was wrong, delete the
+parts you are happy to leave to the classifier, and save.
+
+A site that pages by address, like WebsiteClosers (illustrative — copy the real values from
+your own run's details):
+
+```json
+[
+  {
+    "match": "websiteclosers.com",
+    "listing_links": ["www.websiteclosers.com/businesses/{*}/{*}"],
+    "next_page": "https://www.websiteclosers.com/businesses-for-sale/page/{page}/",
+    "drop_status": ["sold", "under contract"]
+  }
+]
+```
+
+A site with a script-only Next button and labelled card fields, like an FCBB office:
+
+```json
+[
+  {
+    "match": "https://sfbay.fcbb.com/silicon-valley",
+    "next_page": "click:a.pagination-next",
+    "fields": {
+      "Asking Price": "asking_price",
+      "Cash Flow": "cash_flow_sde",
+      "Gross Revenue": "revenue",
+      "Listing #": "ignore"
+    }
+  }
+]
+```
+
+Overrides only change how a site is read, so they apply once a TypeSafe Classifier key is
+saved. If a saved document ever stops being valid, sweeps of other sites are refused until
+it is fixed or cleared; BizBuySell sweeps are never affected.
 
 ## Clean up the Railway volume
 

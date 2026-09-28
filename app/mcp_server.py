@@ -53,7 +53,7 @@ from .services.geo import GeoUnresolved, ProxyUnreachable
 from .services.instances import BrowserUnavailable, CapExceeded
 from .services.license import LicenseNotPro
 from .services.proxy import ProxyNotConfigured
-from .services.scrape import NotionNotConfigured
+from .services.scrape import ClassifierNotReady, NotionNotConfigured
 from .services.tokens import OWNER
 from .services.urls import public_base
 from .services.views import (
@@ -138,8 +138,8 @@ DESTRUCTIVE_OPEN_WORLD = ToolAnnotations(
 
 # The failures a caller is MEANT to read: every deliberate refusal. ValueError
 # is the house convention for one (AgentBrowserError, ProfileError and NotASweep
-# all subclass it); the rest are the launch and sync refusals the REST twin turns
-# into a 4xx with the same text.
+# all subclass it); the rest are the launch, sync and classifier refusals the
+# REST twin turns into a 4xx (a classifier outage: 503) with the same text.
 #
 # The SDK shows a tool's own message only for ToolError. Anything else is a
 # crash, reported as a bare "Error executing tool X" with its text kept on the
@@ -156,6 +156,7 @@ REFUSALS: tuple[type[Exception], ...] = (
     ProxyNotConfigured,
     LicenseNotPro,
     NotionNotConfigured,
+    ClassifierNotReady,
 )
 
 
@@ -377,7 +378,9 @@ def build(app) -> MCPServer:
     # Annotated for sync=true, because an annotation cannot vary by argument:
     # sync=false only reads, but the same tool writes Notion rows when asked to.
     # Still not destructive in the sense above: on a row it already has, it
-    # rewrites only its own Last Synced At and Excerpt, from the live card.
+    # rewrites only its own Last Synced At and Excerpt, from the live card. Open
+    # world because the caller names the site: any listings page, not only
+    # BizBuySell, once the classifier key is saved.
     @tool(annotations=ADDITIVE_OPEN_WORLD)
     async def scrape_listings(
         urls: list[str], max_pages: int = 1, sync: bool = False
@@ -396,22 +399,36 @@ def build(app) -> MCPServer:
         archive_page(notion_page_id=…). Listings already in the database are left
         out of `listings` but still counted in `synced.existing`.
 
-        urls: a NON-EMPTY list of pages that each list many businesses, not single
-            listings (BizBuySell only for now). Each entry is either a
-            SEARCH-RESULTS (SERP) page, or a broker's profile page
-            (bizbuysell.com/business-broker/…), whose for-sale listings are swept.
-            Each URL decides how it is read, so for a search use one with the
-            filters already applied. Pass several to sweep several searches or
-            brokers at once (e.g. the same search across a few regions). If a URL
-            isn't a supported listings page it is reported as that source's
-            failure and the others still run; the call only errors outright if the
-            list is empty or none of the URLs are readable. If you don't have such
-            a URL, either ask the user for it, OR get one yourself: create_instance
-            a browser, use agent_browser to run the search on the site (navigate,
-            fill the search box, apply filters), read the resulting address bar
-            (agent_browser get url), and pass that here.
+        urls: a NON-EMPTY list of pages that each list many businesses for sale —
+            a search-results page or a broker's or marketplace's listings page, not
+            a single listing. BizBuySell search results and broker profiles
+            (bizbuysell.com/business-broker/…) are read natively. Any other site's
+            listings page is read by finding the list of businesses on it, which
+            needs the TypeSafe Classifier (e.g. Jev) key saved in the server's
+            Settings; without it such a URL fails with a message saying so. Listings
+            from other sites carry the site (e.g. "websiteclosers.com") as `source`
+            and an empty `listing_id`. For a search, use the URL with the filters
+            already applied. Pass several to sweep several searches, brokers or
+            sites at once. A URL that can't be read is reported as that source's
+            failure, with the reason, and the others still run; the call only errors
+            outright if the list is empty or none of the URLs can be read (including
+            when every URL needs the classifier and its key is rejected, out of
+            credits, or not answering). A page that loads but can't be used fails its source with a
+            reason instead of coming back empty: "found no list of businesses for
+            sale" (a single listing's page, a landing page, a 404), or the cards
+            "don't read as business listings". A BizBuySell page other than a search
+            or a broker profile is refused; to save one listing's page, use
+            archive_page. How a site's page is read is decided fresh each time; if
+            a site keeps being read wrong, the fix is a site override a person
+            saves in the server's Settings, not an argument here. If you don't have
+            a listings URL, either ask the user for it, OR get one yourself:
+            create_instance a browser, use agent_browser to run the search on the
+            site (navigate, fill the search box, apply filters), read the resulting
+            address bar (agent_browser get url), and pass that here.
         max_pages: how many pages of results to walk PER URL (shared across all of
-            them). A broker profile pages its for-sale tab too, so raise this to
+            them). Later pages are reached the way the site pages them — a page
+            link, or a Next / Load more button — and a URL with no next page stops
+            early. A broker profile pages its for-sale tab too, so raise this to
             sweep a broker with many listings.
         sync: false (default) just reads the listings back — no Notion involved,
             and the collected result holds ALL listings found with an empty
@@ -424,7 +441,7 @@ def build(app) -> MCPServer:
             Notion page.) Sync always targets the Notion database configured under
             Settings — there is no per-call database override.
         """
-        job = app.state.scrape.start(urls, max_pages=max_pages, sync=sync)
+        job = await app.state.scrape.submit(urls, max_pages=max_pages, sync=sync)
         return ScrapeResult.of(job)
 
     @tool(annotations=READ_ONLY)

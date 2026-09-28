@@ -32,6 +32,12 @@ from app.stores.base import UpsertResult
 SERP = "https://www.bizbuysell.com/california/sacramento-area-businesses-for-sale/"
 SERP2 = "https://www.bizbuysell.com/california/san-francisco-bay-area-businesses-for-sale/"
 BROKER = "https://www.bizbuysell.com/business-broker/jane-doe/acme-advisors/41243/"
+# Right site, wrong job: a BizBuySell listing's own page.
+DETAIL = "https://www.bizbuysell.com/business-opportunity/premier-restoration/2515728/"
+# Sites with no adapter of their own.
+WC = "https://www.websiteclosers.com/businesses-for-sale/"
+DEALONOMY = "https://www.dealonomy.com/s"
+KEY_HINT = "add an OpenRouter key under Settings → TypeSafe Classifier (e.g. Jev)"
 
 
 def _listing(listing_id: str, source: str = "bizbuysell_serp") -> Listing:
@@ -124,11 +130,14 @@ async def _drain(svc):
 
 
 class TestStarting:
-    def test_an_unsupported_url_never_creates_a_job(self, settings, jobs):
+    @pytest.mark.parametrize("url", ["", "not a url", "ftp://example.com/listings/", DETAIL,
+                                     "https://abc.xyz/investor/"])
+    def test_a_url_nothing_can_read_never_creates_a_job(self, settings, jobs, url):
         """A job id for a URL we cannot read would be a promise of a result that
-        can never come."""
+        can never come. (The last one is readable with a classifier key; there
+        is none saved here.)"""
         with pytest.raises(UnsupportedURL):
-            service(settings, jobs).start(["https://abc.xyz/investor/"])
+            service(settings, jobs).start([url])
         assert jobs.all() == []
 
     def test_sync_without_notion_fails_before_any_browsing(self, settings, jobs):
@@ -430,9 +439,10 @@ class TestMultiUrlFanOut:
 
     @pytest.mark.asyncio
     async def test_all_urls_unsupported_raises_and_creates_no_job(self, settings, jobs):
-        with pytest.raises(UnsupportedURL):
+        with pytest.raises(UnsupportedURL) as exc:
             service(settings, jobs).start(["https://abc.xyz/a", "https://abc.xyz/b"])
         assert jobs.all() == []
+        assert KEY_HINT in str(exc.value), "the first URL's own reason, saying what fixes it"
 
     @pytest.mark.asyncio
     async def test_one_source_failing_leaves_the_others_completed(self, settings, jobs):
@@ -517,6 +527,9 @@ class TestMultiUrlFanOut:
         assert result.status == "completed"
         assert [l.listing_id for l in result.listings] == ["kept"]
         assert "1 of 2 source(s) failed" in result.error
+        # The URL's own reason, not a generic "not supported".
+        assert f"abc.xyz ({sources_hint()})" in result.error
+        assert "not a supported listings page" not in result.error
 
 
 class TestJobLabel:
@@ -1202,3 +1215,368 @@ class TestPageFailures:
         assert res["error"] is None
         assert len(res["data"]["listings"]) == 9
         assert res["data"]["legibility"][0]["dropped"] == 1
+
+
+# ── which source reads a URL, the classifier preflight, and diagnostics ──────
+
+
+def sources_hint() -> str:
+    from app.services.scrape import NEEDS_CLASSIFIER
+
+    return NEEDS_CLASSIFIER
+
+
+class FakeTypeSafe:
+    """The classifier client, as far as `submit` uses it: `check()`, counted."""
+
+    def __init__(self, error=None):
+        from app.services.typesafe import TypeSafeCheck
+
+        self.checks = 0
+        self._result = (TypeSafeCheck(ok=True, message="Working: jev answered in 90 ms.")
+                        if error is None else
+                        TypeSafeCheck(ok=False, message=str(error), error=error))
+
+    async def check(self, key=None, model=None):
+        self.checks += 1
+        return self._result
+
+    async def ask(self, state, questions):  # pragma: no cover — never reached here
+        raise AssertionError("a stubbed sweep asks the classifier nothing")
+
+
+def generic_service(settings, jobs, *, typesafe=None, key=True, sweep=None):
+    """A service whose `_sweep` records which source each URL was given."""
+    if key:
+        settings.update(typesafe_openrouter_api_key="sk-or-test")
+    svc = ScrapeService(instances=None, jobs=jobs, settings=settings,
+                        store_factory=FakeStore, typesafe=typesafe or FakeTypeSafe())
+    svc.swept = {}
+
+    async def recording(job, i, url, source, prog):
+        svc.swept[url] = source
+        return {"blocked": False, "error": None,
+                "data": {"listings": [_listing(f"{i}-1")], "pages_crawled": 1}}
+
+    svc._sweep = sweep or recording
+    return svc
+
+
+class TestWhichSourceReadsAUrl:
+    """An adapter when one matches; else the generic reader, with a key; never
+    the generic reader for a page on a site that has an adapter."""
+
+    @pytest.mark.asyncio
+    async def test_a_site_without_an_adapter_is_read_generically_with_a_key(self, settings, jobs):
+        from app.sources.generic import GenericSource
+
+        typesafe = FakeTypeSafe()
+        svc = generic_service(settings, jobs, typesafe=typesafe)
+        job = svc.start([WC])
+        await _drain(svc)
+
+        source = svc.swept[WC]
+        assert isinstance(source, GenericSource)
+        assert source.url == WC and source.site == "websiteclosers.com"
+        assert source._classifier is typesafe, "the shared client, not a copy"
+        assert source.override is None
+        assert job.source == "generic"
+        assert svc.result(job.id).status == "completed"
+
+    @pytest.mark.asyncio
+    async def test_each_url_gets_its_own_reader(self, settings, jobs):
+        """A GenericSource remembers what it decided on its page; two URLs must
+        never share one."""
+        svc = generic_service(settings, jobs)
+        svc.start([WC, DEALONOMY])
+        await _drain(svc)
+        assert svc.swept[WC] is not svc.swept[DEALONOMY]
+        assert svc.swept[DEALONOMY].site == "dealonomy.com"
+
+    def test_without_a_key_the_refusal_says_where_the_key_goes(self, settings, jobs):
+        svc = generic_service(settings, jobs, key=False)
+        with pytest.raises(UnsupportedURL) as exc:
+            svc.start([WC])
+        assert KEY_HINT in str(exc.value)
+        assert str(exc.value).startswith(f"Can't read listings from {WC!r}")
+        assert jobs.all() == []
+
+    @pytest.mark.parametrize("url", [
+        DETAIL, "https://bizbuysell.com/business-opportunity/x/1/", "https://www.bizbuysell.com/",
+    ])
+    def test_a_site_with_an_adapter_never_falls_through(self, settings, jobs, url):
+        """Even with a key: BizBuySell's adapters chose not to read this page, and
+        the generic reader would sweep its "similar listings" rail as a search."""
+        svc = generic_service(settings, jobs)
+        with pytest.raises(UnsupportedURL) as exc:
+            svc.start([url])
+        message = str(exc.value)
+        assert "bizbuysell.com is read by this app's own adapter" in message
+        assert "businesses-for-sale" in message and "archive_page" in message
+        assert jobs.all() == []
+
+    @pytest.mark.parametrize("url", ["", "not a url", "ftp://example.com/x", "mailto:a@b.co",
+                                     "https://"])
+    def test_what_is_not_a_web_address_is_refused_even_with_a_key(self, settings, jobs, url):
+        svc = generic_service(settings, jobs)
+        with pytest.raises(UnsupportedURL) as exc:
+            svc.start([url])
+        assert "not a web address" in str(exc.value)
+
+    @pytest.mark.asyncio
+    async def test_every_refused_url_carries_its_own_reason_into_the_job_error(
+        self, settings, jobs,
+    ):
+        svc = generic_service(settings, jobs, key=False)
+        job = svc.start([SERP, DETAIL, "ftp://files.example/x", WC])
+        await _drain(svc)
+
+        error = svc.result(job.id).error
+        assert "3 of 4 source(s) failed" in error
+        assert "www.bizbuysell.com (on bizbuysell.com, only these pages are swept: " in error
+        assert "files.example (not a web address — it must start with http:// or https://)" in error
+        assert f"www.websiteclosers.com ({sources_hint()})" in error
+        assert "not a supported listings page" not in error
+        assert list(svc.swept) == [SERP], "refused URLs never reach the browser"
+
+    @pytest.mark.asyncio
+    async def test_the_longest_matching_override_is_handed_to_the_reader(self, settings, jobs):
+        settings.update(site_overrides_json="""[
+          {"match": "websiteclosers.com", "next_page": "none"},
+          {"match": "https://www.websiteclosers.com/businesses-for-sale",
+           "next_page": "https://www.websiteclosers.com/businesses-for-sale/page/{page}/"},
+          {"match": "dealonomy.com", "drop_status": ["sold"]}
+        ]""")
+        svc = generic_service(settings, jobs)
+        svc.start([WC, "https://www.websiteclosers.com/other/", "https://example.org/list"])
+        await _drain(svc)
+
+        assert svc.swept[WC].override.next_page.endswith("/page/{page}/")
+        assert svc.swept["https://www.websiteclosers.com/other/"].override.next_page == "none"
+        assert svc.swept["https://example.org/list"].override is None
+
+    @pytest.mark.asyncio
+    async def test_unreadable_overrides_refuse_generic_urls_only(self, settings, jobs):
+        """A bad document must not stop BizBuySell sweeps — or the app booting."""
+        settings.update(site_overrides_json='[{"match": "a.com"\n  "next_page": "none"}]')
+        svc = generic_service(settings, jobs)
+        job = svc.start([SERP, WC])
+        await _drain(svc)
+
+        assert list(svc.swept) == [SERP]
+        error = svc.result(job.id).error
+        assert "Site overrides" in error and "Line 2, column 3" in error
+
+        with pytest.raises(UnsupportedURL) as exc:
+            svc.start([WC])
+        assert "Settings → Site overrides can't be read" in str(exc.value)
+
+    @pytest.mark.asyncio
+    async def test_overrides_are_parsed_once_per_edit(self, settings, jobs, monkeypatch):
+        import app.services.scrape as scrape_module
+
+        calls = []
+        real = scrape_module.parse_overrides
+
+        def counting(text):
+            calls.append(text)
+            return real(text)
+
+        monkeypatch.setattr(scrape_module, "parse_overrides", counting)
+        settings.update(site_overrides_json='[{"match": "websiteclosers.com"}]')
+        svc = generic_service(settings, jobs)
+        svc.start([WC])
+        svc.start([WC, DEALONOMY])
+        assert len(calls) == 1
+        settings.update(site_overrides_json="")
+        svc.start([WC])
+        assert len(calls) == 2
+        await _drain(svc)
+
+    def test_a_generic_sweep_is_labelled_by_its_site(self):
+        one = SweepTask(id="g1", source="generic", urls=[WC])
+        assert describe(one) == "Listing sweep · websiteclosers.com"
+        two = SweepTask(id="g2", source="generic", urls=[WC, DEALONOMY, SERP])
+        assert describe(two) == "Listing sweep · websiteclosers.com and 1 more · 3 sources"
+        same = SweepTask(id="g3", source="generic",
+                         urls=[WC, "https://websiteclosers.com/businesses-for-sale/page/2/"])
+        assert describe(same) == "Listing sweep · websiteclosers.com · 2 sources"
+
+
+class TestPreflight:
+    """`submit` checks the classifier's key once, before a job exists, when —
+    and only when — some URL needs it."""
+
+    @pytest.mark.asyncio
+    async def test_no_generic_url_means_no_check(self, settings, jobs):
+        typesafe = FakeTypeSafe()
+        svc = generic_service(settings, jobs, typesafe=typesafe)
+        job = await svc.submit([SERP, BROKER], max_pages=2)
+        await _drain(svc)
+        assert typesafe.checks == 0, "a BizBuySell-only call never pays for a check"
+        assert job.max_pages == 2 and svc.result(job.id).status == "completed"
+
+    @pytest.mark.asyncio
+    async def test_no_key_is_refused_before_any_check(self, settings, jobs):
+        typesafe = FakeTypeSafe()
+        svc = generic_service(settings, jobs, typesafe=typesafe, key=False)
+        with pytest.raises(UnsupportedURL) as exc:
+            await svc.submit([WC])
+        assert KEY_HINT in str(exc.value)
+        assert typesafe.checks == 0 and jobs.all() == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("error_type,message,transient", [
+        ("TypeSafeAuthError", "OpenRouter rejected the key (HTTP 401). Check it was copied "
+                              "whole.", False),
+        ("TypeSafeCreditError", "The key works, but the OpenRouter account is out of credits "
+                                "(HTTP 402).", False),
+        ("TypeSafeUnavailable", "The TypeSafe Classifier could not answer; try again in a "
+                                "few minutes.", True),
+    ])
+    async def test_a_failed_check_refuses_a_call_that_is_all_generic(
+        self, settings, jobs, error_type, message, transient,
+    ):
+        import app.services.typesafe as typesafe_module
+        from app.services.scrape import ClassifierNotReady
+
+        typesafe = FakeTypeSafe(getattr(typesafe_module, error_type)(message))
+        svc = generic_service(settings, jobs, typesafe=typesafe)
+        with pytest.raises(ClassifierNotReady) as exc:
+            await svc.submit([WC, DEALONOMY])
+        assert message in str(exc.value), "the check's own words: each is fixed elsewhere"
+        assert "these 2 pages" in str(exc.value)
+        assert exc.value.transient is transient
+        assert typesafe.checks == 1, "one check per call, not one per URL"
+        assert jobs.all() == [] and svc.swept == {}
+
+    @pytest.mark.asyncio
+    async def test_a_mixed_batch_runs_bizbuysell_and_fails_the_generic_urls(
+        self, settings, jobs,
+    ):
+        from app.services.typesafe import TypeSafeAuthError
+
+        typesafe = FakeTypeSafe(TypeSafeAuthError("OpenRouter rejected the key (HTTP 401)."))
+        svc = generic_service(settings, jobs, typesafe=typesafe)
+        job = await svc.submit([SERP, WC])
+        await _drain(svc)
+
+        assert list(svc.swept) == [SERP], "the generic URL never reached the browser"
+        result = svc.result(job.id)
+        assert result.status == "completed"
+        assert "1 of 2 source(s) failed" in result.error
+        assert "www.websiteclosers.com (needs the TypeSafe Classifier (e.g. Jev)" in result.error
+        assert "OpenRouter rejected the key (HTTP 401)." in result.error
+        assert job.decisions[1]["adapter"] is None
+
+    @pytest.mark.asyncio
+    async def test_a_working_check_starts_the_sweep(self, settings, jobs):
+        from app.sources.generic import GenericSource
+
+        typesafe = FakeTypeSafe()
+        svc = generic_service(settings, jobs, typesafe=typesafe)
+        job = await svc.submit([WC, SERP])
+        await _drain(svc)
+        assert typesafe.checks == 1
+        assert isinstance(svc.swept[WC], GenericSource) and SERP in svc.swept
+        assert job.source == "generic", "the first readable URL's source"
+
+    @pytest.mark.asyncio
+    async def test_submit_keeps_start_s_own_refusals(self, settings, jobs):
+        svc = generic_service(settings, jobs)
+        with pytest.raises(ValueError):
+            await svc.submit([])
+        with pytest.raises(NotionNotConfigured):
+            await svc.submit([SERP], sync=True)
+        assert jobs.all() == []
+
+
+class _DecidingSource(_PlainSource):
+    """A source that reports what it decided, as the generic reader does."""
+
+    name = "generic"
+
+    def __init__(self, pages):
+        super().__init__(pages)
+        self.decisions = []
+
+    async def cards(self, page):
+        self.decisions.append({"page": self.reads + 1, "listing_links": {"by": "jev"}})
+        return await super().cards(page)
+
+    def suggested_override(self):
+        return {"match": "example.com", "next_page": "none"}
+
+
+class TestDecisions:
+    """How each URL was read, on the job for a person — never in ScrapeResult."""
+
+    @pytest.mark.asyncio
+    async def test_one_entry_per_url_in_order(self, settings, jobs):
+        pages = [{"page": 1, "listing_links": {"by": "jev", "patterns": ["x/{*}"]}}]
+        suggestion = {"match": "websiteclosers.com", "listing_links": ["x/{*}"]}
+        checks = [{"page": 1, "ok": True, "kept": 1, "dropped": 0}]
+
+        async def sweep(job, i, url, source, prog):
+            data = {"listings": [_listing(str(i))], "pages_crawled": 1, "legibility": checks}
+            if url == WC:
+                data.update(pages=pages, suggested_override=suggestion)
+            return {"blocked": False, "error": None, "data": data}
+
+        svc = generic_service(settings, jobs, sweep=sweep)
+        job = svc.start([WC, SERP, DETAIL])
+        await _drain(svc)
+
+        stored = jobs.get(job.id)
+        assert [d["url"] for d in stored.decisions] == [WC, SERP, DETAIL]
+        generic, serp, refused = stored.decisions
+        assert generic == {"url": WC, "adapter": "generic", "pages": pages,
+                           "legibility": checks, "suggested_override": suggestion}
+        assert serp["adapter"] == "bizbuysell_serp" and serp["pages"] == []
+        assert serp["suggested_override"] is None and serp["legibility"] == checks
+        assert refused["adapter"] is None
+        assert "only these pages are swept" in refused["error"]
+
+    @pytest.mark.asyncio
+    async def test_decisions_stay_out_of_the_scrape_result(self, settings, jobs):
+        from app.models import ScrapeResult
+
+        svc = generic_service(settings, jobs)
+        job = svc.start([WC])
+        await _drain(svc)
+        assert jobs.get(job.id).decisions
+        assert "decisions" not in ScrapeResult.model_fields
+        assert "decisions" not in svc.result(job.id).model_dump()
+
+    @pytest.mark.asyncio
+    async def test_a_sweep_carries_the_source_s_decisions_back(self, settings, jobs, tmp_path):
+        from app.sources.base import CardPage
+
+        svc = ScrapeService(instances=None, jobs=jobs, settings=settings)
+        source = _DecidingSource([CardPage([_gen(1), _gen(2)]), CardPage([_gen(3)])])
+        res, _, _ = await _once(svc, _job(jobs, max_pages=2), source, tmp_path)
+        assert [d["page"] for d in res["data"]["pages"]] == [1, 2]
+        assert res["data"]["suggested_override"] == {"match": "example.com",
+                                                     "next_page": "none"}
+
+        plain, _, _ = await _once(svc, _job(jobs, max_pages=1),
+                                  _PlainSource([CardPage([_gen(1)])]), tmp_path)
+        assert "pages" not in plain["data"], "an adapter's choices are its code"
+
+    @pytest.mark.asyncio
+    async def test_a_failed_attempt_still_reports_what_was_decided(self, settings, jobs):
+        source_seen = {}
+
+        async def sweep(job, i, url, source, prog):
+            source.decisions.append({"page": 1, "error": "the page could not be read"})
+            source_seen["source"] = source
+            raise RuntimeError("page crashed")
+
+        svc = generic_service(settings, jobs, sweep=sweep)
+        job = svc.start([WC])
+        await _drain(svc)
+
+        entry = jobs.get(job.id).decisions[0]
+        assert entry["pages"] == [{"page": 1, "error": "the page could not be read"}]
+        assert entry["error"] == "page crashed"
+        assert entry["suggested_override"] == {"match": "websiteclosers.com"}

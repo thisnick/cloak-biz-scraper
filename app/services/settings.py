@@ -114,6 +114,16 @@ class Settings(BaseModel):
     typesafe_last_check_ok: bool | None = None
     typesafe_last_check_summary: str = ""
 
+    # Site overrides for the generic listing reader (sources/overrides.py): a
+    # JSON list a person writes by hand, stored as the raw text so their
+    # formatting and order survive a save. Deliberately NOT validated here —
+    # `_read` refuses to load a settings file with any invalid field, so a
+    # document that stops matching a later schema would stop the whole app
+    # booting over one site's pins. It is checked when it is saved instead
+    # (routes/ui.py) and parsed when a generic sweep starts, where a bad one
+    # refuses only the URLs that would use it. Not seeded from the environment.
+    site_overrides_json: str = ""
+
     # Pool budget. Task budget = max_instances - interactive_reserve; interactive
     # sessions are never starved by a running sweep.
     max_instances: int = Field(default=4, ge=1)

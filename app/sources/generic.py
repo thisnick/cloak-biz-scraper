@@ -48,6 +48,7 @@ from ..models import Listing
 from ..services import extract
 from ..services.blocker import text_contains_blocker
 from ..services.typesafe import Choice, Noul, TypeSafeError, TypeSafeNotConfigured
+from . import GENERIC_LABEL, GENERIC_NAME
 from .base import CardPage
 from .overrides import MONEY_ROLES, ROLES, SiteOverride
 from .urls import listing_url, normalize_url
@@ -611,8 +612,8 @@ class GenericSource:
     into a paste-ready `SiteOverride`.
     """
 
-    name = "generic"
-    label = "Any site"
+    name = GENERIC_NAME
+    label = GENERIC_LABEL
     describes = ("Any other site's page of businesses for sale, read with the TypeSafe "
                  "Classifier (e.g. Jev)")
     example = "https://www.websiteclosers.com/businesses-for-sale/"

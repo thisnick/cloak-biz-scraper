@@ -109,9 +109,10 @@ class SweepTask(TaskBase):
 
     A sweep spans one *or more* source URLs (a multi-URL fan-out that lands in
     one record), so the target is `urls`, a list. `source` is the representative
-    adapter name for the batch — every URL in v1 is BizBuySell, and each Listing
-    still carries its own `source`, so nothing downstream depends on this being
-    a single value.
+    source name for the batch — the first readable URL's: a BizBuySell adapter,
+    or "generic" for a site read by the generic reader. A batch can mix both,
+    and each Listing carries its own `source`, so nothing downstream depends on
+    this being a single value.
     """
 
     kind: Literal["sweep"] = "sweep"
@@ -122,6 +123,15 @@ class SweepTask(TaskBase):
     pages_crawled: int = 0
     listings: list[Listing] = Field(default_factory=list)
     synced: SyncResult | None = None
+    # How each URL was read, one entry per URL in `urls` order: `url`,
+    # `adapter` (the source name, or None when the URL was refused), `pages`
+    # (the generic reader's per-page decisions: which link pattern is the list
+    # and who decided it, what each field holds, the next-page rule, what was
+    # dropped), `legibility` (each page's verdict), `suggested_override` (a
+    # paste-ready site override pinning what was decided, generic sources
+    # only), and `error` when the source failed. For a person diagnosing a run
+    # (/runs/{id}); deliberately not in ScrapeResult, which an agent polls.
+    decisions: list[dict] = Field(default_factory=list)
 
 
 class ArchiveTask(TaskBase):

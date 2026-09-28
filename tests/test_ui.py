@@ -3393,3 +3393,170 @@ class TestStorage:
 
         assert old.is_dir()
         assert storage.jobs.get(job.id) is not None
+
+
+class TestSiteOverridesSetting:
+    """The app's first free-form editor: checked on save, stored as typed, and a
+    refusal says where the problem is and keeps the person's text."""
+
+    DOC = """[
+  {
+    "match": "bizquest.com",
+    "next_page": "none",
+    "fields": {"Asking Price": "asking_price", "Brokered By": "ignore"}
+  },
+
+  {"match": "https://sfbay.fcbb.com/silicon-valley", "next_page": "click:a.next"}
+]"""
+
+    def test_empty_by_default_and_says_what_it_is_for(self, auth):
+        response = auth.get("/")
+        page = shown(response)
+        assert "Site overrides" in page
+        assert 'name="site_overrides_json"' in response.text
+        assert "Anything you leave out is still decided by the classifier" in page
+        assert "suggested_override" in page, "points at the paste-ready suggestion"
+        assert "Tasks → History" in page and "Details" in page
+
+    def test_a_valid_document_is_saved_verbatim(self, auth):
+        app.state.settings.update(typesafe_openrouter_api_key="sk-or-test")
+        response = auth.post("/settings/overrides", data={"site_overrides_json": self.DOC})
+        assert response.status_code == 200
+        assert "Saved 2 site overrides." in shown(response)
+        assert app.state.settings.load().site_overrides_json == self.DOC
+        later = auth.get("/")
+        assert self.DOC in shown(later), "their formatting and order survive"
+        assert '<span class="chip ok">2 sites</span>' in later.text
+
+    def test_browser_line_endings_are_stored_as_typed(self, auth):
+        auth.post("/settings/overrides",
+                  data={"site_overrides_json": self.DOC.replace("\n", "\r\n")})
+        assert app.state.settings.load().site_overrides_json == self.DOC
+
+    def test_saving_without_a_key_warns_that_nothing_uses_them_yet(self, auth):
+        response = auth.post("/settings/overrides", data={"site_overrides_json": self.DOC})
+        assert response.status_code == 200
+        assert 'class="banner warn"' in response.text
+        assert "once a TypeSafe Classifier (e.g. Jev) key is saved" in shown(response)
+
+    def test_broken_json_is_refused_with_its_line_and_column(self, auth):
+        app.state.settings.update(site_overrides_json='[{"match": "old.example"}]')
+        broken = '[\n  {"match": "bizquest.com"\n   "next_page": "none"}\n]'
+        response = auth.post("/settings/overrides", data={"site_overrides_json": broken})
+        assert response.status_code == 400
+        page = shown(response)
+        assert "Not saved. Line 3, column 4: Expecting ',' delimiter." in page
+        assert broken in page, "the person's own text is back in the box to fix"
+        assert app.state.settings.load().site_overrides_json == '[{"match": "old.example"}]'
+
+    @pytest.mark.parametrize("doc,where", [
+        ('[{"match": "bizquest.com", "next_page": "page 2"}]',
+         "Override 1 (bizquest.com) → next_page: next_page must be a URL containing {page}"),
+        ('[{"match": "a.com"}, {"match": "b.com", "fields": {"Price": "price"}}]',
+         "Override 2 (b.com) → fields → Price: Input should be 'title'"),
+        ('[{"match": "a.com", "pagination": "none"}]',
+         "Override 1 (a.com) → pagination: is not something an override can set"),
+        ('{"match": "a.com"}', "must be a JSON list with one entry per site"),
+    ])
+    def test_a_bad_value_is_refused_with_its_field_path(self, auth, doc, where):
+        response = auth.post("/settings/overrides", data={"site_overrides_json": doc})
+        assert response.status_code == 400
+        assert where in shown(response)
+        assert app.state.settings.load().site_overrides_json == ""
+
+    def test_blank_clears_every_override(self, auth):
+        app.state.settings.update(site_overrides_json=self.DOC)
+        response = auth.post("/settings/overrides", data={"site_overrides_json": "  \n "})
+        assert response.status_code == 200
+        assert "Cleared." in shown(response)
+        assert app.state.settings.load().site_overrides_json == ""
+        assert '<span class="chip">None</span>' in response.text
+
+    def test_a_saved_document_that_no_longer_parses_still_renders(self, auth):
+        """A later version may tighten the schema; the page must still load and
+        say so, because it is the only place to fix it."""
+        app.state.settings.update(site_overrides_json='[{"match": "a.com", "retired": 1}]')
+        response = auth.get("/")
+        assert response.status_code == 200
+        assert '<span class="chip bad">Invalid</span>' in response.text
+        assert "The saved overrides can’t be read" in shown(response)
+
+    def test_signed_out_and_cross_origin_saves_are_refused(self, client, auth):
+        r = auth.post("/settings/overrides", data={"site_overrides_json": self.DOC},
+                      headers={"Origin": "https://evil.example"}, follow_redirects=False)
+        assert r.status_code == 403
+        assert app.state.settings.load().site_overrides_json == ""
+        assert auth.get("/settings/overrides", follow_redirects=False).status_code == 405
+
+
+class TestSweepPreflightOnTheDashboard:
+    """The dashboard's "run sweep" goes through the same `submit` as the tools."""
+
+    WC = "https://www.websiteclosers.com/businesses-for-sale/"
+
+    def _failing_check(self, monkeypatch, error):
+        from app.services.typesafe import TypeSafeCheck
+
+        calls = []
+
+        async def check(key=None, model=None):
+            calls.append(1)
+            return TypeSafeCheck(ok=False, message=str(error), error=error)
+
+        # The per-test volume is app.state.settings; point the sweep at it too.
+        monkeypatch.setattr(app.state.scrape, "_settings", app.state.settings)
+        monkeypatch.setattr(app.state.typesafe, "check", check)
+        app.state.settings.update(typesafe_openrouter_api_key="sk-or-test")
+        return calls
+
+    def test_a_rejected_key_is_a_banner_on_the_tasks_tab(self, auth, monkeypatch):
+        from app.services.typesafe import TypeSafeAuthError
+
+        calls = self._failing_check(
+            monkeypatch, TypeSafeAuthError("OpenRouter rejected the key (HTTP 401)."))
+        jobs_before = len(app.state.jobs.all())
+        r = auth.post("/sessions/sweep", data={"url": self.WC}, follow_redirects=False)
+        assert r.status_code == 409
+        assert "OpenRouter rejected the key (HTTP 401)." in shown(r)
+        assert 'class="banner' in r.text and 'data-section="tasks" class="on"' in r.text
+        assert calls == [1] and len(app.state.jobs.all()) == jobs_before
+
+    def test_an_outage_is_a_503_banner(self, auth, monkeypatch):
+        from app.services.typesafe import TypeSafeUnavailable
+
+        self._failing_check(monkeypatch, TypeSafeUnavailable("could not answer"))
+        r = auth.post("/sessions/sweep", data={"url": self.WC}, follow_redirects=False)
+        assert r.status_code == 503 and "could not answer" in shown(r)
+
+    def test_no_key_is_the_guided_refusal(self, auth, monkeypatch):
+        monkeypatch.setattr(app.state.scrape, "_settings", app.state.settings)
+        r = auth.post("/sessions/sweep", data={"url": self.WC}, follow_redirects=False)
+        assert r.status_code == 422
+        assert "add an OpenRouter key under Settings → TypeSafe Classifier (e.g. Jev)" in shown(r)
+
+
+class TestRunDecisions:
+    """How each URL was read is in the run's detail, for a person — and one
+    click from the Tasks history."""
+
+    def test_a_sweep_s_run_detail_carries_its_decisions(self, auth):
+        decisions = [{"url": "https://www.websiteclosers.com/businesses-for-sale/",
+                      "adapter": "generic", "pages": [{"page": 1}], "legibility": [],
+                      "suggested_override": {"match": "websiteclosers.com"}}]
+        job = app.state.jobs.create(urls=[decisions[0]["url"]], source="generic",
+                                    status="completed", decisions=decisions)
+        body = auth.get(f"/runs/{job.id}").json()
+        assert body["decisions"] == decisions
+        row = {r["job_id"]: r for r in auth.get("/runs").json()}[job.id]
+        assert "decisions" not in row, "the list stays small; the detail has it"
+        assert "decisions" not in auth.get(f"/runs/{job.id}/results").json()
+        page = auth.get("/").text
+        assert f'href="/runs/{job.id}"' in page and ">Details</a>" in page
+        assert "Listing sweep · websiteclosers.com" in shown(auth.get("/"))
+
+    def test_an_archive_has_no_decisions(self, auth):
+        task = app.state.jobs.create(kind="archive", url="https://x.example/",
+                                     notion_page_id="page-1", status="completed")
+        assert task.kind == "archive"
+        assert "decisions" not in auth.get(f"/runs/{task.id}").json()
+        assert f'href="/runs/{task.id}"' not in auth.get("/").text, "no Details link"
