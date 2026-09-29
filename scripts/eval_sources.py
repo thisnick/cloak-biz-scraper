@@ -262,18 +262,22 @@ def score(truth: dict[str, Any], res: dict[str, Any] | None, pages: int) -> dict
         if list_ok and not legible_ok:
             out["notes"].append(legible.get("reason") or "no legibility verdict")
 
-    label = truth.get("next") or "none"
+    # A label may list alternatives ("click|none"): a load-more page whose
+    # infinite scroll sometimes loads every listing before the sweep reads it
+    # is right either way.
+    labels = (truth.get("next") or "none").split("|")
     rule = str(((rec.get("next_page") or {}).get("rule")) or "none")
-    if label == "none":
-        next_ok = rule == "none"
-    elif label == "click":
-        next_ok = rule == "click"
-    else:
-        next_ok = rule.startswith("http") and label.removeprefix("url:") in rule
+
+    def matches(label: str) -> bool:
+        if label in ("none", "click"):
+            return rule == label
+        return rule.startswith("http") and label.removeprefix("url:") in rule
+
+    next_ok = any(matches(label) for label in labels)
     out["next"] = f"{rule if rule in ('none', 'click') else 'url'} {'✓' if next_ok else '✗'}"
     if not next_ok and rule not in ("none", "click"):
         out["notes"].append(f"next: {rule}")
-    if next_ok and label != "none" and pages >= 2:
+    if next_ok and rule != "none" and pages >= 2:
         second = res["pages"][1] if len(res["pages"]) > 1 else None
         if second is None:
             next_ok = False
@@ -360,7 +364,7 @@ async def main() -> int:
         for item in json.loads(args.truth.read_text())["pages"]:
             if args.only and not any(o.lower() in item["name"].lower() for o in args.only):
                 continue
-            if args.paged_only and (item.get("next") or "none") == "none":
+            if args.paged_only and set((item.get("next") or "none").split("|")) == {"none"}:
                 continue
             targets.append((item["name"], item["url"], item))
     if not targets:

@@ -1,5 +1,5 @@
 {
- "_about": "Hand-labelled truth for the generic listing-page gate (2026-09-28). 'group' = substrings, any of which the chosen listing group's pattern must contain (null = the right answer is 'no list of businesses for sale on this page'). 'next' = 'url:<substring of the page-2 URL>', 'click' (a script-only pager control the source must click), or 'none' (no next page). min_cards = lower bound on listings found on page 1. 'soft' pages are single-listing detail pages: picking a 'similar listings' rail there is tolerable but should be reported separately from the hard gate.",
+ "_about": "Hand-labelled truth for the generic listing-page gate (2026-09-28). 'group' = substrings, any of which the chosen listing group's pattern must contain (null = the right answer is 'no list of businesses for sale on this page'). 'next' = 'url:<substring of the page-2 URL>', 'click' (a script-only pager control the source must click), or 'none' (no next page). min_cards = lower bound on listings found on page 1. 'soft' pages are single-listing detail pages: picking a 'similar listings' rail there is tolerable but should be reported separately from the hard gate. 'next' may list alternatives separated by '|'.",
  "pages": [
   {
    "name": "QuietLight",
@@ -129,7 +129,7 @@
     "synergybb.com/listings/"
    ],
    "min_cards": 15,
-   "next": "none"
+   "next": "click|none"
   },
   {
    "name": "FEInternational (landing page)",
