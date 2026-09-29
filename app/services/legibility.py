@@ -51,6 +51,7 @@ it means is the sweep's business, exactly as before.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from dataclasses import dataclass
@@ -75,10 +76,10 @@ MIN_PRICES_READ = 0.5
 MIN_CARD = 0.5
 # The page fails when fewer than this share of the cards asked about pass.
 MIN_PASSING = 0.5
-# Cards asked about per page, all in one request. A longer page has its first
-# and last MAX_CARDS / 2 asked about — cards that are not listings come from
-# the menu above the list and the footer below it — and the ones between kept
-# on the strength of the code checks.
+# Cards asked about per request. Every card is asked about: a longer page goes
+# in several requests of this many, sent together. (Asking only the first and
+# last few missed junk in the middle: Synergy's infinite scroll runs from its
+# active listings into forty "– Sold" ones well inside a 180-card page.)
 MAX_CARDS = 40
 # Enough of a card's excerpt to recognise it: forty of them share one request.
 _EXCERPT_CHARS = 300
@@ -205,25 +206,15 @@ async def check(listings: list[Listing], *, page: int, classifier=None,
     if classifier is None:
         return Verdict(listings=complete, dropped=dropped)
 
-    asked = _asked(len(complete))
-    names = [f"card_{i}" for i in range(1, len(asked) + 1)]
-    state = {"cards": {name: _state(complete[i]) for name, i in zip(names, asked)}}
-    questions = {name: {"type": "noul", "instructions": QUESTION.format(card=name)}
-                 for name in names}
+    asked = list(range(len(complete)))
+    batches = [asked[i:i + MAX_CARDS] for i in range(0, len(asked), MAX_CARDS)]
     try:
-        replies = await classifier.ask(state, questions)
-        answers = []
-        for name in names:
-            reply = replies.get(name)
-            if not isinstance(reply, Noul):
-                raise TypeSafeError(
-                    f"The TypeSafe Classifier did not answer the yes/no question about {name}."
-                )
-            answers.append(reply.probability)
+        replies = await asyncio.gather(*(_ask(classifier, complete, batch) for batch in batches))
     except TypeSafeError as exc:
         # Best-effort: the code checks above have already passed this page.
         logger.warning("legibility: classifier skipped on page %d: %s", page, exc)
         return Verdict(listings=complete, dropped=dropped, classifier_error=str(exc))
+    answers = [p for batch in replies for p in batch]
 
     low = {i: p for i, p in zip(asked, answers) if p < MIN_CARD}
     passing = len(asked) - len(low)
@@ -285,17 +276,22 @@ def _bare(text: str) -> str:
     return text.strip()
 
 
-def _asked(n: int) -> list[int]:
-    """The positions of the cards asked about: all of them, up to MAX_CARDS.
-
-    On a longer page, the first and the last MAX_CARDS / 2 — the ends are where
-    a menu or a footer read as cards would be — and in page order, so the same
-    page gets the same verdict twice.
-    """
-    if n <= MAX_CARDS:
-        return list(range(n))
-    head = MAX_CARDS // 2
-    return list(range(head)) + list(range(n - (MAX_CARDS - head), n))
+async def _ask(classifier, cards: list[Listing], batch: list[int]) -> list[float]:
+    """One request: a yes/no for each card in `batch`, in the batch's order."""
+    names = [f"card_{i}" for i in range(1, len(batch) + 1)]
+    state = {"cards": {name: _state(cards[i]) for name, i in zip(names, batch)}}
+    questions = {name: {"type": "noul", "instructions": QUESTION.format(card=name)}
+                 for name in names}
+    replies = await classifier.ask(state, questions)
+    answers = []
+    for name in names:
+        reply = replies.get(name)
+        if not isinstance(reply, Noul):
+            raise TypeSafeError(
+                f"The TypeSafe Classifier did not answer the yes/no question about {name}."
+            )
+        answers.append(reply.probability)
+    return answers
 
 
 def _state(card: Listing) -> dict[str, str]:

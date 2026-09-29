@@ -287,19 +287,27 @@ class TestClassifier:
                                                        "Profitable Business 2"]
 
     @pytest.mark.asyncio
-    async def test_a_long_page_is_asked_about_its_first_and_last_twenty_cards(self):
-        """Forty cards in one request at most; a menu or footer read as cards
-        sits at the ends. The cards between are kept on the code checks."""
+    async def test_every_card_of_a_long_page_is_asked_about_forty_to_a_request(self):
+        """Junk can sit anywhere in a long page (Synergy's sold listings start
+        well inside it), so every card is asked about — in requests of forty."""
         cards = [_card(i) for i in range(100)]
-        fake = FakeClassifier([0.02] + [0.9] * 38 + [0.03])
+        sold = {5, 50, 97}
+
+        class ByTitle(FakeClassifier):
+            async def ask(self, state, questions):
+                self.calls.append((state, questions))
+                return {name: Noul(probability=0.1 if int(state["cards"][name]["title"].split()[-1])
+                                   in sold else 0.9) for name in questions}
+
+        fake = ByTitle()
         verdict = await legibility.check(cards, page=1, classifier=fake, drop_cards=True)
 
-        state, questions = fake.calls[0]
-        assert len(fake.calls) == 1 and len(questions) == legibility.MAX_CARDS == 40
-        assert [c["title"] for c in state["cards"].values()] == [
-            f"Profitable Business {i}" for i in (*range(20), *range(80, 100))]
-        assert verdict.ok and verdict.listings == cards[1:99]
-        assert (verdict.classifier_asked, verdict.classifier_dropped) == (40, 2)
+        assert [len(q) for _, q in fake.calls] == [40, 40, 20]
+        asked = [c["title"] for state, _ in fake.calls for c in state["cards"].values()]
+        assert asked == [f"Profitable Business {i}" for i in range(100)]
+        assert verdict.ok and [c for c in cards if c not in verdict.listings] == [
+            cards[5], cards[50], cards[97]]
+        assert (verdict.classifier_asked, verdict.classifier_dropped) == (100, 3)
 
     @pytest.mark.asyncio
     async def test_a_classifier_error_skips_the_classifier_and_keeps_the_page(self, caplog):
