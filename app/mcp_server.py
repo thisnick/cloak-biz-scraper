@@ -418,13 +418,17 @@ def build(app) -> MCPServer:
             failure, with the reason, and the others still run; the call only errors
             outright if the list is empty or none of the URLs can be read (including
             when every URL needs the classifier and its key is rejected, out of
-            credits, or not answering). A first page that loads but can't be used
-            fails its source with a reason instead of coming back empty:
-            "found no list of businesses for sale" (a single listing's page, a
-            landing page, a 404), or the cards "don't read as business listings".
-            The same on a LATER page stops that URL's paging there: the pages before
-            it are kept and returned, and `error` says which page stopped it and why
-            (the job still completes). A BizBuySell page other than a search
+            credits, or not answering). With the key saved, each new listing is
+            also asked whether it is a business for sale now; on other sites a
+            sold, pending or under-contract listing, or a menu link read as one,
+            is left out (the `summary` says how many), while BizBuySell's cards
+            are always kept. A first page that loads but can't be used fails its
+            source with a reason instead of coming back empty: "found no list of
+            businesses for sale" (a single listing's page, a landing page, a 404),
+            or fewer than half its cards "read as business listings currently for
+            sale". The same on a LATER page stops that URL's paging there: the
+            pages before it are kept and returned, and `error` says which page
+            stopped it and why (the job still completes). A BizBuySell page other than a search
             or a broker profile is refused; to save one listing's page, use
             archive_page. How a site's page is read is decided anew by every sweep; if
             a site keeps being read wrong, the fix is a site override a person
@@ -451,8 +455,9 @@ def build(app) -> MCPServer:
         triage_prompt: optional. Your triage criteria as plain text — what makes a
             listing one to reject. When given, the sweep also decides REVIEW or
             REJECT for every row it saves, and for every row it sees whose Bot
-            Triage is still blank; a row that already has a Bot Triage is never
-            re-triaged. It writes Bot Triage, Triage Reason, Triaged At and
+            Triage is still blank, on the listing's card as it reads the page;
+            a row that already has a Bot Triage is never re-triaged, nor asked
+            about at all. It writes Bot Triage, Triage Reason, Triaged At and
             Criteria Version where those columns exist or are mapped under Settings.
             A REVIEW row also gets its detail page's Source Content appended (as
             archive_page does), so there is no need to call archive_page for them.
@@ -467,8 +472,8 @@ def build(app) -> MCPServer:
             later sweep — the job still completes, because the rows were saved.
             A sweep reads at most 25 detail pages; REVIEWs past that stay blank
             for the next sweep (`triage.deferred`). A row another sweep is
-            triaging at that moment is left to it (`triage.in_flight`). Leave it out (or pass an empty string) to sweep
-            exactly as without triage.
+            triaging at that moment is left to it (`triage.in_flight`). Leave it
+            out (or pass an empty string) to sweep exactly as without triage.
         """
         job = await app.state.scrape.submit(urls, max_pages=max_pages, sync=sync,
                                             triage_prompt=triage_prompt)

@@ -546,7 +546,8 @@ async def get_run(request: Request, job_id: str) -> dict[str, Any]:
     }
     if job.kind == "sweep":
         # How each URL was read — the chosen link pattern and who chose it,
-        # field roles, the next-page rule, legibility, and a paste-ready site
+        # field roles, the next-page rule, legibility and each page's
+        # per-listing eligibility, and a paste-ready site
         # override. Here and not in /runs (every row) or in the ScrapeResult an
         # agent polls: it is for a person working out why a site read wrong.
         detail["decisions"] = job.decisions

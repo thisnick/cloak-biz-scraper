@@ -953,10 +953,16 @@ class NotionStore:
 
     @staticmethod
     def _index_of(rows: list[_Row]) -> DedupeIndex:
-        return DedupeIndex(
+        index = DedupeIndex(
             listing_ids={r.listing_id for r in rows if r.listing_id},
             normalized_urls={r.normalized_url for r in rows if r.normalized_url},
         )
+        # A key held by two rows means the row the upsert would find: the last.
+        by_id = {r.listing_id: r for r in rows if r.listing_id}
+        by_url = {r.normalized_url: r for r in rows if r.normalized_url}
+        index.decisions_by_id = {k: r.triage for k, r in by_id.items() if r.triage is not None}
+        index.decisions_by_url = {k: r.triage for k, r in by_url.items() if r.triage is not None}
+        return index
 
     async def index(self, db_id: str, column_map: ColumnMap | None = None) -> DedupeIndex:
         data = await self._client.request("GET", f"/databases/{db_id}")

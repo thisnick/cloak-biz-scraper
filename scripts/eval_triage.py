@@ -3,12 +3,16 @@
 Before a new criteria text goes into the daily sweep, this answers the one
 question that matters about it: on the rows that have already been decided, how
 often does the server's triage agree? It runs the prompt through exactly the
-code a sweep uses (`app/services/triage.py`, card stage — the detail stage needs
-a browser per row, so it is not measured here) over every row whose Bot Triage
-is REVIEW or REJECT, and prints the agreement overall, by the month each row
-was created, and since a date (the day the current criteria took effect, so old
-rows judged by older criteria do not blur the number). Also: how many REVIEWs it
-kept (a missed REVIEW is a listing nobody sees) and how many REJECTs it rejected.
+request a sweep makes for each listing (`app/services/legibility.ask`: one
+request per card carrying the eligibility question and the triage question —
+the detail stage needs a browser per row, so it is not measured here) over
+every row whose Bot Triage is REVIEW or REJECT, and prints the agreement
+overall, by the month each row was created, and since a date (the day the
+current criteria took effect, so old rows judged by older criteria do not blur
+the number). Also: how many REVIEWs it kept (a missed REVIEW is a listing
+nobody sees), how many REJECTs it rejected, and how many of these real
+listings the same request would have judged not eligible (not a business for
+sale now) — a generic site's sweep drops those before they are ever saved.
 
 **Read-only.** It reads the database schema and queries its rows; it never
 writes to Notion. It is not run in CI: it needs a real database and a key.
@@ -39,8 +43,14 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.models import Listing  # noqa: E402
+from app.services.legibility import MIN_ELIGIBLE, ask  # noqa: E402
 from app.services.triage import REJECT, REVIEW, Triager  # noqa: E402
-from app.services.typesafe import DEFAULT_MODEL, TypeSafeClient, TypeSafeError  # noqa: E402
+from app.services.typesafe import (  # noqa: E402
+    DEFAULT_MODEL,
+    TYPESAFE_PARALLEL,
+    TypeSafeClient,
+    TypeSafeError,
+)
 
 # Where each field is read from, by default: the app's own column names (what
 # a database it created has), then the names an older hand-built database used.
@@ -155,7 +165,25 @@ def report(results: list[dict[str, Any]], since: str | None) -> list[str]:
     for month in sorted({r["created"][:7] for r in results if r["created"]}):
         lines.append(line(f"  {month}", agreement(
             [r for r in results if r["created"][:7] == month])))
+    lines.extend(eligibility(results))
     return lines
+
+
+def eligibility(results: list[dict[str, Any]], shown: int = 10) -> list[str]:
+    """How many of these real, decided rows the same request judged not
+    eligible (P < 0.5) — each one a listing a generic sweep would have dropped
+    — with the lowest-scoring few named."""
+    judged = [r for r in results if r.get("eligible") is not None]
+    if not judged:
+        return []
+    low = sorted((r for r in judged if r["eligible"] < MIN_ELIGIBLE), key=lambda r: r["eligible"])
+    scores = sorted(r["eligible"] for r in judged)
+    median = scores[len(scores) // 2]
+    out = [f"\nnot eligible (P < {MIN_ELIGIBLE}): {len(low)} of {len(judged)} "
+           f"({len(low) / len(judged):.1%}); median P(eligible) {median:.2f}"]
+    out += [f"  {r['eligible']:.2f}  {r['label'] or '?':6}  {(r.get('title') or '')[:70]}"
+            for r in low[:shown]]
+    return out
 
 
 # ── the run ─────────────────────────────────────────────────────────────────
@@ -190,8 +218,9 @@ async def dump(client, db_id: str) -> tuple[dict[str, Any], list[dict[str, Any]]
         cursor = data.get("next_cursor")
 
 
-async def judge(rows: list[dict[str, Any]], triager: Triager, concurrency: int,
+async def judge(rows: list[dict[str, Any]], client, triager: Triager, concurrency: int,
                 out: Path | None) -> tuple[list[dict[str, Any]], int]:
+    """Each row's one request, as a sweep makes it: eligible and triage together."""
     sem = asyncio.Semaphore(max(1, concurrency))
     results: list[dict[str, Any]] = []
     failed = 0
@@ -202,14 +231,16 @@ async def judge(rows: list[dict[str, Any]], triager: Triager, concurrency: int,
         nonlocal failed, done
         async with sem:
             try:
-                decision = await triager.card(row["listing"])
+                answer = await ask(client, row["listing"], triager)
             except TypeSafeError as exc:
                 failed += 1
                 print(f"  no answer for {row['id']}: {exc}", file=sys.stderr)
                 return
+        decision = answer.triage
         result = {"id": row["id"], "created": row["created"], "label": row["label"],
+                  "title": row["listing"].title,
                   "jev": decision.decision, "p_review": round(decision.p_review, 4),
-                  "model": decision.model}
+                  "eligible": round(answer.eligible, 4), "model": decision.model}
         results.append(result)
         if handle:
             handle.write(json.dumps(result) + "\n")
@@ -232,7 +263,7 @@ async def main() -> int:
     ap.add_argument("--since", help="also report rows created on or after YYYY-MM-DD")
     ap.add_argument("--limit", type=int, help="judge at most this many rows")
     ap.add_argument("--sample", type=int, help="judge a random sample of this many rows")
-    ap.add_argument("--concurrency", type=int, default=8)
+    ap.add_argument("--concurrency", type=int, default=TYPESAFE_PARALLEL)
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--column", action="append", default=[], metavar="KEY=NAME",
                     help="read a field from a differently named column")
@@ -277,7 +308,7 @@ async def main() -> int:
     triager = Triager(client, prompt)
     print(f"judging {len(rows)} decided rows with criteria version {triager.version} "
           f"({a.model})")
-    results, failed = await judge(rows, triager, a.concurrency, a.out)
+    results, failed = await judge(rows, client, triager, a.concurrency, a.out)
 
     print()
     for text in report(results, a.since):

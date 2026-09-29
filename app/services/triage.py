@@ -25,6 +25,17 @@ template — the decision, P(review), and what it was decided on — not prose.
 **`criteria_version`** is the first 8 hex characters of the criteria text's
 sha256: a row triaged under different words says so, and changing one comma
 changes it, which is the point — the row records exactly which text judged it.
+
+**At the card stage the question rides in the listing's one request**
+(`legibility.ask`): the sweep asks every question about one listing element
+together — is it a business for sale now, and REVIEW or REJECT — in one
+request whose state is that card. One listing per request, never several:
+bundling 5–10 listings (the criteria sent once, in the state) cut input
+tokens to ~30%, but agreement with Bot Triage fell from 96% to 93% on
+current-criteria rows — about three times as many false REVIEWs. Adding the
+eligibility question to the same request changed none of 219 answers
+(96.3% agreement either way) for 4% more input tokens. The detail stage
+asks this question alone, on the card and the detail page.
 """
 from __future__ import annotations
 
@@ -50,14 +61,6 @@ CRITERIA: dict[str, str] = {
 }
 REVIEW, REJECT = "REVIEW", "REJECT"
 REJECT_THRESHOLD = 0.5
-
-# Listings per classifier request at the card stage. Bundling 5–10 listings per
-# request (the criteria sent once, in the state) cut input tokens to ~30%, but
-# agreement with Bot Triage fell from 96% to 93% on current-criteria rows — about
-# three times as many false REVIEWs, each costing a detail-page read and a
-# person's attention. So card-stage triage stays one listing per request; this
-# is the one number to change if that trade is ever worth revisiting.
-TRIAGE_BATCH = 1
 
 # The detail page's text, at most. The classifier reads ~32k tokens per question
 # and the criteria and card take a few thousand of them; 60k characters of
@@ -173,11 +176,14 @@ class TriageDecision:
 
 
 class Triager:
-    """Asks the one triage question with one criteria text.
+    """The one triage question with one criteria text.
 
     Built per sweep (or per evaluation run) over the shared TypeSafe client, so
-    the client's concurrency ceiling is the only one. Raises the client's
-    TypeSafeError when it cannot answer; what that means is the caller's call.
+    the client's concurrency ceiling is the only one. At the card stage the
+    question goes out inside the listing's one request (`question`, read back
+    with `decision`); at the detail stage `detail` asks it on its own. Raises
+    the client's TypeSafeError when it cannot answer; what that means is the
+    caller's call.
     """
 
     def __init__(self, typesafe, prompt: str) -> None:
@@ -188,16 +194,19 @@ class Triager:
         self.version = criteria_version(self.prompt)
         self._instructions = instructions(self.prompt)
 
-    async def card(self, listing: Listing) -> TriageDecision:
-        """The decision on the card alone."""
-        return await self._decide(card_state(listing), STAGE_CARD)
+    def question(self) -> dict[str, Any]:
+        """The triage question, for a request that asks it alongside others."""
+        return {"type": "choice", "instructions": self._instructions,
+                "criteria": dict(CRITERIA)}
 
     async def detail(self, listing: Listing, markdown: str) -> TriageDecision:
         """The decision on the card and the detail page's text."""
-        return await self._decide(detail_state(listing, markdown), STAGE_DETAIL)
+        answer = await self._typesafe.choice(detail_state(listing, markdown),
+                                             self._instructions, CRITERIA)
+        return self.decision(answer, STAGE_DETAIL)
 
-    async def _decide(self, state: dict[str, str], stage: str) -> TriageDecision:
-        answer = await self._typesafe.choice(state, self._instructions, CRITERIA)
+    def decision(self, answer, stage: str) -> TriageDecision:
+        """The decision a choice answer (`Choice`) to `question` makes."""
         probs = answer.probabilities or {}
         if REJECT in probs:
             p_reject = float(probs[REJECT])

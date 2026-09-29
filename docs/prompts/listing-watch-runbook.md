@@ -71,10 +71,15 @@ call `archive_page` for these rows: the sweep has already done both.
 
 ## What the sweep does
 
+- Asks one question per listing it has not seen before: is it a business currently for
+  sale — and, in the same request, `REVIEW` or `REJECT` on its card. On sites other than
+  BizBuySell a listing that is sold, pending, under contract or not a listing at all is left
+  out and never saved; the `summary` counts them ("N left out as not currently for sale /
+  not listings").
 - Saves new rows, skipping listings already in the database.
 - Decides `REVIEW` or `REJECT` for every new row, and for every row it saw whose Bot Triage
   is still blank (rows an earlier run could not finish). A row with any Bot Triage value is
-  never judged again.
+  never judged again, nor asked about.
 - Reads each card `REVIEW` on its detail page. A real page is judged again; a `REVIEW` gets
   the page appended as a Source Content section, a `REJECT` gets nothing appended. A login
   or NDA wall, removed listing, or error page keeps the card's `REVIEW` with nothing
@@ -103,7 +108,8 @@ call `archive_page` for these rows: the sweep has already done both.
 Use counts from the actual results, and make uncertainty visible:
 
 - active source count, successful source count, and failed source URLs with their errors;
-- newly inserted rows (`synced.new`) and existing rows (`synced.existing`);
+- newly inserted rows (`synced.new`) and existing rows (`synced.existing`), and how many
+  listings were left out as not currently for sale (from `summary`), if any;
 - REVIEW and REJECT counts (`triage.review`, `triage.reject`), and how many earlier blank
   rows were decided (`triage.backlog`);
 - rows left undecided, each with its URL and error, and `triage.error` if set;

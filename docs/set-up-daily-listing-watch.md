@@ -227,6 +227,10 @@ interesting,” or “probably manageable.” Save subjective ranking for human 
 
 The scraper applies them this way:
 
+- A listing that is not currently for sale — sold, pending, under contract — or is not a
+  listing at all (a menu link, an ad) is left out on sites other than BizBuySell, before
+  anything is saved; you do not need a criterion for it. The same one request per listing
+  asks this and your criteria together.
 - **REJECT** only when a written criterion clearly fails.
 - **REVIEW** when the listing passes, the evidence conflicts, or a required fact is
   missing.
@@ -465,6 +469,11 @@ That first response is expected. `scrape_listings` is asynchronous. The agent mu
 With `sync=true`, listings already present in Notion are counted as existing and omitted from
 the returned `listings` array. On the existing row the scraper refreshes only `Last Synced At`
 and `Excerpt` (from the live card); every other column is left as it was.
+
+On sites other than BizBuySell, a listing judged not currently for sale (sold, pending, under
+contract) or not a listing at all is left out before saving, and the sweep's `summary` counts
+it. The sweep's **Details** (Tasks → History) name the first ten under `legibility` →
+`eligibility` → `not_eligible_listings`, with the classifier's probability for each.
 
 ### A row stays blank in Needs Triage
 

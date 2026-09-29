@@ -1316,6 +1316,31 @@ class TestTheSyncReadsBotTriage:
 
     @respx.mock
     @pytest.mark.asyncio
+    async def test_the_index_says_which_known_rows_are_blank(self):
+        """Read once before a sweep's first page, so the page loop can ask only
+        about new listings and blank rows: the same read, the same rule."""
+        mock_db({**FULL_SCHEMA, **TRIAGE_SCHEMA})
+        mock_query([
+            triage_row("p1", "1", _url(1), None),
+            triage_row("p2", "2", _url(2), "REVIEW"),
+            triage_row("p3", "", _url(3), "Maybe"),
+        ])
+        index = await NotionStore(TOKEN).index(DB)
+        assert index.decision(known(1)) == "", "read and blank"
+        assert index.decision(known(2)) == "REVIEW"
+        assert index.decision(listing(normalized_url=_url(3))) == "Maybe", "found by URL"
+        assert index.decision(known(9)) is None, "not stored"
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_an_index_without_the_column_knows_no_decisions(self):
+        mock_db(FULL_SCHEMA)
+        mock_query([row("p1", "1", _url(1))])
+        index = await NotionStore(TOKEN).index(DB)
+        assert index.contains(known(1)) and index.decision(known(1)) is None
+
+    @respx.mock
+    @pytest.mark.asyncio
     async def test_a_column_that_was_not_read_never_reads_as_blank(self):
         """Unmapped Bot Triage means "not read", which must not become "every
         known row is blank" — that would triage (and overwrite) them all."""

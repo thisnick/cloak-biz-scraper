@@ -4,9 +4,11 @@ The unit tests drive `GenericSource` with canned probe output and a fake
 classifier, which pins the contract but not the thing that matters: whether, on
 real pages it was never tuned to, the TypeSafe Classifier (e.g. Jev) picks the
 list of businesses (and "none" where there is none), names the fields, and finds
-the next page. This script answers that, page by page, and prints what a site
-override pinning those decisions would look like. It is not run in CI: it needs
-a browser, the live sites and an OpenRouter key.
+the next page — and whether each card it read is a business for sale now, asked
+the way a sweep asks it (one request per card, `legibility.ListingCheck`, as
+with sync=false: every card is new). This script answers that, page by page,
+and prints what a site override pinning those decisions would look like. It is
+not run in CI: it needs a browser, the live sites and an OpenRouter key.
 
     set -a; source .env; set +a          # OPENROUTER_API_KEY — never printed
     python scripts/eval_sources.py https://www.websiteclosers.com/businesses-for-sale/ --pages 2
@@ -45,6 +47,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.services import legibility  # noqa: E402
 from app.services.blocker import text_contains_blocker  # noqa: E402
+from app.services.legibility import ListingCheck  # noqa: E402
 from app.services.typesafe import DEFAULT_MODEL, TypeSafeClient  # noqa: E402
 from app.sources import owner_of  # noqa: E402
 from app.sources.generic import GenericSource  # noqa: E402
@@ -61,8 +64,10 @@ async def evaluate(context, url: str, *, classifier, pages: int, wait_ms: int,
     """Read up to `pages` pages of `url` the way a sweep does, in a new tab.
 
     Returns {url, pages: [{n, url, seconds, record, listings, legibility, fresh,
-    blocked, error}], error, suggested_override}. Never raises: one site failing
-    must not end an evaluation of twenty.
+    blocked, error}], error, suggested_override}. `legibility` is the page's
+    code checks and its cards' eligibility (`eligibility`), as a sweep records
+    them; `listings` are the cards the page keeps. Never raises: one site
+    failing must not end an evaluation of twenty.
     """
     out: dict[str, Any] = {"url": url, "pages": [], "error": None, "suggested_override": None}
     page = await context.new_page()
@@ -71,6 +76,8 @@ async def evaluate(context, url: str, *, classifier, pages: int, wait_ms: int,
             await _serve_fixtures(page, fixtures)
         source = GenericSource(url, classifier, override_for(url, overrides or []))
         source.begin()
+        # One per URL, as one sweep of it: a card seen on two pages is asked once.
+        cards_check = ListingCheck(classifier)
         seen: set[str] = set()
         for n in range(1, pages + 1):
             started = time.monotonic()
@@ -89,8 +96,17 @@ async def evaluate(context, url: str, *, classifier, pages: int, wait_ms: int,
             if result.blocked or text_contains_blocker(result.title):
                 entry["blocked"] = True
             elif not result.error and result.listings:
-                verdict = await legibility.check(result.listings, page=n, classifier=classifier)
-                entry["legibility"] = verdict.record(n)
+                verdict = legibility.check(result.listings, page=n)
+                record = verdict.record(n)
+                if verdict.ok:
+                    judged = await cards_check.page(verdict.listings, page=n,
+                                                    drop=GenericSource.chooses_cards)
+                    record["eligibility"] = judged.record
+                    record.update(ok=judged.ok, kept=len(judged.listings))
+                    if judged.reason:
+                        record["reason"] = judged.reason
+                    entry["listings"] = [_listing_row(item) for item in judged.listings]
+                entry["legibility"] = record
             urls = [item.url for item in result.listings] + list(result.seen_urls or ())
             fresh = [u for u in dict.fromkeys(urls) if u not in seen]
             seen.update(urls)
@@ -170,8 +186,8 @@ def _print_page(entry: dict[str, Any]) -> None:
     if entry["error"]:
         print(f"    error     {entry['error']}")
         return
-    print(f"    cards     {rec.get('cards', 0)} on the list · {rec.get('kept', 0)} kept · "
-          f"{rec.get('dropped_unavailable', 0)} dropped as unavailable · {entry['fresh']} new")
+    print(f"    cards     {rec.get('cards', 0)} on the list · {rec.get('kept', 0)} read · "
+          f"{rec.get('dropped_unavailable', 0)} dropped by drop_status · {entry['fresh']} new")
     for i, field in enumerate(rec.get("fields") or []):
         label = "fields" if i == 0 else ""
         conf = f" {field['confidence']:.2f}" if "confidence" in field else ""
@@ -195,16 +211,20 @@ def _print_page(entry: dict[str, Any]) -> None:
     leg = entry["legibility"]
     if leg:
         judged = ""
-        if leg.get("classifier_asked"):
-            judged = (f" · classifier dropped {leg['classifier_dropped']} of "
-                      f"{leg['classifier_asked']} (mean {leg.get('classifier_mean', 0):.2f})")
+        eligibility = leg.get("eligibility") or {}
+        if eligibility.get("asked"):
+            judged = (f" · {eligibility['not_eligible']} of {eligibility['answered']} not for "
+                      f"sale now, {eligibility['dropped']} dropped")
         state = "ok" if leg["ok"] else f"FAILED: {leg.get('reason', '')}"
-        print(f"    legible   {state} · kept {leg['kept']} · dropped {leg['dropped']}{judged}")
-        for reject in leg.get("classifier_rejected") or []:
-            print(f"              not a listing: {reject['title'] or '(no title)'} "
+        print(f"    legible   {state} · kept {leg['kept']} · no title/link {leg['dropped']}"
+              f"{judged}")
+        for reject in eligibility.get("not_eligible_listings") or []:
+            print(f"              not for sale: {reject['title'] or '(no title)'} "
                   f"p={reject['p']:.2f}")
-        if leg.get("classifier_error"):
-            print(f"              classifier skipped: {leg['classifier_error']}")
+        if eligibility.get("stopped"):
+            print(f"              classifier stopped: {eligibility['stopped']}")
+        if eligibility.get("errors"):
+            print(f"              {eligibility['errors']} card(s) got no answer")
     for row in entry["listings"][:2]:
         print("    sample    " + " | ".join(
             row[k] or "–" for k in ("title", "location", "asking_price", "cashflow")))
@@ -218,7 +238,8 @@ def score(truth: dict[str, Any], res: dict[str, Any] | None, pages: int) -> dict
 
     The list is right when a chosen pattern contains any of the labelled
     substrings (or, labelled null, when no list was chosen); the page must also
-    have at least `min_cards` cards on its list and pass the legibility check.
+    have at least `min_cards` cards on its list and pass the legibility check
+    (the code checks and its cards' eligibility).
     The next-page rule must match its label (`none`, `click`, or a URL
     containing the `url:` substring); with `pages` ≥ 2 a labelled next page
     must also have been reached and shown new listings.

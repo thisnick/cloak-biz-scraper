@@ -58,10 +58,13 @@ _BACKOFF_SEC = 0.5
 # A Retry-After longer than this is a server asking us to go away for a while;
 # waiting it out inside one request would just look like a hang.
 _MAX_RETRY_AFTER_SEC = 20.0
-# In-flight requests per client. Triage and page decisions fan out (a question
-# per link group, per card, per row), and without a ceiling a 50-row sweep
-# would open 50 connections at once and earn 429s for all of them.
-_CONCURRENCY = 8
+# Classifier requests in flight at once — the one parallelism limit for
+# everything that asks the classifier. The client holds every caller to it
+# (one shared ceiling per process), and the callers that fan out — a sweep's
+# per-listing requests above all — gate themselves on the same number, so a
+# 50-listing page never opens 50 connections at once and earns 429s for all
+# of them, and an outage is met by at most this many requests.
+TYPESAFE_PARALLEL = 5
 # TypeSafe's documented ceiling for one choice question.
 _MAX_CHOICE_OPTIONS = 255
 # Upstream error text shown to a person, at most. Enough for "Model x does not
@@ -282,7 +285,7 @@ class TypeSafeClient:
         """
         loop = asyncio.get_running_loop()
         if self._sem is None or self._sem_loop is not loop:
-            self._sem = asyncio.Semaphore(_CONCURRENCY)
+            self._sem = asyncio.Semaphore(TYPESAFE_PARALLEL)
             self._sem_loop = loop
         return self._sem
 

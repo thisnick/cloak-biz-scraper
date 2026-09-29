@@ -102,6 +102,12 @@ class DedupeIndex:
 
     listing_ids: set[str] = field(default_factory=set)
     normalized_urls: set[str] = field(default_factory=set)
+    # Each stored row's triage decision, under the key it is found by: "" when
+    # it was read and is blank. A row whose decision was not read (the store
+    # has nowhere to keep one) is absent here, never "": "never read" and
+    # "blank" lead to opposite actions, exactly as for `UpsertResult.untriaged`.
+    decisions_by_id: dict[str, str] = field(default_factory=dict)
+    decisions_by_url: dict[str, str] = field(default_factory=dict)
 
     def contains(self, listing: Listing) -> bool:
         """True when this listing is already stored.
@@ -114,6 +120,16 @@ class DedupeIndex:
         if listing.listing_id and listing.listing_id in self.listing_ids:
             return True
         return bool(listing.normalized_url and listing.normalized_url in self.normalized_urls)
+
+    def decision(self, listing: Listing) -> str | None:
+        """The stored row's triage decision ("" when read and blank), found the
+        way `contains` finds the row — by listing id, then by normalized URL.
+        None when the listing is not stored or its decision was not read."""
+        if listing.listing_id and listing.listing_id in self.listing_ids:
+            return self.decisions_by_id.get(listing.listing_id)
+        if listing.normalized_url and listing.normalized_url in self.normalized_urls:
+            return self.decisions_by_url.get(listing.normalized_url)
+        return None
 
     def __len__(self) -> int:
         return len(self.listing_ids | self.normalized_urls)
@@ -208,7 +224,10 @@ class ListingStore(Protocol):
     async def index(
         self, db_id: str, column_map: "dict[str, str | None] | None" = None
     ) -> DedupeIndex:
-        """The dedupe keys already stored, read from the mapped columns."""
+        """The dedupe keys already stored, read from the mapped columns, with
+        each row's triage decision where the store keeps one. A synced sweep
+        reads this once, before its first page, to tell new listings from known
+        ones."""
         ...
 
     async def upsert_new(

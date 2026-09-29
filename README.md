@@ -241,8 +241,9 @@ parsed into numbers only when written to Notion.
 
 A synced sweep given a `triage_prompt` — your screening criteria as plain text — also
 triages, in the server: every new row, and every row it saw whose Bot Triage is still blank,
-is decided REVIEW or REJECT by the TypeSafe Classifier (e.g. Jev), first on the card and then,
-for a REVIEW, on the listing's detail page. A REVIEW row gets that page appended as a Source
+is decided REVIEW or REJECT by the TypeSafe Classifier (e.g. Jev), first on the card (in the
+same one request per listing that asks whether it is for sale now) and then, for a REVIEW,
+on the listing's detail page. A REVIEW row gets that page appended as a Source
 Content section before REVIEW is written; the decision, a templated reason, the time and a
 Criteria Version (a fingerprint of the text) go to the Bot Triage, Triage Reason, Triaged At
 and Criteria Version columns where they exist or are mapped. A row that already has a Bot
@@ -254,16 +255,21 @@ decides it. Without `triage_prompt` a sweep behaves exactly as before — see
 
 BizBuySell pages are read by their own adapters. A page on any other site is read
 generically: the list of listings is found by grouping the page's links, and the TypeSafe
-Classifier (e.g. Jev) decides which group is the list, what each card field holds, which
-statuses mean a business is gone, and how to reach the next page. The list and the fields are
-decided on a sweep's first page and reused for its later pages; the next page is decided on
-every page; nothing is remembered between sweeps.
-Without a key such a URL is refused with a pointer to Settings; a key that OpenRouter
-rejects or that is out of credits refuses the call before a job starts (in a batch that
-also has BizBuySell URLs, only the other sites fail). A first page with no list of
-businesses on it, or whose cards don't read as listings, fails that source with evidence
-rather than returning nothing; the same on a later page stops paging there, keeps the pages
-before it, and says so in the result's `error`. A BizBuySell page other than a search or
+Classifier (e.g. Jev) decides which group is the list, what each card field holds, and how
+to reach the next page. The list and the fields are decided on a sweep's first page and
+reused for its later pages; the next page is decided on every page; nothing is remembered
+between sweeps. Once a page is down to its listings, each listing the store does not have yet
+(or, when triaging, has with a blank Bot Triage) gets one request carrying every question
+about it: is it a business for sale now — not sold, pending or under contract, not a menu
+link or an ad — and, with a `triage_prompt`, REVIEW or REJECT. On other sites a listing that
+is not for sale now is left out and counted in the summary; BizBuySell's cards are always
+kept. Listings already decided in Notion cost nothing, and without a key nothing is asked.
+Without a key a URL on another site is refused with a pointer to Settings; a key that
+OpenRouter rejects or that is out of credits refuses the call before a job starts (in a
+batch that also has BizBuySell URLs, only the other sites fail). A first page with no list
+of businesses on it, or where fewer than half the listings read as businesses for sale now,
+fails that source with evidence rather than returning nothing; the same on a later page
+stops paging there, keeps the pages before it, and says so in the result's `error`. A BizBuySell page other than a search or
 broker profile never falls
 through to the generic reader. Listings from other sites carry their site as `source` and
 an empty `listing_id`. **Settings → Site overrides** pins any part of those decisions for

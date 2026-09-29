@@ -117,12 +117,13 @@ class FakeJev:
 
     `group` is a substring of the pattern to pick ("none" picks none). `fields`
     maps a field's label, or its first value, to (role, confidence); anything
-    else is "other" at 0.99. `status` maps a status value to P(gone); `next`
-    maps a link's URL, or text in its `appears_as`, to P(next page).
+    else is "other" at 0.99. `next` maps a link's URL, or text in its
+    `appears_as`, to P(next page). There is no fourth kind: whether a card is
+    for sale now is asked per card by the sweep (services/legibility.py).
     """
 
     def __init__(self, *, group: str = "/listing/", group_confidence: float = 0.97,
-                 fields=None, status=None, next=None, error: Exception | None = None,
+                 fields=None, next=None, error: Exception | None = None,
                  error_on: str | None = None):
         self.group = group
         self.group_confidence = group_confidence
@@ -132,7 +133,6 @@ class FakeJev:
             "Business 1": ("title", 0.96),
             "Austin, TX": ("location", 0.92),
         } if fields is None else fields
-        self.status = status or {}
         self.next = {NEXT_URL: 0.97} if next is None else next
         self.error = error
         self.error_on = error_on
@@ -143,7 +143,7 @@ class FakeJev:
         first = next(iter(questions))
         if first == "listing_group":
             return "group"
-        return {"field": "fields", "status": "status", "link": "next"}[first.split("_")[0]]
+        return {"field": "fields", "link": "next"}[first.split("_")[0]]
 
     def kinds(self) -> collections.Counter:
         return collections.Counter(kind for kind, _, _ in self.requests)
@@ -172,14 +172,10 @@ class FakeJev:
         for name in questions:
             field = state["fields"][name]
             label = field["text_just_before_this_field"]
-            first = field["values_on_three_cards"][0]
+            first = field["values_on_some_cards"][0]
             role, conf = self.fields.get(label) or self.fields.get(first) or ("other", 0.99)
             out[name] = Choice(role, {role: conf}, conf, "typesafe/jev-test")
         return out
-
-    def _status(self, state, questions):
-        return {name: Noul(self.status.get(state["statuses"][name], 0.02), "typesafe/jev-test")
-                for name in questions}
 
     def _next(self, state, questions):
         out = {}
@@ -733,11 +729,11 @@ class TestFields:
         assert state["example_listing_card"].startswith("Business 1 Austin, TX")
         assert state["fields"]["field_1"] == {
             "text_just_before_this_field": "Asking Price",
-            "values_on_three_cards": ["$1,100,000", "$1,200,000", "$1,300,000"],
+            "values_on_some_cards": ["$1,100,000", "$1,200,000", "$1,300,000", "$1,400,000"],
         }
-        slot = next(f for f in state["fields"].values() if f["values_on_three_cards"][0] == "Austin, TX")
+        slot = next(f for f in state["fields"].values() if f["values_on_some_cards"][0] == "Austin, TX")
         assert slot["text_just_before_this_field"] is None
-        assert slot["values_on_three_cards"] == ["Austin, TX"]
+        assert slot["values_on_some_cards"] == ["Austin, TX"]
         assert set(questions) == set(state["fields"]) and len(questions) == 4
         assert questions["field_3"]["instructions"] == (
             "Each listing card on this page has the fields in the state. What does field_3 hold?"
@@ -764,25 +760,46 @@ class TestFields:
         [(state, questions)] = jev.of("fields")
         for name, field in state["fields"].items():
             criteria = questions[name]["criteria"]
-            if field["values_on_three_cards"][0].startswith("$"):
+            if field["values_on_some_cards"][0].startswith("$"):
                 assert set(criteria) == {*MONEY_ROLES, "other"}
             else:
                 assert criteria == ROLES
             assert all(criteria[k] == ROLES[k] for k in criteria)
 
     @pytest.mark.asyncio
-    async def test_a_field_on_fewer_than_30_percent_of_cards_is_not_asked_about(self):
-        cards = [_card(n) for n in range(1, 11)]
-        cards[0]["labeled"]["EBITDA"] = "$90,000"
-        cards[1]["labeled"]["EBITDA"] = "$95,000"
-        cards[2]["labeled"]["EBITDA"] = "$99,000"
-        _, _, jev, _ = await _read(_probe([_group(cards=cards)]))
+    async def test_a_field_on_two_cards_is_asked_about_and_on_one_it_is_not(self):
+        """Two of twenty cards with an EBITDA is the list's EBITDA field (it
+        was below the old 30% bar); one card's own text is not a field."""
+        cards = [_card(n) for n in range(1, 21)]
+        cards[4]["labeled"]["EBITDA"] = "$90,000"
+        cards[15]["labeled"]["EBITDA"] = "$95,000"
+        jev = FakeJev(fields={**FakeJev().fields, "EBITDA": ("ebitda", 0.93)})
+        result, _, jev, _ = await _read(_probe([_group(cards=cards)]), jev)
         asked = [f["text_just_before_this_field"] for f in jev.of("fields")[0][0]["fields"].values()]
         assert "EBITDA" in asked
-        cards[2]["labeled"].pop("EBITDA")
+        assert [l.ebitda for l in result.listings if l.ebitda] == ["$90,000", "$95,000"]
+        cards[15]["labeled"].pop("EBITDA")
         _, _, jev, _ = await _read(_probe([_group(cards=cards)]))
         asked = [f["text_just_before_this_field"] for f in jev.of("fields")[0][0]["fields"].values()]
         assert "EBITDA" not in asked
+
+    @pytest.mark.asyncio
+    async def test_the_sample_values_are_spread_across_the_page(self):
+        """The first, the last and evenly between — not the first three, which
+        are often three of a kind (a page sorted by price, three "Featured")."""
+        cards = [_card(n) for n in range(1, 13)]
+        _, _, jev, _ = await _read(_probe([_group(cards=cards)]))
+        [(state, _)] = jev.of("fields")
+        asking = next(f for f in state["fields"].values()
+                      if f["text_just_before_this_field"] == "Asking Price")
+        assert asking["values_on_some_cards"] == [
+            "$1,100,000", "$1,400,000", "$1,700,000", "$1,900,000", "$1,1200,000"]
+        assert generic.FIELD_SAMPLES == 5 and generic.FIELD_MIN_CARDS == 2
+
+    def test_spread_keeps_order_and_distinct_values(self):
+        assert generic._spread(["a", "a", "b"], 5, None) == ["a", "b"]
+        assert generic._spread([str(i) for i in range(9)], 5, None) == ["0", "2", "4", "6", "8"]
+        assert generic._spread(["x" * 90], 5, 70) == ["x" * 70]
 
     @pytest.mark.asyncio
     async def test_an_unsure_answer_leaves_the_field_empty(self):
@@ -858,7 +875,7 @@ class TestFields:
         ]
 
 
-# ── unavailable listings ─────────────────────────────────────────────────────
+# ── status: read, never asked about ──────────────────────────────────────────
 
 
 def _with_status(*statuses: str) -> dict:
@@ -872,40 +889,23 @@ STATUS_FIELDS = {"Asking Price": ("asking_price", 0.97), "Business 1": ("title",
                  "Active": ("status", 0.95)}
 
 
-class TestUnavailable:
+class TestStatus:
+    """No request asks which statuses mean gone: whether a card is a business
+    for sale now is part of the sweep's one request per card, which drops the
+    sold, pending and under-contract ones (tests/test_scrape.py). A person's
+    `drop_status` still drops by the status field, asking nothing."""
+
     @pytest.mark.asyncio
-    async def test_gone_listings_are_dropped_but_still_seen(self):
-        jev = FakeJev(fields=STATUS_FIELDS, status={"Sold": 0.94, "Under Contract": 0.9})
-        result, source, _, _ = await _read(_with_status("Active", "Sold", "Active",
-                                                        "Under Contract"), jev)
-        assert [l.url for l in result.listings] == [f"{SITE}/listing/biz-1",
-                                                    f"{SITE}/listing/biz-3"]
-        assert result.seen_urls == [f"{SITE}/listing/biz-{n}" for n in range(1, 5)]
+    async def test_sold_cards_are_read_like_any_other_and_nothing_is_asked_about_them(self):
+        result, source, jev, _ = await _read(
+            _with_status("Active", "Sold", "Active", "Under Contract"), FakeJev(fields=STATUS_FIELDS))
+        assert set(jev.kinds()) == {"group", "fields"}, "no page, so no next-page request"
+        assert len(result.listings) == 4
         record = source.decisions[0]
-        assert (record["cards"], record["kept"], record["dropped_unavailable"]) == (4, 2, 2)
-        assert record["status"] == {
-            "by": "jev", "unavailable": ["Sold", "Under Contract"],
-            "values": {"Active": 0.02, "Sold": 0.94, "Under Contract": 0.9},
-        }
-
-    @pytest.mark.asyncio
-    async def test_every_distinct_status_is_one_yes_no_in_one_request(self):
-        jev = FakeJev(fields=STATUS_FIELDS)
-        await _read(_with_status("Active", "Sold", "Active", "Pending"), jev)
-        [(state, questions)] = jev.of("status")
-        assert state == {"statuses": {"status_1": "Active", "status_2": "Sold",
-                                      "status_3": "Pending"}}
-        assert questions["status_2"] == {
-            "type": "noul",
-            "instructions": ("status_2 in the state means the business is no longer available: "
-                             "sold, pending, or under contract"),
-        }
-
-    @pytest.mark.asyncio
-    async def test_no_status_field_means_no_status_request(self):
-        _, source, jev, _ = await _read(_probe())
-        assert "status" not in jev.kinds()
-        assert "status" not in source.decisions[0]
+        assert (record["cards"], record["kept"], record["dropped_unavailable"]) == (4, 4, 0)
+        assert "status" not in record
+        roles = {f["key"]: f["role"] for f in record["fields"]}
+        assert roles["div.card>span.badge#0"] == "status", "the field is still read"
 
     @pytest.mark.asyncio
     async def test_override_drop_status_matches_substrings_without_asking(self):
@@ -913,17 +913,27 @@ class TestUnavailable:
         jev = FakeJev(fields=STATUS_FIELDS)
         result, source, _, _ = await _read(
             _with_status("Active", "SOLD!", "Under Contract", "Pending"), jev, override)
-        assert "status" not in jev.kinds()
         assert [l.url.rsplit("-", 1)[1] for l in result.listings] == ["1", "4"]
-        assert source.decisions[0]["status"]["by"] == "override"
+        assert source.decisions[0]["status"] == {
+            "by": "override", "unavailable": ["SOLD!", "Under Contract"],
+            "values": ["Active", "SOLD!", "Under Contract", "Pending"]}
+
+    @pytest.mark.asyncio
+    async def test_dropped_cards_are_still_seen(self):
+        """A page of dropped cards is not the end of the feed."""
+        override = SiteOverride(match="brokers.example", drop_status=["sold"])
+        result, source, _, _ = await _read(
+            _with_status("Active", "Sold", "Sold", "Sold"), FakeJev(fields=STATUS_FIELDS), override)
+        assert [l.url for l in result.listings] == [f"{SITE}/listing/biz-1"]
+        assert result.seen_urls == [f"{SITE}/listing/biz-{n}" for n in range(1, 5)]
+        assert source.decisions[0]["dropped_unavailable"] == 3
 
     @pytest.mark.asyncio
     async def test_an_empty_drop_status_drops_nothing(self):
         override = SiteOverride(match="brokers.example", drop_status=[])
-        jev = FakeJev(fields=STATUS_FIELDS, status={"Sold": 0.99})
-        result, _, _, _ = await _read(_with_status("Active", "Sold", "Active"), jev, override)
+        result, _, _, _ = await _read(_with_status("Active", "Sold", "Active"),
+                                      FakeJev(fields=STATUS_FIELDS), override)
         assert len(result.listings) == 3
-        assert "status" not in jev.kinds()
 
 
 # ── next page ────────────────────────────────────────────────────────────────
@@ -1224,19 +1234,19 @@ class TestRequestsPerPage:
     async def test_each_decision_is_one_request_on_page_one_and_only_next_after(self):
         """Page 1 asks each question once; a later page with nothing new on it
         asks only for its own next page (see TestLaterPagesReuse)."""
-        jev = FakeJev(fields=STATUS_FIELDS, status={"Sold": 0.9})
+        jev = FakeJev(fields=STATUS_FIELDS)
         probe = _with_status("Active", "Sold", "Active", "Active")
         probe["pager"] = [_pager(1, NEXT_URL, "rel=next"), _pager(2, None, "text 'Load more'")]
         source = GenericSource(LIST_URL, jev)
         page = FakePage(probe)
         await source.cards(page)
-        assert jev.kinds() == {"group": 1, "fields": 1, "status": 1, "next": 1}
+        assert jev.kinds() == {"group": 1, "fields": 1, "next": 1}
         await source.advance(page, 2)
         await source.cards(page)
-        assert jev.kinds() == {"group": 1, "fields": 1, "status": 1, "next": 2}
+        assert jev.kinds() == {"group": 1, "fields": 1, "next": 2}
         await source.advance(page, 3)
         await source.cards(page)
-        assert jev.kinds() == {"group": 1, "fields": 1, "status": 1, "next": 3}
+        assert jev.kinds() == {"group": 1, "fields": 1, "next": 3}
 
 
 # ── the later pages of one sweep ─────────────────────────────────────────────
@@ -1464,22 +1474,26 @@ class TestLaterPagesReuse:
         assert sweep.source.suggested_override()["listing_links"] == [CONTACTS]
 
     @pytest.mark.asyncio
-    async def test_only_new_status_values_are_asked_about(self):
-        jev = FakeJev(fields=STATUS_FIELDS, status={"Sold": 0.94, "Pending": 0.8})
+    async def test_a_known_field_on_one_card_of_a_last_page_is_still_read(self):
+        """A field needs two cards to be asked about; one page 1 already named
+        is read wherever it appears — the one listing of a last page included."""
+        last = _card(9, labeled={"Asking Price": "$1,900,000", "Cash Flow": "$950,000"})
+        sweep = _Sweep(_probe(), _probe([_group(cards=[last], links=1), _nav()]))
+        _, second = await sweep.read_all()
+        assert (second.listings[0].asking_price, second.listings[0].cashflow) == (
+            "$1,900,000", "$950,000")
+        assert sweep.jev.kinds()["fields"] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_drop_status_override_applies_on_every_page(self):
+        override = SiteOverride(match="brokers.example", drop_status=["sold"])
         sweep = _Sweep(_with_status("Active", "Sold", "Active"),
-                       _with_status("Sold", "Pending", "Active"),
-                       _with_status("Active", "Pending", "Sold"), jev=jev)
-        _, second, third = await sweep.read_all()
-        assert jev.kinds()["status"] == 2
-        assert jev.of("status")[1][0] == {"statuses": {"status_1": "Pending"}}
-        assert [l.url for l in second.listings] == [f"{SITE}/listing/biz-3"]
-        assert sweep.source.decisions[1]["status"] == {
-            "by": "jev", "unavailable": ["Pending", "Sold"],
-            "values": {"Sold": 0.94, "Pending": 0.8, "Active": 0.02},
-            "reused": ["Sold", "Active"]}
-        assert sweep.source.decisions[2]["status"]["by"] == "pages 1, 2"
-        assert [l.url for l in third.listings] == [f"{SITE}/listing/biz-1"]
-        assert sweep.source.suggested_override()["drop_status"] == ["Sold", "Pending"]
+                       _with_status("Sold", "Active", "Active"),
+                       jev=FakeJev(fields=STATUS_FIELDS), override=override)
+        first, second = await sweep.read_all()
+        assert [l.url for l in first.listings] == [f"{SITE}/listing/biz-1", f"{SITE}/listing/biz-3"]
+        assert [l.url for l in second.listings] == [f"{SITE}/listing/biz-2", f"{SITE}/listing/biz-3"]
+        assert sweep.source.suggested_override()["drop_status"] == ["Sold"]
 
     @pytest.mark.asyncio
     async def test_overrides_still_win_on_every_page(self):
@@ -1642,12 +1656,13 @@ class TestSourceObject:
 
     @pytest.mark.asyncio
     async def test_the_suggested_override_is_valid_and_pins_what_was_decided(self):
-        jev = FakeJev(fields={**STATUS_FIELDS, "Cash Flow": ("cash_flow_sde", 0.5)},
-                      status={"Sold": 0.9})
+        jev = FakeJev(fields={**STATUS_FIELDS, "Cash Flow": ("cash_flow_sde", 0.5)})
         probe = _with_status("Active", "Sold", "Active")
         probe["pager"] = [_pager(1, NEXT_URL, "rel=next")]
         _, source, _, _ = await _read(probe, jev)
         suggested = source.suggested_override()
+        # No drop_status: nothing decided which statuses mean gone (the
+        # sweep's per-card request does, card by card).
         assert suggested == {
             "match": "brokers.example",
             "listing_links": [PATTERN],
@@ -1655,7 +1670,6 @@ class TestSourceObject:
                        "div.card>h3#0": "title", "div.card>p.loc#0": "other",
                        "div.card>span.badge#0": "status"},
             "next_page": f"{LIST_URL}page/{{page}}/",
-            "drop_status": ["Sold"],
         }
         pinned = SiteOverride(**suggested)
         # Pasted back, it answers every question itself.

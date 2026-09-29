@@ -158,9 +158,11 @@ class TestStateless:
         assert "BizBuySell only" not in description
         assert "read natively" in description
         assert "TypeSafe Classifier (e.g. Jev)" in description
-        assert "found no list of businesses for" in description
-        assert "don't read as business listings" in description
         flat = " ".join(description.split())
+        assert "found no list of businesses for sale" in flat
+        assert "read as business listings currently for sale" in flat
+        assert "sold, pending or under-contract listing" in flat
+        assert "BizBuySell's cards are always kept" in flat
         assert "The same on a LATER page stops that URL's paging there: the pages before it " \
                "are kept and returned" in flat
         assert "site override" in description and "Settings" in description

@@ -204,7 +204,10 @@ class SweepTask(TaskBase):
     # `adapter` (the source name, or None when the URL was refused), `pages`
     # (the generic reader's per-page decisions: which link pattern is the list
     # and who decided it, what each field holds, the next-page rule, what was
-    # dropped), `legibility` (each page's verdict), `suggested_override` (a
+    # dropped), `legibility` (each page's verdict: the code checks, and with a
+    # classifier key `eligibility` — how many cards were asked about, known,
+    # judged not for sale now and dropped, the first of those by title and
+    # probability, and why the classifier stopped if it did), `suggested_override` (a
     # paste-ready site override pinning what was decided, generic sources
     # only), and `error` when the source failed. For a person diagnosing a run
     # (/runs/{id}); deliberately not in ScrapeResult, which an agent polls.

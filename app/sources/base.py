@@ -86,12 +86,12 @@ class Source(Protocol):
       there is no next page, and paging stops.
     * `chooses_cards: bool` — True for a source that decides for itself which
       elements of a page it has never seen are the cards (the generic reader).
-      Only then may the legibility check drop single cards the classifier judges
-      not to be listings, and only then is an illegible page final rather than
-      retried from a new exit IP. A site adapter's cards are read by code
-      written for the page, so the classifier judges the page and never removes
-      one of them; and an adapter's page that reads wrong is most likely a soft
-      block served to a flagged IP.
+      Only then are single cards dropped that the per-listing request judges
+      not to be a business for sale now (services/legibility.py), and only
+      then is an illegible page final rather than retried from a new exit IP.
+      A site adapter's cards are read by code written for the page, so the
+      answers judge the page and never remove one of them; and an adapter's
+      page that reads wrong is most likely a soft block served to a flagged IP.
     """
 
     # Recorded on every Listing, and the value of the Notion `Source` column.

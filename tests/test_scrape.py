@@ -1258,6 +1258,8 @@ class TestPageFailures:
     async def test_the_classifier_is_asked_only_once_a_key_is_saved(
         self, settings, jobs, tmp_path,
     ):
+        """No key: no request at all — a BizBuySell sweep makes no classifier
+        call, as before the classifier existed. With one: a request per card."""
         from app.services.typesafe import Noul
 
         class Fake:
@@ -1270,38 +1272,66 @@ class TestPageFailures:
 
         fake = Fake()
         svc = self._svc(settings, jobs, None, typesafe=fake)
-        source = _PlainSource([CardPage([_gen(1), _gen(2)])])
-
-        res, _, _ = await _once(svc, _job(jobs, max_pages=1), source, tmp_path)
+        cards = [_gen(1), _gen(2), _gen(3)]
+        res, _, _ = await _once(svc, _job(jobs, max_pages=1), _PlainSource([CardPage(cards)]),
+                                tmp_path)
         assert fake.calls == 0, "no key saved: the code checks alone decide"
-        assert res["error"] is None
+        assert res["error"] is None and "eligibility" not in res["data"]["legibility"][0]
 
         settings.update(typesafe_openrouter_api_key="sk-or-test")
-        res, _, _ = await _once(svc, _job(jobs, max_pages=1), _PlainSource(
-            [CardPage([_gen(1), _gen(2)])]), tmp_path)
-        assert fake.calls == 1, "one request for the page's cards"
+        res, _, _ = await _once(svc, _job(jobs, max_pages=1), _PlainSource([CardPage(cards)]),
+                                tmp_path)
+        assert fake.calls == 3, "one request per card"
         assert res["retry"] is True, "an adapter's page that reads wrong gets a new exit IP"
-        assert "Only 0 of 2 cards on page 1 read as business listings" in res["error"]
+        assert ("Only 0 of 3 cards on page 1 read as business listings currently for sale"
+                in res["error"])
         assert (tmp_path / "ev" / "page-01-illegible").is_dir()
 
     @pytest.mark.asyncio
     async def test_a_classifier_outage_keeps_the_page(self, settings, jobs, tmp_path):
+        """A BizBuySell sweep keeps working while the classifier is down."""
         from app.services.typesafe import TypeSafeUnavailable
 
         class Down:
+            calls = 0
+
             async def ask(self, state, questions):
+                Down.calls += 1
+                await asyncio.sleep(0)  # in flight, as a real request is
                 raise TypeSafeUnavailable("The TypeSafe Classifier did not answer.")
 
         settings.update(typesafe_openrouter_api_key="sk-or-test")
         svc = self._svc(settings, jobs, None, typesafe=Down())
         res, _, _ = await _once(svc, _job(jobs, max_pages=1),
-                                _PlainSource([CardPage([_gen(1), _gen(2)])]), tmp_path)
+                                _PlainSource([CardPage([_gen(i) for i in range(8)])]), tmp_path)
 
         assert res["error"] is None
-        assert len(res["data"]["listings"]) == 2
-        assert "did not answer" in res["data"]["legibility"][0]["classifier_error"]
+        assert len(res["data"]["listings"]) == 8
+        assert Down.calls == 5, "the requests already in flight, and no more"
+        eligibility = res["data"]["legibility"][0]["eligibility"]
+        assert "did not answer" in eligibility["stopped"] and eligibility["unanswered"] == 8
         assert "did not answer" in _meta(tmp_path / "ev" / "final")["legibility"][0][
-            "classifier_error"], "recorded in the run's evidence"
+            "eligibility"]["stopped"], "recorded in the run's evidence"
+
+    @pytest.mark.asyncio
+    async def test_a_refused_request_on_a_bizbuysell_page_fails_nothing(
+        self, settings, jobs, tmp_path,
+    ):
+        """A 400 for one card is that card's; the page and its card are kept."""
+        from app.services.typesafe import Noul, TypeSafeError
+
+        class Picky:
+            async def ask(self, state, questions):
+                if state["title"] == "Business 2":
+                    raise TypeSafeError("The TypeSafe Classifier refused this request (HTTP 400).")
+                return {"eligible": Noul(0.9)}
+
+        settings.update(typesafe_openrouter_api_key="sk-or-test")
+        svc = self._svc(settings, jobs, None, typesafe=Picky())
+        res, _, _ = await _once(svc, _job(jobs, max_pages=1),
+                                _PlainSource([CardPage([_gen(i) for i in range(4)])]), tmp_path)
+        assert res["error"] is None and len(res["data"]["listings"]) == 4
+        assert res["data"]["legibility"][0]["eligibility"]["errors"] == 1
 
     @pytest.mark.asyncio
     async def test_cards_without_a_title_are_dropped_but_the_page_is_kept(
@@ -1317,22 +1347,25 @@ class TestPageFailures:
 
 
 class _TitleJudge:
-    """A classifier that scores each card of a legibility request by its title."""
+    """A classifier that answers each card's one request by its title: not
+    eligible for the titles in `low`, eligible otherwise."""
 
     def __init__(self, low: set[str]):
         self.low = low
         self.calls = 0
+        self.asked: list[str] = []
 
     async def ask(self, state, questions):
         from app.services.typesafe import Noul
 
         self.calls += 1
-        return {name: Noul(probability=0.05 if state["cards"][name]["title"] in self.low
-                           else 0.93) for name in questions}
+        self.asked.append(state["title"])
+        return {"eligible": Noul(probability=0.05 if state["title"] in self.low else 0.93)}
 
 
 class TestWhoMayDropCards:
-    """The classifier removes single cards only from a source that chose them."""
+    """A card judged not for sale now is removed only from a source that chose
+    the cards; an adapter's page is judged as a page."""
 
     @pytest.mark.asyncio
     async def test_bizbuysell_cards_are_never_dropped_one_by_one(self, settings, jobs, tmp_path):
@@ -1360,17 +1393,20 @@ class TestWhoMayDropCards:
         res, _, _ = await _once(svc, _job(jobs, max_pages=1), BizBuySellSerp(), tmp_path,
                                 page=SerpPage())
 
-        assert judge.calls == 1, "the page was judged"
+        assert judge.calls == 6, "one request per card"
         assert res["error"] is None
         assert [l.title for l in res["data"]["listings"]] == titles, "every card is kept"
         (check,) = res["data"]["legibility"]
-        assert (check["classifier_low"], check["classifier_dropped"], check["kept"]) == (2, 0, 6)
+        assert (check["eligibility"]["not_eligible"], check["eligibility"]["dropped"],
+                check["kept"]) == (2, 0, 6)
 
     @pytest.mark.asyncio
-    async def test_the_generic_reader_drops_what_it_misjudged_and_the_summary_says_so(
+    async def test_the_generic_reader_drops_what_is_not_for_sale_and_the_summary_says_so(
         self, settings, jobs, monkeypatch,
     ):
-        cards = ([_gen(0, title="Sell Your Business"), _gen(1, title="Login")]
+        """Menu links and sold tiles alike: there is no separate sold handling —
+        the per-listing request's eligibility is it."""
+        cards = ([_gen(0, title="Sell Your Business"), _gen(1, title="Pizzeria – Sold")]
                  + [_gen(i) for i in range(2, 8)])
         source = _ScriptedSource([CardPage(cards)])
         source.chooses_cards = True
@@ -1378,14 +1414,65 @@ class TestWhoMayDropCards:
         settings.update(typesafe_openrouter_api_key="sk-or-test")
         svc = ScrapeService(instances=_FakeInstances(), jobs=jobs, settings=settings,
                             store_factory=FakeStore, task_profiles=_Pool(),
-                            typesafe=_TitleJudge({"Sell Your Business", "Login"}))
+                            typesafe=_TitleJudge({"Sell Your Business", "Pizzeria – Sold"}))
         job = svc.start([LIST], max_pages=1)
         await _drain(svc)
 
         result = svc.result(job.id)
         assert result.status == "completed" and result.error is None
         assert len(result.listings) == 6
-        assert "2 card(s) left out for not reading as business listings" in result.summary
+        assert "Pizzeria – Sold" not in [l.title for l in result.listings]
+        assert "2 left out as not currently for sale / not listings" in result.summary
+        (entry,) = jobs.get(job.id).decisions
+        eligibility = entry["legibility"][0]["eligibility"]
+        assert eligibility["dropped"] == 2
+        assert eligibility["not_eligible_listings"] == [
+            {"title": "Sell Your Business", "p": 0.05}, {"title": "Pizzeria – Sold", "p": 0.05}]
+
+    @pytest.mark.asyncio
+    async def test_a_first_page_mostly_not_for_sale_fails_its_url(
+        self, settings, jobs, monkeypatch,
+    ):
+        cards = [_gen(i, title=f"Sold {i}") for i in range(4)] + [_gen(9)]
+        source = _ScriptedSource([CardPage(cards)])
+        source.chooses_cards = True
+        monkeypatch.setattr("app.sources.for_url", lambda url: source)
+        settings.update(typesafe_openrouter_api_key="sk-or-test")
+        judge = _TitleJudge({f"Sold {i}" for i in range(4)})
+        instances = _FakeInstances()
+        svc = ScrapeService(instances=instances, jobs=jobs, settings=settings,
+                            store_factory=FakeStore, task_profiles=_Pool(), typesafe=judge)
+        job = svc.start([LIST], max_pages=2)
+        await _drain(svc)
+
+        result = svc.result(job.id)
+        assert result.status == "failed" and instances.launches == 1, "final, not retried"
+        assert ("Only 1 of 5 cards on page 1 read as business listings currently for sale"
+                in result.error)
+        assert (CONFIG.evidence_dir / job.id / "source-01" / "page-01-illegible").is_dir()
+
+    @pytest.mark.asyncio
+    async def test_a_later_page_mostly_not_for_sale_stops_paging_and_keeps_the_rest(
+        self, settings, jobs, monkeypatch,
+    ):
+        """An infinite scroll that runs from its listings into its sold ones."""
+        sold = [_gen(i, title=f"Sold {i}") for i in range(10, 14)]
+        source = _ScriptedSource([CardPage([_gen(1), _gen(2), _gen(3)]), CardPage(sold),
+                                  CardPage([_gen(4)])])
+        source.chooses_cards = True
+        monkeypatch.setattr("app.sources.for_url", lambda url: source)
+        settings.update(typesafe_openrouter_api_key="sk-or-test")
+        svc = ScrapeService(instances=_FakeInstances(), jobs=jobs, settings=settings,
+                            store_factory=FakeStore, task_profiles=_Pool(),
+                            typesafe=_TitleJudge({s.title for s in sold}))
+        job = svc.start([LIST], max_pages=3)
+        await _drain(svc)
+
+        result = svc.result(job.id)
+        assert result.status == "completed" and source.reads == 2
+        assert [l.url for l in result.listings] == [_gen(i).url for i in (1, 2, 3)]
+        assert "stopped at page 2 and kept the 3 listing(s) from page 1: Only 0 of 4 cards" \
+            in result.error
 
 
 # ── which source reads a URL, the classifier preflight, and diagnostics ──────
@@ -1755,17 +1842,20 @@ class TestDecisions:
 
 # ── triage ───────────────────────────────────────────────────────────────────
 #
-# The pipeline after a synced sweep that was given a triage_prompt, with every
-# collaborator faked: the classifier answers by listing title, the archive's
-# `read` serves a page per URL and its `append` records the write, and the store
-# records each decision. They share one `events` log, so the ORDER of writes —
-# the part of this that matters most — is asserted directly.
+# A synced sweep that was given a triage_prompt, from its page loop to its last
+# write, with every collaborator faked: the page loop runs for real over one
+# scripted page of cards, the classifier answers each card's one request (and
+# the guard and the detail question) by listing title, the archive's `read`
+# serves a page per URL and its `append` records the write, and the store
+# serves its index and records each decision. They share one `events` log, so
+# the ORDER of writes — the part of this that matters most — is asserted
+# directly.
 
 import dataclasses  # noqa: E402
 from pathlib import Path  # noqa: E402
 
 from app.services.archive import GUARD_QUESTION, PageRead, guard_state  # noqa: E402
-from app.services.triage import criteria_version  # noqa: E402
+from app.services.triage import CRITERIA, criteria_version  # noqa: E402
 from app.services.typesafe import (  # noqa: E402
     Choice,
     TypeSafeAuthError,
@@ -1775,7 +1865,8 @@ from app.services.typesafe import (  # noqa: E402
     TypeSafeNotConfigured,
     TypeSafeUnavailable,
 )
-from app.stores.base import TriageTarget, TriageUnavailable  # noqa: E402
+from app.stores.base import DedupeIndex, TriageTarget, TriageUnavailable  # noqa: E402
+from app.services.typesafe import TYPESAFE_PARALLEL, Noul  # noqa: E402
 
 PROMPT = "Reject restaurants.\nReject if the asking price is below $1M."
 OUTAGE = "The TypeSafe Classifier did not answer after 4 attempts (HTTP 503)."
@@ -1812,9 +1903,14 @@ class TriageStore:
         self.fail_writes = set(fail_writes)
         self.prepare_error = prepare_error
         self.prepared = 0
+        self.index_reads = 0
         self.client = object()
         self.writes: list[dict] = []
         self.statuses: list[str] = []
+
+    async def index(self, db_id, column_map=None):
+        self.index_reads += 1
+        return DedupeIndex(listing_ids=set(self.existing), decisions_by_id=dict(self.existing))
 
     async def upsert_new(self, db_id, listings, column_map=None):
         new, untriaged, existing = [], [], 0
@@ -1849,19 +1945,22 @@ class TriageStore:
 
 class TriageClassifier:
     """Answers by listing title: `card`/`detail` give P(review) per title
-    (default 0.9), `guard` gives P(real content) per title (default 0.96).
-    A (stage, title) in `down` makes the classifier fail at that question with
-    `down_error` (an outage by default); one in `refuse` makes it refuse that
-    one request (a plain TypeSafeError, e.g. a 400). Every answer yields to the
-    loop first, as a real request does — without that, questions started "at
-    once" would each run to completion before the next began."""
+    (default 0.9), `eligible` P(a business for sale now) (default 0.95),
+    `guard` P(real content) (default 0.96). A card's one request is recorded
+    as stage "card" when it carries the triage question and "eligible" when it
+    does not. A (stage, title) in `down` makes the classifier fail at that
+    request with `down_error` (an outage by default); one in `refuse` makes it
+    refuse that one request (a plain TypeSafeError, e.g. a 400). Every answer
+    yields to the loop first, as a real request does — without that, requests
+    started "at once" would each run to completion before the next began."""
 
     def __init__(self, events, *, card=None, detail=None, guard=None, down=(), check_error=None,
-                 refuse=(), down_error=None):
+                 refuse=(), down_error=None, eligible=None):
         self.events = events
         self.card = dict(card or {})
         self.detail = dict(detail or {})
         self.guard = dict(guard or {})
+        self.eligible = dict(eligible or {})
         self.down = set(down)
         self.refuse = set(refuse)
         self.down_error = down_error or TypeSafeUnavailable(OUTAGE)
@@ -1875,8 +1974,35 @@ class TriageClassifier:
             return TypeSafeCheck(ok=True, message="Working: jev answered in 90 ms.")
         return TypeSafeCheck(ok=False, message=str(self.check_error), error=self.check_error)
 
+    async def ask(self, state, questions):
+        """A card's one request: eligible, and the triage question when asked."""
+        stage = "card" if "triage" in questions else "eligible"
+        title = state["title"]
+        assert "detail_page_text" not in state, "the card, and only the card"
+        self.asked.append((stage, title))
+        self.events.append(("ask", stage, title))
+        await asyncio.sleep(0)
+        if (stage, title) in self.down:
+            raise self.down_error
+        if (stage, title) in self.refuse:
+            raise TypeSafeError(REFUSED)
+        out = {"eligible": Noul(self.eligible.get(title, 0.95), "typesafe/jev-test")}
+        if "triage" in questions:
+            q = questions["triage"]
+            out["triage"] = self._choice(self.card, title)
+            assert q["criteria"] == CRITERIA and q["instructions"].endswith(PROMPT)
+        return out
+
+    def _choice(self, table, title):
+        p = table.get(title, 0.9)
+        return Choice(choice="REVIEW" if p > 0.5 else "REJECT",
+                      probabilities={"REVIEW": p, "REJECT": round(1 - p, 6)},
+                      confidence=max(p, 1 - p), model="typesafe/jev-test")
+
     async def choice(self, state, instructions, criteria):
-        stage = "detail" if "detail_page_text" in state else "card"
+        # Only the detail stage asks the triage question on its own.
+        assert "detail_page_text" in state, "the card stage rides in the card's one request"
+        stage = "detail"
         title = state["title"]
         self.asked.append((stage, title))
         self.events.append(("ask", stage, title))
@@ -1885,10 +2011,7 @@ class TriageClassifier:
             raise self.down_error
         if (stage, title) in self.refuse:
             raise TypeSafeError(REFUSED)
-        p = (self.card if stage == "card" else self.detail).get(title, 0.9)
-        return Choice(choice="REVIEW" if p > 0.5 else "REJECT",
-                      probabilities={"REVIEW": p, "REJECT": round(1 - p, 6)},
-                      confidence=max(p, 1 - p), model="typesafe/jev-test")
+        return self._choice(self.detail, title)
 
     async def noul(self, state, instructions):
         # The guard is its own question: only the page's text, only the guard.
@@ -1942,12 +2065,13 @@ class TriageArchive:
 
 
 class Rig:
-    """A ScrapeService wired for triage, with every collaborator above."""
+    """A ScrapeService wired for triage, with every collaborator above. Each
+    URL is swept by the real page loop over one page holding `listings`."""
 
     def __init__(self, settings, jobs, listings, *, key=True, notion=True, archive=True,
                  existing=None, fail_writes=(), prepare_error=None, card=None, detail=None,
                  guard=None, down=(), check_error=None, pages=None, fail_appends=(), hang=None,
-                 refuse=(), down_error=None):
+                 refuse=(), down_error=None, eligible=None, chooses_cards=False):
         if notion:
             settings.update(notion_api_token="ntn_x", notion_db_id="db-1")
         if key:
@@ -1965,7 +2089,7 @@ class Rig:
 
         self.classifier = TriageClassifier(self.events, card=card, detail=detail, guard=guard,
                                            down=down, check_error=check_error, refuse=refuse,
-                                           down_error=down_error)
+                                           down_error=down_error, eligible=eligible)
         self.archive = TriageArchive(self.events, jobs, {l.url: l.title for l in listings},
                                      pages=pages, fail_appends=fail_appends, hang=hang)
         self.svc = ScrapeService(instances=None, jobs=jobs, settings=settings,
@@ -1975,8 +2099,12 @@ class Rig:
 
         async def sweep(job, i, url, source, prog):
             self.swept += 1
-            return {"blocked": False, "error": None,
-                    "data": {"listings": list(self.listings), "pages_crawled": 1}}
+            page = _FakePage()
+            cards = _PlainSource([CardPage(list(self.listings))])
+            if chooses_cards:
+                cards.chooses_cards = True
+            return await self.svc._sweep_once(_FakeInst(1, page), page, job, url, cards,
+                                              self.svc._evidence_dir(job, i))
 
         self.svc._sweep = sweep
 
@@ -1987,6 +2115,102 @@ class Rig:
 
     def writes(self) -> dict[str, str]:
         return {w["row_id"]: w["decision"] for w in self.store.writes}
+
+    def asked(self, stage: str) -> list[str]:
+        return [title for s, title in self.classifier.asked if s == stage]
+
+
+class TestOneRequestPerListing:
+    """Once a page is down to its array of cards, every question about one card
+    is asked together, in one request whose state is that card — and only
+    about cards the store does not have, or has with a blank Bot Triage."""
+
+    @pytest.mark.asyncio
+    async def test_each_new_card_is_one_request_carrying_both_questions(self, settings, jobs):
+        rows = [_tl(1, "Taqueria"), _tl(2, "HVAC Services"), _tl(3, "Plumbing")]
+        rig = Rig(settings, jobs, rows, card={"Taqueria": 0.04})
+        result, _ = await rig.run()
+
+        assert rig.classifier.asked[:3] == [("card", t) for t in ("Taqueria", "HVAC Services",
+                                                                  "Plumbing")]
+        assert rig.asked("eligible") == [], "no second request for eligibility"
+        assert rig.asked("card") == ["Taqueria", "HVAC Services", "Plumbing"], (
+            "the triage phase reads the card decision; it does not ask again")
+        assert rig.writes()["row-t1"] == "REJECT"
+        assert rig.store.writes[0]["reason"] == "REJECT · P(review)=0.04 · card"
+        assert rig.asked("detail") == ["HVAC Services", "Plumbing"]
+        assert result.triage.ok and (result.triage.review, result.triage.reject) == (2, 1)
+
+    @pytest.mark.asyncio
+    async def test_known_rows_with_a_decision_cost_nothing_and_the_index_is_read_once(
+        self, settings, jobs,
+    ):
+        rows = [_tl(1, "Decided Row"), _tl(2, "Blank Row"), _tl(3, "New Row")]
+        rig = Rig(settings, jobs, rows, existing={"t1": "REJECT", "t2": ""})
+        result, _ = await rig.run(urls=(SERP, SERP2))
+
+        assert rig.store.index_reads == 1, "once per sweep, before the first page, not per URL"
+        assert sorted(rig.asked("card")) == ["Blank Row", "New Row"], (
+            "each asked once, though both URLs showed it")
+        assert "row-t1" not in rig.writes()
+        assert set(rig.writes()) == {"row-t2", "row-t3"}
+        assert [r.row_id for r in result.triage.backlog] == ["row-t2"]
+
+    @pytest.mark.asyncio
+    async def test_when_the_index_cannot_be_read_every_card_is_asked(self, settings, jobs):
+        rig = Rig(settings, jobs, [_tl(1, "Decided Row"), _tl(2, "New Row")],
+                  existing={"t1": "REJECT"})
+
+        async def broken(db_id, column_map=None):
+            raise RuntimeError("Notion is having a moment")
+
+        rig.store.index = broken
+        result, _ = await rig.run()
+        assert rig.asked("card") == ["Decided Row", "New Row"]
+        assert rig.writes() == {"row-t2": "REVIEW"}, "the upsert's own read still protects t1"
+        assert result.status == "completed"
+
+    @pytest.mark.asyncio
+    async def test_sync_false_asks_eligible_only_and_reads_no_store(self, settings, jobs):
+        rig = Rig(settings, jobs, [_tl(1, "A"), _tl(2, "B")], existing={"t1": "REJECT"})
+        job = await rig.svc.submit([SERP], sync=False)
+        await _drain(rig.svc)
+        assert rig.classifier.asked == [("eligible", "A"), ("eligible", "B")]
+        assert rig.stores_built == 0 and rig.store.index_reads == 0
+        assert len(rig.svc.result(job.id).listings) == 2
+
+    @pytest.mark.asyncio
+    async def test_without_a_key_nothing_is_asked_at_all(self, settings, jobs):
+        """A BizBuySell sweep with no key makes no classifier call, and reads
+        no index early: exactly as before the classifier existed."""
+        rig = Rig(settings, jobs, [_tl(1, "A"), _tl(2, "B")], key=False)
+        job = await rig.svc.submit([SERP], sync=True)
+        await _drain(rig.svc)
+        assert rig.classifier.asked == [] and rig.store.index_reads == 0
+        result = rig.svc.result(job.id)
+        assert result.status == "completed" and result.synced.new == 2
+
+    @pytest.mark.asyncio
+    async def test_a_generic_card_not_for_sale_is_neither_saved_nor_triaged(
+        self, settings, jobs,
+    ):
+        rows = [_tl(1, "Deli – Sold"), _tl(2, "HVAC"), _tl(3, "Plumbing"), _tl(4, "Bakery")]
+        rig = Rig(settings, jobs, rows, eligible={"Deli – Sold": 0.04}, chooses_cards=True)
+        result, _ = await rig.run()
+        assert result.synced.new == 3 and "row-t1" not in rig.writes()
+        assert rig.asked("detail") == ["HVAC", "Plumbing", "Bakery"]
+        assert "1 left out as not currently for sale / not listings" in result.summary
+
+    @pytest.mark.asyncio
+    async def test_a_bizbuysell_card_judged_not_for_sale_is_still_saved_and_triaged(
+        self, settings, jobs,
+    ):
+        rows = [_tl(1, "Deli – Owner Retiring"), _tl(2, "HVAC"), _tl(3, "Plumbing")]
+        rig = Rig(settings, jobs, rows, eligible={"Deli – Owner Retiring": 0.3},
+                  card={"Deli – Owner Retiring": 0.02})
+        result, _ = await rig.run()
+        assert result.synced.new == 3 and rig.writes()["row-t1"] == "REJECT"
+        assert "left out" not in result.summary
 
 
 class TestTriageDecisions:
@@ -2116,14 +2340,19 @@ class TestWhichRowsAreTriaged:
         assert result.synced.new == 1 and result.synced.existing == 1
 
     @pytest.mark.asyncio
-    async def test_without_a_prompt_nothing_is_asked_prepared_or_read(self, settings, jobs):
-        rig = Rig(settings, jobs, [_tl(1, "Anything")], existing={"t9": ""})
+    async def test_without_a_prompt_only_eligibility_is_asked_and_nothing_is_prepared(
+        self, settings, jobs,
+    ):
+        rig = Rig(settings, jobs, [_tl(1, "Anything"), _tl(9, "Known Blank")],
+                  existing={"t9": ""})
         job = await rig.svc.submit([SERP], sync=True)
         await _drain(rig.svc)
         result = rig.svc.result(job.id)
 
         assert rig.classifier.checks == 0, "a BizBuySell-only call never pays for a check"
-        assert rig.classifier.asked == [] and rig.store.prepared == 0
+        assert rig.classifier.asked == [("eligible", "Anything")], (
+            "the new card only, and no triage question: a blank Bot Triage matters to triage")
+        assert rig.store.prepared == 0
         assert rig.archive.reads == [] and rig.store.writes == []
         assert result.triage is None and job.triage is None
         assert result.listings[0].bot_triage == "" and "triaged" not in result.summary
@@ -2134,19 +2363,18 @@ class TestTriageFailures:
     async def test_an_outage_mid_run_completes_the_job_and_leaves_the_rest_blank(
         self, settings, jobs,
     ):
-        """Every row's question is started at once; only the ones already in
-        flight when the classifier went down are asked — the rest never spend
-        the client's retries on an outage."""
-        from app.services.scrape import TRIAGE_PARALLEL
-
-        titles = ["First", "Second"] + [f"Row {i}" for i in range(3, TRIAGE_PARALLEL + 6)]
+        """Every card's request is started at once, five at a time; only the
+        ones already in flight when the classifier went down are asked — the
+        rest never spend the client's retries on an outage. The page is kept,
+        the rows are saved, and what was decided before stays decided."""
+        titles = ["First", "Second"] + [f"Row {i}" for i in range(3, TYPESAFE_PARALLEL + 6)]
         rows = [_tl(i, t) for i, t in enumerate(titles, 1)]
         rig = Rig(settings, jobs, rows, card={"First": 0.05}, down={("card", "Second")})
         result, _ = await rig.run()
 
         assert rig.writes() == {"row-t1": "REJECT"}, "what was decided before it went down stays"
-        asked = [t for stage, t in rig.classifier.asked if stage == "card"]
-        assert asked == titles[:TRIAGE_PARALLEL], "no question after the outage"
+        assert rig.asked("card") == titles[:TYPESAFE_PARALLEL], "no request after the outage"
+        assert result.synced.new == len(rows), "every card was kept and saved"
         assert rig.archive.reads == []
         assert result.status == "completed", "the scrape and the save succeeded"
         assert result.triage.error == OUTAGE and not result.triage.ok
@@ -2286,7 +2514,10 @@ class TestOverlappingSweeps:
         assert other.triage.in_flight == 1 and other.triage.undecided == 0 and other.triage.ok
         assert other.triage.backlog == []
         assert "1 left to another sweep triaging them" in other.summary
-        assert rig.classifier.asked.count(("card", "Shared Row")) == 1, "asked by the first only"
+        # Each sweep's page loop asked its card's one request (the row was
+        # blank when each started); only the first judges its page and writes.
+        assert rig.asked("card") == ["Shared Row", "Shared Row"]
+        assert [u for u, _, _ in rig.archive.reads] == [_tl(1, "").url]
 
         release.set()
         await _drain(rig.svc)
@@ -2380,7 +2611,8 @@ class TestTriageLifecycle:
         rig = Rig(settings, jobs, [_tl(1, "Anything")])
         await rig.run()
         assert rig.stores_built == 1 and rig.store.prepared == 1
-        assert rig.events[0] == ("upsert",)
+        assert rig.store.index_reads == 1, "the index before the first page, on the same store"
+        assert [e for e in rig.events if e[0] != "ask"][0] == ("upsert",)
 
     @pytest.mark.asyncio
     async def test_start_with_a_prompt_prepares_the_target_in_the_run(self, settings, jobs):
@@ -2397,7 +2629,9 @@ class TestTriageLifecycle:
         rig.svc.start([SERP], sync=True, triage_prompt=PROMPT)
         await _drain(rig.svc)
         result = rig.svc.result(jobs.all()[0].id)
-        assert result.status == "completed" and rig.classifier.asked == []
+        assert result.status == "completed"
+        assert rig.asked("card") == [], "no triage question with nowhere to record the answer"
+        assert rig.asked("eligible") == ["Taqueria"]
         assert "no 'Bot Triage' column" in result.triage.error
         assert result.triage.undecided == 1
 
@@ -2440,7 +2674,7 @@ class TestTriageRefusals:
         result, job = await rig.run(prompt=prompt, sync=sync)
         assert result.status == "completed" and result.error is None
         assert result.triage is None and job.triage is None
-        assert rig.classifier.checks == 0 and rig.classifier.asked == []
+        assert rig.classifier.checks == 0 and rig.asked("card") == []
         assert rig.store.prepared == 0 and rig.store.writes == []
 
     @pytest.mark.asyncio

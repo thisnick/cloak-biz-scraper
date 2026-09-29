@@ -1,10 +1,12 @@
 """Site overrides: a person pinning part of how a generic listing page is read.
 
 The generic reader (`sources/generic.py`) decides everything about a page
-fresh, every time: which links are the listings, what each field on a card
-holds, which link is the next page, which statuses mean "gone". Nothing is
-remembered between sweeps, because a site that changes its layout would
-otherwise be read with last month's answers. An override is the one exception,
+fresh on every sweep: which links are the listings and what each field on a
+card holds (on the sweep's first page, reused for its later pages), and which
+link is the next page (on every page). Nothing is remembered between sweeps,
+because a site that changes its layout would otherwise be read with last
+month's answers. Whether each card is still for sale is asked per card by the
+sweep; `drop_status` is a person's deterministic rule for it on one site. An override is the one exception,
 and it is a person's, not the reader's: when a decision keeps coming out wrong
 for one site, whoever runs the scraper pins that part and the reader stops
 asking about it. Every part is optional — anything left out is still decided

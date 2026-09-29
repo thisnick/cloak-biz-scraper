@@ -15,7 +15,7 @@ import hashlib
 import pytest
 
 from app.models import Listing
-from app.services import triage
+from app.services import legibility, triage
 from app.services.triage import (
     CRITERIA,
     DETAIL_CHARS,
@@ -23,7 +23,6 @@ from app.services.triage import (
     STAGE_CARD,
     STAGE_CARD_ONLY,
     STAGE_DETAIL,
-    TRIAGE_BATCH,
     TriageDecision,
     Triager,
     card_state,
@@ -31,7 +30,7 @@ from app.services.triage import (
     detail_state,
     price_to_earnings,
 )
-from app.services.typesafe import Choice, TypeSafeUnavailable
+from app.services.typesafe import Choice, Noul, TypeSafeUnavailable
 
 PROMPT = "Reject restaurants.\nReject if asking price / SDE > 6.0."
 
@@ -47,7 +46,10 @@ def _listing(**fields) -> Listing:
 
 
 class FakeClassifier:
-    """Answers every choice question with fixed probabilities, and records it."""
+    """Answers every choice question with fixed probabilities, and records it —
+    asked alone (`choice`, the detail stage) or inside the listing's one
+    request (`ask`, the card stage, where it rides with the eligibility
+    question)."""
 
     def __init__(self, p_review: float = 0.9, *, probabilities=None, choice=None,
                  error: Exception | None = None, model: str = "typesafe/jev-test") -> None:
@@ -66,6 +68,16 @@ class FakeClassifier:
         picked = self._choice or (max(probs, key=probs.get) if probs else "REVIEW")
         return Choice(choice=picked, probabilities=dict(probs),
                       confidence=probs.get(picked, 0.0), model=self.model)
+
+    async def ask(self, state, questions):
+        triage_q = questions["triage"]
+        answer = await self.choice(state, triage_q["instructions"], triage_q["criteria"])
+        return {"eligible": Noul(0.9, self.model), "triage": answer}
+
+
+async def _card(triager: Triager, listing: Listing) -> TriageDecision:
+    """The card-stage decision, as a sweep gets it: from the listing's one request."""
+    return (await legibility.ask(triager._typesafe, listing, triager)).triage
 
 
 class TestTheState:
@@ -128,7 +140,7 @@ class TestTheQuestion:
     @pytest.mark.asyncio
     async def test_one_choice_question_with_the_fixed_lead_in_and_options(self):
         classifier = FakeClassifier()
-        await Triager(classifier, PROMPT + "\n\n").card(_listing())
+        await _card(Triager(classifier, PROMPT + "\n\n"), _listing())
 
         ((state, instructions, criteria),) = classifier.asked
         assert instructions == (
@@ -146,15 +158,18 @@ class TestTheQuestion:
     async def test_the_detail_stage_asks_the_same_question_about_more_text(self):
         classifier = FakeClassifier()
         triager = Triager(classifier, PROMPT)
-        await triager.card(_listing())
+        await _card(triager, _listing())
         await triager.detail(_listing(), "# HVAC\n\nRecurring maintenance contracts.")
         (card_q, detail_q) = classifier.asked
         assert card_q[1:] == detail_q[1:], "same instructions and options"
         assert detail_q[0]["detail_page_text"].startswith("# HVAC")
 
-    def test_one_listing_per_request_at_the_card_stage(self):
-        """Bundling cost 3 points of agreement (96% → 93%); see the constant."""
-        assert TRIAGE_BATCH == 1
+    def test_the_question_is_the_one_asked_alone_and_inside_a_listing_s_request(self):
+        """At the card stage it rides in the listing's one request, next to the
+        eligibility question — the same instructions and options either way."""
+        triager = Triager(FakeClassifier(), PROMPT)
+        assert triager.question() == {"type": "choice", "instructions": LEAD_IN + PROMPT,
+                                      "criteria": CRITERIA}
 
     def test_a_blank_prompt_is_refused(self):
         with pytest.raises(ValueError):
@@ -164,7 +179,9 @@ class TestTheQuestion:
     async def test_a_classifier_error_is_raised_for_the_caller_to_handle(self):
         triager = Triager(FakeClassifier(error=TypeSafeUnavailable("down")), PROMPT)
         with pytest.raises(TypeSafeUnavailable):
-            await triager.card(_listing())
+            await _card(triager, _listing())
+        with pytest.raises(TypeSafeUnavailable):
+            await triager.detail(_listing(), "page")
 
 
 class TestTheDecision:
@@ -173,7 +190,7 @@ class TestTheDecision:
         (0.91, "REVIEW"), (0.51, "REVIEW"), (0.5, "REJECT"), (0.04, "REJECT"),
     ])
     async def test_reject_when_p_reject_is_at_least_a_half(self, p_review, expected):
-        decision = await Triager(FakeClassifier(p_review), PROMPT).card(_listing())
+        decision = await _card(Triager(FakeClassifier(p_review), PROMPT), _listing())
         assert decision.decision == expected
         assert decision.p_review == pytest.approx(p_review)
 
@@ -182,22 +199,22 @@ class TestTheDecision:
         """An answer whose `choice` disagrees with its own probabilities is
         decided by the probabilities — the threshold is the rule."""
         classifier = FakeClassifier(probabilities={"REVIEW": 0.4, "REJECT": 0.6}, choice="REVIEW")
-        decision = await Triager(classifier, PROMPT).card(_listing())
+        decision = await _card(Triager(classifier, PROMPT), _listing())
         assert decision.decision == "REJECT"
 
     @pytest.mark.asyncio
     async def test_a_missing_probability_is_the_complement(self):
-        only_reject = await Triager(FakeClassifier(probabilities={"REJECT": 0.2}),
-                                    PROMPT).card(_listing())
+        only_reject = await _card(Triager(FakeClassifier(probabilities={"REJECT": 0.2}),
+                                          PROMPT), _listing())
         assert only_reject.decision == "REVIEW" and only_reject.p_review == pytest.approx(0.8)
-        only_review = await Triager(FakeClassifier(probabilities={"REVIEW": 0.3}),
-                                    PROMPT).card(_listing())
+        only_review = await _card(Triager(FakeClassifier(probabilities={"REVIEW": 0.3}),
+                                          PROMPT), _listing())
         assert only_review.decision == "REJECT" and only_review.p_review == pytest.approx(0.3)
 
     @pytest.mark.asyncio
     async def test_the_decision_carries_its_stage_version_and_model(self):
         triager = Triager(FakeClassifier(0.88), PROMPT)
-        card = await triager.card(_listing())
+        card = await _card(triager, _listing())
         detail = await triager.detail(_listing(), "page")
         assert card.stage == STAGE_CARD and detail.stage == STAGE_DETAIL
         assert card.criteria_version == criteria_version(PROMPT) == triager.version

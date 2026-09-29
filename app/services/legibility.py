@@ -1,4 +1,4 @@
-"""Does this page of cards read as business listings? Asked before anything is kept.
+"""Is each card a business for sale now, and does the page read as listings at all?
 
 A source adapter can be wrong without failing. A site redesign moves the title
 out of the element the adapter reads; a generic reader picks the wrong list of
@@ -6,45 +6,59 @@ links; a consent screen happens to contain a few links that look like cards.
 Each of those still returns *something*, and filed into a database it is worse
 than nothing: garbage rows look like listings until someone reads them, and
 dedupe then treats them as already seen. So every page that returned cards is
-asked, cheaply, whether they look like listings — and a page that does not is
-a loud, per-source failure with evidence, not a quiet contribution to the
-results.
+checked before anything from it is kept, in two layers.
 
-Two layers, both conservative:
+* **Code checks** (`check`), always. A card with no title or no link cannot be
+  filed, so it is dropped; but when most cards on a page lack one, the adapter
+  is reading the wrong thing, and the page fails. And when the asking prices
+  that contain a digit mostly do not read as an amount, the "price" is some
+  other text. Only the asking price is judged: revenue and cash flow are
+  legitimately ranges on some sites ("$250K - $500K").
+* **One request per listing** (`ListingCheck`), when the TypeSafe Classifier
+  (e.g. Jev) has a key. Once a page is down to its array of listing elements,
+  every question about one element is asked together, in ONE request whose
+  state is that card (`triage.card_state`): is it one listing of a business
+  that is currently for sale (not sold, pending or under contract, and not a
+  menu link, an ad or other page furniture) — and, when the sweep triages,
+  REVIEW or REJECT with the caller's criteria. One card per request because
+  that is what the triage answers were measured on (bundling several cards
+  lost agreement, see `triage.py`); adding the eligibility question to it
+  changed none of 219 triage answers. Requests go out `TYPESAFE_PARALLEL` at a
+  time, the one limit every classifier caller shares.
 
-* **Code checks**, always. A card with no title or no link cannot be filed, so
-  it is dropped; but when most cards on a page lack one, the adapter is reading
-  the wrong thing, and the page fails. And when the asking prices that contain
-  a digit mostly do not read as an amount, the "price" is some other text.
-  Only the asking price is judged: revenue and cash flow are legitimately
-  ranges on some sites ("$250K - $500K"), which is not a sign of anything.
-* **The TypeSafe Classifier (e.g. Jev)**, when a key is saved: a yes/no on
-  every card that passed the code checks. It catches what the code cannot see —
-  well-formed cards that are blog posts, franchise ads, or a site's own
-  navigation. A page where fewer than half pass fails. The cards go in ONE
-  request — every card in one state, one question per card — because the
-  classifier reads the state once and answers every question in it; a request
-  per card would pay for that reading again and again.
+Only elements the store does not have are asked about — plus, in a triaging
+sweep, stored rows whose Bot Triage is still blank (the backlog triage heals).
+A stored row that already has a decision costs nothing, and with sync=false
+every element is new. Without a key nothing is asked at all: a BizBuySell sweep
+then makes no classifier call, exactly as before the classifier existed.
 
-What the classifier's per-card answers are allowed to do depends on who chose
-the cards (`drop_cards`):
+What the answers are allowed to do depends on who chose the cards (`drop`):
 
 * **The generic reader chose them itself** (it picked a group of links on a
-  page it had never seen), so a card the classifier judges not to be a listing
-  is dropped: two menu links at the ends of a list are two cards to leave out,
-  not a reason to throw away the seventeen listings between them
-  (BusinessesForSale, second live gate, where a sample of three failed the
-  page).
+  page it had never seen), so a card judged not eligible is dropped: two menu
+  links at the ends of a list, or the "– Sold" tiles an infinite scroll runs
+  into, are cards to leave out, not a reason to throw away the listings
+  between them. There is no separate "sold" handling: this is it.
 * **A site adapter's cards** (BizBuySell) are read by code written for that
-  page, so the classifier's answer is a verdict on the PAGE only: it fails
-  when fewer than half pass — the adapter is reading the wrong thing — and
-  otherwise every card is kept. One misjudged listing is not the classifier's
-  to silently remove from a page the adapter read correctly.
+  page, so the answers are a verdict on the PAGE only, and every card is kept.
+  One misjudged listing is not the classifier's to silently remove from a page
+  the adapter read correctly.
 
-The classifier half is best-effort here. BizBuySell pages do not depend on it,
-so a classifier outage must not fail them: the error is logged and recorded on
-the verdict, and the code checks still decide. (A source that does depend on
-the classifier fails on its own calls long before this one.)
+The page check comes from the same answers: a page where fewer than half of
+its cards pass fails — the source is reading the wrong thing. A card the store
+already has counts as passing (it was filed as a listing before, and asking
+about it again would cost a request per known row per sweep), so a page whose
+cards are all known asks nothing and passes. A page with fewer than
+`MIN_JUDGED` cards to go on is never failed by it: one sold listing left on a
+broker's profile is not a page read wrong.
+
+The classifier half is best-effort. A classifier that cannot answer at all (no
+key, a rejected key, no credits, no answer after the client's retries) stops
+this sweep's requests — every later one would fail the same way — and the
+cards not yet asked about are kept as the code checks left them; triage leaves
+their rows blank for a later sweep. Any other classifier error is that one
+card's: it is kept, and its row fails triage. Neither ever fails a page, so a
+BizBuySell sweep keeps working while the classifier is down.
 
 A page with zero cards is never judged — that is an empty last page, and what
 it means is the sweep's business, exactly as before.
@@ -54,40 +68,54 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from ..models import Listing
 from ..stores.money import parse_money
-from .typesafe import Noul, TypeSafeError
+from .triage import STAGE_CARD, TriageDecision, Triager, card_state
+from .typesafe import (
+    TYPESAFE_PARALLEL,
+    Choice,
+    Noul,
+    TypeSafeAuthError,
+    TypeSafeCreditError,
+    TypeSafeError,
+    TypeSafeNotConfigured,
+    TypeSafeUnavailable,
+)
 
 logger = logging.getLogger("cloakbiz.legibility")
 
-# The statement put to the classifier about each card, by its key in the state
-# ("card_1", "card_2", …).
-QUESTION = "{card} in the state is a listing of a business for sale."
+# The statement put to the classifier about each listing element, with the
+# card as the state. This exact wording was validated live on 2026-09-28: 20 of
+# 20 Synergy "– Sold" titles scored ≤ 0.08, 218 of 219 real listings ≥ 0.5
+# (median 0.80, one at 0.48), menu links ("Sell Your Business", "Login") ≤ 0.48.
+ELIGIBLE_QUESTION = (
+    "The state is one listing of a business that is currently for sale — not a sold, pending "
+    "or under-contract listing, and not a menu link, an advertisement or some other page "
+    "element."
+)
 
 # At least this share of cards must have both a title and a link.
 MIN_COMPLETE = 0.7
 # At least this share of digit-bearing asking prices must read as an amount.
 MIN_PRICES_READ = 0.5
-# A card the classifier gives less than this is not a listing (and is dropped,
-# when the check may drop cards — see `drop_cards`).
-MIN_CARD = 0.5
-# The page fails when fewer than this share of the cards asked about pass.
+# A card the classifier gives less than this is not a listing for sale now.
+MIN_ELIGIBLE = 0.5
+# The page fails when fewer than this share of its judged cards pass...
 MIN_PASSING = 0.5
-# Cards asked about per request. Every card is asked about: a longer page goes
-# in several requests of this many, sent together. (Asking only the first and
-# last few missed junk in the middle: Synergy's infinite scroll runs from its
-# active listings into forty "– Sold" ones well inside a 180-card page.)
-MAX_CARDS = 40
-# Enough of a card's excerpt to recognise it: forty of them share one request.
-_EXCERPT_CHARS = 300
+# ...and it has at least this many judged cards to go on.
+MIN_JUDGED = 3
 # How much of an unreadable price to quote in the failure message.
 _QUOTE_CHARS = 40
-# Dropped cards named in the record, for someone checking the classifier's call.
-_REJECTS_SHOWN = 10
-_REJECT_TITLE_CHARS = 80
+# Cards judged not eligible, named in a page's record for someone checking the call.
+_SHOWN = 10
+_TITLE_CHARS = 80
+
+# Classifier failures that stop a sweep's requests: every later one would fail
+# the same way. Any other TypeSafeError is that one card's.
+STOPS = (TypeSafeAuthError, TypeSafeCreditError, TypeSafeUnavailable, TypeSafeNotConfigured)
 
 _DIGIT = re.compile(r"\d")
 # A currency before an amount: a code ("USD", "CAD"), a sign ("$", "€", "£"),
@@ -109,36 +137,24 @@ _WORD_MULTIPLIERS = (
 )
 
 
+# ── the code checks ──────────────────────────────────────────────────────────
+
+
 @dataclass(frozen=True)
 class Verdict:
-    """What the check decided about one page.
+    """What the code checks decided about one page.
 
-    `listings` are the cards that survive — those with a title and a link, less
-    (when the check was allowed to drop cards) any the classifier judged not to
-    be listings — and the only ones the sweep keeps. `reason` is set when `ok` is False and is written for the person
-    reading the job's error: what was wrong, on which page, and that nothing
-    from it was kept.
+    `listings` are the cards with a title and a link — the only ones the sweep
+    goes on with. `reason` is set when `ok` is False and is written for the
+    person reading the job's error: what was wrong, on which page, and that
+    nothing from it was kept.
     """
 
     listings: list[Listing]
     ok: bool = True
     reason: str = ""
-    # Cards the code checks dropped (no title or no link).
+    # Cards dropped for having no title or no link.
     dropped: int = 0
-    # Cards the classifier was asked about, how many of those it judged not to
-    # be listings, and how many of those were dropped for it (all of them when
-    # the check may drop cards or the page failed; none on an adapter's page
-    # that passed). 0 when it was not asked (no key) or could not answer.
-    classifier_asked: int = 0
-    classifier_low: int = 0
-    classifier_dropped: int = 0
-    # The classifier's mean over the cards it was asked about; None when it
-    # was not asked or could not answer.
-    classifier_mean: float | None = None
-    # The cards it judged not to be listings, as (title, probability), page order.
-    classifier_rejected: tuple[tuple[str, float], ...] = ()
-    # Why the classifier half was skipped, when it was asked and failed.
-    classifier_error: str = ""
 
     def record(self, page: int) -> dict[str, Any]:
         """A small, JSON-safe summary for the run's evidence."""
@@ -146,32 +162,11 @@ class Verdict:
                                "dropped": self.dropped}
         if self.reason:
             out["reason"] = self.reason
-        if self.classifier_asked:
-            out["classifier_asked"] = self.classifier_asked
-            out["classifier_low"] = self.classifier_low
-            out["classifier_dropped"] = self.classifier_dropped
-            if self.classifier_mean is not None:
-                out["classifier_mean"] = round(self.classifier_mean, 3)
-            if self.classifier_rejected:
-                out["classifier_rejected"] = [
-                    {"title": title[:_REJECT_TITLE_CHARS], "p": round(p, 3)}
-                    for title, p in self.classifier_rejected[:_REJECTS_SHOWN]
-                ]
-        if self.classifier_error:
-            out["classifier_error"] = self.classifier_error
         return out
 
 
-async def check(listings: list[Listing], *, page: int, classifier=None,
-                drop_cards: bool = False) -> Verdict:
-    """Judge one page's cards. Never raises for a classifier failure.
-
-    `classifier` is a TypeSafe client (anything with `ask(state, questions)`),
-    passed only when a key is saved; None skips that half. `drop_cards` lets
-    the classifier's answers remove single cards from a page that passes — only
-    for a source that chose the cards itself (the generic reader). Left False,
-    the answers judge the page and nothing else (see the module docstring).
-    """
+def check(listings: list[Listing], *, page: int) -> Verdict:
+    """The code checks on one page's cards: no title or link, prices that aren't."""
     if not listings:
         return Verdict(listings=[])
 
@@ -202,47 +197,7 @@ async def check(listings: list[Listing], *, page: int, classifier=None,
                 f"business listings — nothing from this page was kept."
             ),
         )
-
-    if classifier is None:
-        return Verdict(listings=complete, dropped=dropped)
-
-    asked = list(range(len(complete)))
-    batches = [asked[i:i + MAX_CARDS] for i in range(0, len(asked), MAX_CARDS)]
-    try:
-        replies = await asyncio.gather(*(_ask(classifier, complete, batch) for batch in batches))
-    except TypeSafeError as exc:
-        # Best-effort: the code checks above have already passed this page.
-        logger.warning("legibility: classifier skipped on page %d: %s", page, exc)
-        return Verdict(listings=complete, dropped=dropped, classifier_error=str(exc))
-    answers = [p for batch in replies for p in batch]
-
-    low = {i: p for i, p in zip(asked, answers) if p < MIN_CARD}
-    passing = len(asked) - len(low)
-    judged = {
-        "classifier_asked": len(asked),
-        "classifier_low": len(low),
-        "classifier_mean": sum(answers) / len(answers),
-        "classifier_rejected": tuple((complete[i].title.strip(), p) for i, p in low.items()),
-    }
-    if passing < MIN_PASSING * len(asked):
-        return Verdict(
-            listings=[], ok=False, dropped=dropped, classifier_dropped=len(low), **judged,
-            reason=(
-                f"Only {passing} of {len(asked)} cards on page {page} read as business "
-                f"listings (at least half should) — nothing from this page was kept."
-            ),
-        )
-    if not drop_cards:
-        # An adapter's page that passed: every card it read is kept.
-        if low:
-            logger.info("legibility: page %d: %d of %d cards judged not listings, all kept "
-                        "(the adapter chose them)", page, len(low), len(asked))
-        return Verdict(listings=complete, dropped=dropped, **judged)
-    if low:
-        logger.info("legibility: page %d: %d of %d cards dropped as not listings",
-                    page, len(low), len(asked))
-    kept = [c for i, c in enumerate(complete) if i not in low]
-    return Verdict(listings=kept, dropped=dropped, classifier_dropped=len(low), **judged)
+    return Verdict(listings=complete, dropped=dropped)
 
 
 def _reads_as_amount(value: str) -> bool:
@@ -276,33 +231,175 @@ def _bare(text: str) -> str:
     return text.strip()
 
 
-async def _ask(classifier, cards: list[Listing], batch: list[int]) -> list[float]:
-    """One request: a yes/no for each card in `batch`, in the batch's order."""
-    names = [f"card_{i}" for i in range(1, len(batch) + 1)]
-    state = {"cards": {name: _state(cards[i]) for name, i in zip(names, batch)}}
-    questions = {name: {"type": "noul", "instructions": QUESTION.format(card=name)}
-                 for name in names}
-    replies = await classifier.ask(state, questions)
-    answers = []
-    for name in names:
-        reply = replies.get(name)
-        if not isinstance(reply, Noul):
-            raise TypeSafeError(
-                f"The TypeSafe Classifier did not answer the yes/no question about {name}."
-            )
-        answers.append(reply.probability)
-    return answers
+# ── one request per listing ──────────────────────────────────────────────────
 
 
-def _state(card: Listing) -> dict[str, str]:
-    """A card as the classifier sees it: its readable fields, blanks left out."""
-    fields = {
-        "title": card.title,
-        "location": card.location,
-        "asking_price": card.asking_price,
-        "cash_flow": card.cashflow,
-        "ebitda": card.ebitda,
-        "revenue": card.revenue,
-        "excerpt": card.excerpt[:_EXCERPT_CHARS],
+@dataclass(frozen=True)
+class ListingAnswer:
+    """Everything one request said about one listing element.
+
+    `eligible` is P(a business currently for sale); `triage` the card-stage
+    decision when the sweep triages. `error` is set, and the rest empty, when
+    this one request failed without the classifier being down (a request it
+    refused, an answer that can't be read).
+    """
+
+    eligible: float | None = None
+    triage: TriageDecision | None = None
+    error: str = ""
+
+
+async def ask(classifier, listing: Listing, triager: Triager | None = None) -> ListingAnswer:
+    """ONE request about one listing: eligible, and triage when `triager` is given.
+
+    The state is the card (`triage.card_state`: title, location, money, the
+    excerpt and the computed price/earnings multiple). Raises the client's
+    TypeSafeError; an answer of the wrong kind is one too.
+    """
+    questions: dict[str, dict[str, Any]] = {
+        "eligible": {"type": "noul", "instructions": ELIGIBLE_QUESTION},
     }
-    return {k: v.strip() for k, v in fields.items() if v and v.strip()}
+    if triager is not None:
+        questions["triage"] = triager.question()
+    replies = await classifier.ask(card_state(listing), questions)
+    eligible = replies.get("eligible") if isinstance(replies, dict) else None
+    if not isinstance(eligible, Noul):
+        raise TypeSafeError("The TypeSafe Classifier did not answer whether this is a listing "
+                            "of a business for sale.")
+    decision = None
+    if triager is not None:
+        answer = replies.get("triage")
+        if not isinstance(answer, Choice):
+            raise TypeSafeError("The TypeSafe Classifier did not answer the triage question.")
+        decision = triager.decision(answer, STAGE_CARD)
+    return ListingAnswer(eligible=eligible.probability, triage=decision)
+
+
+def listing_key(listing: Listing) -> str:
+    """The identity a sweep dedupes on (listing id, else normalized URL, else URL)."""
+    return listing.listing_id or listing.normalized_url or listing.url
+
+
+@dataclass(frozen=True)
+class PageCheck:
+    """What one page's answers decided: the cards it keeps, or why it fails."""
+
+    listings: list[Listing]
+    ok: bool = True
+    reason: str = ""
+    record: dict[str, Any] = field(default_factory=dict)
+
+
+class ListingCheck:
+    """One sweep's per-listing requests, shared by every URL and page of it.
+
+    `known` is the store's index read at the start of a synced sweep (None
+    with sync=false, or when it could not be read: then every element is new),
+    or the task reading it — started with the sweep, so the read overlaps the
+    browser's start-up, and waited for by the first page that needs it.
+    `triager` adds the triage question to each request. Answers are kept by
+    listing identity for the whole sweep, so a listing seen on two pages or
+    under two URLs — or a page retried from a new exit IP — is asked once, and
+    the triage phase reads each row's card decision from here (`answer`).
+    """
+
+    def __init__(self, classifier, *, triager: Triager | None = None, known=None) -> None:
+        self._classifier = classifier
+        self.triager = triager
+        self._known = known
+        self._gate = asyncio.Semaphore(TYPESAFE_PARALLEL)
+        self._answers: dict[str, ListingAnswer] = {}
+        # One lock per listing, so two pages showing it at once (two URLs of
+        # one sweep) wait for one request rather than making two.
+        self._asking: dict[str, asyncio.Lock] = {}
+        # Why the classifier stopped being asked, once it could not answer at all.
+        self.stopped: str | None = None
+        self.requests = 0
+
+    def close(self) -> None:
+        """Stop reading the index, if the sweep ends before any page needed it."""
+        if isinstance(self._known, asyncio.Future) and not self._known.done():
+            self._known.cancel()
+
+    def to_ask(self, listing: Listing) -> bool:
+        """New to the store, or (when triaging) stored with a blank Bot Triage."""
+        if self._known is None or not self._known.contains(listing):
+            return True
+        return self.triager is not None and self._known.decision(listing) == ""
+
+    def answer(self, listing: Listing) -> ListingAnswer | None:
+        """What this sweep's request said about `listing`, if it was asked."""
+        return self._answers.get(listing_key(listing))
+
+    async def ask_one(self, listing: Listing) -> ListingAnswer | None:
+        """`listing`'s answer, asked now unless it already was; None once stopped.
+
+        Gated `TYPESAFE_PARALLEL` at a time, and the stop is looked at inside
+        the gate: every card of a page is started at once, and one that only
+        looked before waiting would still ask after an outage it had queued
+        behind.
+        """
+        key = listing_key(listing)
+        if key in self._answers:
+            return self._answers[key]
+        async with self._asking.setdefault(key, asyncio.Lock()), self._gate:
+            if key in self._answers:
+                return self._answers[key]
+            if self.stopped:
+                return None
+            self.requests += 1
+            try:
+                answer = await ask(self._classifier, listing, self.triager)
+            except STOPS as exc:
+                if self.stopped is None:
+                    logger.warning("listing check: the classifier stopped answering: %s", exc)
+                    self.stopped = str(exc)
+                return None
+            except TypeSafeError as exc:
+                logger.warning("listing check: no answer for %s: %s", listing.url, exc)
+                answer = ListingAnswer(error=str(exc))
+            self._answers[key] = answer
+        return answer
+
+    async def page(self, listings: list[Listing], *, page: int, drop: bool) -> PageCheck:
+        """Ask about this page's new cards, then judge the page from the answers.
+
+        `drop` lets a card judged not eligible be left out — only for a source
+        that chose the cards itself (see the module docstring).
+        """
+        if isinstance(self._known, asyncio.Future):
+            self._known = await self._known
+        asked = [c for c in listings if self.to_ask(c)]
+        known = len(listings) - len(asked)
+        answers = await asyncio.gather(*(self.ask_one(c) for c in asked))
+        judged = [(c, a.eligible) for c, a in zip(asked, answers)
+                  if a is not None and a.eligible is not None]
+        low = [(c, p) for c, p in judged if p < MIN_ELIGIBLE]
+        passing = len(judged) - len(low) + known
+        total = len(judged) + known
+        record: dict[str, Any] = {"asked": len(asked), "answered": len(judged), "known": known,
+                                  "eligible": len(judged) - len(low), "not_eligible": len(low),
+                                  "dropped": 0}
+        if low:
+            record["not_eligible_listings"] = [
+                {"title": c.title.strip()[:_TITLE_CHARS], "p": round(p, 3)} for c, p in low[:_SHOWN]]
+        errors = sum(1 for a in answers if a is not None and a.error)
+        if errors:
+            record["errors"] = errors
+        if any(a is None for a in answers):
+            record["unanswered"] = sum(1 for a in answers if a is None)
+            record["stopped"] = self.stopped
+        if total >= MIN_JUDGED and passing < MIN_PASSING * total:
+            return PageCheck(listings=[], ok=False, record=record, reason=(
+                f"Only {passing} of {total} cards on page {page} read as business listings "
+                f"currently for sale (at least half should) — nothing from this page was kept."))
+        if not drop or not low:
+            if low:
+                logger.info("listing check: page %d: %d of %d cards judged not for sale, all "
+                            "kept (the adapter chose them)", page, len(low), len(judged))
+            return PageCheck(listings=list(listings), record=record)
+        gone = {id(c) for c, _ in low}
+        record["dropped"] = len(low)
+        logger.info("listing check: page %d: %d of %d cards left out as not currently for sale",
+                    page, len(low), len(judged))
+        return PageCheck(listings=[c for c in listings if id(c) not in gone], record=record)

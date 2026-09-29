@@ -107,6 +107,20 @@ class TestAgreement:
         assert "agree= 50.0%" in lines[1]
         assert [l.split()[0] for l in lines[2:]] == ["2026-08", "2026-09"]
 
+    def test_real_rows_judged_not_eligible_are_counted_and_named(self):
+        """The same request a sweep makes judges eligibility too: every row
+        here is a real listing, so each one below 0.5 is one a generic sweep
+        would have dropped."""
+        results = [{**self._r("REVIEW", "REVIEW"), "eligible": p, "title": f"Row {p}"}
+                   for p in (0.9, 0.8, 0.48, 0.7)]
+        results.append(self._r("REJECT", "REJECT"))  # an answer from an older run: no score
+        lines = eval_triage.eligibility(results)
+        assert lines[0].strip() == (
+            "not eligible (P < 0.5): 1 of 4 (25.0%); median P(eligible) 0.80")
+        assert lines[1].split() == ["0.48", "REVIEW", "Row", "0.48"]
+        assert eval_triage.eligibility([self._r("REVIEW", "REVIEW")]) == []
+        assert eval_triage.report(results, None)[-2:] == lines
+
 
 class TestCriteriaPageText:
     def _b(self, kind, text="", children=None):

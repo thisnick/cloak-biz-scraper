@@ -20,13 +20,22 @@ decide anything without it, and with that site's override if one is pinned. A
 URL on a site that HAS an adapter, which the adapter does not read, is refused:
 it never falls through.
 
-**Triage** runs after a synced sweep when the call carries a `triage_prompt`:
-every row this sweep inserted, plus every row it saw whose Bot Triage is still
-blank, gets REVIEW or REJECT from the TypeSafe Classifier (e.g. Jev) — on the
-card first, then (for a card REVIEW) on the listing's detail page, which is
-archived into the row when the verdict stays REVIEW. A row that already has a
-decision is never judged again. See `_TriagePhase` for the order of writes, and
-services/triage.py for the question itself. Without a prompt none of it runs.
+**Every listing element gets one request** while its page is read, when a
+classifier key is saved (`legibility.ListingCheck`): is it a business for sale
+now, and — when the call carries a `triage_prompt` — REVIEW or REJECT on its
+card. Only elements the store does not have are asked (plus, when triaging,
+stored rows whose Bot Triage is still blank), so a synced sweep reads the
+store's index once, before its first page. The same answers drop what is not
+for sale from the generic reader's pages and fail a page that does not read as
+listings.
+
+**Triage** then runs after a synced sweep's save: every row this sweep inserted,
+plus every row it saw whose Bot Triage is still blank, gets the REVIEW or REJECT
+decided on its card; a card REVIEW is judged again on the listing's detail
+page, which is archived into the row when the verdict stays REVIEW. A row that
+already has a decision is never judged again. See `_TriagePhase` for the order
+of writes, and services/triage.py for the question itself. Without a prompt
+none of it runs.
 """
 from __future__ import annotations
 
@@ -61,16 +70,11 @@ from .archive import guard as archive_guard
 from .blocker import text_contains_blocker
 from .browsing import capture, gesture, scrape_with_retry
 from .jobs import JobStore, interrupted
+from .legibility import ListingAnswer, ListingCheck
 from .settings import SettingsService
 from .task_profiles import TaskProfilePool
 from .triage import REJECT, REVIEW, TriageDecision, Triager, criteria_version
-from .typesafe import (
-    TypeSafeAuthError,
-    TypeSafeCreditError,
-    TypeSafeError,
-    TypeSafeNotConfigured,
-    TypeSafeUnavailable,
-)
+from .typesafe import TypeSafeError, TypeSafeUnavailable
 
 logger = logging.getLogger("cloakbiz.scrape")
 
@@ -93,16 +97,12 @@ _SCRAPING_SUMMARY = "Sweeping the search results…"
 # pooled browser; a first sweep of a big new site could otherwise hold the pool
 # for an hour. The card REVIEWs past it stay blank, and a later sweep reads them.
 MAX_DETAIL_READS = 25
-# Card-stage triage questions in flight at once, per sweep. Each row is gated
-# BEFORE it checks whether triage has stopped, so an outage costs this many
-# rows' retries, not every row's.
-TRIAGE_PARALLEL = 4
-# Classifier failures that end a sweep's triage: every later question would
-# fail the same way (no key, a rejected key, no credits, no answer after the
-# client's retries). Any other TypeSafeError — a 400 for one request, an answer
-# in a shape that can't be read — is that one row's failure.
-_TRIAGE_STOPS = (TypeSafeAuthError, TypeSafeCreditError, TypeSafeUnavailable,
-                 TypeSafeNotConfigured)
+# Classifier failures that end a sweep's triage (and its per-listing requests):
+# every later question would fail the same way (no key, a rejected key, no
+# credits, no answer after the client's retries). Any other TypeSafeError — a
+# 400 for one request, an answer in a shape that can't be read — is that one
+# row's failure.
+_TRIAGE_STOPS = legibility.STOPS
 
 # Why a site with no adapter is refused when no classifier key is saved. Says
 # where the key goes, because that is the whole fix.
@@ -152,6 +152,8 @@ class _TriagePlan:
     version: str
     store: Any = None
     target: Any = None
+    # Why the run could not find where decisions go, when it had to look itself.
+    error: str | None = None
 
 
 class ClassifierNotReady(RuntimeError):
@@ -258,8 +260,8 @@ class ScrapeService:
         self._archive = archive
         # The shared TypeSafe Classifier client (app.state.typesafe). Optional:
         # without it — or without a saved key, checked at sweep time so a key
-        # added in Settings applies to the next sweep — the legibility check
-        # runs its code half only.
+        # added in Settings applies to the next sweep — pages get the code
+        # checks only, and no per-listing request is made.
         self._typesafe = typesafe
         # Injected so the sweep never imports Notion. The default is resolved
         # lazily and only when sync=true, so a user with no Notion token can
@@ -275,6 +277,9 @@ class ScrapeService:
         if self._task_profiles is None and instances is not None:
             self._task_profiles = instances.task_profiles
         self._running: set[asyncio.Task] = set()
+        # Each running sweep's per-listing requests (`_listing_check`), by job
+        # id; None for a sweep that asks none (no classifier key).
+        self._checks: dict[str, ListingCheck | None] = {}
         # Store rows some sweep's triage is working on right now. Two sweeps that
         # overlap (a scheduled one and a manual one) both see a row with a
         # blank Bot Triage; the second to reach it leaves it to the first rather
@@ -647,7 +652,10 @@ class ScrapeService:
         # would hand an agent listings without their decisions, and the
         # progress summary (which only renders a working job) would freeze.
         status, error, summary = "failed", None, "Sweep failed."
+        check: ListingCheck | None = None
         try:
+            check, store = await self._listing_check(job, plan)
+            self._checks[job.id] = check
             outcomes = await asyncio.gather(
                 *(worker(i, target) for i, target in enumerate(targets))
             )
@@ -662,7 +670,6 @@ class ScrapeService:
                 _triage_not_run(job, "Nothing was triaged: every source failed.")
                 return
             found = len(listings)
-            store = plan.store if plan is not None else None
             upsert: UpsertResult | None = None
             if job.sync:
                 # Dedupe+upsert the MERGED set ONCE, not per source. Under
@@ -709,7 +716,7 @@ class ScrapeService:
                 # detail page that will not load) leaves those rows blank for a
                 # later sweep. The scrape and the save succeeded, so the job
                 # still completes, with the reason alongside.
-                await _TriagePhase(self, job, plan, store, upsert).run()
+                await _TriagePhase(self, job, plan, store, upsert, check).run()
                 note = _triage_note(job.triage)
                 if note:
                     error = f"{error} {note}" if error else note
@@ -730,12 +737,63 @@ class ScrapeService:
             status, error, summary = "failed", str(exc), "Sweep failed."
             _triage_not_run(job, f"Triage did not finish: {exc}")
         finally:
+            self._checks.pop(job.id, None)
+            if check is not None:
+                check.close()
             job.status, job.error, job.summary = status, error, summary
             self._jobs.save(job)
             logger.info(
                 "job %s -> %s (%d listings across %d source(s))",
                 job.id, job.status, len(job.listings), total,
             )
+
+    async def _listing_check(self, job: SweepTask, plan: _TriagePlan | None,
+                             ) -> tuple[ListingCheck | None, ListingStore | None]:
+        """This sweep's per-listing requests, and the store a synced sweep uses.
+
+        Everything is decided before the first page, so the page loop can tell
+        a new listing from a known one: a synced sweep reads the store's index
+        once (dedupe keys and each row's Bot Triage), on the store its save and
+        triage will use too — started here, so the read overlaps the browsers'
+        start-up, and awaited by the first page's check. A triaging sweep started without `submit`'s
+        preflight finds where decisions go here; when it cannot, the triage
+        question is left out of every request and the reason is kept for the
+        triage phase to report. None when no classifier key is saved and
+        nothing is triaged: then nothing is asked.
+        """
+        settings = self._settings.load()
+        store = plan.store if plan is not None else None
+        classifier = self._classifier()
+        if job.sync and (classifier is not None or plan is not None) and store is None:
+            store = self._store_factory(settings)
+            if plan is not None:
+                plan.store = store
+        triager = None
+        if plan is not None:
+            if plan.target is None and plan.error is None:
+                try:
+                    plan.target = await store.prepare_triage(
+                        job.db_id, settings.notion_column_map or None)
+                except Exception as exc:  # noqa: BLE001 — TriageUnavailable or a store failure
+                    plan.error = f"couldn't find where to record decisions: {exc}"
+            if plan.target is not None:
+                triager = Triager(self._typesafe, plan.prompt)
+        if classifier is None and triager is None:
+            return None, store
+        index = getattr(store, "index", None) if job.sync else None
+        known = None
+        if index is not None:
+            async def read_index():
+                try:
+                    return await index(job.db_id, settings.notion_column_map or None)
+                except Exception as exc:  # noqa: BLE001 — then every listing counts as new
+                    logger.warning("sweep %s: could not read the store's index before the "
+                                   "first page (%s); every listing is asked about", job.id, exc)
+                    return None
+
+            # Read while the browsers start; the first page's check waits for it.
+            known = asyncio.create_task(read_index())
+        return ListingCheck(classifier or self._typesafe, triager=triager, known=known), store
 
     def _phase(self, job: SweepTask, text: str) -> None:
         """Say what a still-working sweep is doing now, where a poll and the
@@ -838,10 +896,12 @@ class ScrapeService:
         pages = f"{job.pages_crawled} page{'s' if job.pages_crawled != 1 else ''}"
         parts = [f"{ok} of {total} source(s) swept · {found} listing(s) across {pages}"]
         if left_out:
-            # Cards the generic reader's legibility check left out one by one
-            # (a menu link read as a card, an ad in the list). Said here, in the
-            # result an agent reads — not only in the run's diagnostics.
-            parts.append(f"{left_out} card(s) left out for not reading as business listings")
+            # Cards left out one by one: judged not a business for sale now (a
+            # sold tile, a menu link read as a card, an ad in the list) on the
+            # generic reader's pages, or with no title or link on any page.
+            # Said here, in the result an agent reads — not only in the run's
+            # diagnostics.
+            parts.append(f"{left_out} left out as not currently for sale / not listings")
         if job.synced is None:
             parts.append("Nothing was saved (sync=false)")
         else:
@@ -981,8 +1041,21 @@ class ScrapeService:
             return None
         return self._typesafe if self._settings.load().typesafe_configured() else None
 
+    def _check_for(self, job: SweepTask) -> ListingCheck | None:
+        """The running sweep's per-listing requests. An attempt run on its own
+        (not from `_run`) asks eligibility only, about every card, when a key is
+        saved."""
+        if job.id in self._checks:
+            return self._checks[job.id]
+        classifier = self._classifier()
+        return ListingCheck(classifier) if classifier is not None else None
+
     async def _sweep_once(self, inst, page, job: SweepTask, url: str, source, evidence: Path) -> dict:
         """One attempt at one URL: page 1, then each later page until the end.
+
+        Each page's cards go through the code checks, then — with a classifier
+        key — one request per new card (`ListingCheck.page`), which drops what
+        is not for sale from the generic reader's pages and judges the page.
 
         A page that loads, is not a block, and still cannot be used — no list on
         it, cards that don't read as listings, a classifier that stopped
@@ -1006,9 +1079,10 @@ class ScrapeService:
         checks: list[dict] = []  # the legibility verdict of each page that had cards
         pages_done = 0
         # A source that picks the cards itself, on a page it has never seen (the
-        # generic reader), lets the legibility check drop single cards; a site
-        # adapter's cards are only ever judged as a page.
+        # generic reader), may have single cards dropped for not being for sale;
+        # a site adapter's cards are only ever judged as a page.
         chooses = bool(getattr(source, "chooses_cards", False))
+        listing_check = self._check_for(job)
 
         def data() -> dict:
             return {"listings": listings, "pages_crawled": pages_done, "legibility": checks,
@@ -1070,22 +1144,28 @@ class ScrapeService:
 
             page_listings = result.listings
             if page_listings:
-                verdict = await legibility.check(page_listings, page=n,
-                                                 classifier=self._classifier(),
-                                                 drop_cards=chooses)
-                checks.append(verdict.record(n))
-                if not verdict.ok:
+                verdict = legibility.check(page_listings, page=n)
+                record = verdict.record(n)
+                ok, reason, page_listings = verdict.ok, verdict.reason, verdict.listings
+                if ok and listing_check is not None:
+                    judged = await listing_check.page(page_listings, page=n, drop=chooses)
+                    record["eligibility"] = judged.record
+                    ok, reason, page_listings = judged.ok, judged.reason, judged.listings
+                    record.update(ok=ok, kept=len(page_listings))
+                    if reason:
+                        record["reason"] = reason
+                checks.append(record)
+                if not ok:
                     # An adapter's page that reads wrong is retried from a new
                     # exit IP, like a block; the generic reader's is final.
-                    return await failed(n, "illegible", verdict.reason, retry=not chooses)
-                page_listings = verdict.listings
+                    return await failed(n, "illegible", reason, retry=not chooses)
 
             # Paging stops on cards this crawl has already seen, not on cards the
             # store already has: a feed whose first two pages are all known
             # listings still has new ones on page three, and dedupe is a separate
             # question answered at the end. "Seen" counts every card the page
-            # showed — including ones the source or the legibility check dropped
-            # — so a page of sold listings is not mistaken for the end.
+            # showed — including ones the source or the listing check dropped —
+            # so a page of sold listings is not mistaken for the end.
             on_page = [l.url for l in result.listings] + list(result.seen_urls or ())
             fresh = 0
             for href in on_page:
@@ -1143,11 +1223,12 @@ def _diagnostics(source) -> dict:
 
 
 def _cards_left_out(outcomes: list[dict]) -> int:
-    """Cards the legibility check dropped one by one, over every source's pages.
+    """Cards left out one by one, over every source's pages.
 
-    Only the generic reader's pages drop single cards for the classifier; a
-    card with no title or link is dropped on any source (it cannot be filed).
-    A page that failed outright is its source's failure or stop, not counted.
+    Only the generic reader's pages drop single cards judged not for sale now;
+    a card with no title or link is dropped on any source (it cannot be
+    filed). A page that failed outright is its source's failure or stop, not
+    counted.
     """
     total = 0
     for res in outcomes:
@@ -1155,7 +1236,8 @@ def _cards_left_out(outcomes: list[dict]) -> int:
             continue  # a failed source kept nothing, so it left nothing out
         for check in (res.get("data") or {}).get("legibility") or []:
             if isinstance(check, dict) and check.get("ok", True):
-                total += int(check.get("dropped") or 0) + int(check.get("classifier_dropped") or 0)
+                eligibility = check.get("eligibility") or {}
+                total += int(check.get("dropped") or 0) + int(eligibility.get("dropped") or 0)
     return total
 
 
@@ -1254,8 +1336,12 @@ class _TriagePhase:
     Bot Triage is blank (`UpsertResult.untriaged`) — a row holding a decision,
     anyone's, is never judged again. Two stages:
 
-    1. **The card**, for every row at once (the TypeSafe client's own ceiling
-       bounds the fan-out). REJECT is written straight away.
+    1. **The card.** Each row's card decision was made while its page was read,
+       in the one request that asked everything about that listing
+       (`legibility.ListingCheck`); it is read from there, not asked again. A
+       row that was not asked then — it had a decision when the sweep started
+       and is blank at the save — is asked now, with the same request. REJECT
+       is written straight away.
     2. **The detail page**, for each card REVIEW, read through the archive's
        gate and pooled identities. Then, in this order:
        - the page could not be read (blocked, failed to load) → nothing is
@@ -1274,25 +1360,30 @@ class _TriagePhase:
 
     A classifier that cannot answer at all (`_TRIAGE_STOPS`: no key, a
     rejected key, no credits, no answer after the client's own retries) stops
-    the phase: no more questions are asked and the rows not yet decided stay
-    blank. Card questions are gated (`TRIAGE_PARALLEL` at once, each gated
-    before it looks at whether triage has stopped), so an outage costs a few
-    rows' retries rather than every row's. Any other classifier error — a
-    request it refused, an answer that can't be read — and a failed Notion
-    write fail that row only, so one bad row never holds up the rest. None of
-    it is raised — the scrape and the save succeeded, and the job says so
-    (`_triage_note`). Only a cancellation propagates, after the record has been
-    brought up to date.
+    the phase — whether it went down while the pages were read or here: no
+    more questions are asked, the detail stage is skipped, and the rows not yet
+    decided stay blank. (The per-listing requests are gated, `TYPESAFE_PARALLEL`
+    at once, each gated before it looks at whether the classifier has stopped,
+    so an outage costs a few rows' retries rather than every row's.) Any other
+    classifier error — a request it refused, an answer that can't be read — and
+    a failed Notion write fail that row only, so one bad row never holds up the
+    rest. None of it is raised — the scrape and the save succeeded, and the job
+    says so (`_triage_note`). Only a cancellation propagates, after the record
+    has been brought up to date.
     """
 
     def __init__(self, service: ScrapeService, job: SweepTask, plan: _TriagePlan,
-                 store: ListingStore, upsert: UpsertResult) -> None:
+                 store: ListingStore, upsert: UpsertResult,
+                 check: ListingCheck | None = None) -> None:
         self._svc = service
         self._job = job
         self._plan = plan
         self._store = store
         self._target = plan.target
         self._triager = Triager(service._typesafe, plan.prompt)
+        # The sweep's per-listing requests: each row's card decision, and the
+        # way to ask for one it lacks.
+        self._check = check
         if job.triage is None:
             job.triage = TriageSummary(criteria_version=plan.version)
         self._summary = job.triage
@@ -1308,7 +1399,6 @@ class _TriagePhase:
         self._decided: dict[str, TriageDecision] = {}
         self._failed: dict[str, TriageFailure] = {}
         self._stopped: str | None = None
-        self._asking = asyncio.Semaphore(TRIAGE_PARALLEL)
         # Rows another sweep is triaging (left to it), and the ones this phase
         # holds in the service's in-flight set until it finishes.
         self._in_flight: list[Listing] = []
@@ -1342,8 +1432,13 @@ class _TriagePhase:
             self._claim()
             if not self._rows:
                 return
-            if self._target is None and not await self._prepare():
+            if self._target is None:
+                self._stopped = self._plan.error or "couldn't find where to record decisions"
                 return
+            if self._check is not None and self._check.stopped:
+                # The classifier went down while the pages were read: the rows
+                # it answered before that are decided; the rest stay blank.
+                self._stopped = self._check.stopped
             new = sum(1 for _, backlog in self._rows if not backlog)
             old = len(self._rows) - new
             what = _plural(new, "new listing") if new else ""
@@ -1372,40 +1467,44 @@ class _TriagePhase:
         finally:
             self._finish()
 
-    async def _prepare(self) -> bool:
-        """Resolve the triage target when `submit`'s preflight did not."""
-        settings = self._svc._settings.load()
-        try:
-            self._target = await self._store.prepare_triage(
-                self._job.db_id, settings.notion_column_map or None,
-            )
-        except Exception as exc:  # noqa: BLE001 — TriageUnavailable or a store failure
-            self._stopped = f"couldn't find where to record decisions: {exc}"
-            return False
-        return True
-
     # -- the two stages --
 
     async def _card(self, listing: Listing) -> TriageDecision | None:
-        # The gate comes first and the stop check inside it: every row is
-        # started at once, and a row that only looked at `_stopped` before
-        # waiting would still ask after an outage it had queued behind.
-        async with self._asking:
-            if self._stopped:
+        answer = self._check.answer(listing) if self._check is not None else None
+        if answer is None or (answer.triage is None and not answer.error):
+            answer = await self._ask(listing)
+            if answer is None:
                 return None
-            try:
-                decision = await self._triager.card(listing)
-            except TypeSafeError as exc:
-                self._classifier_failed(listing, exc)
-                return None
-            except Exception as exc:  # noqa: BLE001 — one row's trouble is that row's
-                logger.exception("triage of %s failed", listing.url)
-                self._fail(listing, f"The classifier's answer could not be used: {exc}")
-                return None
-        self._note(listing, card=decision.record())
+        if answer.error:
+            self._fail(listing, f"The classifier couldn't judge this listing: {answer.error}")
+            return None
+        decision = answer.triage
+        if decision is None:  # pragma: no cover — a request made with a triager has one
+            self._fail(listing, "The classifier's answer had no triage decision in it.")
+            return None
+        self._note(listing, eligible=None if answer.eligible is None else round(answer.eligible, 4),
+                   card=decision.record())
         if decision.decision == REJECT:
             await self._write(listing, decision)
         return decision
+
+    async def _ask(self, listing: Listing) -> ListingAnswer | None:
+        """A row's card request, asked now: it was not asked while its page was
+        read. None once the classifier has stopped answering."""
+        if self._stopped:
+            return None
+        if self._check is None or self._check.triager is None:
+            self._check = ListingCheck(self._svc._typesafe, triager=self._triager)
+        try:
+            answer = await self._check.ask_one(listing)
+        except Exception as exc:  # noqa: BLE001 — one row's trouble is that row's
+            logger.exception("triage of %s failed", listing.url)
+            self._fail(listing, f"The classifier's answer could not be used: {exc}")
+            return None
+        if answer is None and self._stopped is None:
+            logger.warning("triage for sweep %s stopped: %s", self._job.id, self._check.stopped)
+            self._stopped = self._check.stopped
+        return answer
 
     async def _details(self, reviews: list[tuple[int, Listing, TriageDecision]]) -> None:
         total = len(reviews)

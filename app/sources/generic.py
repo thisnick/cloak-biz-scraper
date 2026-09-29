@@ -15,15 +15,21 @@ adapter for, a page seen once. It reads a page in two halves.
   and pagers are there to be found.
 * **What code cannot see, the TypeSafe Classifier (e.g. Jev) decides**: which
   group is the list of businesses for sale (and not the menu, the footer, or a
-  "similar listings" rail), what each field holds, which statuses mean the
-  business is gone, and which candidate is really the next page. Each of those
-  is ONE request — the classifier reads the state once and answers every
-  question in it, so a request per field or per link would pay for the same
-  reading many times. (Measured on 2026-09-28: bundled answers were as
-  accurate as separate ones.) The rest of a chosen list — a second link shape
-  on the same tiles, or the detail links behind an "Unlock"/"Watch" group — is
-  then found from the probe's own evidence, without asking again
-  (`_whole_list`).
+  "similar listings" rail), what each field holds, and which candidate is
+  really the next page. Each of those is ONE request — the classifier reads the
+  state once and answers every question in it, so a request per field or per
+  link would pay for the same reading many times. (Measured on 2026-09-28:
+  bundled answers were as accurate as separate ones.) The rest of a chosen
+  list — a second link shape on the same tiles, or the detail links behind an
+  "Unlock"/"Watch" group — is then found from the probe's own evidence,
+  without asking again (`_whole_list`).
+
+Whether each card is a business for sale NOW — not sold, pending or under
+contract, not a menu link or an ad — is not asked here: once the page is down
+to its array of cards, the sweep asks every question about one card together,
+in one request per card (`services/legibility.py`), and drops the ones that
+are not. A status field is still read (a site override's `drop_status` pins
+which values to drop without asking anything).
 
 **The list and the fields are decided on a sweep's first page and reused for
 the pages after it; the next page is decided on every page; nothing is kept
@@ -82,15 +88,18 @@ MAX_CANDIDATES = 12
 # in the same element and share at least this much of their fields (Sunbelt's
 # two link shapes: 1.0; a franchise ad slotted into BizQuest's list: 0.36).
 SAME_LIST_FIELDS = 0.75
-# A card field is asked about when at least this share of cards has it.
-FIELD_PRESENCE = 0.3
+# A card field is asked about when at least this many cards have it (every
+# card, on a page with fewer): a label on two cards is a field of the list, a
+# slot on one is that card's own text.
+FIELD_MIN_CARDS = 2
+# Values shown for each field asked about, spread across the page (first,
+# middle, last…): the first three cards alone are often three of a kind.
+FIELD_SAMPLES = 5
 # A field fills a Listing only at this confidence; below it the field is left
 # empty and the excerpt keeps the text.
 FIELD_CONFIDENCE = 0.8
 # A next-page candidate is followed at this probability or above.
 NEXT_MIN = 0.5
-# A status value at this probability or above means "no longer available".
-UNAVAILABLE_MIN = 0.5
 # Bounds on one request, so a strange page cannot build an enormous one.
 MAX_FIELDS = 40
 MAX_STATUS_VALUES = 20
@@ -160,10 +169,6 @@ GROUP_NONE = "None of these groups is a list of businesses for sale"
 FIELD_QUESTION = (
     "Each listing card on this page has the fields in the state. What does {field} hold?"
 )
-STATUS_QUESTION = (
-    "{status} in the state means the business is no longer available: sold, pending, or under "
-    "contract"
-)
 # Its second half is from the second live gate, where Empire Flippers' "Load
 # More Listings" scored 0.46–0.49 read literally as "goes to page N".
 NEXT_QUESTION = (
@@ -225,13 +230,16 @@ _LISTING_FIELD = {
 # gives the probe PROBE_TIMEOUT_S to return at all.
 #
 # Called with {next_number, patterns} (the page number to look for in a pager,
-# and any pinned listing patterns). Returns JSON:
+# and any pinned listing patterns) and, on a later page of a sweep, {shapes,
+# known_keys} (page 1's card shapes per pinned pattern, and the field keys
+# already named — see `_Decided`). Returns JSON:
 #   {url, title, body (first 5000 chars), body_chars,
 #    groups: [{pattern, links, chrome, text_chars, varying_keys, paths_unique,
 #              card_shape, containers, examples, cards}],   biggest (links × text) first
 #    pager:  [{id, url|null, script_only, numbered, appears_as, selector}]}
 # where `cards` is null except for the top 12 non-chrome groups and pinned ones:
-#   [{card, pos, href, hrefs, link_text, heading, text, excerpt, labeled, slots}]
+#   [{card, pos, href, hrefs, link_text, heading, text, excerpt, labeled, slots,
+#     shape, container, shaped (found by a known card shape)}]
 # (`pos` is the card's link's place among the page's links: page order).
 JS_PROBE = r"""
 (args) => {
@@ -874,11 +882,11 @@ class GenericSource:
     one source object across retries.
 
     Within one attempt, the list and the fields are decided on the first page
-    and reused on the pages after it (`_Decided`, `_known_fields`,
-    `_known_status`): a later page asks only about field keys and status
-    values no earlier page had, and a page that does not have the first page's
-    list at all (a changed layout) is decided afresh, and that decision is
-    the one reused from then on. The next page is decided on every page.
+    and reused on the pages after it (`_Decided`, `_known_fields`): a later
+    page asks only about field keys no earlier page had, and a page that does
+    not have the first page's list at all (a changed layout) is decided
+    afresh, and that decision is the one reused from then on. The next page is
+    decided on every page.
 
     `decisions` has one JSON-safe dict per page read, saying what was decided
     and by whom ("override", "jev", "probe" when there was nothing to ask, or
@@ -887,8 +895,8 @@ class GenericSource:
     same_list, instead_of, left_out, cards_by_shape (cards found by the reused
     card shape), missing (the reused patterns a page did not have)};
     `fields` [{key, labeled, role, by, confidence, used}];
-    `status` {by, unavailable, values, and reused when some were} when the
-    cards have a status field; `next_page` {by, rule (a URL, "click" or
+    `status` {by: "override", unavailable, values} when a site override's
+    `drop_status` applied to a status field; `next_page` {by, rule (a URL, "click" or
     "none"), probability, candidates, appears_as, selector}; `cards`, `kept`,
     `dropped_unavailable`; and `blocked` or `error` when the page ended that
     way. `suggested_override()` turns it into a paste-ready `SiteOverride`.
@@ -899,8 +907,8 @@ class GenericSource:
     describes = ("Any other site's page of businesses for sale, read with the TypeSafe "
                  "Classifier (e.g. Jev)")
     example = "https://www.websiteclosers.com/businesses-for-sale/"
-    # It picks the cards itself, so the legibility check may drop single cards
-    # it judges not to be listings (see `Source`).
+    # It picks the cards itself, so the sweep may drop single cards its
+    # per-listing request judges not to be a business for sale now (see `Source`).
     chooses_cards = True
 
     def __init__(self, url: str, classifier, override: SiteOverride | None = None) -> None:
@@ -917,7 +925,6 @@ class GenericSource:
         # Reused by the later pages of this attempt, never kept past it.
         self._decided: _Decided | None = None
         self._known_fields: dict[str, dict[str, Any]] = {}
-        self._known_status: dict[str, tuple[float, int]] = {}
 
     # -- the Source protocol --
 
@@ -929,10 +936,9 @@ class GenericSource:
         self._forget()
 
     def _forget(self) -> None:
-        """Drop the list, field and status decisions later pages would reuse."""
+        """Drop the list and field decisions later pages would reuse."""
         self._decided = None
         self._known_fields = {}
-        self._known_status = {}
 
     def matches(self, url: str) -> bool:
         p = urlparse((url or "").strip())
@@ -1141,7 +1147,7 @@ class GenericSource:
             if chosen:
                 return chosen
             # Not this page's layout (a redesign, an A/B page): decided afresh,
-            # fields and statuses too, and what is decided here is reused next.
+            # fields too, and what is decided here is reused next.
             missing = {"decided_on_page": decided.page, "patterns": decided.pinned}
             logger.info("generic: page %d of %s does not have page %d's list (%s); deciding "
                         "it afresh", n, self.url, decided.page, ", ".join(decided.pinned))
@@ -1236,14 +1242,15 @@ class GenericSource:
 
     async def _decide_fields(self, cards: list[_Card], title: str,
                              record: dict) -> tuple[dict[str, tuple[str, float]], set[str]]:
-        """What each common field holds (role, confidence), then which statuses mean gone.
+        """What each common field holds (role, confidence), then which statuses
+        a site override drops.
 
         A key an earlier page of this attempt already decided keeps that
-        answer; only the rest are asked about, and when there is no rest,
-        nothing is asked.
+        answer, on however few cards it appears here; only the rest are asked
+        about, and when there is no rest, nothing is asked.
         """
         n = int(record.get("page") or 1)
-        keys = _field_keys(cards)
+        keys = _field_keys(cards, set(self._known_fields))
         roles: dict[str, tuple[str, float]] = {}
         report: list[dict] = []
         ask: dict[str, str] = {}
@@ -1275,7 +1282,7 @@ class GenericSource:
                 values = [c.values[key] for c in cards if c.values.get(key)]
                 fields_state[name] = {
                     "text_just_before_this_field": key if labeled_keys[key] else None,
-                    "values_on_three_cards": _distinct(values, 3, _FIELD_VALUE_CHARS),
+                    "values_on_some_cards": _spread(values, FIELD_SAMPLES, _FIELD_VALUE_CHARS),
                 }
                 criteria = ROLES
                 if _looks_like_money(values):
@@ -1302,43 +1309,25 @@ class GenericSource:
 
     async def _decide_status(self, cards: list[_Card], roles: dict[str, tuple[str, float]],
                              record: dict) -> set[str]:
-        """The status values on this page that mean the business is gone.
+        """The status values on this page a site override's `drop_status` drops.
 
-        A value an earlier page of this attempt judged keeps its answer; only
-        new ones are asked about.
+        Nothing is asked: whether a card is a business for sale now (not sold,
+        pending or under contract) is part of the one request the sweep makes
+        per card. The override is a person's deterministic rule for one site —
+        a value containing any of its words (case-insensitive) is dropped
+        before that request is made.
         """
+        drop = self.override.drop_status if self.override else None
         status_keys = [k for k, (role, _) in roles.items() if role == "status"]
+        if drop is None or not status_keys:
+            return set()
         values = _distinct([c.values[k] for c in cards for k in status_keys if c.values.get(k)],
                            MAX_STATUS_VALUES, None)
         if not values:
             return set()
-        drop = self.override.drop_status if self.override else None
-        if drop is not None:
-            needles = [d.lower() for d in drop]
-            gone = {v for v in values if any(d in v.lower() for d in needles)}
-            record["status"] = {"by": "override", "unavailable": sorted(gone), "values": values}
-            return gone
-        n = int(record.get("page") or 1)
-        reused = [v for v in values if v in self._known_status]
-        names = {f"status_{i}": v for i, v in
-                 enumerate((v for v in values if v not in self._known_status), 1)}
-        if names:
-            answers = await self._ask(
-                {"statuses": names},
-                {name: {"type": "noul", "instructions": STATUS_QUESTION.format(status=name)}
-                 for name in names},
-            )
-            for name, value in names.items():
-                self._known_status[value] = (_noul(answers, name), n)
-        probabilities = {v: self._known_status[v][0] for v in values}
-        gone = {v for v, p in probabilities.items() if p >= UNAVAILABLE_MIN}
-        pages = sorted({self._known_status[v][1] for v in reused})
-        by = ("jev" if names else
-              f"page{'s' if len(pages) > 1 else ''} {', '.join(map(str, pages))}")
-        record["status"] = {"by": by, "unavailable": sorted(gone),
-                            "values": {v: round(p, 3) for v, p in probabilities.items()}}
-        if names and reused:
-            record["status"]["reused"] = reused
+        needles = [d.lower() for d in drop]
+        gone = {v for v in values if any(d in v.lower() for d in needles)}
+        record["status"] = {"by": "override", "unavailable": sorted(gone), "values": values}
         return gone
 
     async def _decide_next(self, probe: dict, n: int, title: str, listing_hrefs: set[str],
@@ -1458,8 +1447,9 @@ class GenericSource:
         """A paste-ready `SiteOverride` that pins what this attempt decided.
 
         Built from page 1 (where every decision is made from the fullest page)
-        plus any status values later pages judged. Parts nothing was decided
-        about are left out, so pasting it pins exactly what was seen.
+        plus any status values an override dropped on later pages. Parts
+        nothing was decided about are left out, so pasting it pins exactly what
+        was seen.
         """
         out: dict[str, Any] = {"match": self.site}
         first = next((d for d in self.decisions if d.get("listing_links")), None)
@@ -1980,8 +1970,14 @@ def _values_of(card: dict) -> dict[str, str]:
     return values
 
 
-def _field_keys(cards: list[_Card]) -> list[tuple[str, bool]]:
-    """The fields common enough to ask about: (key, is it a label), card order."""
+def _field_keys(cards: list[_Card], known: set[str] = frozenset()) -> list[tuple[str, bool]]:
+    """The fields common enough to ask about: (key, is it a label), card order.
+
+    A field is common when at least FIELD_MIN_CARDS cards have it (every card,
+    on a page with fewer). A key an earlier page of the sweep decided (`known`)
+    counts on any card that has it: its meaning is settled, and a last page
+    with one card still needs its price read.
+    """
     counts: dict[str, int] = {}
     labeled: dict[str, bool] = {}
     for card in cards:
@@ -1991,8 +1987,9 @@ def _field_keys(cards: list[_Card]) -> list[tuple[str, bool]]:
             labeled.setdefault(key, False)
         for key, value in card.values.items():
             counts[key] = counts.get(key, 0) + 1
-    need = FIELD_PRESENCE * len(cards)
-    common = [k for k in labeled if counts.get(k, 0) >= need and counts.get(k, 0) > 0]
+    need = max(1, min(FIELD_MIN_CARDS, len(cards)))
+    common = [k for k in labeled
+              if counts.get(k, 0) >= (1 if k in known else need)]
     if len(common) > MAX_FIELDS:
         keep = set(sorted(common, key=lambda k: -counts[k])[:MAX_FIELDS])
         common = [k for k in common if k in keep]
@@ -2011,6 +2008,17 @@ def _pinned(fields: dict[str, str], key: str) -> str | None:
 
 def _fold(key: str) -> str:
     return " ".join(key.replace(":", " ").split()).lower()
+
+
+def _spread(values: list[str], limit: int, chars: int | None) -> list[str]:
+    """Up to `limit` distinct values, taken across the page rather than from its
+    top: the first, the last and evenly between, in page order."""
+    distinct = _distinct(values, len(values), chars)
+    if len(distinct) <= limit:
+        return distinct
+    last = len(distinct) - 1
+    picks = sorted({round(i * last / (limit - 1)) for i in range(limit)})
+    return [distinct[i] for i in picks]
 
 
 def _distinct(values: list[str], limit: int, chars: int | None) -> list[str]:
