@@ -24,6 +24,7 @@ from app.services.presentation import human_size
 from app.services.scrape import ScrapeService
 from app.services.secret import SecretService
 from app.services.settings import SettingsService
+from app.services.typesafe import API as TYPESAFE_API
 from app.stores.notion import API
 
 SECRET = "test-secret-long-enough-1"
@@ -158,6 +159,7 @@ class TestWriteRoutesRequireAuth:
             "/settings/notion/verify",
             "/settings/notion/create",
             "/settings/notion/mapping",
+            "/settings/typesafe",
             "/settings/connections/disconnect",
         ],
     )
@@ -633,6 +635,180 @@ class TestProxyTest:
         assert "Fill in the username" in response.text
 
 
+class TestTypeSafeUi:
+    """Settings → TypeSafe Classifier (e.g. Jev): the proxy's rules for a key.
+
+    Write-only secret, blank keeps it, Test checks what was typed before saving
+    it, and the chip comes from the remembered verdict — not from the form."""
+
+    KEY = "sk-or-v1-UI-SECRET-KEY-abcdef0123456789"
+
+    @staticmethod
+    def _ok():
+        return httpx.Response(200, json={
+            "model": "typesafe/jev-1.13-20260917",
+            "answers": {"check": {"type": "noul", "noul": 0.9}},
+            "usage": {"input_tokens": 12, "output_tokens": 1, "cost": 0.0000005},
+        })
+
+    @staticmethod
+    def _rejected(status=401, message="User not found."):
+        return httpx.Response(status, json={"error": {"message": message, "code": status}})
+
+    def test_off_by_default_and_says_what_it_is_for(self, auth):
+        response = auth.get("/")
+        page = shown(response)
+        assert "TypeSafe Classifier (e.g. Jev)" in page
+        assert '<span class="chip">Not set</span>' in response.text
+        assert "read listing sites other than BizBuySell" in page
+        assert "Without one, everything else works as it does today" in page
+        # Listed on Overview, and marked optional there.
+        assert ("<b>TypeSafe Classifier (e.g. Jev) "
+                '<span class="opt-tag">optional</span></b>') in response.text
+        assert 'value="jev-latest"' in response.text
+
+    def test_a_saved_key_is_never_rendered_back(self, auth):
+        response = auth.post("/settings/typesafe", data={
+            "action": "save", "typesafe_openrouter_api_key": self.KEY,
+            "typesafe_model": "jev-latest"})
+        assert response.status_code == 200
+        assert app.state.settings.load().typesafe_openrouter_api_key == self.KEY
+        for page in (response.text, auth.get("/").text):
+            assert self.KEY not in page
+            assert "(saved — leave blank to keep it)" in page
+            assert '<span class="chip warn">Untested</span>' in page
+        assert "not tested" in shown(response)
+
+    def test_a_blank_key_field_keeps_the_saved_key(self, auth):
+        auth.post("/settings/typesafe", data={"typesafe_openrouter_api_key": self.KEY})
+        auth.post("/settings/typesafe", data={"typesafe_openrouter_api_key": "",
+                                              "typesafe_model": "jev-2"})
+        settings = app.state.settings.load()
+        assert settings.typesafe_openrouter_api_key == self.KEY
+        assert settings.typesafe_model == "jev-2"
+
+    def test_a_cleared_model_goes_back_to_the_default(self, auth):
+        auth.post("/settings/typesafe", data={"typesafe_openrouter_api_key": self.KEY,
+                                              "typesafe_model": "jev-2"})
+        auth.post("/settings/typesafe", data={"typesafe_model": "  "})
+        assert app.state.settings.load().typesafe_model == "jev-latest"
+
+    @respx.mock
+    def test_a_passing_test_saves_and_is_remembered(self, auth):
+        route = respx.post(TYPESAFE_API).mock(return_value=self._ok())
+        response = auth.post("/settings/typesafe", data={
+            "action": "test", "typesafe_openrouter_api_key": self.KEY,
+            "typesafe_model": "jev-latest"})
+        assert response.status_code == 200
+        assert route.calls.last.request.headers["Authorization"] == f"Bearer {self.KEY}"
+        settings = app.state.settings.load()
+        assert settings.typesafe_openrouter_api_key == self.KEY
+        assert settings.typesafe_status() == "working"
+        # Come back later: the verdict is still there, the key is not.
+        later = auth.get("/")
+        assert '<span class="chip ok">Working</span>' in later.text
+        assert "Last tested" in shown(later) and "typesafe/jev-1.13-20260917" in shown(later)
+        assert self.KEY not in later.text
+
+    @respx.mock
+    def test_a_rejected_key_is_reported_and_stays_broken(self, auth):
+        respx.post(TYPESAFE_API).mock(
+            return_value=self._rejected(401, f"Invalid key {self.KEY}"))
+        response = auth.post("/settings/typesafe", data={
+            "action": "test", "typesafe_openrouter_api_key": self.KEY})
+        assert response.status_code == 400
+        assert "OpenRouter rejected the key" in shown(response)
+        assert self.KEY not in response.text
+        # Nothing working was at stake, so the attempt is recorded as broken.
+        assert app.state.settings.load().typesafe_status() == "broken"
+        later = auth.get("/")
+        assert '<span class="chip bad">Broken</span>' in later.text
+        assert "did not work when it was last tested" in shown(later)
+        assert self.KEY not in later.text
+
+    @respx.mock
+    def test_an_empty_account_says_so(self, auth):
+        respx.post(TYPESAFE_API).mock(return_value=self._rejected(402, "Insufficient credits"))
+        response = auth.post("/settings/typesafe", data={
+            "action": "test", "typesafe_openrouter_api_key": self.KEY})
+        assert response.status_code == 400
+        assert "out of credits" in shown(response)
+
+    @respx.mock
+    def test_a_failed_test_of_a_new_key_keeps_the_working_one(self, auth):
+        respx.post(TYPESAFE_API).mock(return_value=self._ok())
+        auth.post("/settings/typesafe", data={
+            "action": "test", "typesafe_openrouter_api_key": self.KEY})
+        assert app.state.settings.load().typesafe_status() == "working"
+
+        respx.post(TYPESAFE_API).mock(return_value=self._rejected())
+        response = auth.post("/settings/typesafe", data={
+            "action": "test", "typesafe_openrouter_api_key": "sk-or-v1-typo"})
+        assert response.status_code == 400
+        assert "were kept unchanged" in shown(response)
+        after = app.state.settings.load()
+        assert after.typesafe_openrouter_api_key == self.KEY, "a typo replaced a working key"
+        assert after.typesafe_status() == "working"
+
+    @respx.mock
+    def test_retesting_the_saved_key_records_that_it_stopped_working(self, auth):
+        """Keeping the old config only protects a working key from a DIFFERENT
+        candidate. Re-testing the saved key measures the saved key."""
+        respx.post(TYPESAFE_API).mock(return_value=self._ok())
+        auth.post("/settings/typesafe", data={
+            "action": "test", "typesafe_openrouter_api_key": self.KEY})
+
+        respx.post(TYPESAFE_API).mock(return_value=self._rejected(402, "Insufficient credits"))
+        response = auth.post("/settings/typesafe", data={
+            "action": "test", "typesafe_openrouter_api_key": ""})
+        assert response.status_code == 400
+        assert "kept unchanged" not in shown(response)
+        assert app.state.settings.load().typesafe_status() == "broken"
+
+    @respx.mock
+    def test_editing_the_key_retires_the_verdict_and_saving_nothing_keeps_it(self, auth):
+        respx.post(TYPESAFE_API).mock(return_value=self._ok())
+        auth.post("/settings/typesafe", data={
+            "action": "test", "typesafe_openrouter_api_key": self.KEY})
+        auth.post("/settings/typesafe", data={"typesafe_model": "jev-latest"})
+        assert app.state.settings.load().typesafe_status() == "working"
+
+        auth.post("/settings/typesafe", data={"typesafe_openrouter_api_key": "sk-or-v1-new",
+                                              "typesafe_model": "jev-latest"})
+        assert app.state.settings.load().typesafe_status() == "untested"
+
+    def test_testing_without_a_key_asks_for_one(self, auth):
+        response = auth.post("/settings/typesafe", data={"action": "test"})
+        assert response.status_code == 400
+        assert "Enter an OpenRouter API key first" in response.text
+
+    def test_remove_key_clears_it_and_its_verdict(self, auth):
+        app.state.settings.update(typesafe_openrouter_api_key=self.KEY,
+                                  typesafe_last_check_ok=True, typesafe_last_check_at=1.0,
+                                  typesafe_last_check_summary="Working.")
+        assert "Remove key" in auth.get("/").text
+        response = auth.post("/settings/typesafe", data={"action": "clear"})
+        assert response.status_code == 200
+        settings = app.state.settings.load()
+        assert settings.typesafe_openrouter_api_key == ""
+        assert settings.typesafe_status() == "unset"
+        assert "Key removed" in shown(response)
+        assert '<span class="chip">Not set</span>' in response.text
+
+    def test_archive_page_shares_the_one_classifier(self, client):
+        """The archive guard asks through the process's one client, so its
+        concurrency ceiling is shared and a key saved here applies at once."""
+        assert app.state.archive._typesafe is app.state.typesafe
+
+    def test_a_foreign_origin_is_refused(self, auth):
+        response = auth.post("/settings/typesafe",
+                             data={"typesafe_openrouter_api_key": self.KEY},
+                             headers={"Origin": "https://evil.example"},
+                             follow_redirects=False)
+        assert response.status_code == 403
+        assert app.state.settings.load().typesafe_openrouter_api_key == ""
+
+
 class TestNotionUi:
     @respx.mock
     def test_select_stores_and_verifies(self, auth):
@@ -684,7 +860,8 @@ class TestNotionUi:
                         "Normalized URL": text(),
                         "Listing ID": text(),
                         "Asking Price": text(),  # the hand-built reality
-                        "Bot Triage": text(),    # a column we know nothing about
+                        "Key Risks": text(),     # a column we know nothing about
+                        "Bot Triage": text(),    # written by triage, and only by triage
                     },
                 },
             )
@@ -704,7 +881,13 @@ class TestNotionUi:
         # A column we know nothing about is not mapped, so it is left untouched.
         map_ = app.state.settings.load().notion_column_map
         assert map_["asking_price"] == "Asking Price"
-        assert "Bot Triage" not in map_.values()
+        assert "Key Risks" not in map_.values()
+        assert "Your other 1 column is never touched" in page
+        # Bot Triage is no longer "a column we know nothing about": it maps by
+        # name to the triage field, which only a triaging sweep ever writes —
+        # and it costs this non-triaging database nothing (still "is ready").
+        assert map_["bot_triage"] == "Bot Triage"
+        assert [k for k, v in map_.items() if v == "Bot Triage"] == ["bot_triage"]
 
     @respx.mock
     def test_create_is_only_ever_explicit(self, auth):
@@ -881,6 +1064,84 @@ class TestNotionMapping:
         saved = app.state.settings.load().notion_column_map
         # Not a real column -> treated as "don't sync", never stored as a target.
         assert saved["asking_price"] is None
+
+
+class TestTriageMapping:
+    """The triage fields in the mapping table: under their own subheading, so
+    nobody expects an ordinary sweep to fill them, and saved like any other
+    field — Nick maps Triage Reason onto his "Why Review" column here."""
+
+    _REQUIRED = {"map_listing_title": "Deal", "map_url": "Link",
+                 "map_normalized_url": "Canonical", "map_listing_id": "Ref"}
+
+    def _db(self):
+        body = {**_RENAMED_DB, "properties": {
+            **_RENAMED_DB["properties"],
+            "Bot Triage": {"id": "bt", "type": "select", "select": {}},
+            "Why Review": {"id": "wr", "type": "rich_text", "rich_text": {}},
+        }}
+        respx.get(f"{API}/databases/db-1").mock(return_value=httpx.Response(200, json=body))
+
+    @respx.mock
+    def test_the_triage_rows_sit_under_their_own_subheading(self, auth):
+        self._db()
+        auth.post("/settings/notion", data={"notion_api_token": "ntn_x"})
+        page = shown(auth.post("/settings/notion/select", data={"db_id": "db-1"}))
+
+        heading = page.index("Written only by triage")
+        assert page.index('name="map_last_synced_at"') < heading < page.index('name="map_bot_triage"')
+        for key in ("bot_triage", "triage_reason", "triaged_at", "criteria_version"):
+            assert page.index(f'name="map_{key}"') > heading
+        assert "— don't write —" in page
+        # The same-named Bot Triage column is picked up without being chosen.
+        bot = page[page.index('name="map_bot_triage"'):page.index('name="map_triage_reason"')]
+        assert '<option value="Bot Triage" selected>' in bot
+        reason = page[page.index('name="map_triage_reason"'):page.index('name="map_triaged_at"')]
+        assert "selected>" not in reason.replace("<option value=\"\" selected>", "")
+
+    @respx.mock
+    def test_saving_maps_the_triage_fields(self, auth):
+        self._db()
+        auth.post("/settings/notion", data={"notion_api_token": "ntn_x"})
+        auth.post("/settings/notion/select", data={"db_id": "db-1"})
+
+        response = auth.post("/settings/notion/mapping", data={
+            **self._REQUIRED, "map_asking_price": "Ask", "map_bot_triage": "Bot Triage",
+            "map_triage_reason": "Why Review", "map_triaged_at": "", "map_criteria_version": "",
+        })
+
+        saved = app.state.settings.load().notion_column_map
+        assert saved["bot_triage"] == "Bot Triage"
+        assert saved["triage_reason"] == "Why Review"
+        # No column of that name exists, so an empty choice stores nothing and a
+        # "Triaged At" column added later is still found by its name.
+        assert "triaged_at" not in saved and "criteria_version" not in saved
+        page = shown(response)
+        assert "is ready" in page, "triage fields never block or nag"
+        assert "Your other 1 column is never touched" in page  # Notes; not Why Review
+
+    @respx.mock
+    def test_an_empty_choice_switches_off_a_same_named_column(self, auth):
+        self._db()
+        auth.post("/settings/notion", data={"notion_api_token": "ntn_x"})
+        auth.post("/settings/notion/select", data={"db_id": "db-1"})
+
+        response = auth.post("/settings/notion/mapping", data={
+            **self._REQUIRED, "map_bot_triage": ""})
+
+        assert app.state.settings.load().notion_column_map["bot_triage"] is None
+        bot = shown(response)
+        bot = bot[bot.index('name="map_bot_triage"'):bot.index('name="map_triage_reason"')]
+        assert '<option value="" selected>— don\'t write —' in bot
+
+    @respx.mock
+    def test_a_triage_column_that_does_not_exist_is_ignored(self, auth):
+        self._db()
+        auth.post("/settings/notion", data={"notion_api_token": "ntn_x"})
+        auth.post("/settings/notion/select", data={"db_id": "db-1"})
+        auth.post("/settings/notion/mapping", data={
+            **self._REQUIRED, "map_bot_triage": "Bot Triage", "map_triage_reason": "Nope"})
+        assert "triage_reason" not in app.state.settings.load().notion_column_map
 
 
 # APP_SECRET is managed in Railway rather than this settings page. The
@@ -1233,6 +1494,49 @@ class TestArchiveTasksInTheDashboard:
         assert "1 listings" in page
         row = {r["job_id"]: r for r in auth.get("/runs").json()}[job.id]
         assert row["kind"] == "sweep" and row["listings"] == 1 and row["pages_crawled"] == 2
+
+
+class TestTriageInTheDashboard:
+    """A triaging sweep keeps working after its sources are done, so the row
+    under Running now says what it is doing; and its result says how many rows
+    now wait for review."""
+
+    SERP = "https://www.bizbuysell.com/california/businesses-for-sale/"
+
+    @pytest.fixture(autouse=True)
+    def _leave_the_store_as_it_was_found(self):
+        before = {j.id for j in app.state.jobs.all()}
+        yield
+        for job in app.state.jobs.all():
+            if job.id in before:
+                continue
+            if job.status == "working":
+                job.status = "completed"
+                app.state.jobs.save(job)
+            app.state.jobs.drop(job.id)
+
+    def test_a_running_sweep_shows_its_phase(self, auth):
+        app.state.jobs.create(url=self.SERP, source="bizbuysell_serp", max_pages=2,
+                              summary="Reading 3 detail pages… (1 of 3 done)")
+        page = shown(auth.get("/"))
+        assert "Reading 3 detail pages… (1 of 3 done)" in page
+        assert "page 0 / 2" not in page
+
+    def test_the_result_counts_the_rows_left_for_review(self):
+        from app.models import SyncResult, TriageSummary
+        from app.routes.ui import _job_result
+
+        triaged = app.state.jobs.create(
+            url=self.SERP, source="bizbuysell_serp", status="completed", sync=True,
+            synced=SyncResult(new=15, existing=4, db_id="db"),
+            triage=TriageSummary(ok=True, review=3, reject=12),
+        )
+        assert _job_result(triaged) == ("ok", "15 new, 4 known · 3 review")
+        plain = app.state.jobs.create(
+            url=self.SERP, source="bizbuysell_serp", status="completed", sync=True,
+            synced=SyncResult(new=15, existing=4, db_id="db"),
+        )
+        assert _job_result(plain) == ("ok", "15 new, 4 known")
 
 
 class TestSessionsControls:
@@ -3222,3 +3526,170 @@ class TestStorage:
 
         assert old.is_dir()
         assert storage.jobs.get(job.id) is not None
+
+
+class TestSiteOverridesSetting:
+    """The app's first free-form editor: checked on save, stored as typed, and a
+    refusal says where the problem is and keeps the person's text."""
+
+    DOC = """[
+  {
+    "match": "bizquest.com",
+    "next_page": "none",
+    "fields": {"Asking Price": "asking_price", "Brokered By": "ignore"}
+  },
+
+  {"match": "https://sfbay.fcbb.com/silicon-valley", "next_page": "click:a.next"}
+]"""
+
+    def test_empty_by_default_and_says_what_it_is_for(self, auth):
+        response = auth.get("/")
+        page = shown(response)
+        assert "Site overrides" in page
+        assert 'name="site_overrides_json"' in response.text
+        assert "Anything you leave out is still decided by the classifier" in page
+        assert "suggested_override" in page, "points at the paste-ready suggestion"
+        assert "Tasks → History" in page and "Details" in page
+
+    def test_a_valid_document_is_saved_verbatim(self, auth):
+        app.state.settings.update(typesafe_openrouter_api_key="sk-or-test")
+        response = auth.post("/settings/overrides", data={"site_overrides_json": self.DOC})
+        assert response.status_code == 200
+        assert "Saved 2 site overrides." in shown(response)
+        assert app.state.settings.load().site_overrides_json == self.DOC
+        later = auth.get("/")
+        assert self.DOC in shown(later), "their formatting and order survive"
+        assert '<span class="chip ok">2 sites</span>' in later.text
+
+    def test_browser_line_endings_are_stored_as_typed(self, auth):
+        auth.post("/settings/overrides",
+                  data={"site_overrides_json": self.DOC.replace("\n", "\r\n")})
+        assert app.state.settings.load().site_overrides_json == self.DOC
+
+    def test_saving_without_a_key_warns_that_nothing_uses_them_yet(self, auth):
+        response = auth.post("/settings/overrides", data={"site_overrides_json": self.DOC})
+        assert response.status_code == 200
+        assert 'class="banner warn"' in response.text
+        assert "once a TypeSafe Classifier (e.g. Jev) key is saved" in shown(response)
+
+    def test_broken_json_is_refused_with_its_line_and_column(self, auth):
+        app.state.settings.update(site_overrides_json='[{"match": "old.example"}]')
+        broken = '[\n  {"match": "bizquest.com"\n   "next_page": "none"}\n]'
+        response = auth.post("/settings/overrides", data={"site_overrides_json": broken})
+        assert response.status_code == 400
+        page = shown(response)
+        assert "Not saved. Line 3, column 4: Expecting ',' delimiter." in page
+        assert broken in page, "the person's own text is back in the box to fix"
+        assert app.state.settings.load().site_overrides_json == '[{"match": "old.example"}]'
+
+    @pytest.mark.parametrize("doc,where", [
+        ('[{"match": "bizquest.com", "next_page": "page 2"}]',
+         "Override 1 (bizquest.com) → next_page: next_page must be a URL containing {page}"),
+        ('[{"match": "a.com"}, {"match": "b.com", "fields": {"Price": "price"}}]',
+         "Override 2 (b.com) → fields → Price: Input should be 'title'"),
+        ('[{"match": "a.com", "pagination": "none"}]',
+         "Override 1 (a.com) → pagination: is not something an override can set"),
+        ('{"match": "a.com"}', "must be a JSON list with one entry per site"),
+    ])
+    def test_a_bad_value_is_refused_with_its_field_path(self, auth, doc, where):
+        response = auth.post("/settings/overrides", data={"site_overrides_json": doc})
+        assert response.status_code == 400
+        assert where in shown(response)
+        assert app.state.settings.load().site_overrides_json == ""
+
+    def test_blank_clears_every_override(self, auth):
+        app.state.settings.update(site_overrides_json=self.DOC)
+        response = auth.post("/settings/overrides", data={"site_overrides_json": "  \n "})
+        assert response.status_code == 200
+        assert "Cleared." in shown(response)
+        assert app.state.settings.load().site_overrides_json == ""
+        assert '<span class="chip">None</span>' in response.text
+
+    def test_a_saved_document_that_no_longer_parses_still_renders(self, auth):
+        """A later version may tighten the schema; the page must still load and
+        say so, because it is the only place to fix it."""
+        app.state.settings.update(site_overrides_json='[{"match": "a.com", "retired": 1}]')
+        response = auth.get("/")
+        assert response.status_code == 200
+        assert '<span class="chip bad">Invalid</span>' in response.text
+        assert "The saved overrides can’t be read" in shown(response)
+
+    def test_signed_out_and_cross_origin_saves_are_refused(self, client, auth):
+        r = auth.post("/settings/overrides", data={"site_overrides_json": self.DOC},
+                      headers={"Origin": "https://evil.example"}, follow_redirects=False)
+        assert r.status_code == 403
+        assert app.state.settings.load().site_overrides_json == ""
+        assert auth.get("/settings/overrides", follow_redirects=False).status_code == 405
+
+
+class TestSweepPreflightOnTheDashboard:
+    """The dashboard's "run sweep" goes through the same `submit` as the tools."""
+
+    WC = "https://www.websiteclosers.com/businesses-for-sale/"
+
+    def _failing_check(self, monkeypatch, error):
+        from app.services.typesafe import TypeSafeCheck
+
+        calls = []
+
+        async def check(key=None, model=None):
+            calls.append(1)
+            return TypeSafeCheck(ok=False, message=str(error), error=error)
+
+        # The per-test volume is app.state.settings; point the sweep at it too.
+        monkeypatch.setattr(app.state.scrape, "_settings", app.state.settings)
+        monkeypatch.setattr(app.state.typesafe, "check", check)
+        app.state.settings.update(typesafe_openrouter_api_key="sk-or-test")
+        return calls
+
+    def test_a_rejected_key_is_a_banner_on_the_tasks_tab(self, auth, monkeypatch):
+        from app.services.typesafe import TypeSafeAuthError
+
+        calls = self._failing_check(
+            monkeypatch, TypeSafeAuthError("OpenRouter rejected the key (HTTP 401)."))
+        jobs_before = len(app.state.jobs.all())
+        r = auth.post("/sessions/sweep", data={"url": self.WC}, follow_redirects=False)
+        assert r.status_code == 409
+        assert "OpenRouter rejected the key (HTTP 401)." in shown(r)
+        assert 'class="banner' in r.text and 'data-section="tasks" class="on"' in r.text
+        assert calls == [1] and len(app.state.jobs.all()) == jobs_before
+
+    def test_an_outage_is_a_503_banner(self, auth, monkeypatch):
+        from app.services.typesafe import TypeSafeUnavailable
+
+        self._failing_check(monkeypatch, TypeSafeUnavailable("could not answer"))
+        r = auth.post("/sessions/sweep", data={"url": self.WC}, follow_redirects=False)
+        assert r.status_code == 503 and "could not answer" in shown(r)
+
+    def test_no_key_is_the_guided_refusal(self, auth, monkeypatch):
+        monkeypatch.setattr(app.state.scrape, "_settings", app.state.settings)
+        r = auth.post("/sessions/sweep", data={"url": self.WC}, follow_redirects=False)
+        assert r.status_code == 422
+        assert "add an OpenRouter key under Settings → TypeSafe Classifier (e.g. Jev)" in shown(r)
+
+
+class TestRunDecisions:
+    """How each URL was read is in the run's detail, for a person — and one
+    click from the Tasks history."""
+
+    def test_a_sweep_s_run_detail_carries_its_decisions(self, auth):
+        decisions = [{"url": "https://www.websiteclosers.com/businesses-for-sale/",
+                      "adapter": "generic", "pages": [{"page": 1}], "legibility": [],
+                      "suggested_override": {"match": "websiteclosers.com"}}]
+        job = app.state.jobs.create(urls=[decisions[0]["url"]], source="generic",
+                                    status="completed", decisions=decisions)
+        body = auth.get(f"/runs/{job.id}").json()
+        assert body["decisions"] == decisions
+        row = {r["job_id"]: r for r in auth.get("/runs").json()}[job.id]
+        assert "decisions" not in row, "the list stays small; the detail has it"
+        assert "decisions" not in auth.get(f"/runs/{job.id}/results").json()
+        page = auth.get("/").text
+        assert f'href="/runs/{job.id}"' in page and ">Details</a>" in page
+        assert "Listing sweep · websiteclosers.com" in shown(auth.get("/"))
+
+    def test_an_archive_has_no_decisions(self, auth):
+        task = app.state.jobs.create(kind="archive", url="https://x.example/",
+                                     notion_page_id="page-1", status="completed")
+        assert task.kind == "archive"
+        assert "decisions" not in auth.get(f"/runs/{task.id}").json()
+        assert f'href="/runs/{task.id}"' not in auth.get("/").text, "no Details link"

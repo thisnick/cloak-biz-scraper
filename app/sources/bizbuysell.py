@@ -178,6 +178,7 @@ class BizBuySellSerp:
     """The BizBuySell search-results adapter."""
 
     name = "bizbuysell_serp"
+    hosts = ("bizbuysell.com",)
     label = "BizBuySell"
     describes = "BizBuySell search results (bizbuysell.com … businesses-for-sale)"
     example = "https://www.bizbuysell.com/california/san-francisco-bay-area-businesses-for-sale/"
@@ -354,6 +355,7 @@ class BizBuySellBroker:
     """
 
     name = "bizbuysell_broker"
+    hosts = ("bizbuysell.com",)
     label = "BizBuySell broker"
     describes = "BizBuySell broker profile (bizbuysell.com/business-broker/…)"
     example = "https://www.bizbuysell.com/business-broker/murali-barathi/krea-business/41243/"

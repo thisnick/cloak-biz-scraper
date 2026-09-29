@@ -13,7 +13,11 @@ number is invisibly wrong. Nothing is lost either way — the verbatim text stil
 survives in the listing's excerpt, the archived page body, and the run evidence.
 
 So this parser accepts only strings that are *entirely* a single amount, and
-rejects anything with trailing qualifiers, ranges, or commentary.
+rejects anything with trailing qualifiers, ranges, or commentary. The one thing
+allowed before the amount besides "$" is a US-dollar code in front of it
+("USD $650,000", "US$650,000", as Flippa prints prices): that says the same
+thing as the bare "$", only more exactly. Another currency's code ("CAD $…")
+is not a US-dollar amount and is refused.
 """
 from __future__ import annotations
 
@@ -23,6 +27,7 @@ import re
 # That is the point — trailing junk means we do not know the number.
 _AMOUNT = re.compile(
     r"""^
+    (?:(?:USD|US)\s*(?=\$))?            # "USD $650,000" / "US$650,000": only before a "$"
     \$?\s*                              # optional currency marker
     (?P<num>
         \d{1,3}(?:,\d{3})+              # 1,258,000
@@ -50,6 +55,10 @@ def parse_money(value: object) -> float | None:
     >>> parse_money("Not Disclosed") is None
     True
     >>> parse_money("$81,000 + Inventory") is None   # not $81,000
+    True
+    >>> parse_money("USD $650,000")
+    650000.0
+    >>> parse_money("USD $28,274 p/mo") is None      # a month's profit is not a year's
     True
     """
     if value is None:

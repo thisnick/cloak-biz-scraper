@@ -136,7 +136,11 @@ class TestStateless:
             "archive_page",
             "agent_browser",
         }
-        assert {n for n, h in hints.items() if h.get("idempotentHint")} == {"close_instance"}
+        # archive_page skips a page that already has its Source Content section,
+        # so the same call twice leaves the page as the first call did.
+        assert {n for n, h in hints.items() if h.get("idempotentHint")} == {
+            "close_instance", "archive_page",
+        }
 
     def test_the_async_pair_is_described_as_a_pair(self, client):
         """A model that does not know to call back reports zero listings for a
@@ -144,6 +148,54 @@ class TestStateless:
         tools = {t["name"]: t for t in rpc(client, "tools/list").json()["result"]["tools"]}
         assert "get_scrape_listing_results" in tools["scrape_listings"]["description"]
         assert "job_id" in tools["scrape_listings"]["description"]
+
+    def test_the_sweep_is_described_as_reading_any_listings_page(self, client):
+        """What the model is told decides which URLs it passes: any site's
+        listings page, BizBuySell natively, other sites with the classifier key,
+        and the two ways a page that loads can still fail its source."""
+        description = {t["name"]: t for t in rpc(client, "tools/list").json()["result"]["tools"]}[
+            "scrape_listings"]["description"]
+        assert "BizBuySell only" not in description
+        assert "read natively" in description
+        assert "TypeSafe Classifier (e.g. Jev)" in description
+        flat = " ".join(description.split())
+        assert "found no list of businesses for sale" in flat
+        assert "read as business listings currently for sale" in flat
+        assert "sold, pending or under-contract listing" in flat
+        assert "BizBuySell's cards are always kept" in flat
+        assert "The same on a LATER page stops that URL's paging there: the pages before it " \
+               "are kept and returned" in flat
+        assert "site override" in description and "Settings" in description
+        assert "archive_page" in description
+
+    def test_the_sweep_describes_triage(self, client):
+        """What the model needs to use triage_prompt: what it writes, what it
+        needs, that a decided row is left alone, and where failures show up."""
+        tool = {t["name"]: t for t in rpc(client, "tools/list").json()["result"]["tools"]}[
+            "scrape_listings"]
+        description = " ".join(tool["description"].split())
+        assert "triage_prompt" in description
+        assert "Needs sync=true" in description
+        assert "TypeSafe Classifier (e.g. Jev)" in description
+        for column in ("Bot Triage", "Triage Reason", "Triaged At", "Criteria Version"):
+            assert column in description
+        assert "never re-triaged" in description
+        assert "Source Content" in description
+        assert "triage.failures" in description
+        schema = tool["inputSchema"]["properties"]["triage_prompt"]
+        assert {"type": "null"} in schema.get("anyOf", []) and schema.get("default") is None
+        output = tool["outputSchema"]
+        assert "triage" in output["properties"]
+        assert {"bot_triage", "triage_p_review"} <= set(output["$defs"]["Listing"]["properties"])
+
+    def test_archive_page_describes_the_guard_and_the_repeat(self, client):
+        """Behaviour only: what a repeat call does, and what happens to a page
+        that turns out to be a wall or an error."""
+        description = " ".join({t["name"]: t for t in rpc(client, "tools/list").json()[
+            "result"]["tools"]}["archive_page"]["description"].split())
+        assert "already has a Source Content section gets nothing appended" in description
+        assert "TypeSafe Classifier (e.g. Jev)" in description
+        assert "login wall, error, removed listing or anti-bot page is not written" in description
 
     def test_money_is_advertised_as_a_string_not_a_number(self, client):
         """The contract an agent reads. Money is quoted, never interpreted."""
@@ -322,3 +374,168 @@ class TestWhatAFailureTellsTheCaller:
         text = self._call(client, "server_info", {})
         assert text == "Error executing tool server_info"
         assert "/data" not in text
+
+
+class TestSweepRefusalsReachBothDoors:
+    """MCP and REST start a sweep through the same `submit`, so a classifier key
+    that fails its check refuses the call on both, with the same sentence."""
+
+    WC = "https://www.websiteclosers.com/businesses-for-sale/"
+
+    @pytest.fixture
+    def keyed(self, client, tmp_path, monkeypatch):
+        from app.services.settings import SettingsService
+
+        settings = SettingsService(tmp_path / "settings.json", tmp_path / ".dek")
+        monkeypatch.setattr(app.state.scrape, "_settings", settings)
+        return settings
+
+    def _check_fails(self, monkeypatch, error):
+        from app.services.typesafe import TypeSafeCheck
+
+        async def check(key=None, model=None):
+            return TypeSafeCheck(ok=False, message=str(error), error=error)
+
+        monkeypatch.setattr(app.state.typesafe, "check", check)
+
+    def _mcp_call(self, client, urls):
+        r = rpc(client, "tools/call", {"name": "scrape_listings", "arguments": {"urls": urls}})
+        assert r.status_code == 200, r.text
+        return r.json()["result"]
+
+    def test_a_rejected_key_is_the_tool_s_answer_and_a_409(self, client, keyed, monkeypatch):
+        from app.services.typesafe import TypeSafeAuthError
+
+        keyed.update(typesafe_openrouter_api_key="sk-or-test")
+        self._check_fails(monkeypatch, TypeSafeAuthError("OpenRouter rejected the key (HTTP 401)."))
+        result = self._mcp_call(client, [self.WC])
+        assert result["isError"] is True
+        assert "OpenRouter rejected the key (HTTP 401)." in result["content"][0]["text"]
+
+        r = client.post("/api/scrape", json={"urls": [self.WC]})
+        assert r.status_code == 409
+        assert "OpenRouter rejected the key (HTTP 401)." in r.json()["detail"]
+
+    def test_an_outage_is_a_503_over_rest(self, client, keyed, monkeypatch):
+        from app.services.typesafe import TypeSafeUnavailable
+
+        keyed.update(typesafe_openrouter_api_key="sk-or-test")
+        self._check_fails(monkeypatch, TypeSafeUnavailable("The TypeSafe Classifier could not answer."))
+        r = client.post("/api/scrape", json={"urls": [self.WC]})
+        assert r.status_code == 503 and "could not answer" in r.json()["detail"]
+        assert "could not answer" in self._mcp_call(client, [self.WC])["content"][0]["text"]
+
+    def test_without_a_key_both_say_where_it_goes(self, client, keyed):
+        hint = "add an OpenRouter key under Settings → TypeSafe Classifier (e.g. Jev)"
+        result = self._mcp_call(client, [self.WC])
+        assert result["isError"] is True and hint in result["content"][0]["text"]
+        r = client.post("/api/scrape", json={"urls": [self.WC]})
+        assert r.status_code == 422 and hint in r.json()["detail"]
+
+    def test_a_bizbuysell_listing_page_is_refused_even_with_a_key(self, client, keyed):
+        keyed.update(typesafe_openrouter_api_key="sk-or-test")
+        detail = "https://www.bizbuysell.com/business-opportunity/premier-restoration/2515728/"
+        text = self._mcp_call(client, [detail])["content"][0]["text"]
+        assert "bizbuysell.com is read by this app's own adapter" in text
+        assert "archive_page" in text
+
+
+SERP = "https://www.bizbuysell.com/california/sacramento-area-businesses-for-sale/"
+
+
+class TestTriageRefusalsReachBothDoors:
+    """A triage_prompt that cannot be honoured refuses the call on MCP and REST
+    alike, with the same sentence — a setup problem (409), or an outage (503)."""
+
+    @pytest.fixture
+    def configured(self, client, tmp_path, monkeypatch):
+        from app.services.settings import SettingsService
+
+        settings = SettingsService(tmp_path / "settings.json", tmp_path / ".dek")
+        settings.update(notion_api_token="ntn_test", notion_db_id="db-test",
+                        typesafe_openrouter_api_key="sk-or-test")
+        monkeypatch.setattr(app.state.scrape, "_settings", settings)
+        return settings
+
+    def _both(self, client, arguments):
+        r = rpc(client, "tools/call", {"name": "scrape_listings", "arguments": arguments})
+        assert r.status_code == 200, r.text
+        result = r.json()["result"]
+        assert result["isError"] is True, result
+        rest = client.post("/api/scrape", json=arguments)
+        return result["content"][0]["text"], rest
+
+    def _check(self, monkeypatch, error=None):
+        from app.services.typesafe import TypeSafeCheck
+
+        async def check(key=None, model=None):
+            if error is None:
+                return TypeSafeCheck(ok=True, message="Working.")
+            return TypeSafeCheck(ok=False, message=str(error), error=error)
+
+        monkeypatch.setattr(app.state.typesafe, "check", check)
+
+    def test_sync_false(self, client, configured):
+        text, rest = self._both(client, {"urls": [SERP], "triage_prompt": "Reject restaurants."})
+        assert "needs sync=true" in text
+        assert rest.status_code == 409 and rest.json()["detail"] in text
+
+    def test_a_blank_prompt_is_no_prompt_on_either_door(self, client, configured, monkeypatch):
+        """Agents fill optional strings with "": that is no triage, not a
+        refusal — here not even the "needs sync=true" one triage alone makes."""
+        from app.models import SweepTask
+
+        started: list[dict] = []
+
+        def start(urls, **kw):
+            started.append(kw)
+            return SweepTask(id=f"job-{len(started)}", urls=urls, status="working")
+
+        monkeypatch.setattr(app.state.scrape, "start", start)
+        for prompt in ("", "  \n"):
+            r = rpc(client, "tools/call", {"name": "scrape_listings", "arguments": {
+                "urls": [SERP], "triage_prompt": prompt}})
+            assert r.json()["result"].get("isError") is not True, r.text
+            rest = client.post("/api/scrape", json={"urls": [SERP], "triage_prompt": prompt})
+            assert rest.status_code == 200, rest.text
+        assert len(started) == 4
+        assert all("triage_plan" not in kw and not kw.get("triage_prompt") for kw in started)
+
+    def test_no_key(self, client, configured):
+        configured.update(typesafe_openrouter_api_key="")
+        text, rest = self._both(client, {"urls": [SERP], "sync": True,
+                                         "triage_prompt": "Reject restaurants."})
+        assert "no OpenRouter key is saved" in text
+        assert rest.status_code == 409
+
+    def test_a_rejected_key_even_for_bizbuysell(self, client, configured, monkeypatch):
+        from app.services.typesafe import TypeSafeAuthError
+
+        self._check(monkeypatch, TypeSafeAuthError("OpenRouter rejected the key (HTTP 401)."))
+        text, rest = self._both(client, {"urls": [SERP], "sync": True,
+                                         "triage_prompt": "Reject restaurants."})
+        assert "OpenRouter rejected the key (HTTP 401)." in text
+        assert rest.status_code == 409 and "HTTP 401" in rest.json()["detail"]
+
+    def test_an_outage_is_a_503_over_rest(self, client, configured, monkeypatch):
+        from app.services.typesafe import TypeSafeUnavailable
+
+        self._check(monkeypatch, TypeSafeUnavailable("The TypeSafe Classifier could not answer."))
+        text, rest = self._both(client, {"urls": [SERP], "sync": True,
+                                         "triage_prompt": "Reject restaurants."})
+        assert "could not answer" in text
+        assert rest.status_code == 503
+
+    def test_no_bot_triage_column(self, client, configured, monkeypatch):
+        from app.stores.base import TriageUnavailable
+
+        class NoColumn:
+            async def prepare_triage(self, db_id, column_map=None):
+                raise TriageUnavailable("This database has no 'Bot Triage' column.")
+
+        self._check(monkeypatch)
+        monkeypatch.setattr(app.state.scrape, "_store_factory", lambda settings: NoColumn())
+        text, rest = self._both(client, {"urls": [SERP], "sync": True,
+                                         "triage_prompt": "Reject restaurants."})
+        assert "Can't triage into your Notion database" in text and "'Bot Triage'" in text
+        assert rest.status_code == 409 and "'Bot Triage'" in rest.json()["detail"]

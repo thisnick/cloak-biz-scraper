@@ -53,7 +53,7 @@ from .services.geo import GeoUnresolved, ProxyUnreachable
 from .services.instances import BrowserUnavailable, CapExceeded
 from .services.license import LicenseNotPro
 from .services.proxy import ProxyNotConfigured
-from .services.scrape import NotionNotConfigured
+from .services.scrape import ClassifierNotReady, NotionNotConfigured
 from .services.tokens import OWNER
 from .services.urls import public_base
 from .services.views import (
@@ -125,6 +125,9 @@ ADDITIVE = ToolAnnotations(
 ADDITIVE_OPEN_WORLD = ToolAnnotations(
     read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=True,
 )
+ADDITIVE_OPEN_WORLD_IDEMPOTENT = ToolAnnotations(
+    read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=True,
+)
 DESTRUCTIVE = ToolAnnotations(
     read_only_hint=False, destructive_hint=True, idempotent_hint=False, open_world_hint=False,
 )
@@ -138,8 +141,8 @@ DESTRUCTIVE_OPEN_WORLD = ToolAnnotations(
 
 # The failures a caller is MEANT to read: every deliberate refusal. ValueError
 # is the house convention for one (AgentBrowserError, ProfileError and NotASweep
-# all subclass it); the rest are the launch and sync refusals the REST twin turns
-# into a 4xx with the same text.
+# all subclass it); the rest are the launch, sync and classifier refusals the
+# REST twin turns into a 4xx (a classifier outage: 503) with the same text.
 #
 # The SDK shows a tool's own message only for ToolError. Anything else is a
 # crash, reported as a bare "Error executing tool X" with its text kept on the
@@ -156,6 +159,7 @@ REFUSALS: tuple[type[Exception], ...] = (
     ProxyNotConfigured,
     LicenseNotPro,
     NotionNotConfigured,
+    ClassifierNotReady,
 )
 
 
@@ -377,10 +381,14 @@ def build(app) -> MCPServer:
     # Annotated for sync=true, because an annotation cannot vary by argument:
     # sync=false only reads, but the same tool writes Notion rows when asked to.
     # Still not destructive in the sense above: on a row it already has, it
-    # rewrites only its own Last Synced At and Excerpt, from the live card.
+    # rewrites only its own Last Synced At and Excerpt, from the live card, and
+    # triage fills a Bot Triage that is blank — never one that holds a value.
+    # Open world because the caller names the site: any listings page, not only
+    # BizBuySell, once the classifier key is saved.
     @tool(annotations=ADDITIVE_OPEN_WORLD)
     async def scrape_listings(
-        urls: list[str], max_pages: int = 1, sync: bool = False
+        urls: list[str], max_pages: int = 1, sync: bool = False,
+        triage_prompt: str | None = None,
     ) -> ScrapeResult:
         """Start sweeping one or more listings pages for business listings.
 
@@ -396,22 +404,43 @@ def build(app) -> MCPServer:
         archive_page(notion_page_id=…). Listings already in the database are left
         out of `listings` but still counted in `synced.existing`.
 
-        urls: a NON-EMPTY list of pages that each list many businesses, not single
-            listings (BizBuySell only for now). Each entry is either a
-            SEARCH-RESULTS (SERP) page, or a broker's profile page
-            (bizbuysell.com/business-broker/…), whose for-sale listings are swept.
-            Each URL decides how it is read, so for a search use one with the
-            filters already applied. Pass several to sweep several searches or
-            brokers at once (e.g. the same search across a few regions). If a URL
-            isn't a supported listings page it is reported as that source's
-            failure and the others still run; the call only errors outright if the
-            list is empty or none of the URLs are readable. If you don't have such
-            a URL, either ask the user for it, OR get one yourself: create_instance
-            a browser, use agent_browser to run the search on the site (navigate,
-            fill the search box, apply filters), read the resulting address bar
-            (agent_browser get url), and pass that here.
+        urls: a NON-EMPTY list of pages that each list many businesses for sale —
+            a search-results page or a broker's or marketplace's listings page, not
+            a single listing. BizBuySell search results and broker profiles
+            (bizbuysell.com/business-broker/…) are read natively. Any other site's
+            listings page is read by finding the list of businesses on it, which
+            needs the TypeSafe Classifier (e.g. Jev) key saved in the server's
+            Settings; without it such a URL fails with a message saying so. Listings
+            from other sites carry the site (e.g. "websiteclosers.com") as `source`
+            and an empty `listing_id`. For a search, use the URL with the filters
+            already applied. Pass several to sweep several searches, brokers or
+            sites at once. A URL that can't be read is reported as that source's
+            failure, with the reason, and the others still run; the call only errors
+            outright if the list is empty or none of the URLs can be read (including
+            when every URL needs the classifier and its key is rejected, out of
+            credits, or not answering). With the key saved, each new listing is
+            also asked whether it is a business for sale now; on other sites a
+            sold, pending or under-contract listing, or a menu link read as one,
+            is left out (the `summary` says how many), while BizBuySell's cards
+            are always kept. A first page that loads but can't be used fails its
+            source with a reason instead of coming back empty: "found no list of
+            businesses for sale" (a single listing's page, a landing page, a 404),
+            or fewer than half its cards "read as business listings currently for
+            sale". The same on a LATER page stops that URL's paging there: the
+            pages before it are kept and returned, and `error` says which page
+            stopped it and why (the job still completes). A BizBuySell page other than a search
+            or a broker profile is refused; to save one listing's page, use
+            archive_page. How a site's page is read is decided anew by every sweep; if
+            a site keeps being read wrong, the fix is a site override a person
+            saves in the server's Settings, not an argument here. If you don't have
+            a listings URL, either ask the user for it, OR get one yourself:
+            create_instance a browser, use agent_browser to run the search on the
+            site (navigate, fill the search box, apply filters), read the resulting
+            address bar (agent_browser get url), and pass that here.
         max_pages: how many pages of results to walk PER URL (shared across all of
-            them). A broker profile pages its for-sale tab too, so raise this to
+            them). Later pages are reached the way the site pages them — a page
+            link, or a Next / Load more button — and a URL with no next page stops
+            early. A broker profile pages its for-sale tab too, so raise this to
             sweep a broker with many listings.
         sync: false (default) just reads the listings back — no Notion involved,
             and the collected result holds ALL listings found with an empty
@@ -423,8 +452,31 @@ def build(app) -> MCPServer:
             sync=true here, plus archive_page to file a page's full content into a
             Notion page.) Sync always targets the Notion database configured under
             Settings — there is no per-call database override.
+        triage_prompt: optional. Your triage criteria as plain text — what makes a
+            listing one to reject. When given, the sweep also decides REVIEW or
+            REJECT for every row it saves, and for every row it sees whose Bot
+            Triage is still blank, on the listing's card as it reads the page;
+            a row that already has a Bot Triage is never re-triaged, nor asked
+            about at all. It writes Bot Triage, Triage Reason, Triaged At and
+            Criteria Version where those columns exist or are mapped under Settings.
+            A REVIEW row also gets its detail page's Source Content appended (as
+            archive_page does), so there is no need to call archive_page for them.
+            Needs sync=true and the TypeSafe Classifier (e.g. Jev) key in the
+            server's Settings; without either, or if the key fails its check or the
+            database has no Bot Triage column, the call is refused before anything
+            starts. The collected result's `triage` holds the counts, the earlier
+            rows it decided (`backlog`), and `failures`; each new listing carries
+            its `bot_triage`. A row that could not be decided (its detail page
+            would not load, the classifier stopped answering) stays blank, is
+            listed in `triage.failures` or `triage.error`, and is triaged by a
+            later sweep — the job still completes, because the rows were saved.
+            A sweep reads at most 25 detail pages; REVIEWs past that stay blank
+            for the next sweep (`triage.deferred`). A row another sweep is
+            triaging at that moment is left to it (`triage.in_flight`). Leave it
+            out (or pass an empty string) to sweep exactly as without triage.
         """
-        job = app.state.scrape.start(urls, max_pages=max_pages, sync=sync)
+        job = await app.state.scrape.submit(urls, max_pages=max_pages, sync=sync,
+                                            triage_prompt=triage_prompt)
         return ScrapeResult.of(job)
 
     @tool(annotations=READ_ONLY)
@@ -438,7 +490,8 @@ def build(app) -> MCPServer:
         synced_row_id empty); a sync=true sweep returns only the ones it newly
         added to Notion, each carrying the synced_row_id of its new row (pass it to
         archive_page). Rows already in the database are omitted from `listings` but
-        counted in `synced.existing`.
+        counted in `synced.existing`. A sweep started with a triage_prompt stays
+        "working" until triage has finished; `triage` then holds what it decided.
         """
         result = app.state.scrape.result(job_id)
         if result is None:
@@ -448,15 +501,22 @@ def build(app) -> MCPServer:
             )
         return result
 
-    # Not idempotent: it appends, so a second call with the same arguments
-    # leaves the page holding the content twice.
-    @tool(annotations=ADDITIVE_OPEN_WORLD)
+    # Idempotent: the append is skipped when the page already has its "Source
+    # Content" section, so a second call with the same arguments leaves the page
+    # exactly as the first one did.
+    @tool(annotations=ADDITIVE_OPEN_WORLD_IDEMPOTENT)
     async def archive_page(url: str, notion_page_id: str) -> ArchiveResult:
         """Read a page and append its content to an existing Notion page.
 
         Blocking: takes roughly a minute. Works on any URL, including a single
         listing's own page. Appends to the page you name and touches nothing
-        else — it never creates a page or edits a property.
+        else — it never creates a page or edits a property. A page that already
+        has a Source Content section gets nothing appended, so calling this again
+        for the same page is safe. If Notion refuses part of a long page, what was
+        already written is deleted again (or, if that fails, the error says to
+        delete the partial section by hand). When a TypeSafe Classifier (e.g. Jev) key is
+        set, a page that turns out to be a login wall, error, removed listing or
+        anti-bot page is not written, and the result says so.
         """
         return await app.state.archive.archive(url, notion_page_id)
 
@@ -715,13 +775,14 @@ def build(app) -> MCPServer:
     # Closed-world: proxy status comes from saved settings, not a live probe.
     @tool(annotations=READ_ONLY)
     async def server_info() -> ServerInfo:
-        """How this server is set up: proxy, browser, pool, and Notion status.
+        """How this server is set up: proxy, browser, pool, Notion, and TypeSafe status.
 
         Read-only, and carries no secrets — status and versions only. Useful to
         check before a sweep or a browser launch: whether the optional residential
         proxy is direct/configured/working, whether the selected CloakBrowser build
         is public, resolved Pro, or has an unverified Pro key, how many browser slots
-        are free, and whether Notion is connected.
+        are free, whether Notion is connected, and whether the optional TypeSafe
+        Classifier (e.g. Jev) has a key and passed its last test.
         """
         from .services.views import server_info as build_server_info
 

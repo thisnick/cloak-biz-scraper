@@ -16,7 +16,7 @@ import pytest
 from app import sources
 from app.sources import UnsupportedURL
 from app.sources.bizbuysell import JS_CARDS, BizBuySellBroker, BizBuySellSerp, listing_id_from
-from app.sources.urls import canonical_url, normalize_url
+from app.sources.urls import canonical_url, listing_url, normalize_url
 
 MURALI = "https://www.bizbuysell.com/business-broker/murali-barathi/krea-business/41243/"
 RICK = "https://www.bizbuysell.com/business-broker/rick-teh-emba-cbi/accel-business-advisors/36034/"
@@ -65,6 +65,103 @@ class TestNormalization:
         )
 
 
+class TestNormalizationDefaultIsUnchanged:
+    """Byte-for-byte pins on the default key. It is shared with rows already in
+    people's databases and with another codebase, so `keep_query` must not have
+    moved it by a character."""
+
+    @pytest.mark.parametrize("url,key", [
+        (BAY_AREA, "bizbuysell.com/california/san-francisco-bay-area-businesses-for-sale"),
+        (SACRAMENTO + "3/", "bizbuysell.com/california/sacramento-area-businesses-for-sale/3"),
+        (MURALI + "?bp_cfspg=2&bplt=10#bdProfileTabs",
+         "bizbuysell.com/business-broker/murali-barathi/krea-business/41243"),
+        ("https://www.bizbuysell.com/listings/Profile/?q=2484566",
+         "bizbuysell.com/listings/Profile"),
+        ("http://www.bizbuysell.com:8080//business-opportunity//foo/1/",
+         "bizbuysell.com:8080/business-opportunity/foo/1"),
+        ("https://www.bizbuysell.com/", "bizbuysell.com/"),
+    ])
+    def test_the_default_key(self, url, key):
+        assert normalize_url(url) == key
+        assert normalize_url(url, keep_query=None) == key
+
+
+class TestKeepQuery:
+    """For sites where the query names the listing (`listing.php?LID=5`)."""
+
+    def test_only_the_named_keys_are_kept_in_sorted_order(self):
+        url = "https://www.example.com/listing.php?utm_source=x&sort=price&cat=2&LID=5"
+        assert normalize_url(url, keep_query=["LID", "cat"]) == (
+            "example.com/listing.php?LID=5&cat=2"
+        )
+
+    def test_two_listings_on_one_path_stay_two(self):
+        a = normalize_url("https://example.com/listing.php?LID=5", keep_query=["LID"])
+        b = normalize_url("https://example.com/listing.php?LID=6", keep_query=["LID"])
+        assert a != b
+
+    def test_order_and_tracking_do_not_split_one_listing(self):
+        a = normalize_url("https://www.example.com/listing.php?LID=5&cat=2&utm_source=x",
+                          keep_query=("cat", "LID"))
+        b = normalize_url("http://example.com/listing.php/?cat=2&LID=5#top",
+                          keep_query=("LID", "cat"))
+        assert a == b == "example.com/listing.php?LID=5&cat=2"
+
+    @pytest.mark.parametrize("keep", [[], ["LID"]])
+    def test_nothing_to_keep_is_the_plain_key(self, keep):
+        assert normalize_url("https://example.com/listing/5/?page=2", keep_query=keep) == (
+            "example.com/listing/5"
+        )
+
+
+class TestListingUrl:
+    def test_fragment_and_tracking_go_but_the_listing_id_stays(self):
+        url = ("https://www.example.com/listing.php?utm_source=news&LID=5&gclid=abc"
+               "&fbclid=z&mc_cid=1&mc_eid=2&_ga=3#photos")
+        assert listing_url(url) == "https://www.example.com/listing.php?LID=5"
+
+    @pytest.mark.parametrize("key", ["ref", "ref_src", "REF"])
+    def test_ref_is_not_tracking_it_can_be_the_listing_id(self, key):
+        """Sites use ?ref=<id> as the listing id; dropped, every listing on the
+        page would be stored as one address."""
+        assert listing_url(f"https://example.com/listing.php?{key}=1234&utm_source=x") == (
+            f"https://example.com/listing.php?{key}=1234")
+        a = normalize_url(listing_url("https://example.com/listing.php?ref=1234"),
+                          keep_query=["ref"])
+        b = normalize_url(listing_url("https://example.com/listing.php?ref=5678"),
+                          keep_query=["ref"])
+        assert a != b
+
+    def test_the_probe_treats_the_same_keys_as_tracking(self):
+        """JS_PROBE carries its own copy of the list (it runs in the page)."""
+        import re
+
+        from app.sources import generic, urls
+
+        source = re.search(r"const TRACKING = /\^\((.*?)\)\$/i;", generic.JS_PROBE).group(1)
+        probe = re.compile(rf"^({source})$", re.IGNORECASE)
+        for key in ("utm_source", "gclid", "fbclid", "_ga", "mkt_tok"):
+            assert probe.match(key) and urls._is_tracking(key)
+        for key in ("ref", "ref_src", "LID", "id"):
+            assert not probe.match(key) and not urls._is_tracking(key)
+
+    def test_the_remaining_query_is_kept_exactly_as_written(self):
+        """A URL to open, not a key: order and encoding are the site's."""
+        url = "https://example.com/l?b=2&q=Z2lm%3D%3D&a=1&UTM_Medium=email"
+        assert listing_url(url) == "https://example.com/l?b=2&q=Z2lm%3D%3D&a=1"
+
+    def test_a_link_with_only_tracking_loses_its_question_mark(self):
+        assert listing_url("https://example.com/listings/18829322/?utm_campaign=x#top") == (
+            "https://example.com/listings/18829322/"
+        )
+
+    @pytest.mark.parametrize("href", [
+        None, "", "   ", "/listing/5", "javascript:void(0)", "mailto:a@example.com", "https://",
+    ])
+    def test_anything_that_is_not_an_absolute_web_link_is_none(self, href):
+        assert listing_url(href) is None
+
+
 class TestListingId:
     def test_from_a_profile_query(self):
         assert listing_id_from("https://www.bizbuysell.com/listings/Profile/?q=2484566") == "2484566"
@@ -95,6 +192,19 @@ class TestSourceLabels:
         assert sources.label_for("craigslist_biz") == "craigslist_biz"
         assert sources.label_for("") == ""
 
+    def test_the_generic_reader_has_a_label_without_being_registered(self):
+        """It is not in SOURCES (it is built per URL, and it is not a site the
+        "what is supported" list could name), but a sweep it ran still needs a
+        name on the dashboard."""
+        from app.sources.generic import GenericSource
+
+        assert sources.label_for("generic") == "Any site"
+        assert GenericSource.name == "generic" and GenericSource.label == "Any site"
+        assert all(s.name != "generic" for s in sources.SOURCES)
+
+    def test_a_generically_read_listing_is_labelled_by_its_site(self):
+        assert sources.label_for("websiteclosers.com") == "websiteclosers.com"
+
 
 class TestDispatch:
     @pytest.mark.parametrize("url", [BAY_AREA, SACRAMENTO])
@@ -111,10 +221,11 @@ class TestDispatch:
             "not a url",
         ],
     )
-    def test_an_unsupported_url_is_a_hard_error(self, url):
-        """Never a best-effort attempt: a generic scrape of a page we do not
-        understand returns an empty result that looks exactly like "no listings
-        matched", and an agent would report that as fact."""
+    def test_only_the_site_adapters_answer_for_url(self, url):
+        """`for_url` is the site adapters' answer, and it stays a hard error for
+        anything they do not read. Whether some other site is read generically
+        is the sweep's decision — it depends on a saved classifier key and the
+        site overrides — and is pinned in tests/test_scrape.py."""
         with pytest.raises(UnsupportedURL):
             sources.for_url(url)
 
@@ -145,6 +256,55 @@ class TestDispatch:
 
     def test_a_lookalike_domain_does_not_match(self):
         assert not BizBuySellSerp().matches("https://bizbuysell.com.evil.example/x-businesses-for-sale/")
+
+
+class TestOwnerOf:
+    """A site with an adapter never falls through to the generic reader."""
+
+    DETAIL = "https://www.bizbuysell.com/business-opportunity/premier-restoration/2515728/"
+
+    @pytest.mark.parametrize("url", [
+        DETAIL,
+        "https://bizbuysell.com/business-opportunity/premier-restoration/2515728/",
+        "http://m.bizbuysell.com/anything",
+        SACRAMENTO,
+        MURALI,
+    ])
+    def test_every_page_on_an_adapter_s_site_is_owned(self, url):
+        """Right site, wrong job: a listing's own page is still BizBuySell's, so
+        the sweep refuses it instead of reading its "similar listings" rail."""
+        assert sources.owner_of(url) is not None
+        assert sources.owner_of(url).label.startswith("BizBuySell")
+
+    @pytest.mark.parametrize("url", [
+        "https://www.websiteclosers.com/businesses-for-sale/",
+        "https://bizbuysell.com.evil.example/x-businesses-for-sale/",
+        "https://notbizbuysell.com/x",
+        "", "not a url", "https://",
+    ])
+    def test_other_sites_and_non_urls_have_no_owner(self, url):
+        assert sources.owner_of(url) is None
+
+    def test_every_site_adapter_names_the_hosts_it_owns(self):
+        for source in sources.SOURCES:
+            assert source.hosts and all("/" not in h and not h.startswith("www.")
+                                        for h in source.hosts), source.name
+
+
+class TestUnsupportedUrl:
+    def test_a_hint_leads_the_message_and_is_the_one_line_reason(self):
+        exc = UnsupportedURL("https://x.example/", sources.SOURCES, hint="add a key.")
+        message = str(exc)
+        assert message.startswith("Can't read listings from 'https://x.example/': add a key.")
+        assert "bizbuysell.com" in message, "the adapter-read pages still follow"
+        assert exc.reason == "add a key."
+
+    def test_a_reason_can_be_shorter_than_the_hint(self):
+        exc = UnsupportedURL("u", sources.SOURCES, hint="a long explanation.", reason="short")
+        assert exc.reason == "short" and "a long explanation." in str(exc)
+
+    def test_without_a_hint_the_reason_is_generic(self):
+        assert UnsupportedURL("u", sources.SOURCES).reason == "not a supported listings page"
 
 
 class TestPaging:

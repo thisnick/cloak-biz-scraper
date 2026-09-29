@@ -1,0 +1,184 @@
+{
+ "_about": "Hand-labelled truth for the generic listing-page gate (2026-09-28). 'group' = substrings, any of which the chosen listing group's pattern must contain (null = the right answer is 'no list of businesses for sale on this page'). 'next' = 'url:<substring of the page-2 URL>', 'click' (a script-only pager control the source must click), or 'none' (no next page). min_cards = lower bound on listings found on page 1. 'soft' pages are single-listing detail pages: picking a 'similar listings' rail there is tolerable but should be reported separately from the hard gate. 'next' may list alternatives separated by '|'.",
+ "pages": [
+  {
+   "name": "QuietLight",
+   "url": "https://quietlight.com/listings/",
+   "group": [
+    "quietlight.com/listings/"
+   ],
+   "min_cards": 60,
+   "next": "none"
+  },
+  {
+   "name": "WebsiteClosers",
+   "url": "https://www.websiteclosers.com/businesses-for-sale/",
+   "group": [
+    "websiteclosers.com/businesses/"
+   ],
+   "min_cards": 10,
+   "next": "url:/businesses-for-sale/page/2/"
+  },
+  {
+   "name": "Dealonomy",
+   "url": "https://www.dealonomy.com/s",
+   "group": [
+    "dealonomy.com/s/"
+   ],
+   "min_cards": 25,
+   "next": "url:/s?page=2"
+  },
+  {
+   "name": "Magnolia (404)",
+   "url": "https://www.themagnoliafirm.com/current-listings",
+   "group": null,
+   "next": "none"
+  },
+  {
+   "name": "FCBB",
+   "url": "https://sfbay.fcbb.com/silicon-valley/businesses-for-sale?sort=ListingDateNewerToOlder",
+   "group": [
+    "sfbay.fcbb.com/"
+   ],
+   "min_cards": 8,
+   "next": "click"
+  },
+  {
+   "name": "LibertyGroup",
+   "url": "https://www.thelibertygroupofnevada.com/businesses-for-sale/",
+   "group": [
+    "/listing/"
+   ],
+   "min_cards": 8,
+   "next": "none"
+  },
+  {
+   "name": "BusinessTeam",
+   "url": "https://www.business-team.com/buy-a-business/search-results.aspx?lid=all",
+   "group": [
+    "business-team.com/"
+   ],
+   "min_cards": 60,
+   "next": "none"
+  },
+  {
+   "name": "BizEx (blog of new listings)",
+   "url": "https://www.bizex.net/blog",
+   "group": [
+    "bizex.net/blog/"
+   ],
+   "min_cards": 15,
+   "next": "url:/blog?page=2"
+  },
+  {
+   "name": "BusinessesForSale",
+   "url": "https://us.businessesforsale.com/us/search/businesses-for-sale-in-california",
+   "group": [
+    "businessesforsale.com/us/"
+   ],
+   "min_cards": 10,
+   "next": "url:businesses-for-sale-in-california-2"
+  },
+  {
+   "name": "BizQuest",
+   "url": "https://www.bizquest.com/businesses-for-sale-in-california-ca/",
+   "group": [
+    "bizquest.com/"
+   ],
+   "min_cards": 30,
+   "next": "url:/page-2/"
+  },
+  {
+   "name": "EmpireFlippers",
+   "url": "https://empireflippers.com/marketplace/",
+   "group": [
+    "empireflippers.com/listing/",
+    "app.empireflippers.com/unlock/"
+   ],
+   "min_cards": 12,
+   "next": "click"
+  },
+  {
+   "name": "Sunbelt",
+   "url": "https://www.sunbeltnetwork.com/business-search/business-results/",
+   "group": [
+    "sunbeltnetwork.com/"
+   ],
+   "min_cards": 8,
+   "next": "click"
+  },
+  {
+   "name": "BusinessBrokerNet",
+   "url": "https://www.businessbroker.net/state/california-businesses-for-sale.aspx",
+   "group": [
+    "businessbroker.net/"
+   ],
+   "min_cards": 30,
+   "next": "url:?page=2"
+  },
+  {
+   "name": "Murphy (404)",
+   "url": "https://murphybusiness.com/businesses-for-sale/",
+   "group": null,
+   "next": "none"
+  },
+  {
+   "name": "Synergy",
+   "url": "https://synergybb.com/businesses-for-sale/",
+   "group": [
+    "synergybb.com/listings/"
+   ],
+   "min_cards": 15,
+   "next": "click|none"
+  },
+  {
+   "name": "FEInternational (landing page)",
+   "url": "https://feinternational.com/buy-a-website/",
+   "group": null,
+   "next": "none"
+  },
+  {
+   "name": "Transworld (404)",
+   "url": "https://www.tworld.com/buy-a-business/business-listings",
+   "group": null,
+   "next": "none"
+  },
+  {
+   "name": "Flippa",
+   "url": "https://flippa.com/search?filter%5Bproperty_type%5D%5B%5D=saas",
+   "group": [
+    "flippa.com/"
+   ],
+   "min_cards": 4,
+   "next": "url:page=2"
+  },
+  {
+   "name": "WebsiteClosers listing (detail page)",
+   "url": "https://www.websiteclosers.com/businesses/performance-marketing-network-120-active-affiliate-partners-cpa-model-no-ad-spend-seller-financing-available/119624/",
+   "group": null,
+   "next": "none",
+   "soft": true
+  },
+  {
+   "name": "Dealonomy listing (detail page)",
+   "url": "https://www.dealonomy.com/s/digital-marketing-web-design-firm-in-dc-metro-area",
+   "group": null,
+   "next": "none",
+   "soft": true
+  },
+  {
+   "name": "QuietLight listing (detail page)",
+   "url": "https://quietlight.com/listings/18829636/",
+   "group": null,
+   "next": "none",
+   "soft": true
+  },
+  {
+   "name": "Synergy listing (detail page)",
+   "url": "https://synergybb.com/listings/epc-services-company-community-solar-energy-storage/",
+   "group": null,
+   "next": "none",
+   "soft": true
+  }
+ ]
+}

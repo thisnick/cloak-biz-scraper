@@ -115,7 +115,9 @@ async def scrape_with_retry(instances, *, profile: str, owner: str, wait_ms: int
     Evomi session token** so the next launch gets a fresh sticky exit IP, and
     back off briefly. A block almost always means the exit IP was flagged, so the
     IP is the lever that matters — retrying on the same one just spends time.
-    Rotating keeps the profile's cookies and warmth; only the exit changes.
+    Rotating keeps the profile's cookies and warmth; only the exit changes. An
+    errored result carrying `retry: False` is the exception: it is returned at
+    once, with no rotation.
 
     A launch that fails with a resource-exhaustion signature (the container out
     of threads/processes) is treated as a *transient capacity* failure, not a
@@ -157,5 +159,11 @@ async def scrape_with_retry(instances, *, profile: str, owner: str, wait_ms: int
         await instances.stop(inst.id)
         last = res
         if not res.get("blocked") and not res.get("error"):
+            return res
+        if res.get("retry") is False:
+            # The attempt says a new exit IP cannot help — the page loaded and
+            # is simply not what was asked for (no listings on it, cards that
+            # do not read as listings). Rotating and retrying would spend
+            # minutes arriving at the same answer, so it is final.
             return res
     return last

@@ -49,6 +49,17 @@ class Listing(BaseModel):
         "Empty unless this sweep synced and inserted the row (so it is empty for sync=false "
         "and for listings already in the store).",
     )
+    bot_triage: str = Field(
+        default="",
+        description="REVIEW or REJECT: the decision this sweep's triage wrote to the row's "
+        "Bot Triage. Empty when the sweep was not given a triage_prompt, or when this row "
+        "got no decision (see triage.failures) — a later triaging sweep decides it.",
+    )
+    triage_p_review: float | None = Field(
+        default=None,
+        description="The classifier's probability, 0–1, that the listing should be kept for "
+        "review — the number behind bot_triage. Null when the row was not triaged.",
+    )
 
 
 class SyncResult(BaseModel):
@@ -61,6 +72,72 @@ class SyncResult(BaseModel):
     skipped: list[str] = Field(
         default_factory=list,
         description="Columns the database could not hold, so their values were not written.",
+    )
+
+
+class TriagedRow(BaseModel):
+    """A row this sweep triaged that was already in the store: its Bot Triage was
+    still blank, so this sweep decided it."""
+
+    row_id: str
+    url: str = ""
+    decision: str = Field(
+        default="",
+        description="REVIEW or REJECT as written; empty when it still got no decision "
+        "(see failures).",
+    )
+
+
+class TriageFailure(BaseModel):
+    """A row triage could not decide. Its Bot Triage stays blank, so a later
+    triaging sweep that sees it decides it."""
+
+    row_id: str = ""
+    url: str = ""
+    error: str
+
+
+class TriageSummary(BaseModel):
+    """What triage did in this sweep. Null on the result when no triage_prompt
+    was given."""
+
+    ok: bool = Field(
+        default=False,
+        description="True when every row this sweep had to triage got a decision. False "
+        "while the sweep is still running, and when rows were left for a later sweep "
+        "(`undecided`, `deferred`).",
+    )
+    criteria_version: str = Field(
+        default="",
+        description="First 8 hex characters of the sha256 of the triage_prompt text — "
+        "written to each row's Criteria Version.",
+    )
+    review: int = Field(default=0, description="Rows decided REVIEW.")
+    reject: int = Field(default=0, description="Rows decided REJECT.")
+    undecided: int = Field(
+        default=0, description="Rows left without a decision, each triaged on a later sweep.",
+    )
+    in_flight: int = Field(
+        default=0,
+        description="Rows this sweep left to another sweep that was triaging them at the same "
+        "moment; that sweep decides them. Not counted in `undecided`.",
+    )
+    deferred: int = Field(
+        default=0,
+        description="Rows judged REVIEW on their card whose detail page this sweep did not "
+        "read, because a sweep reads at most 25 detail pages. They stay blank and a later "
+        "sweep decides them. Counted in `undecided`.",
+    )
+    backlog: list[TriagedRow] = Field(
+        default_factory=list,
+        description="Rows already in the store, seen by this sweep with a blank Bot Triage, "
+        "and what this sweep decided for them. They are not in `listings`.",
+    )
+    failures: list[TriageFailure] = Field(default_factory=list)
+    error: str | None = Field(
+        default=None,
+        description="Why triage stopped before deciding every row, e.g. the classifier "
+        "stopped answering. The saved rows are unaffected.",
     )
 
 
@@ -109,9 +186,10 @@ class SweepTask(TaskBase):
 
     A sweep spans one *or more* source URLs (a multi-URL fan-out that lands in
     one record), so the target is `urls`, a list. `source` is the representative
-    adapter name for the batch — every URL in v1 is BizBuySell, and each Listing
-    still carries its own `source`, so nothing downstream depends on this being
-    a single value.
+    source name for the batch — the first readable URL's: a BizBuySell adapter,
+    or "generic" for a site read by the generic reader. A batch can mix both,
+    and each Listing carries its own `source`, so nothing downstream depends on
+    this being a single value.
     """
 
     kind: Literal["sweep"] = "sweep"
@@ -122,6 +200,22 @@ class SweepTask(TaskBase):
     pages_crawled: int = 0
     listings: list[Listing] = Field(default_factory=list)
     synced: SyncResult | None = None
+    # How each URL was read, one entry per URL in `urls` order: `url`,
+    # `adapter` (the source name, or None when the URL was refused), `pages`
+    # (the generic reader's per-page decisions: which link pattern is the list
+    # and who decided it, what each field holds, the next-page rule, what was
+    # dropped), `legibility` (each page's verdict: the code checks, and with a
+    # classifier key `eligibility` — how many cards were asked about, known,
+    # judged not for sale now and dropped, the first of those by title and
+    # probability, and why the classifier stopped if it did), `suggested_override` (a
+    # paste-ready site override pinning what was decided, generic sources
+    # only), and `error` when the source failed. For a person diagnosing a run
+    # (/runs/{id}); deliberately not in ScrapeResult, which an agent polls.
+    decisions: list[dict] = Field(default_factory=list)
+    # Set when the sweep was given a triage prompt (None otherwise), from the
+    # moment the job is written, so a record interrupted mid-run still says
+    # triage was asked for (JobStore.adopt words its message on that).
+    triage: TriageSummary | None = None
 
 
 class ArchiveTask(TaskBase):
@@ -150,8 +244,8 @@ Task = Annotated[SweepTask | ArchiveTask, Field(discriminator="kind")]
 class ScrapeResult(BaseModel):
     """The result of a sweep.
 
-    While status is "working" the sweep is still running and `listings` is
-    empty — collect it with get_scrape_listing_results. `synced` is null when
+    While status is "working" the sweep is still running and `listings` is not
+    final — collect it again with get_scrape_listing_results. `synced` is null when
     sync was false, which means nothing was saved rather than nothing was found.
 
     What `listings` holds once completed depends on how the sweep was started.
@@ -160,6 +254,10 @@ class ScrapeResult(BaseModel):
     carrying the `synced_row_id` of the row it was written to (hand straight to
     archive_page). Already-stored listings are left out of `listings` but counted
     in `synced.existing`.
+
+    `triage` is null unless the sweep was given a triage_prompt. Then each new
+    listing's `bot_triage` holds the decision written to its row, and rows that
+    were already stored with a blank Bot Triage are reported in `triage.backlog`.
     """
 
     # Both tools return this one shape so an agent never has to learn two:
@@ -175,6 +273,7 @@ class ScrapeResult(BaseModel):
     error: str | None = None
     synced: SyncResult | None = None
     listings: list[Listing] = Field(default_factory=list)
+    triage: TriageSummary | None = None
     # Where this sweep's screenshots and page snapshots were written. A sweep
     # that finds nothing is the failure users hit first, and "it didn't work and
     # you can't see why" is where they give up: the pictures of the blocked page
@@ -193,6 +292,7 @@ class ScrapeResult(BaseModel):
             error=job.error,
             synced=job.synced,
             listings=job.listings,
+            triage=job.triage,
             evidence_dir=str(CONFIG.evidence_dir / job.id),
         )
 
@@ -470,14 +570,27 @@ class NotionInfo(BaseModel):
     connected: bool = Field(description="Whether a Notion token and database are set.")
 
 
+class TypeSafeInfo(BaseModel):
+    configured: bool = Field(
+        description="Whether an OpenRouter key is saved for the optional TypeSafe Classifier "
+                    "(e.g. Jev). Says nothing about whether it works; see status."
+    )
+    status: Literal["unset", "untested", "working", "broken"] = Field(
+        description="unset / untested / working / broken, as of the last test in Settings."
+    )
+    model: str = Field(description="The TypeSafe model asked, e.g. 'jev-latest'.")
+
+
 class ServerInfo(BaseModel):
     """A read-only status snapshot of the server's setup. Never carries a secret —
-    no proxy password, no licence key, no Notion token; status and version only."""
+    no proxy password, no licence key, no Notion token, no OpenRouter key; status
+    and version only."""
 
     proxy: ProxyInfo
     browser: BrowserInfo
     pool: PoolInfo
     notion: NotionInfo
+    typesafe: TypeSafeInfo
 
 
 class Health(BaseModel):

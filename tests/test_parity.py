@@ -21,7 +21,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.models import Listing, SyncResult
+from app.models import Listing, SyncResult, TriagedRow, TriageFailure, TriageSummary
 
 from conftest import mint_access
 
@@ -62,12 +62,20 @@ def _rich_job():
                     title="Remodeling Contractor", location="San Francisco, CA",
                     asking_price="$965,000", revenue="", cashflow="$210,000",
                     ebitda="", excerpt="20+ years.", source="bizbuysell_serp",
-                    synced_row_id="notion-page-2453593"),
+                    synced_row_id="notion-page-2453593", bot_triage="REVIEW",
+                    triage_p_review=0.91),
             Listing(listing_id="2461001", url="https://x/2", normalized_url="x/2",
                     title="Coffee Roaster", location="Oakland, CA",
                     asking_price="Not Disclosed", revenue="$1,200,000", cashflow="",
                     ebitda="$300,000", excerpt="Wholesale accounts.", source="bizbuysell_serp"),
         ],
+        triage=TriageSummary(
+            ok=False, criteria_version="abcd1234", review=1, reject=0, undecided=1,
+            backlog=[TriagedRow(row_id="notion-page-1", url="https://x/0", decision="REJECT")],
+            failures=[TriageFailure(row_id="notion-page-2461001", url="https://x/2",
+                                    error="Couldn't read the detail page.")],
+            error=None,
+        ),
     )
 
 
@@ -122,6 +130,17 @@ class TestScrapeResultParity:
         assert rest["evidence_dir"] == mcp["evidence_dir"]
         assert rest["evidence_dir"].endswith(job.id)
 
+    def test_the_triage_result_crosses_both_facades(self, client):
+        """Triage's summary and each listing's decision come from `of()` too."""
+        job = _rich_job()
+        rest = _rest_payload(client, job.id)
+        mcp = _mcp_payload(client, job.id)
+        assert rest["triage"] == mcp["triage"]
+        assert rest["triage"]["backlog"][0]["decision"] == "REJECT"
+        assert rest["triage"]["failures"][0]["row_id"] == "notion-page-2461001"
+        assert [l["bot_triage"] for l in rest["listings"]] == ["REVIEW", ""]
+        assert [l["triage_p_review"] for l in mcp["listings"]] == [0.91, None]
+
     def test_parity_holds_for_a_bare_working_job(self, client):
         """The other end of the range: a just-started sweep, most fields empty.
         Empty and null serialise differently if the two paths ever diverge on
@@ -156,8 +175,9 @@ class TestServerInfoParity:
     def test_the_two_facades_return_the_same_snapshot(self, client):
         rest = _rest_info(client)
         mcp = _mcp_info(client)
-        # Control: a real snapshot with the four sections, not two empty/error bodies.
-        assert set(rest) == {"proxy", "browser", "pool", "notion"} and rest["pool"]["max"] >= 1, rest
+        # Control: a real snapshot with the five sections, not two empty/error bodies.
+        assert set(rest) == {"proxy", "browser", "pool", "notion", "typesafe"} \
+            and rest["pool"]["max"] >= 1, rest
         assert rest == mcp, (
             "MCP and REST disagree about server_info. A field added at one façade "
             "instead of in views.server_info is how it shows up.\n"

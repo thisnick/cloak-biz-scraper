@@ -125,3 +125,39 @@ class TestOnLaunchCallback:
             scrape_once=_ok, warmup_url=None, on_launch=lambda inst: seen.append(inst.id),
         )
         assert seen == ["inst-1"], "the caller is told when the browser is obtained"
+
+
+class TestRetryFlag:
+    """An errored attempt that says a new exit IP cannot help is final."""
+
+    async def _run(self, result: dict, attempts: int = 3):
+        insts = _Instances([None] * attempts)
+        calls = 0
+
+        async def once(inst, page):
+            nonlocal calls
+            calls += 1
+            return dict(result)
+
+        res = await scrape_with_retry(
+            insts, profile="task-1", owner="job:x", wait_ms=0,
+            attempts=attempts, scrape_once=once, warmup_url=None,
+        )
+        return res, insts, calls
+
+    @pytest.mark.asyncio
+    async def test_retry_false_stops_after_one_attempt_without_rotating(self):
+        res, insts, calls = await self._run(
+            {"blocked": False, "error": "no listings here", "retry": False, "data": {}})
+        assert calls == 1 and insts.launches == 1
+        assert insts.profiles.rotations == 0, "no new exit IP for a page that cannot change"
+        assert res["error"] == "no listings here"
+        assert insts.stopped == ["inst-1"], "the instance is still stopped"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("flag", [{}, {"retry": True}])
+    async def test_an_error_without_retry_false_is_retried_as_before(self, flag):
+        res, insts, calls = await self._run(
+            {"blocked": False, "error": "flaky", "data": {}, **flag})
+        assert calls == 3 and insts.profiles.rotations == 2
+        assert res["attempts_used"] == 3
