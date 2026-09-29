@@ -1,8 +1,8 @@
 # Advanced controls
 
 The default settings work for an initial test. Use this page when you need a fresh proxy exit,
-more or fewer simultaneous browsers, a separate browser identity, or space back on the
-Railway volume.
+more or fewer simultaneous browsers, a separate browser identity, listing sites other than
+BizBuySell, a fix for a site that is read wrong, or space back on the Railway volume.
 
 Complete [Set up Cloak Biz Scraper for your AI](set-up-scraper-for-ai.md) before changing
 these controls. Change one setting at a time and run a small read-only test afterward.
@@ -85,6 +85,228 @@ shows saved data size for each profile so you can find unusually large identitie
 An AI can use `list_profiles`, `create_profile`, `update_profile`, `new_proxy_session`, and
 `delete_profile`. Make destructive intent explicit. For example, do not ask an agent to
 “clean profiles”; name the profile and whether you mean rotate, clear, or delete.
+
+## TypeSafe Classifier (e.g. Jev)
+
+The sweep reads BizBuySell with adapters written for its pages. Every other listing site —
+a broker's own site, WebsiteClosers, Dealonomy, BizQuest, and so on — is read generically:
+the app groups the page's links by their shape, and the **TypeSafe Classifier (e.g. Jev)**
+decides which group is the list of businesses for sale, what each field on a card holds
+(asking price, cash flow, revenue, location…), and which link or button is the next page.
+The list and the fields are decided on a sweep's first page and reused for its later pages;
+the next page is decided on every page. It is a classifier, not a chat model: it answers
+those questions and nothing else.
+
+With a key saved:
+
+- `scrape_listings` accepts any site's listings page, alongside BizBuySell URLs.
+- Every listing a sweep reads — BizBuySell included — gets **one request** that asks every
+  question about it together: is it a business that is currently for sale (not sold,
+  pending or under contract, and not a menu link, an ad or other page furniture), and, with
+  a `triage_prompt`, REVIEW or REJECT. Only listings your Notion database does not have yet
+  are asked about (plus, when triaging, rows whose Bot Triage is still blank), so a daily
+  sweep of mostly-known listings asks little; with `sync=false` every listing is asked. Up
+  to five requests are in flight at once — the one limit every classifier call shares.
+- On other sites a listing that is not for sale now is left out, and the result's summary
+  counts them ("N left out as not currently for sale / not listings"); there is no separate
+  handling of sold listings. On BizBuySell every card the adapter read is kept.
+- The same answers check each page: where fewer than half of a page's listings read as
+  businesses for sale now (a listing already in Notion counts as one), or a page has no
+  list on it at all, that source fails with screenshots instead of filing garbage or
+  reporting "no listings" — on the first page; on a later page the sweep stops there, keeps
+  the pages before it, and says so in the result's `error`. A page with fewer than three
+  listings to go on is never failed this way. A BizBuySell first page that fails is retried
+  from a new exit IP, like a block.
+- A synced sweep can triage the rows it saves: pass your criteria as `triage_prompt` (see
+  [Triage prompt](#triage-prompt)).
+
+To set it up:
+
+1. Create a key at [openrouter.ai/settings/keys](https://openrouter.ai/settings/keys) and
+   add a few dollars of credit to the account.
+2. Open **Settings → TypeSafe Classifier (e.g. Jev)**, paste the key into
+   **OpenRouter API key**, leave **Model** as `jev-latest`, and select **Save & test**.
+3. The section shows **Working** once OpenRouter answers.
+
+Without a key, everything else works exactly as before: BizBuySell sweeps (which then make
+no classifier request at all), Notion sync and `archive_page`. A URL on another site is refused for that URL, with a message pointing at
+this setting, and the rest of the batch still runs.
+
+A key that stops working is caught before a sweep starts, with one quick question (at most
+10 seconds). If OpenRouter rejects the key, the account is out of credits, or the service is
+not answering, a call whose URLs all need the classifier is refused with that reason. In a batch that also has BizBuySell URLs, only
+the other sites fail and the BizBuySell ones still run. A call with a `triage_prompt` is
+refused whole, BizBuySell or not, because it would save rows it then could not decide. If
+the classifier stops answering during a sweep, the sweep carries on without it: the
+listings not yet asked about are kept, BizBuySell pages keep working, and triage leaves
+their rows blank for a later sweep.
+
+Cost: each is a small request, fractions of a cent, billed to your OpenRouter account. A
+generic site's first page takes three — which list, the fields, the next page — and each
+later page one (the next page; a fields request only for a field the first page did not
+have). Every listing not yet in Notion adds one, with or without triage (the triage question
+rides in the same request), and triage adds two more for each card REVIEW read on its
+detail page. A two-page sweep of a generic site with 20 new listings a page and triage:
+4 page requests + 40 listing requests, plus 2 per REVIEW. A BizBuySell sweep with a key
+makes only the listing requests; without a key, none.
+
+## Triage prompt
+
+`scrape_listings(urls, max_pages, sync=true, triage_prompt="…")` saves the new listings
+and then decides **REVIEW** or **REJECT** for each one, in the server, with the TypeSafe
+Classifier (e.g. Jev). It needs `sync=true` and a working classifier key; a call without
+either is refused before anything starts.
+
+What it does, for every row the sweep inserted and every row it saw whose Bot Triage is
+still blank:
+
+1. While the page is read, it asks one question — your text, behind a fixed lead-in —
+   about the card: title, location, asking price, cash flow, EBITDA, revenue, excerpt and
+   the price/earnings multiple, in the same request that asks whether the listing is for
+   sale now. Once the rows are saved, **REJECT** is written straight away.
+2. A **REVIEW** is checked again on the listing's detail page. If the page is the real
+   listing, the same question is asked about the card plus the page: REVIEW appends the
+   page as a Source Content section to the row (exactly as `archive_page` does) and then
+   writes REVIEW; REJECT is written with nothing archived. If the page is a login or NDA
+   wall, a removed listing or an error page, REVIEW is written as decided on the card, with
+   nothing archived. If the page will not load at all, the row stays blank and is reported,
+   and a later sweep tries it again.
+
+A row that already has a Bot Triage value — the bot's or yours — is never judged again. A
+sweep reads at most 25 detail pages: card REVIEWs past that stay blank, are counted in the
+result's `triage.deferred`, and are read by the next sweep. An empty `triage_prompt` is the
+same as leaving it out.
+
+The decision goes to the **Bot Triage** column (Select or Text); a database without one
+refuses the call. **Triage Reason** (e.g. `REVIEW · P(review)=0.91 · card + detail page`),
+**Triaged At** and **Criteria Version** are written where the database has those columns,
+or where **Settings → Notion** maps them to columns of your own — Triage Reason to an
+existing "Why Review", say. Nothing else on the row is touched.
+
+If the classifier stops answering part-way — or OpenRouter rejects the key or runs out of
+credits — the sweep still completes (the rows are saved); no more requests are made, the
+rows it had not decided stay blank, the result's `triage.error` says why, and the next sweep
+that sees them decides them.
+A question the classifier refuses for one listing only (an answer it can't give for that
+card) fails that row alone, listed in `triage.failures`; the others are still decided.
+
+Two sweeps that run at the same time never triage the same row twice: a row the other sweep
+is already on is left to it and counted in `triage.in_flight`. And a page archived into a row
+is written whole or not at all — if Notion refuses part of it, the part already written is
+deleted again, so the next sweep (or `archive_page`) can file it cleanly.
+
+**Writing the text.** The classifier judges; it cannot follow a procedure or write an
+explanation. So:
+
+- **State the reject conditions plainly**, one per line or bullet: "Reject restaurants,
+  retail, franchises." "Reject if the asking price is below $1M or above $7.5M." Say what
+  happens when a fact is missing ("Continue if the price is not disclosed") — the question
+  already leans towards REVIEW when the evidence is missing or ambiguous.
+- **Leave out tool and procedure steps** — "open the detail page", "call archive_page",
+  "write a reason". The server does those; in the text they are only noise.
+- **You do not need to compute the multiple.** When the asking price and the cash flow (or
+  EBITDA) are each one exact amount, the card is given a `price_to_earnings_multiple` such
+  as `4.25x`, so "Reject if asking price / SDE > 6.0" works as written.
+- **Changing the text changes the Criteria Version**, the first 8 characters of its
+  sha256, written on every row it decides. Rows decided under earlier text keep theirs;
+  clear a row's Bot Triage to have the next sweep decide it again under the current text.
+
+Keeping the criteria on a Notion page works well: the scheduled agent reads the page and
+passes its text. `scripts/triage_prompt_from_notion.py <page id or URL>` prints a page's
+plain text, the same way, to check what the classifier will be given; and
+`scripts/eval_triage.py` runs a prompt over your Listings database's existing rows and
+reports how often it agrees with the Bot Triage values already there, without writing
+anything.
+
+## Site overrides
+
+A generic site is decided fresh by every sweep — its list and fields on the first page
+(reused for that sweep's later pages), its next page on every page — and nothing is
+remembered between sweeps, so a site that changes its layout is read by its new layout. When one decision keeps coming out wrong for one site — the wrong list, a
+field left empty, paging that stops early or never stops, sold listings kept — pin that
+part in **Settings → Site overrides**. Anything you leave out is still decided by the
+classifier.
+
+The setting is a JSON list with one entry per site. It is saved only when every entry is
+valid; otherwise the page shows where the problem is (a line and column for broken JSON,
+or the override and field for a bad value) and keeps your text in the box. Leave it empty
+for no overrides.
+
+| Key | What it pins |
+|---|---|
+| `match` | The site: a host (`bizquest.com`, any page on it) or a URL prefix (`https://www.bizquest.com/businesses-for-sale-in-`). `www.` and http/https never matter; the longest match wins; `fcbb.com` does not cover `sfbay.fcbb.com`. Required. |
+| `listing_links` | The link patterns that are the listings, exactly as a run reports them, e.g. `www.bizquest.com/business-for-sale/{*}/{*}` (`{*}` is any one path segment). Several patterns are read as one list. A single pattern of links that act on each card (`…/{*}/contact`, "Watch", "Unlock") is read through the listing links inside those cards. |
+| `fields` | A card field — its label, or the slot key a run reports for an unlabelled one — mapped to what it holds, or to `ignore`. |
+| `next_page` | How to reach the next page: see below. |
+| `drop_status` | Status texts that mean a listing is gone, matched as case-insensitive substrings, e.g. `["sold", "under contract"]`, and dropped before any listing is asked about. Without it, each listing's own request decides whether it is still for sale. An empty list drops nothing here. |
+
+`next_page` takes one of three forms:
+
+- **A URL with `{page}` in it** — `"https://example.com/listings?page={page}"` — for a site
+  that pages by address. Page 2 is that URL with `2`, and so on.
+- **`click:<css selector>`** — `"click:a.pagination-next"` — for a Next or Load more
+  button with no address of its own.
+- **`none`** — the site has one page; stop after page 1.
+
+The values for `fields` are `title`, `location`, `asking_price`, `cash_flow_sde`, `ebitda`,
+`revenue`, `status`, `category`, `description`, `listing_id`, `other` and `ignore`. The first
+six fill the listing's columns; the rest stay in the listing's excerpt only. Money is always
+kept exactly as the card printed it.
+
+The easiest way to write one is to copy it. In **Tasks → History**, select **Details** on a
+sweep of the site. Each generically read URL in `decisions` has:
+
+- `pages` — what was decided on each page and by whom (`jev` or `override`): the chosen
+  `listing_links` pattern with its confidence, each field's role and whether it was
+  confident enough to use, the `next_page` rule (and, for a button, `clicked_by`: its
+  `mark`, its `selector`, or a `re-probe` when the site had re-drawn it; for a link that
+  pointed off the site, `refused` with where it went — it is not followed), and how many
+  cards a `drop_status` override dropped.
+- `legibility` — for each page, the code checks (cards without a title or link) and
+  `eligibility`: how many listings were asked about and how many were already in Notion,
+  how many were judged not for sale now (the first ten by title and probability) and how
+  many of those were left out, and why the classifier stopped if it did.
+- `warning` — when the sweep stopped at a later page it could not use, which page and why
+  (the pages before it were kept).
+- `suggested_override` — a ready-to-paste override that pins what was decided on page 1.
+
+Paste the `suggested_override` into the list, change the part that was wrong, delete the
+parts you are happy to leave to the classifier, and save.
+
+A site that pages by address, like WebsiteClosers (illustrative — copy the real values from
+your own run's details):
+
+```json
+[
+  {
+    "match": "websiteclosers.com",
+    "listing_links": ["www.websiteclosers.com/businesses/{*}/{*}"],
+    "next_page": "https://www.websiteclosers.com/businesses-for-sale/page/{page}/",
+    "drop_status": ["sold", "under contract"]
+  }
+]
+```
+
+A site with a script-only Next button and labelled card fields, like an FCBB office:
+
+```json
+[
+  {
+    "match": "https://sfbay.fcbb.com/silicon-valley",
+    "next_page": "click:a.pagination-next",
+    "fields": {
+      "Asking Price": "asking_price",
+      "Cash Flow": "cash_flow_sde",
+      "Gross Revenue": "revenue",
+      "Listing #": "ignore"
+    }
+  }
+]
+```
+
+Overrides only change how a site is read, so they apply once a TypeSafe Classifier key is
+saved. If a saved document ever stops being valid, sweeps of other sites are refused until
+it is fixed or cleared; BizBuySell sweeps are never affected.
 
 ## Clean up the Railway volume
 

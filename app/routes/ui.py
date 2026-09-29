@@ -144,7 +144,12 @@ def _job_result(job) -> tuple[str, str]:
         # so its length is the new count, not the whole find — say so explicitly
         # rather than let a re-sweep that added nothing read as "0 listings".
         if job.synced is not None:
-            return "ok", f"{job.synced.new} new, {job.synced.existing} known"
+            label = f"{job.synced.new} new, {job.synced.existing} known"
+            # A triaging sweep's result is also how many rows now wait for a
+            # person — the number the triage exists to produce.
+            if getattr(job, "triage", None) is not None:
+                label += f" · {job.triage.review} review"
+            return "ok", label
         return "ok", f"{len(job.listings)} listings"
     if job.status == "failed":
         if _blocked(job):
@@ -170,11 +175,14 @@ def _blocked(job) -> bool:
 def _job_where(job) -> str:
     """The one line under a running task's name: what it is doing right now.
 
-    A sweep counts pages; an archive has a single page to read, so it names it.
+    A sweep says its own phase — waiting for a browser, sweeping N sources,
+    triaging, reading detail pages — from its summary, which it keeps current
+    while it works; the page count is only the fallback. An archive has a
+    single page to read, so it names it.
     """
     if job.kind == "archive":
         return job.urls[0] if job.urls else ""
-    return f"page {job.pages_crawled} / {job.max_pages}"
+    return job.summary or f"page {job.pages_crawled} / {job.max_pages}"
 
 
 def _job_label(job) -> str:
@@ -192,7 +200,13 @@ def _job_label(job) -> str:
 
 def _render(request: Request, result: Result | None = None, status: int = 200,
             active: str | None = None, notion_mapping: Any = None,
-            focus: str | None = None) -> Response:
+            focus: str | None = None, overrides_draft: str | None = None) -> Response:
+    """The dashboard, with an optional banner.
+
+    `overrides_draft` is a Site overrides document that failed to save: the box
+    shows it (not the saved one) so the person fixes their text instead of
+    retyping it.
+    """
     settings: Settings = request.app.state.settings.load()
     from ..services.urls import public_base
     from ..services.views import browser_info, instance_view
@@ -227,8 +241,13 @@ def _render(request: Request, result: Result | None = None, status: int = 200,
             "browser": browser_info(settings, request.app.state.instances),
             "has_proxy_password": bool(settings.proxy_password),
             "has_notion_token": bool(settings.notion_api_token),
+            "has_typesafe_key": settings.typesafe_configured(),
             "connected_apps": request.app.state.oauth.list_clients(),
             "proxy_checked_at": _when(settings.proxy_last_check_at),
+            "typesafe_checked_at": _when(settings.typesafe_last_check_at),
+            "overrides_text": (settings.site_overrides_json if overrides_draft is None
+                               else overrides_draft),
+            "overrides_count": _overrides_count(settings.site_overrides_json),
             # dashboard sections
             "instances": instances,
             "running_jobs": running,
@@ -274,6 +293,21 @@ def _first_error(exc: Exception) -> str:
     if isinstance(exc, ValidationError) and exc.errors():
         return exc.errors()[0]["msg"].removeprefix("Value error, ")
     return str(exc)
+
+
+def _overrides_count(text: str) -> int | None:
+    """How many site overrides are saved; None when the saved text doesn't parse.
+
+    Only for the section's chip. A saved document can stop parsing without
+    anyone touching it (a later version tightens the schema), and the page
+    must still render to let them fix it.
+    """
+    from ..sources.overrides import OverridesInvalid, parse_overrides
+
+    try:
+        return len(parse_overrides(text))
+    except OverridesInvalid:
+        return None
 
 
 def _keep(new: str, existing: str) -> str:
@@ -505,11 +539,19 @@ async def get_run(request: Request, job_id: str) -> dict[str, Any]:
     root = _evidence_root(job_id)
     files = sorted(str(p.relative_to(root)) for p in root.rglob("*") if p.is_file()) \
         if root.is_dir() else []
-    return {
+    detail = {
         "job_id": job.id, "kind": job.kind, "status": job.status,
         "urls": job.urls, "error": job.error, "evidence": files,
         **_run_detail(job),
     }
+    if job.kind == "sweep":
+        # How each URL was read — the chosen link pattern and who chose it,
+        # field roles, the next-page rule, legibility and each page's
+        # per-listing eligibility, and a paste-ready site
+        # override. Here and not in /runs (every row) or in the ScrapeResult an
+        # agent polls: it is for a person working out why a site read wrong.
+        detail["decisions"] = job.decisions
+    return detail
 
 
 @router.get("/runs/{job_id}/results", response_model=None)
@@ -648,20 +690,24 @@ async def ui_run_sweep(
 ) -> Response:
     _require(request)
     _require_same_origin(request)
-    from ..services.scrape import NotionNotConfigured
+    from ..services.scrape import ClassifierNotReady, NotionNotConfigured
     from ..sources import UnsupportedURL
 
     # Same as ui_new_instance: a form submit, so errors re-render the dashboard
     # with a banner (in the Tasks section) rather than a raw JSON body, status
-    # codes unchanged.
+    # codes unchanged. `submit`, like the tools: a site read by the generic
+    # reader has its classifier key checked before the job exists.
     try:
-        request.app.state.scrape.start(
+        await request.app.state.scrape.submit(
             [url.strip()], max_pages=max_pages, sync=sync
         )
     except UnsupportedURL as exc:
         return _render(request, Result("tasks", False, str(exc)), status=422)
     except NotionNotConfigured as exc:
         return _render(request, Result("tasks", False, str(exc)), status=409)
+    except ClassifierNotReady as exc:
+        return _render(request, Result("tasks", False, str(exc)),
+                       status=503 if exc.transient else 409)
     return _sessions_redirect("tasks")
 
 
@@ -1514,10 +1560,16 @@ async def save_mapping(request: Request) -> Response:
     column name, or empty for "don't sync" (optional fields) / unset (required).
     A submitted name is only kept if the database really has that column, so a
     stale form can never make us believe in a column that is not there.
+
+    The triage fields save the same way, with one difference in what an empty
+    choice stores: None ("don't write") only when that switches something off —
+    when the database has a same-named column that would otherwise be used —
+    and nothing at all otherwise, so a Bot Triage column added in Notion later
+    is still found by its name.
     """
     _require(request)
     _require_same_origin(request)
-    from ..stores.notion import KNOWN_PROPS, NotionError, NotionStore
+    from ..stores.notion import KNOWN_PROPS, TRIAGE_PROPS, NotionError, NotionStore
 
     settings = request.app.state.settings.load()
     if not settings.notion_db_id:
@@ -1539,6 +1591,13 @@ async def save_mapping(request: Request) -> Response:
             continue  # unmapped — the user must still choose a column
         else:
             new_map[prop.key] = None  # "don't sync"
+    for prop in TRIAGE_PROPS:
+        chosen = str(form.get(f"map_{prop.key}", "")).strip()
+        if chosen and chosen in columns:
+            new_map[prop.key] = chosen
+        elif prop.name in columns:
+            new_map[prop.key] = None  # "don't write", overriding the same-named column
+        # else: left out, so a same-named column added later is still found
 
     request.app.state.settings.update(notion_column_map=new_map)
     try:
@@ -1624,6 +1683,160 @@ async def create_database(
     )
     return _render(request, Result("notion", report.complete, message, report),
                    notion_mapping=mapping)
+
+
+# ── TypeSafe Classifier (e.g. Jev) ────────────────────────────────────────────
+
+
+# What turning it off costs, said wherever it is turned off.
+_TYPESAFE_OFF = (
+    "reading listing sites other than BizBuySell, triage, and the archive guard are "
+    "off; everything else works as before."
+)
+
+
+@router.post("/settings/typesafe", response_class=HTMLResponse)
+async def save_typesafe(
+    request: Request,
+    action: str = Form("save"),
+    typesafe_openrouter_api_key: str = Form(""),
+    typesafe_model: str = Form(""),
+) -> Response:
+    """Save, test, or remove the OpenRouter key the classifier is asked with.
+
+    The proxy's rules, for the proxy's reasons: Test checks what was typed
+    before anything is written, so a typo cannot replace a key that works; the
+    verdict is remembered, so a revoked key or an empty account still reads as
+    broken tomorrow; and editing the key or model retires the old verdict,
+    because it measured something else.
+    """
+    _require(request)
+    _require_same_origin(request)
+    store = request.app.state.settings
+    current = store.load()
+    no_verdict = dict(
+        typesafe_last_check_at=0.0, typesafe_last_check_ok=None, typesafe_last_check_summary="",
+    )
+
+    if action == "clear":
+        # The key field is write-only and blank keeps it, so removing a key needs
+        # its own button — as the licence key's "Clear" does.
+        store.update(typesafe_openrouter_api_key="", **no_verdict)
+        return _render(
+            request, Result("typesafe", True, f"Key removed. Without it, {_TYPESAFE_OFF}")
+        )
+
+    try:
+        candidate = Settings.model_validate({
+            **current.model_dump(),
+            "typesafe_openrouter_api_key": _keep(
+                typesafe_openrouter_api_key, current.typesafe_openrouter_api_key),
+            "typesafe_model": typesafe_model,
+        })
+    except ValueError as exc:
+        return _render(request, Result("typesafe", False, _first_error(exc)), status=400)
+    changes = dict(
+        typesafe_openrouter_api_key=candidate.typesafe_openrouter_api_key,
+        typesafe_model=candidate.typesafe_model,
+    )
+    unchanged = (
+        candidate.typesafe_openrouter_api_key == current.typesafe_openrouter_api_key
+        and candidate.typesafe_model == current.typesafe_model
+    )
+
+    if action != "test":
+        # A save that changes nothing keeps its verdict; one that changes the key
+        # or model has not been measured yet, so it must not inherit a "working".
+        settings = store.update(**changes, **({} if unchanged else no_verdict))
+        status = settings.typesafe_status()
+        if status == "unset":
+            return _render(
+                request, Result("typesafe", True, f"Saved. Without a key, {_TYPESAFE_OFF}")
+            )
+        if status == "untested":
+            return _render(request, Result(
+                "typesafe", True,
+                "Saved — but not tested. Use 'Save & test' to check OpenRouter accepts the key.",
+                level="warn",
+            ))
+        return _render(request, Result("typesafe", True, "Saved."))
+
+    # action == "test": ask with the SUBMITTED values before writing anything.
+    if not candidate.typesafe_configured():
+        return _render(
+            request, Result("typesafe", False, "Enter an OpenRouter API key first."), status=400
+        )
+    check = await request.app.state.typesafe.check(
+        key=candidate.typesafe_openrouter_api_key, model=candidate.typesafe_model
+    )
+    if not check.ok:
+        if current.typesafe_last_check_ok and not unchanged:
+            # A working key is at stake and this failure measured something else:
+            # keep what works rather than replace it with the typo.
+            return _render(
+                request,
+                Result("typesafe", False,
+                       check.message + " Your previously working key and model were kept "
+                       "unchanged."),
+                status=400,
+            )
+        store.update(
+            **changes,
+            typesafe_last_check_at=time.time(),
+            typesafe_last_check_ok=False,
+            typesafe_last_check_summary=_first_sentence(check.message),
+        )
+        return _render(request, Result("typesafe", False, check.message), status=400)
+
+    store.update(
+        **changes,
+        typesafe_last_check_at=time.time(),
+        typesafe_last_check_ok=True,
+        typesafe_last_check_summary=check.message,
+    )
+    return _render(request, Result("typesafe", True, check.message))
+
+
+# ── Site overrides ────────────────────────────────────────────────────────────
+
+
+@router.post("/settings/overrides", response_class=HTMLResponse)
+async def save_overrides(request: Request, site_overrides_json: str = Form("")) -> Response:
+    """Save the site overrides document — checked here, stored exactly as typed.
+
+    The app's first free-form editor, so the check is the part that matters: a
+    document is saved only when every override in it is valid, and a refusal
+    says where the problem is (a line and column for broken JSON, the override
+    and field for a bad value) and puts the person's text back in the box. The
+    text itself is stored, not a re-serialised copy, so their formatting and
+    order survive. Blank clears every override.
+    """
+    _require(request)
+    _require_same_origin(request)
+    from ..sources.overrides import OverridesInvalid, parse_overrides
+
+    # Browsers submit a textarea with CRLF line endings; the person typed LF.
+    text = site_overrides_json.replace("\r\n", "\n")
+    if not text.strip():
+        request.app.state.settings.update(site_overrides_json="")
+        return _render(request, Result(
+            "overrides", True,
+            "Cleared. Every site is read with the classifier's own decisions."))
+    try:
+        overrides = parse_overrides(text)
+    except OverridesInvalid as exc:
+        return _render(request, Result("overrides", False, f"Not saved. {exc}"),
+                       status=400, overrides_draft=text)
+    settings = request.app.state.settings.update(site_overrides_json=text)
+    n = len(overrides)
+    message = f"Saved {n} site override{'' if n == 1 else 's'}."
+    if not settings.typesafe_configured():
+        # Overrides steer the generic reader, which does not run without a key.
+        return _render(request, Result(
+            "overrides", True,
+            message + " They apply once a TypeSafe Classifier (e.g. Jev) key is saved — "
+            "until then only BizBuySell pages are read.", level="warn"))
+    return _render(request, Result("overrides", True, message))
 
 
 # ── Connected apps ────────────────────────────────────────────────────────────

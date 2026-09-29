@@ -58,6 +58,50 @@ def test_a_job_interrupted_by_a_restart_is_failed_not_working(root):
     assert "start it again" in recovered.error.lower(), "say what to do about it"
 
 
+def test_a_sweep_interrupted_during_triage_says_what_it_saved(root):
+    """Once the rows are in the store the sweep writes `synced` down, still
+    working. A restart after that must not claim "nothing was saved" — the rows
+    are there, and the ones still undecided are triaged on a later sweep."""
+    from app.models import SyncResult, TriageSummary
+
+    first = JobStore(root, boot_id="boot-1")
+    job = first.create(source="bizbuysell_serp", url="https://x/y-businesses-for-sale/",
+                       sync=True, triage=TriageSummary(criteria_version="abcd1234"))
+    job.synced = SyncResult(new=3, existing=1, db_id="db-1")
+    first.save(job)
+
+    assert JobStore(root, boot_id="boot-2").adopt() == 1
+    recovered = first.get(job.id)
+    assert recovered.status == "failed"
+    assert "Saved 3 new rows; triage was interrupted — rows without a decision are " \
+           "triaged on a later sweep" in recovered.error
+    assert "Nothing was saved" not in recovered.error
+    assert recovered.triage.error and not recovered.triage.ok
+
+
+def test_a_synced_sweep_without_triage_still_says_it_saved(root):
+    from app.models import SyncResult
+
+    first = JobStore(root, boot_id="boot-1")
+    job = first.create(url="https://x/y-businesses-for-sale/", sync=True)
+    job.synced = SyncResult(new=1, existing=0, db_id="db-1")
+    first.save(job)
+
+    JobStore(root, boot_id="boot-2").adopt()
+    error = first.get(job.id).error
+    assert "after it had saved 1 new row" in error and "triage" not in error
+
+
+def test_a_triaging_sweep_interrupted_before_saving_saved_nothing(root):
+    from app.models import TriageSummary
+
+    first = JobStore(root, boot_id="boot-1")
+    job = first.create(url="https://x/y-businesses-for-sale/", sync=True,
+                       triage=TriageSummary(criteria_version="abcd1234"))
+    JobStore(root, boot_id="boot-2").adopt()
+    assert "Nothing was saved" in first.get(job.id).error
+
+
 def test_adopt_leaves_this_boot_alone(root):
     """A sweep running right now is not an orphan."""
     store = JobStore(root, boot_id="boot-1")

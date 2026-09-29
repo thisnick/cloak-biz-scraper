@@ -14,7 +14,24 @@ notice until the database was full of duplicates.
 from __future__ import annotations
 
 import re
-from urllib.parse import urlparse, urlunparse
+from typing import Iterable
+from urllib.parse import parse_qsl, unquote_plus, urlencode, urlparse, urlunparse
+
+# Query parameters that say how someone arrived, never which listing they are
+# looking at. Matched case-insensitively; `utm_*` is matched as a prefix. Not
+# `ref`: sites use `?ref=<id>` as the listing's own id, and dropping it stores
+# every listing on the page as one address. (A `ref` that is the same on every
+# link of a list — "?ref=home" — is still left out of `normalize_url`'s key,
+# which keeps only the query keys that vary across the list.)
+_TRACKING = frozenset({
+    "gclid", "gbraid", "wbraid", "dclid", "fbclid", "msclkid", "yclid", "twclid",
+    "igshid", "mc_cid", "mc_eid", "_ga", "_gl", "_hsenc", "_hsmi", "mkt_tok",
+})
+
+
+def _is_tracking(key: str) -> bool:
+    key = key.lower()
+    return key.startswith("utm_") or key in _TRACKING
 
 
 def canonical_url(url: str) -> str:
@@ -27,12 +44,19 @@ def canonical_url(url: str) -> str:
     return urlunparse((p.scheme or "https", p.netloc.lower(), p.path.rstrip("/") + "/", "", "", ""))
 
 
-def normalize_url(url: str | None) -> str | None:
+def normalize_url(url: str | None, keep_query: Iterable[str] | None = None) -> str | None:
     """Canonical dedupe shape: host[:port]/path — no scheme, query, or fragment.
 
     Everything dropped here is something that can differ between two sightings of
     one listing: http vs https, a www prefix, a tracking parameter, a trailing
     slash. What remains is the part that identifies it.
+
+    `keep_query` is for sites where the query IS the identity
+    (`listing.php?LID=5` and `?LID=6` are two listings). The named keys are
+    kept, sorted, after the path; every other parameter is still dropped, so a
+    tracking tag or a sort order cannot split one listing into two rows. Left
+    out (None), the result is exactly what it always was — this is a key shared
+    with rows already written, and with another codebase.
     """
     raw = (url or "").strip()
     if not raw:
@@ -51,4 +75,36 @@ def normalize_url(url: str | None) -> str | None:
     path = re.sub(r"/+", "/", p.path or "/")
     if path != "/":
         path = path.rstrip("/")
-    return f"{host}{port}{path}"
+    base = f"{host}{port}{path}"
+    if keep_query is None:
+        return base
+    keys = set(keep_query)
+    kept = sorted((k, v) for k, v in parse_qsl(p.query, keep_blank_values=True) if k in keys)
+    return f"{base}?{urlencode(kept)}" if kept else base
+
+
+def listing_url(href: str | None) -> str | None:
+    """The address to store for a listing found by following a link on a page.
+
+    Unlike `canonical_url`, the query stays: on many sites it is the only thing
+    naming the listing (`listing.php?LID=5`), and dropping it stores a link
+    that opens the wrong page, or none. What goes is what cannot be the
+    listing — the fragment, and tracking parameters (`utm_*`, `gclid`,
+    `fbclid`, …) — so a link clicked from a newsletter and the same link on the results
+    page store the same address. The remaining parameters are kept exactly as
+    the site wrote them (order and encoding), because this is a URL to open,
+    not a key to compare; `normalize_url` is the key.
+
+    None for anything that is not an absolute http(s) link.
+    """
+    raw = (href or "").strip()
+    if not raw:
+        return None
+    p = urlparse(raw)
+    if p.scheme.lower() not in ("http", "https") or not p.hostname:
+        return None
+    parts = [part for part in p.query.split("&") if part]
+    query = "&".join(
+        part for part in parts if not _is_tracking(unquote_plus(part.split("=", 1)[0]))
+    )
+    return urlunparse((p.scheme.lower(), p.netloc, p.path, p.params, query, ""))

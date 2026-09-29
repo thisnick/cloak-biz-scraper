@@ -12,6 +12,7 @@ concept cannot be expressed for a CSV, it belongs in notion.py.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Protocol, runtime_checkable
 
 from ..models import Listing
@@ -101,6 +102,12 @@ class DedupeIndex:
 
     listing_ids: set[str] = field(default_factory=set)
     normalized_urls: set[str] = field(default_factory=set)
+    # Each stored row's triage decision, under the key it is found by: "" when
+    # it was read and is blank. A row whose decision was not read (the store
+    # has nowhere to keep one) is absent here, never "": "never read" and
+    # "blank" lead to opposite actions, exactly as for `UpsertResult.untriaged`.
+    decisions_by_id: dict[str, str] = field(default_factory=dict)
+    decisions_by_url: dict[str, str] = field(default_factory=dict)
 
     def contains(self, listing: Listing) -> bool:
         """True when this listing is already stored.
@@ -113,6 +120,16 @@ class DedupeIndex:
         if listing.listing_id and listing.listing_id in self.listing_ids:
             return True
         return bool(listing.normalized_url and listing.normalized_url in self.normalized_urls)
+
+    def decision(self, listing: Listing) -> str | None:
+        """The stored row's triage decision ("" when read and blank), found the
+        way `contains` finds the row — by listing id, then by normalized URL.
+        None when the listing is not stored or its decision was not read."""
+        if listing.listing_id and listing.listing_id in self.listing_ids:
+            return self.decisions_by_id.get(listing.listing_id)
+        if listing.normalized_url and listing.normalized_url in self.normalized_urls:
+            return self.decisions_by_url.get(listing.normalized_url)
+        return None
 
     def __len__(self) -> int:
         return len(self.listing_ids | self.normalized_urls)
@@ -134,6 +151,14 @@ class UpsertResult:
     the row (see the sweep service) without re-reading the store. What a row id IS
     stays the store's business: this protocol only knows it lands on
     `Listing.synced_row_id`.
+
+    `untriaged` is the already-stored rows this sync saw whose triage decision is
+    still blank, each carrying its row id on `synced_row_id` — the backlog a
+    triaging sweep heals alongside its new rows. It is filled only when the store
+    actually read the decision: a store with nowhere to keep one returns it empty
+    rather than calling every row blank, because "never read" and "blank" lead to
+    opposite actions (skip it, or judge it). A row holding any decision, a
+    person's included, is never listed, so a decision is made once.
     """
 
     new: int = 0
@@ -141,10 +166,41 @@ class UpsertResult:
     db_id: str = ""
     skipped: list[PropIssue] = field(default_factory=list)
     new_listings: list[Listing] = field(default_factory=list)
+    untriaged: list[Listing] = field(default_factory=list)
 
     @property
     def skipped_names(self) -> list[str]:
         return [issue.name for issue in self.skipped]
+
+
+class TriageUnavailable(RuntimeError):
+    """The store has nowhere to record a triage decision, said so the person can
+    fix it (which place is missing, or why the one chosen cannot hold it).
+
+    Raised by `prepare_triage`, before any listing is judged: a sweep that cannot
+    save a decision should refuse triage for the whole job, not spend a
+    classifier call per row on verdicts it would then have to drop.
+    """
+
+
+@dataclass(frozen=True)
+class TriageTarget:
+    """Where one store records triage decisions, worked out once per sweep.
+
+    Resolved up front, not per row, so every row in a sweep is written to the
+    same places and a store that cannot take a decision says so before anything
+    is judged. `fields` maps each triage field that WILL be written — "bot_triage"
+    (always), "triage_reason", "triaged_at", "criteria_version" — to the person's
+    own name for where it lands; a field absent from it is simply not recorded.
+    `notes` says, in the person's words, why a field they seem to want was left
+    out (a place of the wrong kind, say), so a partial write is never silent.
+    A store extends this with whatever it needs to write, such as a connection
+    shared by every write of the sweep.
+    """
+
+    db_id: str
+    fields: dict[str, str] = field(default_factory=dict)
+    notes: tuple[str, ...] = ()
 
 
 @runtime_checkable
@@ -168,7 +224,10 @@ class ListingStore(Protocol):
     async def index(
         self, db_id: str, column_map: "dict[str, str | None] | None" = None
     ) -> DedupeIndex:
-        """The dedupe keys already stored, read from the mapped columns."""
+        """The dedupe keys already stored, read from the mapped columns, with
+        each row's triage decision where the store keeps one. A synced sweep
+        reads this once, before its first page, to tell new listings from known
+        ones."""
         ...
 
     async def upsert_new(
@@ -176,5 +235,25 @@ class ListingStore(Protocol):
         column_map: "dict[str, str | None] | None" = None,
     ) -> UpsertResult:
         """Insert listings that are not already stored. Must never overwrite a
-        column the user added, and must only write columns named in the map."""
+        column the user added, and must only write columns named in the map.
+        Never writes a triage field: those belong to `write_triage` alone."""
+        ...
+
+    async def prepare_triage(
+        self, db_id: str, column_map: "dict[str, str | None] | None" = None
+    ) -> TriageTarget:
+        """Resolve where triage decisions go, once per sweep. Reads only.
+
+        Raises TriageUnavailable when the decision itself has nowhere to go (no
+        place for it, one switched off, or one that cannot hold the words
+        REVIEW/REJECT); the optional fields are left out of the target instead."""
+        ...
+
+    async def write_triage(
+        self, target: TriageTarget, row_id: str, decision: str, reason: str,
+        triaged_at: datetime, criteria_version: str,
+    ) -> None:
+        """Record one row's decision in the places `target` resolved, and nothing
+        else. Raises when the write fails: a decision that was not saved is a
+        failure to report, never a quiet skip."""
         ...

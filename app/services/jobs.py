@@ -88,6 +88,35 @@ _INTERRUPTED = {
 }
 
 
+def interrupted(job: Task) -> tuple[str, str]:
+    """(error, summary) for a task that stopped before it finished.
+
+    "Nothing was saved" is only true of a sweep that had not reached its save.
+    One that had (`synced` is written the moment the rows are in the store, see
+    ScrapeService._run) DID save rows, and a triaging sweep that stopped part-way
+    through judging them left some without a decision — which is harmless,
+    because a later triaging sweep picks up any row whose Bot Triage is blank.
+    Saying "nothing was saved" there would send someone to redo work that is
+    done, and hide the rows that are waiting.
+    """
+    synced = getattr(job, "synced", None)
+    if job.kind != "sweep" or synced is None:
+        return _INTERRUPTED[job.kind]
+    rows = f"{synced.new} new row{'' if synced.new == 1 else 's'}"
+    if getattr(job, "triage", None) is not None:
+        return (
+            "This sweep was interrupted — the server stopped or restarted while it was "
+            f"running. Saved {rows}; triage was interrupted — rows without a decision are "
+            "triaged on a later sweep.",
+            f"Sweep interrupted after saving {rows}; triage unfinished.",
+        )
+    return (
+        "This sweep was interrupted — the server stopped or restarted while it was "
+        f"running, after it had saved {rows}.",
+        f"Sweep interrupted after saving {rows}.",
+    )
+
+
 class JobStore:
     """Job records as one JSON file each, under the volume's jobs directory."""
 
@@ -200,19 +229,22 @@ class JobStore:
         The wording follows the kind, because "nothing was saved" means a
         different thing for each: a sweep saved no listings, an archive wrote no
         blocks to the page it was pointed at — and someone reading this is about
-        to go and look at that page.
+        to go and look at that page. A sweep that got as far as saving says what
+        it saved (see `interrupted`).
         """
-        interrupted = 0
+        count = 0
         for job in self.all():
             if job.status != "working" or job.boot_id == self.boot_id:
                 continue
             job.status = "failed"
-            job.error, job.summary = _INTERRUPTED[job.kind]
+            job.error, job.summary = interrupted(job)
+            if getattr(job, "triage", None) is not None and not job.triage.error:
+                job.triage.error = "Interrupted by a restart before triage finished."
             self.save(job)
-            interrupted += 1
-        if interrupted:
-            logger.warning("marked %d interrupted job(s) as failed after restart", interrupted)
-        return interrupted
+            count += 1
+        if count:
+            logger.warning("marked %d interrupted job(s) as failed after restart", count)
+        return count
 
     def evidence_dir(self, job_id: str) -> Path:
         """Where this job's captures are. Validates the id's shape first, so a

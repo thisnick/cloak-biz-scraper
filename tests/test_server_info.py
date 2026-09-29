@@ -14,6 +14,7 @@ SECRET = "test-secret-value-long-enough"
 LICENSE = "LICENSE-SECRET-abc123"
 PROXY_PW = "PROXY-PASSWORD-xyz789"
 NOTION_TOK = "NOTION-TOKEN-qwerty"
+OPENROUTER_KEY = "sk-or-v1-OPENROUTER-KEY-zxcv"
 PRO_PATH = "/data/.cloakbrowser/chromium-148.0.7778.215.2-pro/chrome"
 PUBLIC_PATH = "/data/.cloakbrowser/chromium-146.0.7680.177.3/chrome"
 
@@ -25,6 +26,7 @@ def _settings() -> Settings:
         proxy_user="u", proxy_password=PROXY_PW, proxy_host="h", proxy_port="1000",
         proxy_country="US", proxy_region="california",
         notion_api_token=NOTION_TOK, notion_db_id="db-1",
+        typesafe_openrouter_api_key=OPENROUTER_KEY, typesafe_last_check_ok=True,
         max_instances=4, interactive_reserve=1,
     )
 
@@ -43,13 +45,13 @@ class _FakeInstances:
 
 
 class TestNoSecretLeaks:
-    """The crux: no proxy password, licence key, or Notion token — in any field,
-    at any depth — ever appears in the serialized snapshot."""
+    """The crux: no proxy password, licence key, Notion token, or OpenRouter key —
+    in any field, at any depth — ever appears in the serialized snapshot."""
 
     def test_the_serialized_snapshot_contains_no_secret_value(self):
         info = server_info(_settings(), _FakeInstances(binary_path=PRO_PATH))
         blob = info.model_dump_json()
-        for secret in (LICENSE, PROXY_PW, NOTION_TOK):
+        for secret in (LICENSE, PROXY_PW, NOTION_TOK, OPENROUTER_KEY):
             assert secret not in blob, f"a secret leaked into server_info: {secret!r}"
 
     def test_status_is_reported_without_the_secret_that_produced_it(self):
@@ -60,6 +62,7 @@ class TestNoSecretLeaks:
         assert info.browser.pro is True
         assert info.browser.build == "pro"
         assert info.notion.connected is True
+        assert info.typesafe.configured is True and info.typesafe.status == "working"
 
 
 class TestSnapshotContent:
@@ -79,6 +82,16 @@ class TestSnapshotContent:
         assert info.browser.pro is False
         assert info.browser.build == "public"
         assert info.notion.connected is False
+        assert info.typesafe.configured is False and info.typesafe.status == "unset"
+        assert info.typesafe.model == "jev-latest"
+
+    def test_typesafe_status_comes_from_the_last_test_not_the_key(self):
+        untested = Settings(typesafe_openrouter_api_key="k", typesafe_model="jev-2")
+        info = server_info(untested, _FakeInstances())
+        assert (info.typesafe.configured, info.typesafe.status, info.typesafe.model) == (
+            True, "untested", "jev-2")
+        broken = untested.model_copy(update={"typesafe_last_check_ok": False})
+        assert server_info(broken, _FakeInstances()).typesafe.status == "broken"
 
     def test_a_saved_key_is_not_called_pro_before_its_artifact_resolves(self):
         info = server_info(_settings(), _FakeInstances(binary_path=None))
@@ -117,7 +130,8 @@ class TestRestEndpoint:
         r = client.get("/api/server-info", headers={"Authorization": f"Bearer {mint_access(app)}"})
         assert r.status_code == 200
         body = r.json()
-        assert set(body) == {"proxy", "browser", "pool", "notion"}
+        assert set(body) == {"proxy", "browser", "pool", "notion", "typesafe"}
+        assert set(body["typesafe"]) == {"configured", "status", "model"}
         assert "windows_fonts" in body["browser"]
 
     def test_no_token_is_refused(self, client):

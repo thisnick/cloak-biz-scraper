@@ -43,7 +43,7 @@ from ..services.geo import GeoUnresolved, ProxyUnreachable
 from ..services.instances import BrowserUnavailable, CapExceeded
 from ..services.license import LicenseNotPro
 from ..services.proxy import ProxyNotConfigured
-from ..services.scrape import NotASweep, NotionNotConfigured
+from ..services.scrape import ClassifierNotReady, NotASweep, NotionNotConfigured
 from ..services.tokens import OWNER
 from ..services.urls import public_base
 from ..services.views import (
@@ -65,6 +65,10 @@ class ScrapeRequest(BaseModel):
     urls: list[str]
     max_pages: int = 1
     sync: bool = False
+    # Triage criteria as plain text; see the scrape_listings tool. Absent or
+    # blank: no triage, and the sweep is exactly what it was before triage
+    # existed.
+    triage_prompt: str | None = None
 
 
 class ArchiveRequest(BaseModel):
@@ -108,10 +112,13 @@ async def scrape_listings(request: Request, body: ScrapeRequest) -> ScrapeResult
     synced_row_id empty. With sync=true they hold only the listings newly added to
     Notion, each carrying the synced_row_id of its new row (ready for
     archive_page); rows already present are omitted but counted in
-    synced.existing."""
+    synced.existing. With `triage_prompt` (needs sync=true and the TypeSafe
+    Classifier key) every saved row, and every seen row whose Bot Triage is
+    blank, is decided REVIEW or REJECT; see `triage` on the result."""
     try:
-        job = request.app.state.scrape.start(
-            body.urls, max_pages=body.max_pages, sync=body.sync
+        job = await request.app.state.scrape.submit(
+            body.urls, max_pages=body.max_pages, sync=body.sync,
+            triage_prompt=body.triage_prompt,
         )
     except UnsupportedURL as exc:
         # UnsupportedURL is a ValueError subclass, so it must be caught before the
@@ -120,7 +127,17 @@ async def scrape_listings(request: Request, body: ScrapeRequest) -> ScrapeResult
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except NotionNotConfigured as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        # TriageNotConfigured included: a setup problem, fixed in Settings or in
+        # the call. The one exception is a classifier outage found by triage's
+        # check — 503, like ClassifierNotReady below, since retrying later works.
+        status = 503 if getattr(exc, "transient", False) else 409
+        raise HTTPException(status_code=status, detail=str(exc)) from exc
+    except ClassifierNotReady as exc:
+        # A key the server holds that does not work is the server's state, not
+        # the request's: 409 like a missing Notion database. An outage is 503 —
+        # the same call can succeed later without anyone changing anything.
+        raise HTTPException(status_code=503 if exc.transient else 409,
+                            detail=str(exc)) from exc
     return ScrapeResult.of(job)
 
 
@@ -146,7 +163,12 @@ async def get_scrape_listing_results(request: Request, job_id: str) -> ScrapeRes
 
 @router.post("/archive", response_model=ArchiveResult)
 async def archive_page(request: Request, body: ArchiveRequest) -> ArchiveResult:
-    """Read a page and append it to a Notion page. Blocking, ~40-60s."""
+    """Read a page and append it to a Notion page. Blocking, ~40-60s.
+
+    Appends nothing when the page already has a Source Content section, so a
+    repeat call is safe. With a TypeSafe Classifier (e.g. Jev) key set, a page
+    that is a login wall, error, removed listing or anti-bot page is not written
+    and the result says so."""
     return await request.app.state.archive.archive(body.url, body.notion_page_id)
 
 

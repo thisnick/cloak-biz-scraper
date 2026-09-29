@@ -2,6 +2,17 @@
 far only) implementation. Import the protocol from here, never a concrete store:
 scrape logic that reaches for NotionStore directly is the thing this package
 exists to prevent."""
-from .base import DedupeIndex, ListingStore, PropIssue, SchemaReport, UpsertResult
+from .base import (
+    DedupeIndex,
+    ListingStore,
+    PropIssue,
+    SchemaReport,
+    TriageTarget,
+    TriageUnavailable,
+    UpsertResult,
+)
 
-__all__ = ["DedupeIndex", "ListingStore", "PropIssue", "SchemaReport", "UpsertResult"]
+__all__ = [
+    "DedupeIndex", "ListingStore", "PropIssue", "SchemaReport", "TriageTarget",
+    "TriageUnavailable", "UpsertResult",
+]
