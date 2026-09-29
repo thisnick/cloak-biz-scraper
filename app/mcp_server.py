@@ -418,10 +418,13 @@ def build(app) -> MCPServer:
             failure, with the reason, and the others still run; the call only errors
             outright if the list is empty or none of the URLs can be read (including
             when every URL needs the classifier and its key is rejected, out of
-            credits, or not answering). A page that loads but can't be used fails its source with a
-            reason instead of coming back empty: "found no list of businesses for
-            sale" (a single listing's page, a landing page, a 404), or the cards
-            "don't read as business listings". A BizBuySell page other than a search
+            credits, or not answering). A first page that loads but can't be used
+            fails its source with a reason instead of coming back empty:
+            "found no list of businesses for sale" (a single listing's page, a
+            landing page, a 404), or the cards "don't read as business listings".
+            The same on a LATER page stops that URL's paging there: the pages before
+            it are kept and returned, and `error` says which page stopped it and why
+            (the job still completes). A BizBuySell page other than a search
             or a broker profile is refused; to save one listing's page, use
             archive_page. How a site's page is read is decided fresh each time; if
             a site keeps being read wrong, the fix is a site override a person

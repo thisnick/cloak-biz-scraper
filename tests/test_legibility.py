@@ -191,11 +191,12 @@ class TestClassifier:
     @pytest.mark.asyncio
     async def test_cards_that_are_not_listings_are_dropped_and_the_page_kept(self):
         """BusinessesForSale's menu links at both ends of its list: two cards to
-        leave out, not a reason to throw away the listings between them."""
+        leave out, not a reason to throw away the listings between them — when
+        the source chose the cards itself (the generic reader)."""
         cards = ([_card(0, title="Sell Your Business"), _card(1, title="Login")]
                  + [_card(i) for i in range(2, 9)] + [_card(9, title="Email Alerts")])
         fake = FakeClassifier([0.04, 0.12] + [0.93] * 7 + [0.31])
-        verdict = await legibility.check(cards, page=1, classifier=fake)
+        verdict = await legibility.check(cards, page=1, classifier=fake, drop_cards=True)
 
         assert verdict.ok and verdict.reason == ""
         assert verdict.listings == cards[2:9]
@@ -203,10 +204,37 @@ class TestClassifier:
         assert (verdict.classifier_asked, verdict.classifier_dropped) == (10, 3)
         record = verdict.record(1)
         assert record["kept"] == 7
-        assert (record["classifier_asked"], record["classifier_dropped"]) == (10, 3)
+        assert (record["classifier_asked"], record["classifier_low"],
+                record["classifier_dropped"]) == (10, 3, 3)
         assert record["classifier_rejected"] == [
             {"title": "Sell Your Business", "p": 0.04}, {"title": "Login", "p": 0.12},
             {"title": "Email Alerts", "p": 0.31}]
+
+    @pytest.mark.asyncio
+    async def test_an_adapter_s_cards_are_never_dropped_one_by_one(self):
+        """A site adapter (BizBuySell) read these cards with code written for the
+        page: the classifier judges the page, and a page that passes keeps every
+        card — a misjudged listing is not silently removed."""
+        cards = ([_card(0, title="Laundromat — Owner Retiring"), _card(1, title="Coin Op")]
+                 + [_card(i) for i in range(2, 9)] + [_card(9, title="Vending Route")])
+        fake = FakeClassifier([0.04, 0.12] + [0.93] * 7 + [0.31])
+        verdict = await legibility.check(cards, page=1, classifier=fake)
+
+        assert verdict.ok and verdict.reason == ""
+        assert verdict.listings == cards, "every card the adapter read is kept"
+        record = verdict.record(1)
+        assert record["kept"] == 10
+        assert (record["classifier_asked"], record["classifier_low"],
+                record["classifier_dropped"]) == (10, 3, 0)
+        assert [r["title"] for r in record["classifier_rejected"]] == [
+            "Laundromat — Owner Retiring", "Coin Op", "Vending Route"], "still on the record"
+
+    @pytest.mark.asyncio
+    async def test_an_adapter_s_page_still_fails_when_fewer_than_half_pass(self):
+        fake = FakeClassifier([0.1, 0.3, 0.23, 0.9, 0.8, 0.49])
+        verdict = await legibility.check([_card(i) for i in range(6)], page=2, classifier=fake)
+        assert not verdict.ok and verdict.listings == []
+        assert "Only 2 of 6 cards on page 2 read as business listings" in verdict.reason
 
     @pytest.mark.asyncio
     async def test_fewer_than_half_passing_fails_the_page_in_plain_words(self):
@@ -225,7 +253,8 @@ class TestClassifier:
     @pytest.mark.asyncio
     async def test_exactly_half_passing_is_enough(self):
         fake = FakeClassifier([0.9, 0.1, 0.5, 0.2])
-        verdict = await legibility.check([_card(i) for i in range(4)], page=1, classifier=fake)
+        verdict = await legibility.check([_card(i) for i in range(4)], page=1, classifier=fake,
+                                         drop_cards=True)
         assert verdict.ok
         assert [c.title for c in verdict.listings] == ["Profitable Business 0",
                                                        "Profitable Business 2"]
@@ -236,7 +265,7 @@ class TestClassifier:
         sits at the ends. The cards between are kept on the code checks."""
         cards = [_card(i) for i in range(100)]
         fake = FakeClassifier([0.02] + [0.9] * 38 + [0.03])
-        verdict = await legibility.check(cards, page=1, classifier=fake)
+        verdict = await legibility.check(cards, page=1, classifier=fake, drop_cards=True)
 
         state, questions = fake.calls[0]
         assert len(fake.calls) == 1 and len(questions) == legibility.MAX_CARDS == 40
@@ -298,7 +327,7 @@ class TestOneRequestOnTheWire:
         }))
         client = TypeSafeClient(lambda: "sk-or-test", lambda: "jev-latest")
         cards = [_card(i) for i in range(7)]
-        verdict = await legibility.check(cards, page=1, classifier=client)
+        verdict = await legibility.check(cards, page=1, classifier=client, drop_cards=True)
 
         assert verdict.ok and verdict.listings == cards[:6]
         assert verdict.classifier_dropped == 1

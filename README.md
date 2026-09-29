@@ -258,9 +258,11 @@ Classifier (e.g. Jev) decides which group is the list, what each card field hold
 statuses mean a business is gone, and how to reach the next page — fresh on every page.
 Without a key such a URL is refused with a pointer to Settings; a key that OpenRouter
 rejects or that is out of credits refuses the call before a job starts (in a batch that
-also has BizBuySell URLs, only the other sites fail). A page with no list of businesses on
-it, or whose cards don't read as listings, fails that source with evidence rather than
-returning nothing. A BizBuySell page other than a search or broker profile never falls
+also has BizBuySell URLs, only the other sites fail). A first page with no list of
+businesses on it, or whose cards don't read as listings, fails that source with evidence
+rather than returning nothing; the same on a later page stops paging there, keeps the pages
+before it, and says so in the result's `error`. A BizBuySell page other than a search or
+broker profile never falls
 through to the generic reader. Listings from other sites carry their site as `source` and
 an empty `listing_id`. **Settings → Site overrides** pins any part of those decisions for
 one site, and each sweep's **Details** (Tasks → History, or `/runs/<job_id>`) shows what

@@ -64,7 +64,7 @@ class CardPage:
 class Source(Protocol):
     """One site's search-results pages.
 
-    Four optional members are read with `getattr`, so a source that has no use
+    Five optional members are read with `getattr`, so a source that has no use
     for them simply leaves them out (they are not declared below, because a
     runtime-checkable protocol would then demand them):
 
@@ -84,6 +84,14 @@ class Source(Protocol):
       which only works for sites that page by URL; with it, a site that pages
       with a script-only "Next" button can be swept too. Returning False means
       there is no next page, and paging stops.
+    * `chooses_cards: bool` — True for a source that decides for itself which
+      elements of a page it has never seen are the cards (the generic reader).
+      Only then may the legibility check drop single cards the classifier judges
+      not to be listings, and only then is an illegible page final rather than
+      retried from a new exit IP. A site adapter's cards are read by code
+      written for the page, so the classifier judges the page and never removes
+      one of them; and an adapter's page that reads wrong is most likely a soft
+      block served to a flagged IP.
     """
 
     # Recorded on every Listing, and the value of the Notion `Source` column.

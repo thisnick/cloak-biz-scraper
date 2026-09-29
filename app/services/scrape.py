@@ -618,7 +618,7 @@ class ScrapeService:
             outcomes = await asyncio.gather(
                 *(worker(i, target) for i, target in enumerate(targets))
             )
-            listings, pages, ok, failures = self._merge(targets, outcomes)
+            listings, pages, ok, failures, warnings = self._merge(targets, outcomes)
             job.decisions = self._decisions(targets, outcomes)
             job.listings = listings
             job.pages_crawled = pages
@@ -670,8 +670,7 @@ class ScrapeService:
                 # "nothing was saved".
                 self._jobs.save(job)
             status = "completed"
-            if failures:
-                error = self._failure_text(failures, total)
+            error = self._failure_text(failures, total, warnings)
             if plan is not None and upsert is not None:
                 # A triage that stops part-way (the classifier going down, a
                 # detail page that will not load) leaves those rows blank for a
@@ -681,7 +680,8 @@ class ScrapeService:
                 note = _triage_note(job.triage)
                 if note:
                     error = f"{error} {note}" if error else note
-            summary = self._summarize(job, ok, total, failures, found)
+            summary = self._summarize(job, ok, total, failures, found, warnings,
+                                      _cards_left_out(outcomes))
         except asyncio.CancelledError:
             # Cancelled: the server is shutting down under this job. Whatever
             # is written now is what every later poll reads, so it must say
@@ -710,12 +710,15 @@ class ScrapeService:
         job.summary = text
         self._jobs.save(job)
 
-    def _merge(self, targets, outcomes) -> tuple[list[Listing], int, int, list[tuple[str, str]]]:
+    def _merge(self, targets, outcomes) -> tuple[
+            list[Listing], int, int, list[tuple[str, str]], list[tuple[str, str]]]:
         """Fold every source's outcome into one deduped result.
 
         Returns (merged listings, total pages crawled, count of sources that
-        succeeded, list of (url, reason) for the ones that failed). Dedupe uses
-        the same identity the rest of the system does — listing_id, then
+        succeeded, list of (url, reason) for the ones that failed, list of (url,
+        warning) for the ones that succeeded only in part — stopped at a later
+        page they could not use, keeping the pages before it). Dedupe uses the
+        same identity the rest of the system does — listing_id, then
         normalized_url — so the same listing surfacing on two SERP pages, or on
         two of the swept URLs, is counted once.
         """
@@ -724,6 +727,7 @@ class ScrapeService:
         pages = 0
         ok = 0
         failures: list[tuple[str, str]] = []
+        warnings: list[tuple[str, str]] = []
         for target, res in zip(targets, outcomes):
             url = target.url
             data = res.get("data") or {}
@@ -735,6 +739,8 @@ class ScrapeService:
                 failures.append((url, res["error"]))
                 continue
             ok += 1
+            if res.get("warning"):
+                warnings.append((url, res["warning"]))
             for listing in data.get("listings", []):
                 key = listing.listing_id or listing.normalized_url or listing.url
                 if key and key in seen:
@@ -742,7 +748,7 @@ class ScrapeService:
                 if key:
                     seen.add(key)
                 listings.append(listing)
-        return listings, pages, ok, failures
+        return listings, pages, ok, failures, warnings
 
     def _decisions(self, targets: list[_Target], outcomes: list[dict]) -> list[dict]:
         """How each URL was read, for the run's detail (see `SweepTask.decisions`)."""
@@ -759,25 +765,38 @@ class ScrapeService:
             error = "blocked by the site" if res.get("blocked") else res.get("error")
             if error:
                 entry["error"] = error
+            elif res.get("warning"):
+                entry["warning"] = res["warning"]
             entries.append(entry)
         return entries
 
-    def _failure_text(self, failures: list[tuple[str, str]], total: int) -> str:
-        bits = []
-        for url, reason in failures:
-            host = urlparse(url).hostname or url
-            bits.append(f"{host} ({'blocked by the site' if reason == 'blocked' else reason})")
-        text = f"{len(failures)} of {total} source(s) failed: " + "; ".join(bits) + "."
-        if any(reason == "blocked" for _, reason in failures):
-            text += (
-                " A blocked source served an anti-bot page instead of results, each attempt "
-                "from a different exit IP. This usually clears on its own — try again in a "
-                "few minutes."
-            )
-        return text
+    def _failure_text(self, failures: list[tuple[str, str]], total: int,
+                      warnings: list[tuple[str, str]] = ()) -> str | None:
+        """The job's error: the sources that failed, then the ones that stopped
+        early (their earlier pages kept). None when there is neither."""
+        parts = []
+        if failures:
+            bits = []
+            for url, reason in failures:
+                host = urlparse(url).hostname or url
+                bits.append(f"{host} ({'blocked by the site' if reason == 'blocked' else reason})")
+            text = f"{len(failures)} of {total} source(s) failed: " + "; ".join(bits) + "."
+            if any(reason == "blocked" for _, reason in failures):
+                text += (
+                    " A blocked source served an anti-bot page instead of results, each "
+                    "attempt from a different exit IP. This usually clears on its own — try "
+                    "again in a few minutes."
+                )
+            parts.append(text)
+        if warnings:
+            bits = [f"{urlparse(url).hostname or url} ({warning})" for url, warning in warnings]
+            parts.append(f"{len(warnings)} of {total} source(s) stopped early: "
+                         + "; ".join(bits) + ".")
+        return " ".join(parts) or None
 
     def _summarize(
-        self, job: SweepTask, ok: int, total: int, failures: list[tuple[str, str]], found: int
+        self, job: SweepTask, ok: int, total: int, failures: list[tuple[str, str]], found: int,
+        warnings: list[tuple[str, str]] = (), left_out: int = 0,
     ) -> str:
         # `found` is how many DISTINCT listings the sweep saw, passed explicitly
         # because under sync `job.listings` has already been narrowed to just the
@@ -785,6 +804,11 @@ class ScrapeService:
         # whole find, not only the new ones.
         pages = f"{job.pages_crawled} page{'s' if job.pages_crawled != 1 else ''}"
         parts = [f"{ok} of {total} source(s) swept · {found} listing(s) across {pages}"]
+        if left_out:
+            # Cards the generic reader's legibility check left out one by one
+            # (a menu link read as a card, an ad in the list). Said here, in the
+            # result an agent reads — not only in the run's diagnostics.
+            parts.append(f"{left_out} card(s) left out for not reading as business listings")
         if job.synced is None:
             parts.append("Nothing was saved (sync=false)")
         else:
@@ -803,6 +827,8 @@ class ScrapeService:
                 parts.append(seg)
         if failures:
             parts.append(f"{len(failures)} source(s) failed")
+        if warnings:
+            parts.append(f"{len(warnings)} source(s) stopped early (earlier pages kept)")
         return " · ".join(parts)
 
     async def _sync(self, job: SweepTask, listings: list[Listing],
@@ -918,11 +944,33 @@ class ScrapeService:
         return self._typesafe if self._settings.load().typesafe_configured() else None
 
     async def _sweep_once(self, inst, page, job: SweepTask, url: str, source, evidence: Path) -> dict:
+        """One attempt at one URL: page 1, then each later page until the end.
+
+        A page that loads, is not a block, and still cannot be used — no list on
+        it, cards that don't read as listings, a classifier that stopped
+        answering — is handled by where it falls:
+
+        * **Page 1** fails the source, with evidence. Whether another attempt
+          from a new exit IP is worth it depends on who read the cards: a site
+          adapter's page that reads wrong is most likely a soft block or a
+          variant page served to a flagged IP (retry, like a block); the generic
+          reader's is the classifier's judgement of the page itself, which a new
+          IP does not change (the source's own `retry`, False for the reader's
+          failures).
+        * **A later page** stops paging, and the pages before it are kept: they
+          were read and checked, and throwing them away over page 3 would turn a
+          partial sweep into nothing. The source succeeds with a `warning` that
+          the job's error and summary carry, so the stop is never silent.
+        """
         listings: list[Listing] = []
         kept: set[str] = set()   # URLs already in `listings`
         seen: set[str] = set()   # every listing URL any page showed, dropped ones included
         checks: list[dict] = []  # the legibility verdict of each page that had cards
         pages_done = 0
+        # A source that picks the cards itself, on a page it has never seen (the
+        # generic reader), lets the legibility check drop single cards; a site
+        # adapter's cards are only ever judged as a page.
+        chooses = bool(getattr(source, "chooses_cards", False))
 
         def data() -> dict:
             return {"listings": listings, "pages_crawled": pages_done, "legibility": checks,
@@ -932,11 +980,26 @@ class ScrapeService:
             # A page that loaded, was not a block, and still cannot be used. The
             # evidence is what makes "cards don't read as listings" checkable
             # after the fact, so it is captured before anything is returned.
+            if n > 1:
+                return await stopped(n, tag, error)
             await capture(page, evidence / f"page-{n:02d}-{tag}",
                           {"url": page.url, "reason": tag, "error": error, "page": n,
                            "proxy_ip": inst.proxy_ip})
             logger.warning("job %s: %s page %d failed (%s): %s", job.id, url, n, tag, error)
             return {"blocked": False, "error": error, "retry": retry, "data": data()}
+
+        async def stopped(n: int, tag: str, error: str) -> dict:
+            # Page n > 1 could not be used: paging stops here and pages 1..n-1
+            # are this attempt's result — a success, carrying the reason.
+            earlier = "page 1" if n == 2 else f"pages 1–{n - 1}"
+            warning = (f"stopped at page {n} and kept the {len(listings)} listing(s) from "
+                       f"{earlier}: {error}")
+            await capture(page, evidence / f"page-{n:02d}-{tag}",
+                          {"url": page.url, "reason": tag, "error": error, "page": n,
+                           "partial": True, "found": len(listings), "pages_crawled": pages_done,
+                           "legibility": checks, "proxy_ip": inst.proxy_ip})
+            logger.warning("job %s: %s %s", job.id, url, warning)
+            return {"blocked": False, "error": None, "warning": warning, "data": data()}
 
         # One source object serves every attempt scrape_with_retry makes, so
         # whatever it learned on a failed attempt is forgotten before this one.
@@ -970,12 +1033,13 @@ class ScrapeService:
             page_listings = result.listings
             if page_listings:
                 verdict = await legibility.check(page_listings, page=n,
-                                                 classifier=self._classifier())
+                                                 classifier=self._classifier(),
+                                                 drop_cards=chooses)
                 checks.append(verdict.record(n))
                 if not verdict.ok:
-                    # Illegible cards are not a block: the same page from a new
-                    # exit IP reads the same way, so the failure is final.
-                    return await failed(n, "illegible", verdict.reason, retry=False)
+                    # An adapter's page that reads wrong is retried from a new
+                    # exit IP, like a block; the generic reader's is final.
+                    return await failed(n, "illegible", verdict.reason, retry=not chooses)
                 page_listings = verdict.listings
 
             # Paging stops on cards this crawl has already seen, not on cards the
@@ -1033,6 +1097,23 @@ def _diagnostics(source) -> dict:
             logger.exception("could not build a suggested override for %s",
                              getattr(source, "url", "?"))
     return out
+
+
+def _cards_left_out(outcomes: list[dict]) -> int:
+    """Cards the legibility check dropped one by one, over every source's pages.
+
+    Only the generic reader's pages drop single cards for the classifier; a
+    card with no title or link is dropped on any source (it cannot be filed).
+    A page that failed outright is its source's failure or stop, not counted.
+    """
+    total = 0
+    for res in outcomes:
+        if res.get("blocked") or res.get("error"):
+            continue  # a failed source kept nothing, so it left nothing out
+        for check in (res.get("data") or {}).get("legibility") or []:
+            if isinstance(check, dict) and check.get("ok", True):
+                total += int(check.get("dropped") or 0) + int(check.get("classifier_dropped") or 0)
+    return total
 
 
 def _evidence_tag(reason: str, limit: int = 50) -> str:

@@ -1137,23 +1137,122 @@ class TestPageFailures:
         assert meta["url"] == LIST and meta["page"] == 1
 
     @pytest.mark.asyncio
-    async def test_an_illegible_page_fails_without_retry(self, settings, jobs, monkeypatch):
+    async def test_an_illegible_later_page_stops_paging_and_keeps_the_pages_before_it(
+        self, settings, jobs, monkeypatch,
+    ):
+        """Page 2 reads wrong: page 1 was read and checked, so it is kept, and the
+        stop is said in the job's error, its summary and its decisions."""
         untitled = [_gen(i, title="") for i in range(5)]
-        source = _ScriptedSource([CardPage([_gen(1), _gen(2)]), CardPage(untitled)])
+        source = _ScriptedSource([CardPage([_gen(1), _gen(2)]), CardPage(untitled),
+                                  CardPage([_gen(3)])])
         monkeypatch.setattr("app.sources.for_url", lambda url: source)
         instances = _FakeInstances()
         svc = self._svc(settings, jobs, instances)
-        job = svc.start([LIST], max_pages=2)
+        job = svc.start([LIST], max_pages=3)
+        await _drain(svc)
+
+        assert instances.launches == 1 and instances.profiles.rotations == 0
+        assert source.reads == 2, "paging stopped at the page that could not be used"
+        result = svc.result(job.id)
+        assert result.status == "completed"
+        assert [l.url for l in result.listings] == [_gen(1).url, _gen(2).url]
+        assert result.error.startswith("1 of 1 source(s) stopped early: example.com (stopped "
+                                       "at page 2 and kept the 2 listing(s) from page 1: ")
+        assert "0 of 5 cards on page 2" in result.error
+        assert "1 source(s) stopped early (earlier pages kept)" in result.summary
+        assert "2 listing(s) across 2 pages" in result.summary
+        (decision,) = jobs.get(job.id).decisions
+        assert "stopped at page 2" in decision["warning"] and "error" not in decision
+        evidence = CONFIG.evidence_dir / job.id / "source-01" / "page-02-illegible"
+        meta = _meta(evidence)
+        assert meta["reason"] == "illegible" and meta["partial"] is True
+        assert meta["url"] == f"{LIST}?page=2" and meta["found"] == 2
+
+    @pytest.mark.asyncio
+    async def test_a_source_error_on_a_later_page_keeps_the_pages_before_it(
+        self, settings, jobs, monkeypatch,
+    ):
+        """The generic reader's classifier going down on page 3 (or finding no
+        list there) costs page 3, not pages 1 and 2."""
+        down = "Could not read the listings on page 3: the TypeSafe Classifier did not answer."
+        source = _ScriptedSource([CardPage([_gen(1)]), CardPage([_gen(2)]),
+                                  CardPage([], error=down, retry=False)])
+        monkeypatch.setattr("app.sources.for_url", lambda url: source)
+        instances = _FakeInstances()
+        svc = self._svc(settings, jobs, instances)
+        job = svc.start([LIST], max_pages=5)
+        await _drain(svc)
+
+        assert instances.launches == 1
+        result = svc.result(job.id)
+        assert result.status == "completed"
+        assert [l.url for l in result.listings] == [_gen(1).url, _gen(2).url]
+        assert "stopped at page 3 and kept the 2 listing(s) from pages 1–2: " + down \
+            in result.error
+        assert (CONFIG.evidence_dir / job.id / "source-01"
+                / "page-03-could-not-read-the-listings-on-page-3-the-typesafe").is_dir()
+
+    @pytest.mark.asyncio
+    async def test_a_later_page_stop_under_sync_still_saves_the_earlier_pages(
+        self, settings, jobs, monkeypatch,
+    ):
+        settings.update(notion_api_token="ntn_x", notion_db_id="db-1")
+        source = _ScriptedSource([CardPage([_gen(1), _gen(2)]),
+                                  CardPage([_gen(i, title="") for i in range(3, 8)])])
+        monkeypatch.setattr("app.sources.for_url", lambda url: source)
+        svc = self._svc(settings, jobs, _FakeInstances())
+        job = svc.start([LIST], max_pages=2, sync=True)
+        await _drain(svc)
+
+        result = svc.result(job.id)
+        assert result.status == "completed" and result.synced.new == 2
+        assert "stopped at page 2" in result.error
+
+    @pytest.mark.asyncio
+    async def test_an_adapter_s_illegible_first_page_is_retried_from_a_new_exit_ip(
+        self, settings, jobs, monkeypatch,
+    ):
+        """A site adapter's page that reads wrong is most likely a soft block or a
+        variant page served to a flagged IP, so it is retried like a block."""
+        real_sleep = asyncio.sleep
+
+        async def _quick(*_a, **_k):
+            await real_sleep(0)  # the backoff, skipped — but still a yield
+
+        monkeypatch.setattr("app.services.browsing.asyncio.sleep", _quick)
+        untitled = [_gen(i, title="") for i in range(5)]
+        source = _ScriptedSource([CardPage(untitled)], [CardPage([_gen(1)])])
+        monkeypatch.setattr("app.sources.for_url", lambda url: source)
+        instances = _FakeInstances()
+        svc = self._svc(settings, jobs, instances)
+        job = svc.start([LIST], max_pages=1)
+        await _drain(svc)
+
+        assert instances.launches == 2 and instances.profiles.rotations == 1
+        result = svc.result(job.id)
+        assert result.status == "completed" and result.error is None
+        assert [l.url for l in result.listings] == [_gen(1).url]
+        assert (CONFIG.evidence_dir / job.id / "source-01" / "page-01-illegible").is_dir()
+
+    @pytest.mark.asyncio
+    async def test_the_generic_reader_s_illegible_first_page_is_final(
+        self, settings, jobs, monkeypatch,
+    ):
+        """The generic reader chose those cards with the classifier: a new exit IP
+        shows the same page and the same judgement, so there is no retry."""
+        untitled = [_gen(i, title="") for i in range(5)]
+        source = _ScriptedSource([CardPage(untitled)], [CardPage([_gen(1)])])
+        source.chooses_cards = True
+        monkeypatch.setattr("app.sources.for_url", lambda url: source)
+        instances = _FakeInstances()
+        svc = self._svc(settings, jobs, instances)
+        job = svc.start([LIST], max_pages=1)
         await _drain(svc)
 
         assert instances.launches == 1 and instances.profiles.rotations == 0
         result = svc.result(job.id)
         assert result.status == "failed"
-        assert "0 of 5 cards on page 2" in result.error
-        assert "nothing from this page was kept" in result.error
-        evidence = CONFIG.evidence_dir / job.id / "source-01" / "page-02-illegible"
-        assert _meta(evidence)["reason"] == "illegible"
-        assert _meta(evidence)["url"] == f"{LIST}?page=2"
+        assert "0 of 5 cards on page 1" in result.error
 
     @pytest.mark.asyncio
     async def test_the_classifier_is_asked_only_once_a_key_is_saved(
@@ -1181,7 +1280,7 @@ class TestPageFailures:
         res, _, _ = await _once(svc, _job(jobs, max_pages=1), _PlainSource(
             [CardPage([_gen(1), _gen(2)])]), tmp_path)
         assert fake.calls == 1, "one request for the page's cards"
-        assert res["retry"] is False
+        assert res["retry"] is True, "an adapter's page that reads wrong gets a new exit IP"
         assert "Only 0 of 2 cards on page 1 read as business listings" in res["error"]
         assert (tmp_path / "ev" / "page-01-illegible").is_dir()
 
@@ -1215,6 +1314,78 @@ class TestPageFailures:
         assert res["error"] is None
         assert len(res["data"]["listings"]) == 9
         assert res["data"]["legibility"][0]["dropped"] == 1
+
+
+class _TitleJudge:
+    """A classifier that scores each card of a legibility request by its title."""
+
+    def __init__(self, low: set[str]):
+        self.low = low
+        self.calls = 0
+
+    async def ask(self, state, questions):
+        from app.services.typesafe import Noul
+
+        self.calls += 1
+        return {name: Noul(probability=0.05 if state["cards"][name]["title"] in self.low
+                           else 0.93) for name in questions}
+
+
+class TestWhoMayDropCards:
+    """The classifier removes single cards only from a source that chose them."""
+
+    @pytest.mark.asyncio
+    async def test_bizbuysell_cards_are_never_dropped_one_by_one(self, settings, jobs, tmp_path):
+        import json
+
+        from app.sources.bizbuysell import JS_CARDS, BizBuySellSerp
+
+        titles = ["Laundromat — Owner Retiring", "HVAC Contractor", "Coin Op Car Wash",
+                  "Dental Lab", "Pizza Franchise", "Machine Shop"]
+        cards = [{"listing_id": str(2400000 + i),
+                  "url": f"https://www.bizbuysell.com/business-opportunity/x/{2400000 + i}/",
+                  "title": t, "location": "Oakland, CA", "asking_price": "$1,200,000",
+                  "cashflow": "$300,000", "excerpt": f"{t}."} for i, t in enumerate(titles)]
+
+        class SerpPage(_FakePage):
+            async def evaluate(self, js, arg=None):
+                if js != JS_CARDS:
+                    return None
+                return json.dumps({"title": "Businesses For Sale", "blocked": False,
+                                   "cards": cards})
+
+        settings.update(typesafe_openrouter_api_key="sk-or-test")
+        judge = _TitleJudge({"Laundromat — Owner Retiring", "Coin Op Car Wash"})
+        svc = ScrapeService(instances=None, jobs=jobs, settings=settings, typesafe=judge)
+        res, _, _ = await _once(svc, _job(jobs, max_pages=1), BizBuySellSerp(), tmp_path,
+                                page=SerpPage())
+
+        assert judge.calls == 1, "the page was judged"
+        assert res["error"] is None
+        assert [l.title for l in res["data"]["listings"]] == titles, "every card is kept"
+        (check,) = res["data"]["legibility"]
+        assert (check["classifier_low"], check["classifier_dropped"], check["kept"]) == (2, 0, 6)
+
+    @pytest.mark.asyncio
+    async def test_the_generic_reader_drops_what_it_misjudged_and_the_summary_says_so(
+        self, settings, jobs, monkeypatch,
+    ):
+        cards = ([_gen(0, title="Sell Your Business"), _gen(1, title="Login")]
+                 + [_gen(i) for i in range(2, 8)])
+        source = _ScriptedSource([CardPage(cards)])
+        source.chooses_cards = True
+        monkeypatch.setattr("app.sources.for_url", lambda url: source)
+        settings.update(typesafe_openrouter_api_key="sk-or-test")
+        svc = ScrapeService(instances=_FakeInstances(), jobs=jobs, settings=settings,
+                            store_factory=FakeStore, task_profiles=_Pool(),
+                            typesafe=_TitleJudge({"Sell Your Business", "Login"}))
+        job = svc.start([LIST], max_pages=1)
+        await _drain(svc)
+
+        result = svc.result(job.id)
+        assert result.status == "completed" and result.error is None
+        assert len(result.listings) == 6
+        assert "2 card(s) left out for not reading as business listings" in result.summary
 
 
 # ── which source reads a URL, the classifier preflight, and diagnostics ──────

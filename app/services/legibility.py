@@ -21,14 +21,25 @@ Two layers, both conservative:
 * **The TypeSafe Classifier (e.g. Jev)**, when a key is saved: a yes/no on
   every card that passed the code checks. It catches what the code cannot see —
   well-formed cards that are blog posts, franchise ads, or a site's own
-  navigation. A card it judges not to be a listing is dropped, and only a page
-  where fewer than half pass fails: two menu links at the ends of a list are
-  two cards to leave out, not a reason to throw away the seventeen listings
-  between them (BusinessesForSale, second live gate, where a sample of three
-  failed the page). The cards go in ONE request — every card in one state, one
-  question per card — because the classifier reads the state once and answers
-  every question in it; a request per card would pay for that reading again
-  and again.
+  navigation. A page where fewer than half pass fails. The cards go in ONE
+  request — every card in one state, one question per card — because the
+  classifier reads the state once and answers every question in it; a request
+  per card would pay for that reading again and again.
+
+What the classifier's per-card answers are allowed to do depends on who chose
+the cards (`drop_cards`):
+
+* **The generic reader chose them itself** (it picked a group of links on a
+  page it had never seen), so a card the classifier judges not to be a listing
+  is dropped: two menu links at the ends of a list are two cards to leave out,
+  not a reason to throw away the seventeen listings between them
+  (BusinessesForSale, second live gate, where a sample of three failed the
+  page).
+* **A site adapter's cards** (BizBuySell) are read by code written for that
+  page, so the classifier's answer is a verdict on the PAGE only: it fails
+  when fewer than half pass — the adapter is reading the wrong thing — and
+  otherwise every card is kept. One misjudged listing is not the classifier's
+  to silently remove from a page the adapter read correctly.
 
 The classifier half is best-effort here. BizBuySell pages do not depend on it,
 so a classifier outage must not fail them: the error is logged and recorded on
@@ -59,7 +70,8 @@ QUESTION = "{card} in the state is a listing of a business for sale."
 MIN_COMPLETE = 0.7
 # At least this share of digit-bearing asking prices must read as an amount.
 MIN_PRICES_READ = 0.5
-# A card the classifier gives less than this is not a listing, and is dropped.
+# A card the classifier gives less than this is not a listing (and is dropped,
+# when the check may drop cards — see `drop_cards`).
 MIN_CARD = 0.5
 # The page fails when fewer than this share of the cards asked about pass.
 MIN_PASSING = 0.5
@@ -89,8 +101,8 @@ class Verdict:
     """What the check decided about one page.
 
     `listings` are the cards that survive — those with a title and a link, less
-    any the classifier judged not to be listings — and the only ones the sweep
-    keeps. `reason` is set when `ok` is False and is written for the person
+    (when the check was allowed to drop cards) any the classifier judged not to
+    be listings — and the only ones the sweep keeps. `reason` is set when `ok` is False and is written for the person
     reading the job's error: what was wrong, on which page, and that nothing
     from it was kept.
     """
@@ -100,10 +112,12 @@ class Verdict:
     reason: str = ""
     # Cards the code checks dropped (no title or no link).
     dropped: int = 0
-    # Cards the classifier was asked about, and how many of those it judged
-    # not to be listings (dropped, or the page failed); 0 when it was not
-    # asked (no key) or could not answer.
+    # Cards the classifier was asked about, how many of those it judged not to
+    # be listings, and how many of those were dropped for it (all of them when
+    # the check may drop cards or the page failed; none on an adapter's page
+    # that passed). 0 when it was not asked (no key) or could not answer.
     classifier_asked: int = 0
+    classifier_low: int = 0
     classifier_dropped: int = 0
     # The classifier's mean over the cards it was asked about; None when it
     # was not asked or could not answer.
@@ -121,6 +135,7 @@ class Verdict:
             out["reason"] = self.reason
         if self.classifier_asked:
             out["classifier_asked"] = self.classifier_asked
+            out["classifier_low"] = self.classifier_low
             out["classifier_dropped"] = self.classifier_dropped
             if self.classifier_mean is not None:
                 out["classifier_mean"] = round(self.classifier_mean, 3)
@@ -134,11 +149,15 @@ class Verdict:
         return out
 
 
-async def check(listings: list[Listing], *, page: int, classifier=None) -> Verdict:
+async def check(listings: list[Listing], *, page: int, classifier=None,
+                drop_cards: bool = False) -> Verdict:
     """Judge one page's cards. Never raises for a classifier failure.
 
     `classifier` is a TypeSafe client (anything with `ask(state, questions)`),
-    passed only when a key is saved; None skips that half.
+    passed only when a key is saved; None skips that half. `drop_cards` lets
+    the classifier's answers remove single cards from a page that passes — only
+    for a source that chose the cards itself (the generic reader). Left False,
+    the answers judge the page and nothing else (see the module docstring).
     """
     if not listings:
         return Verdict(listings=[])
@@ -198,23 +217,29 @@ async def check(listings: list[Listing], *, page: int, classifier=None) -> Verdi
     passing = len(asked) - len(low)
     judged = {
         "classifier_asked": len(asked),
-        "classifier_dropped": len(low),
+        "classifier_low": len(low),
         "classifier_mean": sum(answers) / len(answers),
         "classifier_rejected": tuple((complete[i].title.strip(), p) for i, p in low.items()),
     }
     if passing < MIN_PASSING * len(asked):
         return Verdict(
-            listings=[], ok=False, dropped=dropped, **judged,
+            listings=[], ok=False, dropped=dropped, classifier_dropped=len(low), **judged,
             reason=(
                 f"Only {passing} of {len(asked)} cards on page {page} read as business "
                 f"listings (at least half should) — nothing from this page was kept."
             ),
         )
+    if not drop_cards:
+        # An adapter's page that passed: every card it read is kept.
+        if low:
+            logger.info("legibility: page %d: %d of %d cards judged not listings, all kept "
+                        "(the adapter chose them)", page, len(low), len(asked))
+        return Verdict(listings=complete, dropped=dropped, **judged)
     if low:
         logger.info("legibility: page %d: %d of %d cards dropped as not listings",
                     page, len(low), len(asked))
     kept = [c for i, c in enumerate(complete) if i not in low]
-    return Verdict(listings=kept, dropped=dropped, **judged)
+    return Verdict(listings=kept, dropped=dropped, classifier_dropped=len(low), **judged)
 
 
 def _reads_as_amount(value: str) -> bool:

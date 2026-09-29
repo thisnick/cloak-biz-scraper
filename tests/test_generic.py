@@ -17,6 +17,7 @@ to — the whole point of the source.
 """
 from __future__ import annotations
 
+import asyncio
 import collections
 import json
 import re
@@ -197,13 +198,22 @@ class FakeLocator:
         self.page, self.selector = page, selector
 
     async def count(self) -> int:
-        return 0 if self.selector in self.page.missing else 1
+        if self.selector in self.page.missing:
+            return 0
+        return self.page.counts.get(self.selector, 1)
 
     @property
     def first(self) -> "FakeLocator":
         return self
 
+    async def is_visible(self) -> bool:
+        return self.selector not in self.page.hidden
+
     async def click(self, **_kw) -> None:
+        if self.selector in self.page.lost:
+            # What a humanized click reports when the site re-renders the
+            # element it had just scrolled into view (FacetWP on Synergy).
+            raise RuntimeError("Element lost after scrolling into view")
         self.page.clicks.append(self.selector)
 
 
@@ -217,6 +227,9 @@ class FakePage:
         self.gotos: list[str] = []
         self.clicks: list[str] = []
         self.missing: set[str] = set()
+        self.lost: set[str] = set()      # found, but the click fails
+        self.hidden: set[str] = set()    # found, not visible
+        self.counts: dict[str, int] = {}  # how many elements a selector finds (default 1)
 
     async def evaluate(self, script, arg=None):
         if script != JS_PROBE:  # extract.inject's libraries
@@ -325,16 +338,21 @@ class TestListingGroup:
                                                         "candidates": 0}
 
     @pytest.mark.asyncio
-    async def test_none_on_a_later_page_is_the_end_of_the_list(self):
+    async def test_none_on_a_later_page_says_so_and_ends_the_list(self):
+        """Reached through a link judged to be the next page, a page with no list
+        is worth a word: the sweep keeps the pages before it and warns (see
+        test_scrape.py's TestLaterPageFailures), rather than ending silently."""
         jev = FakeJev()
         source = GenericSource(LIST_URL, jev)
-        page = FakePage(_probe(pager=[_pager(1, NEXT_URL, "rel=next")]), _probe())
+        page = FakePage(_probe(pager=[_pager(1, NEXT_URL, "rel=next")]), _probe(url=NEXT_URL))
         first = await source.cards(page)
         assert len(first.listings) == 4
         assert await source.advance(page, 2) is True
         jev.group = "none"
         second = await source.cards(page)
-        assert second.listings == [] and second.error == "" and not second.blocked
+        assert second.listings == [] and not second.blocked
+        assert second.error == f"Found no list of businesses for sale on {NEXT_URL} (page 2)."
+        assert second.retry is False
         assert source.decisions[1]["page"] == 2
         assert await source.advance(page, 3) is False
 
@@ -942,6 +960,116 @@ class TestNextPage:
         assert await source.advance(page, 2) is False
 
     @pytest.mark.asyncio
+    async def test_a_re_rendered_control_is_clicked_by_its_selector(self):
+        """Synergy's FacetWP "Load more": re-drawn as it scrolls into view, so the
+        probe's mark is on nothing by the time it is clicked. The stable
+        selector the probe recorded still finds it."""
+        pager = [_pager(1, None, "text 'Load more'", selector="button.facetwp-load-more")]
+        source = GenericSource(LIST_URL, FakeJev(next={"text 'Load more'": 0.55}))
+        page = FakePage(_probe(pager=pager))
+        await source.cards(page)
+        page.lost.add('[data-cbs-next="n1"]')
+
+        assert await source.advance(page, 2) is True
+        assert page.clicks == ["button.facetwp-load-more"]
+        assert source.decisions[0]["next_page"]["clicked_by"] == "selector"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("unusable", ["two", "hidden", "none"])
+    async def test_otherwise_the_pager_is_probed_again_and_the_control_found_by_its_text(
+        self, unusable,
+    ):
+        """A selector that is not exactly one visible element could be anything;
+        a fresh probe of the pager finds the control that reads the same."""
+        selector = None if unusable == "none" else "button.more"
+        first = _probe(pager=[_pager(1, None, "text 'Load more'", selector=selector)])
+        again = _probe(pager=[_pager(3, None, "text 'Newsletter'"),
+                              _pager(4, None, "text 'Load more'", selector=selector)])
+        source = GenericSource(LIST_URL, FakeJev(next={"text 'Load more'": 0.8}))
+        page = FakePage(first, again)
+        await source.cards(page)
+        page.lost.add('[data-cbs-next="n1"]')
+        if unusable == "two":
+            page.counts["button.more"] = 2
+        elif unusable == "hidden":
+            page.hidden.add("button.more")
+
+        assert await source.advance(page, 2) is True
+        assert page.clicks == ['[data-cbs-next="n4"]']
+        assert page.probe_args[-1]["next_number"] == 2, "the pager of the page it is on"
+        assert source.decisions[0]["next_page"]["clicked_by"] == "re-probe"
+
+    @pytest.mark.asyncio
+    async def test_when_nothing_finds_the_control_again_paging_stops(self):
+        pager = [_pager(1, None, "text 'Load more'", selector="button.more")]
+        source = GenericSource(LIST_URL, FakeJev(next={"text 'Load more'": 0.8}))
+        page = FakePage(_probe(pager=pager), _probe(pager=[]))
+        await source.cards(page)
+        page.lost.update({'[data-cbs-next="n1"]', "button.more"})
+
+        assert await source.advance(page, 2) is False
+        assert page.clicks == []
+        assert source.decisions[0]["next_page"]["clicked_by"] == "nothing"
+
+    @pytest.mark.asyncio
+    async def test_a_page_number_s_selector_is_never_a_fallback(self):
+        """"a.page-numbers" is every page number; finding one would be luck."""
+        pager = [_pager(1, None, "text '2' (in a pagination block)", selector="a.page-numbers",
+                        numbered=True)]
+        source = GenericSource(LIST_URL, FakeJev(next={"text '2'": 0.9}))
+        page = FakePage(_probe(pager=pager), _probe(pager=[]))
+        await source.cards(page)
+        page.lost.add('[data-cbs-next="n1"]')
+        assert await source.advance(page, 2) is False
+        assert page.clicks == []
+
+    @pytest.mark.asyncio
+    async def test_a_click_waits_for_new_cards_before_the_page_is_read(self, monkeypatch):
+        """A "Load more" fetches its cards after the click returns; read too soon,
+        the page shows only cards already seen, and paging ends."""
+        class LoadingPage(FakePage):
+            def __init__(self, *probes):
+                super().__init__(*probes)
+                self.polls = 0
+
+            async def evaluate(self, script, arg=None):
+                if script == generic._JS_PAGE_SIZE:
+                    self.polls += 1
+                    return [40, 3000, self.url] if self.polls >= 4 else [20, 1500, self.url]
+                return await super().evaluate(script, arg)
+
+            async def wait_for_timeout(self, ms):
+                self.waited = getattr(self, "waited", 0) + ms
+
+        monkeypatch.setattr(generic, "CLICK_SETTLE_S", 5.0)
+        pager = [_pager(1, None, "text 'Load more'")]
+        source = GenericSource(LIST_URL, FakeJev(next={"text 'Load more'": 0.8}))
+        page = LoadingPage(_probe(pager=pager))
+        await source.cards(page)
+
+        assert await source.advance(page, 2) is True
+        assert page.polls == 4, "measured before the click, then until the page grew"
+        assert page.waited == 3 * generic.CLICK_POLL_MS
+
+    @pytest.mark.asyncio
+    async def test_the_wait_after_a_click_is_bounded(self, monkeypatch):
+        class StillPage(FakePage):
+            async def evaluate(self, script, arg=None):
+                if script == generic._JS_PAGE_SIZE:
+                    return [20, 1500, self.url]
+                return await super().evaluate(script, arg)
+
+            async def wait_for_timeout(self, ms):
+                await asyncio.sleep(0.001)
+
+        monkeypatch.setattr(generic, "CLICK_SETTLE_S", 0.05)
+        source = GenericSource(LIST_URL, FakeJev(next={"text 'Load more'": 0.8}))
+        page = StillPage(_probe(pager=[_pager(1, None, "text 'Load more'")]))
+        await source.cards(page)
+        assert await asyncio.wait_for(source.advance(page, 2), 2) is True, (
+            "nothing new is not a failure: the page is read and the sweep decides")
+
+    @pytest.mark.asyncio
     async def test_listing_links_are_never_candidates(self):
         pager = [_pager(1, f"{SITE}/listing/biz-1", "text '>' (in a pagination block)"),
                  _pager(2, f"{SITE}/listing/biz-2", "text '>'")]
@@ -1011,6 +1139,24 @@ class TestErrorsAndBlocks:
         assert result.error == (f"Could not read the listings on {LIST_URL}: "
                                 f"OpenRouter rejected the key (HTTP 401).")
         assert source.decisions[0]["error"] == "OpenRouter rejected the key (HTTP 401)."
+
+    @pytest.mark.asyncio
+    async def test_a_probe_that_never_returns_is_a_page_error_not_a_stall(self, monkeypatch):
+        class Endless(FakePage):
+            async def evaluate(self, script, arg=None):
+                if script == JS_PROBE:
+                    await asyncio.sleep(3600)
+                return None
+
+        monkeypatch.setattr(generic, "PROBE_TIMEOUT_S", 0.05)
+        jev = FakeJev()
+        source = GenericSource(LIST_URL, jev)
+        result = await asyncio.wait_for(source.cards(Endless(_probe())), 2)
+        assert result.listings == [] and result.retry is False
+        assert result.error == (f"Reading the listings on {LIST_URL} took longer than 0 s, so "
+                                f"the page was not used.")
+        assert jev.requests == []
+        assert "took longer" in source.decisions[0]["error"]
 
     @pytest.mark.asyncio
     async def test_no_classifier_is_a_plain_error(self):

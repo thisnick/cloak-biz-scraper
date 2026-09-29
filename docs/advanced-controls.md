@@ -100,9 +100,13 @@ With a key saved:
 
 - `scrape_listings` accepts any site's listings page, alongside BizBuySell URLs.
 - Every sweep page, BizBuySell included, also gets a check that its cards read as business
-  listings. A card that doesn't (a menu link, an ad) is left out; a page where fewer than half
-  do (or a page with no list on it at all) fails that source with screenshots, instead of
-  filing garbage or reporting "no listings".
+  listings. A page where fewer than half do (or a page with no list on it at all) fails that
+  source with screenshots, instead of filing garbage or reporting "no listings" — on the
+  first page; on a later page the sweep stops there, keeps the pages before it, and says so
+  in the result's `error`. On other sites a single card that doesn't read as a listing (a
+  menu link, an ad) is left out, and the result's summary counts them. On BizBuySell the
+  check judges the page only: a page that passes keeps every card the adapter read, and a
+  first page that fails is retried from a new exit IP, like a block.
 - A synced sweep can triage the rows it saves: pass your criteria as `triage_prompt` (see
   [Triage prompt](#triage-prompt)).
 
@@ -224,9 +228,13 @@ sweep of the site. Each generically read URL in `decisions` has:
 
 - `pages` — what was decided on each page and by whom (`jev` or `override`): the chosen
   `listing_links` pattern with its confidence, each field's role and whether it was
-  confident enough to use, the `next_page` rule, and how many cards were dropped as sold.
-- `legibility` — whether each page's cards read as business listings, and which cards were
-  left out as not listings.
+  confident enough to use, the `next_page` rule (and, for a button, `clicked_by`: its
+  `mark`, its `selector`, or a `re-probe` when the site had re-drawn it), and how many cards
+  were dropped as sold.
+- `legibility` — whether each page's cards read as business listings, which cards the
+  classifier judged not to be listings, and how many of those were left out.
+- `warning` — when the sweep stopped at a later page it could not use, which page and why
+  (the pages before it were kept).
 - `suggested_override` — a ready-to-paste override that pins what was decided on page 1.
 
 Paste the `suggested_override` into the list, change the part that was wrong, delete the

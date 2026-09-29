@@ -107,6 +107,19 @@ _JS_SCROLL_STATE = (
     "document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0)]"
 )
 _JS_SCROLL_TOP = "() => window.scrollTo(0, 0)"
+# The probe gets this long to read a page; a page that takes longer (an endless
+# DOM, a script that never yields) is not read rather than left to stall the
+# sweep.
+PROBE_TIMEOUT_S = 30.0
+# After a next-page click, how long to wait for the page to show something new
+# (more links, a taller document, another address) before reading it anyway.
+CLICK_SETTLE_S = 10.0
+CLICK_POLL_MS = 250
+_JS_PAGE_SIZE = (
+    "() => [document.querySelectorAll('a[href]').length, Math.max("
+    "document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0), "
+    "location.href]"
+)
 
 _GROUP_EXAMPLE_CHARS = 260
 _CARD_EXAMPLE_CHARS = 400
@@ -708,10 +721,18 @@ JS_PROBE = r"""
 
 @dataclass(frozen=True)
 class _Next:
-    """How to reach the next page, decided on the page before it."""
+    """How to reach the next page, decided on the page before it.
+
+    For a control the probe found, `target` is its `data-cbs-next` mark, and
+    `selector` (a stable CSS selector for it, when it has one and is not a page
+    number) and `appears_as` (how it read: "text 'Load more'") are how it is
+    found again when a site re-renders it and the mark is lost.
+    """
 
     kind: str  # "goto" | "click"
     target: str  # a URL, or a CSS selector
+    selector: str | None = None
+    appears_as: tuple[str, ...] = ()
 
 
 @dataclass
@@ -751,6 +772,9 @@ class GenericSource:
     describes = ("Any other site's page of businesses for sale, read with the TypeSafe "
                  "Classifier (e.g. Jev)")
     example = "https://www.websiteclosers.com/businesses-for-sale/"
+    # It picks the cards itself, so the legibility check may drop single cards
+    # it judges not to be listings (see `Source`).
+    chooses_cards = True
 
     def __init__(self, url: str, classifier, override: SiteOverride | None = None) -> None:
         self.url = url
@@ -790,21 +814,60 @@ class GenericSource:
         if step.kind == "goto":
             await page.goto(step.target, wait_until="domcontentloaded", timeout=120_000)
         else:
-            try:
-                target = page.locator(step.target)
-                if not await target.count():
-                    logger.info("generic: next-page control %s is gone on %s", step.target, self.url)
-                    return False
-                await target.first.click(timeout=15_000)
-            except Exception as exc:  # noqa: BLE001 — a control that cannot be clicked ends paging
-                logger.warning("generic: could not click %s on %s: %s", step.target, self.url, exc)
+            before = await _page_size(page)
+            how = await self._click(page, n, step)
+            record = self.decisions[-1].get("next_page") if self.decisions else None
+            if isinstance(record, dict):
+                record["clicked_by"] = how or "nothing"
+            if how is None:
                 return False
             try:
                 await page.wait_for_load_state("domcontentloaded", timeout=30_000)
             except Exception:  # noqa: BLE001 — a click that loads in place never fires it
                 pass
+            await _settle(page, before, self.url)
         self._page = n
         return True
+
+    async def _click(self, page, n: int, step: _Next) -> str | None:
+        """Click the next-page control; how it was found, or None when it could not be.
+
+        By its mark first. A site that re-renders the control after the probe
+        marked it (FacetWP's "Load more" on Synergy, re-drawn as it scrolls into
+        view) leaves the mark on nothing, so then by the stable selector the
+        probe recorded — when exactly one visible element has it — and last by
+        probing the pager again and finding the control that reads the same.
+        """
+        if await _try_click(page, step.target, self.url):
+            # A pinned `click:<css>` is its own selector; the probe's controls
+            # are clicked by the mark it left on them.
+            how = "mark" if step.target.startswith("[data-cbs-next=") else "selector"
+            logger.info("generic: clicked the next-page control on %s by its %s", self.url, how)
+            return how
+        if step.selector and await _try_click(page, step.selector, self.url, exactly_one=True):
+            logger.info("generic: clicked the next-page control on %s by its selector %s",
+                        self.url, step.selector)
+            return "selector"
+        if step.appears_as:
+            try:
+                probe = await _run_probe(page, {"next_number": n, "patterns": []})
+            except Exception as exc:  # noqa: BLE001 — a re-probe that fails ends paging
+                logger.warning("generic: could not probe %s again for its next-page control: %s",
+                               self.url, exc)
+                probe = None
+            wanted = set(step.appears_as)
+            again = next((c for c in (probe or {}).get("pager") or []
+                          if isinstance(c, dict) and not c.get("url")
+                          and wanted & set(c.get("appears_as") or [])), None)
+            if again is not None:
+                mark = f'[data-cbs-next="{again.get("id")}"]'
+                if await _try_click(page, mark, self.url):
+                    logger.info("generic: clicked the next-page control on %s after probing "
+                                "the pager again (%s)", self.url, ", ".join(sorted(wanted)))
+                    return "re-probe"
+        logger.warning("generic: the next-page control on %s could not be clicked by its mark, "
+                       "its selector or a fresh probe; paging stops", self.url)
+        return None
 
     async def cards(self, page) -> CardPage:
         n = self._page
@@ -815,8 +878,13 @@ class GenericSource:
         await _scroll_through(page)
         await extract.inject(page)
         links = list(self.override.listing_links) if self.override else []
-        raw = await page.evaluate(JS_PROBE, {"next_number": n + 1, "patterns": links})
-        probe = json.loads(raw) if isinstance(raw, str) else raw
+        try:
+            probe = await _run_probe(page, {"next_number": n + 1, "patterns": links})
+        except asyncio.TimeoutError:
+            message = (f"Reading the listings on {record['url']} took longer than "
+                       f"{PROBE_TIMEOUT_S:.0f} s, so the page was not used.")
+            record["error"] = message
+            return CardPage(listings=[], retry=False, error=message)
         if not isinstance(probe, dict):
             raise RuntimeError(f"the page at {record['url']} could not be read")
         title = str(probe.get("title") or "")
@@ -847,12 +915,14 @@ class GenericSource:
         groups = [g for g in probe.get("groups") or [] if isinstance(g, dict)]
         chosen = await self._choose_groups(groups, title, record)
         if not chosen:
-            if n == 1:
-                message = record["listing_links"].get("error") or (
-                    f"Found no list of businesses for sale on {record['url']}."
-                )
-                return CardPage(listings=[], title=title, error=message, retry=False)
-            return CardPage(listings=[], title=title)
+            # On page 1 the source fails; on a later page — reached through a
+            # next-page link that was judged real — the sweep stops there and
+            # keeps the pages before it, saying why (see ScrapeService).
+            message = record["listing_links"].get("error") or (
+                f"Found no list of businesses for sale on {record['url']}"
+                + (f" (page {n})." if n > 1 else ".")
+            )
+            return CardPage(listings=[], title=title, error=message, retry=False)
 
         cards = _cards_of(chosen)
         listing_hrefs = {c.href for c in cards} | {c.url for c in cards}
@@ -1051,7 +1121,9 @@ class GenericSource:
             if chosen.get("url"):
                 step = _Next("goto", chosen["url"])
             else:
-                step = _Next("click", f'[data-cbs-next="{chosen["id"]}"]')
+                step = _Next("click", f'[data-cbs-next="{chosen["id"]}"]',
+                             selector=None if chosen.get("numbered") else chosen.get("selector"),
+                             appears_as=tuple(chosen.get("appears_as") or ()))
         decided: dict[str, Any] = {
             "by": "jev",
             "rule": "none" if step is None else step.target if step.kind == "goto" else "click",
@@ -1161,6 +1233,64 @@ class GenericSource:
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
+
+
+async def _run_probe(page, args: dict) -> Any:
+    """JS_PROBE's answer, parsed; raises asyncio.TimeoutError after PROBE_TIMEOUT_S."""
+    raw = await asyncio.wait_for(page.evaluate(JS_PROBE, args), PROBE_TIMEOUT_S)
+    return json.loads(raw) if isinstance(raw, str) else raw
+
+
+async def _try_click(page, selector: str, url: str, *, exactly_one: bool = False) -> bool:
+    """Click the first element `selector` finds; False when there is none, or —
+    with `exactly_one` — when it is not exactly one visible element, or the
+    click fails (detached, covered, re-rendered)."""
+    try:
+        target = page.locator(selector)
+        count = await target.count()
+        if not count or (exactly_one and (count != 1 or not await target.first.is_visible())):
+            logger.info("generic: next-page control %s is not there on %s (%d found)",
+                        selector, url, count)
+            return False
+        await target.first.click(timeout=15_000)
+    except Exception as exc:  # noqa: BLE001 — the caller tries the next way to find it
+        logger.info("generic: could not click %s on %s: %s", selector, url, exc)
+        return False
+    return True
+
+
+async def _page_size(page) -> list | None:
+    """(links on the page, document height, address) — None when it cannot be read."""
+    try:
+        size = await page.evaluate(_JS_PAGE_SIZE)
+    except Exception:  # noqa: BLE001 — then there is nothing to wait on
+        return None
+    return size if isinstance(size, list) and len(size) == 3 else None
+
+
+async def _settle(page, before: list | None, url: str) -> bool:
+    """After a click, wait (at most CLICK_SETTLE_S) for the page to show more:
+    more links, a taller document, or another address. True when it did.
+
+    A "Load more" fetches its cards after the click returns; reading the page
+    before they arrive would find only the cards already seen, which ends
+    paging. Without a first measurement there is nothing to compare, so no wait.
+    """
+    if before is None:
+        return False
+    deadline = time.monotonic() + CLICK_SETTLE_S
+    while time.monotonic() < deadline:
+        try:
+            await page.wait_for_timeout(CLICK_POLL_MS)
+            now = await page.evaluate(_JS_PAGE_SIZE)
+        except Exception:  # noqa: BLE001 — the click navigated: the page is new
+            return True
+        if isinstance(now, list) and len(now) == 3 and (
+                now[0] > before[0] or now[1] > before[1] or now[2] != before[2]):
+            return True
+    logger.info("generic: nothing new appeared on %s within %.0f s of the next-page click",
+                url, CLICK_SETTLE_S)
+    return False
 
 
 async def _scroll_through(page) -> int:

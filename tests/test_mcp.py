@@ -160,6 +160,9 @@ class TestStateless:
         assert "TypeSafe Classifier (e.g. Jev)" in description
         assert "found no list of businesses for" in description
         assert "don't read as business listings" in description
+        flat = " ".join(description.split())
+        assert "The same on a LATER page stops that URL's paging there: the pages before it " \
+               "are kept and returned" in flat
         assert "site override" in description and "Settings" in description
         assert "archive_page" in description
 
