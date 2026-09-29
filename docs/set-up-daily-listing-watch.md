@@ -481,8 +481,9 @@ Read the sweep's `triage.failures`: each blank row is listed with its URL and wh
 not be decided — most often a detail page that would not load. The next sweep that sees the
 row tries again. If `triage.error` is set instead, triage stopped part-way (for example, the
 classifier stopped answering); every row it had not reached stays blank until a later sweep.
-A sweep also reads at most 25 detail pages: when more listings pass the card check than that,
-`triage.deferred` counts the rest, which stay blank until the next sweep reads them. A row
+A sweep also reads at most 25 detail pages (or the call's `max_detail_reads`, up to 200):
+when more listings pass the card check than that, `triage.deferred` counts the rest, which
+stay blank until the next sweep reads them. A row
 another sweep was triaging at the same moment is counted in `triage.in_flight` and decided by
 that sweep.
 

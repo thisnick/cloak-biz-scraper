@@ -318,6 +318,28 @@ class TestParallel:
                                       page=1, drop=True)
         assert len(fake.calls) == 12 and fake.peak == TYPESAFE_PARALLEL
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("n", [1, 2, 8])
+    async def test_a_sweep_s_own_limit(self, n):
+        """`classifier_parallel` on the call: the sweep's check is gated on it."""
+        fake = FakeClassifier()
+        check = ListingCheck(fake, parallel=n)
+        await check.page(_page(1, *(f"Business {i}" for i in range(12))), page=1, drop=True)
+        assert check.parallel == n
+        assert len(fake.calls) == 12 and fake.peak == n
+
+    @pytest.mark.asyncio
+    async def test_two_checks_do_not_share_a_gate(self):
+        """Each sweep has its own check, so each has its own gate."""
+        fake = FakeClassifier()
+        await asyncio.gather(
+            ListingCheck(fake, parallel=3).page(_page(1, *(f"A {i}" for i in range(9))),
+                                                page=1, drop=True),
+            ListingCheck(fake, parallel=3).page(_page(1, *(f"B {i}" for i in range(9))),
+                                                page=1, drop=True),
+        )
+        assert len(fake.calls) == 18 and fake.peak == 6
+
 
 class TestWhatTheAnswersDo:
     @pytest.mark.asyncio

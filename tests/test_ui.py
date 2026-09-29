@@ -3687,6 +3687,16 @@ class TestRunDecisions:
         assert f'href="/runs/{job.id}"' in page and ">Details</a>" in page
         assert "Listing sweep · websiteclosers.com" in shown(auth.get("/"))
 
+    def test_a_sweep_s_run_detail_says_what_limits_it_ran_with(self, auth):
+        job = app.state.jobs.create(urls=["https://www.bizbuysell.com/x"],
+                                    source="bizbuysell_serp", status="completed",
+                                    max_detail_reads=60, classifier_parallel=8)
+        body = auth.get(f"/runs/{job.id}").json()
+        assert (body["max_detail_reads"], body["classifier_parallel"]) == (60, 8)
+        row = {r["job_id"]: r for r in auth.get("/runs").json()}[job.id]
+        assert "max_detail_reads" not in row, "the list stays small; the detail has it"
+        assert "classifier_parallel" not in auth.get(f"/runs/{job.id}/results").json()
+
     def test_an_archive_has_no_decisions(self, auth):
         task = app.state.jobs.create(kind="archive", url="https://x.example/",
                                      notion_page_id="page-1", status="completed")
