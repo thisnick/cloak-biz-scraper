@@ -104,7 +104,8 @@ class TriageSummary(BaseModel):
     ok: bool = Field(
         default=False,
         description="True when every row this sweep had to triage got a decision. False "
-        "while the sweep is still running.",
+        "while the sweep is still running, and when rows were left for a later sweep "
+        "(`undecided`, `deferred`).",
     )
     criteria_version: str = Field(
         default="",
@@ -120,6 +121,12 @@ class TriageSummary(BaseModel):
         default=0,
         description="Rows this sweep left to another sweep that was triaging them at the same "
         "moment; that sweep decides them. Not counted in `undecided`.",
+    )
+    deferred: int = Field(
+        default=0,
+        description="Rows judged REVIEW on their card whose detail page this sweep did not "
+        "read, because a sweep reads at most 25 detail pages. They stay blank and a later "
+        "sweep decides them. Counted in `undecided`.",
     )
     backlog: list[TriagedRow] = Field(
         default_factory=list,

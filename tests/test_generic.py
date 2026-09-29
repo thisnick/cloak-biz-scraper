@@ -972,6 +972,45 @@ class TestNextPage:
         assert await source.advance(page, 2) is False
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("url, why", [
+        ("https://elsewhere.example/businesses-for-sale/page/2/",
+         "on another site (elsewhere.example), not brokers.example"),
+        ("https://brokers.example.evil.test/page/2/", "on another site"),
+        ("javascript:alert(1)", "not a web address"),
+        ("file:///etc/passwd", "not a web address"),
+    ])
+    async def test_a_next_page_off_the_site_is_not_followed(self, url, why):
+        """The address comes from the page: a page can offer anything as its
+        "next" link, and the browser goes only where the swept site is."""
+        source = GenericSource(LIST_URL, FakeJev(next={url: 0.97}))
+        page = FakePage(_probe(pager=[_pager(1, url, "rel=next")]))
+        await source.cards(page)
+        decided = source.decisions[0]["next_page"]
+        assert decided["rule"] == "none"
+        assert decided["refused"]["url"] == url and why in decided["refused"]["why"]
+        assert await source.advance(page, 2) is False
+        assert page.gotos == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("site, url", [
+        ("https://brokers.example/list/", "https://www.brokers.example/list/?page=2"),
+        ("https://www.fcbb.com/listings/", "https://sfbay.fcbb.com/listings/page/2/"),
+        ("https://a.example.co.uk/list/", "https://b.example.co.uk/list/2"),
+    ])
+    async def test_a_next_page_on_the_same_site_is_followed(self, site, url):
+        source = GenericSource(site, FakeJev(next={url: 0.97}))
+        page = FakePage(_probe(pager=[_pager(1, url, "rel=next")], url=site), url=site)
+        await source.cards(page)
+        assert "refused" not in source.decisions[0]["next_page"]
+        assert await source.advance(page, 2) is True
+        assert page.gotos == [url]
+
+    def test_a_country_domain_is_not_one_site(self):
+        assert generic._off_site("https://other.co.uk/p/2", "example.co.uk")
+        assert generic._off_site("https://10.0.0.2/p/2", "10.0.0.1")
+        assert not generic._off_site("https://10.0.0.1/p/2", "10.0.0.1")
+
+    @pytest.mark.asyncio
     async def test_a_re_rendered_control_is_clicked_by_its_selector(self):
         """Synergy's FacetWP "Load more": re-drawn as it scrolls into view, so the
         probe's mark is on nothing by the time it is clicked. The stable
@@ -1647,6 +1686,28 @@ class TestProbeOnSavedPages:
                           "www.business-team.com/buy-a-business/business-for-sale.aspx?From&LID")
         assert group["varying_keys"] == ["LID"]
         assert group["paths_unique"] is False
+
+    @pytest.mark.asyncio
+    async def test_a_pathological_page_gets_a_bounded_answer(self):
+        """250 tiles, one of them a wall of text in 150 lines, and 70 other link
+        shapes: the probe's answer stays small."""
+        lines = "".join(f"<p>Line {i}: {'word ' * 60}</p>" for i in range(150))
+        tiles = "".join(
+            f'<div class="tile"><h3><a href="/listing/biz-{n}">Business {n}</a></h3>'
+            + (lines if n == 1 else f"<p>Asking Price: $1,{n % 10}00,000</p>") + "</div>"
+            for n in range(1, 251))
+        others = "".join(f'<p><a href="/other-{g}/a">x</a><a href="/other-{g}/b">y</a>'
+                         f'<a href="/other-{g}/c">z</a></p>' for g in range(70))
+        html = ('<html><head><base href="https://brokers.example/list/"></head><body><main>'
+                + tiles + others + "</main></body></html>")
+        probe = await _probe_of("inline", html=html)
+        assert len(probe["groups"]) <= 60
+        group = _group_of(probe, "brokers.example/listing/{*}")
+        assert group["links"] == 250 and len(group["cards"]) == 200
+        wall = group["cards"][0]
+        assert len(wall["excerpt"]) <= 4000
+        assert len(wall["labeled"]) + len(wall["slots"]) <= 80
+        assert len(json.dumps(probe)) < 400_000
 
     @pytest.mark.asyncio
     async def test_a_ref_query_is_a_listing_id_not_tracking(self):

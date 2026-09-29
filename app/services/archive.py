@@ -95,6 +95,11 @@ GUARD_THRESHOLD = 0.3
 # What the question reads: the top of the page, where every wall and notice
 # above is. More would cost tokens without changing the answer.
 GUARD_CHARS = 4000
+# archive_page's guard is best-effort (an unanswered guard archives anyway), so
+# it gets one short attempt: the full retry budget made an outage cost every
+# archive two more minutes, only to archive unchecked at the end.
+GUARD_ATTEMPTS = 1
+GUARD_TIMEOUT_SEC = 10.0
 
 
 def guard_state(markdown: str) -> dict[str, str]:
@@ -108,12 +113,15 @@ def guard_question() -> dict[str, str]:
     return {"type": "noul", "instructions": GUARD_QUESTION}
 
 
-async def guard(typesafe, markdown: str) -> float:
+async def guard(typesafe, markdown: str, *, attempts: int | None = None,
+                timeout: float | None = None) -> float:
     """P(the page is its real content), from one classifier question.
 
     Raises TypeSafeError when the classifier cannot answer; what that means is
-    the caller's decision (archive_page archives anyway)."""
-    return await typesafe.noul(guard_state(markdown), GUARD_QUESTION)
+    the caller's decision (archive_page archives anyway). `attempts`/`timeout`
+    override the client's retry budget for this one question."""
+    budget = {k: v for k, v in (("attempts", attempts), ("timeout", timeout)) if v is not None}
+    return await typesafe.noul(guard_state(markdown), GUARD_QUESTION, **budget)
 
 
 def guard_refusal(probability: float) -> str:
@@ -452,7 +460,8 @@ class ArchiveService:
         classifier = self._classifier()
         if classifier is not None:
             try:
-                p_real = await guard(classifier, markdown)
+                p_real = await guard(classifier, markdown, attempts=GUARD_ATTEMPTS,
+                                     timeout=GUARD_TIMEOUT_SEC)
             except Exception as exc:  # noqa: BLE001 — the guard must never stop an archive
                 if isinstance(exc, TypeSafeError):
                     logger.warning("archive guard unavailable for %s: %s", host, exc)

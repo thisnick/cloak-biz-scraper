@@ -465,8 +465,10 @@ def build(app) -> MCPServer:
             would not load, the classifier stopped answering) stays blank, is
             listed in `triage.failures` or `triage.error`, and is triaged by a
             later sweep — the job still completes, because the rows were saved.
-            A row another sweep is triaging at that moment is left to it
-            (`triage.in_flight`). Leave it out to sweep exactly as without triage.
+            A sweep reads at most 25 detail pages; REVIEWs past that stay blank
+            for the next sweep (`triage.deferred`). A row another sweep is
+            triaging at that moment is left to it (`triage.in_flight`). Leave it out (or pass an empty string) to sweep
+            exactly as without triage.
         """
         job = await app.state.scrape.submit(urls, max_pages=max_pages, sync=sync,
                                             triage_prompt=triage_prompt)

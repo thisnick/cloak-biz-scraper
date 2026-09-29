@@ -122,9 +122,9 @@ Without a key, everything else works exactly as before: BizBuySell sweeps, Notio
 `archive_page`. A URL on another site is refused for that URL, with a message pointing at
 this setting, and the rest of the batch still runs.
 
-A key that stops working is caught before a sweep starts. If OpenRouter rejects the key,
-the account is out of credits, or the service is not answering, a call whose URLs all need
-the classifier is refused with that reason. In a batch that also has BizBuySell URLs, only
+A key that stops working is caught before a sweep starts, with one quick question (at most
+10 seconds). If OpenRouter rejects the key, the account is out of credits, or the service is
+not answering, a call whose URLs all need the classifier is refused with that reason. In a batch that also has BizBuySell URLs, only
 the other sites fail and the BizBuySell ones still run. A call with a `triage_prompt` is
 refused whole, BizBuySell or not, because it would save rows it then could not decide.
 
@@ -154,7 +154,10 @@ still blank:
    nothing archived. If the page will not load at all, the row stays blank and is reported,
    and a later sweep tries it again.
 
-A row that already has a Bot Triage value — the bot's or yours — is never judged again.
+A row that already has a Bot Triage value — the bot's or yours — is never judged again. A
+sweep reads at most 25 detail pages: card REVIEWs past that stay blank, are counted in the
+result's `triage.deferred`, and are read by the next sweep. An empty `triage_prompt` is the
+same as leaving it out.
 
 The decision goes to the **Bot Triage** column (Select or Text); a database without one
 refuses the call. **Triage Reason** (e.g. `REVIEW · P(review)=0.91 · card + detail page`),
@@ -236,8 +239,9 @@ sweep of the site. Each generically read URL in `decisions` has:
 - `pages` — what was decided on each page and by whom (`jev` or `override`): the chosen
   `listing_links` pattern with its confidence, each field's role and whether it was
   confident enough to use, the `next_page` rule (and, for a button, `clicked_by`: its
-  `mark`, its `selector`, or a `re-probe` when the site had re-drawn it), and how many cards
-  were dropped as sold.
+  `mark`, its `selector`, or a `re-probe` when the site had re-drawn it; for a link that
+  pointed off the site, `refused` with where it went — it is not followed), and how many
+  cards were dropped as sold.
 - `legibility` — whether each page's cards read as business listings, which cards the
   classifier judged not to be listings, and how many of those were left out.
 - `warning` — when the sweep stopped at a later page it could not use, which page and why

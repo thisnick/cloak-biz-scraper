@@ -49,6 +49,11 @@ _TIMEOUT_SEC = 30.0
 # budget is spent almost entirely in backoff — enough to ride out a blip, short
 # enough that a real outage is reported while the person is still looking.
 _MAX_ATTEMPTS = 4
+# `check()`'s own budget: one attempt, ten seconds. It is asked before a sweep
+# starts and from the Settings page, where the answer is wanted now; with the
+# full budget a dead service took ~2 minutes to be refused.
+CHECK_ATTEMPTS = 1
+CHECK_TIMEOUT_SEC = 10.0
 _BACKOFF_SEC = 0.5
 # A Retry-After longer than this is a server asking us to go away for a while;
 # waiting it out inside one request would just look like a hang.
@@ -177,18 +182,26 @@ class TypeSafeClient:
 
     # -- public API --
 
-    async def ask(self, state: Any, questions: dict[str, dict[str, Any]]) -> dict[str, Answer]:
+    async def ask(self, state: Any, questions: dict[str, dict[str, Any]], *,
+                  attempts: int | None = None, timeout: float | None = None,
+                  ) -> dict[str, Answer]:
         """Ask one or more named questions about `state`; answers keyed the same way.
 
         `state` is text, or a dict/list of text (a card's fields, say) — JSON is
         what goes over the wire. Questions are the API's own shape, e.g.
         `{"team": {"type": "choice", "instructions": "...", "criteria": {...}}}`,
         so a new question type needs nothing from this module.
+
+        `attempts` and `timeout` (seconds per attempt) override the client's
+        budget for this one call — for a caller that would rather have no answer
+        soon than an answer after two minutes of retries (a best-effort check).
         """
         key, model = self._resolve(None, None)
-        return (await self._call(key, model, state, questions)).answers
+        return (await self._call(key, model, state, questions,
+                                 attempts=attempts, timeout=timeout)).answers
 
-    async def choice(self, state: Any, instructions: str, criteria: dict[str, str]) -> Choice:
+    async def choice(self, state: Any, instructions: str, criteria: dict[str, str], *,
+                     attempts: int | None = None, timeout: float | None = None) -> Choice:
         """Pick one of `criteria` (option name → what it means) for `state`."""
         if not criteria:
             raise ValueError("a choice question needs at least one option")
@@ -196,30 +209,36 @@ class TypeSafeClient:
             raise ValueError(f"a choice question takes at most {_MAX_CHOICE_OPTIONS} "
                              f"options, got {len(criteria)}")
         question = {"type": "choice", "instructions": instructions, "criteria": dict(criteria)}
-        answer = (await self.ask(state, {"q": question}))["q"]
+        answer = (await self.ask(state, {"q": question}, attempts=attempts, timeout=timeout))["q"]
         if not isinstance(answer, Choice):
             raise TypeSafeError(
                 "The TypeSafe Classifier answered a choice question with something else."
             )
         return answer
 
-    async def noul(self, state: Any, instructions: str) -> float:
+    async def noul(self, state: Any, instructions: str, *, attempts: int | None = None,
+                   timeout: float | None = None) -> float:
         """Probability (0–1) that `instructions` — a statement — holds for `state`."""
-        answer = (await self.ask(state, {"q": {"type": "noul", "instructions": instructions}}))["q"]
+        answer = (await self.ask(state, {"q": {"type": "noul", "instructions": instructions}},
+                                 attempts=attempts, timeout=timeout))["q"]
         if not isinstance(answer, Noul):
             raise TypeSafeError(
                 "The TypeSafe Classifier answered a yes/no question with something else."
             )
         return answer.probability
 
-    async def check(self, key: str | None = None, model: str | None = None) -> TypeSafeCheck:
+    async def check(self, key: str | None = None, model: str | None = None, *,
+                    attempts: int = CHECK_ATTEMPTS,
+                    timeout: float = CHECK_TIMEOUT_SEC) -> TypeSafeCheck:
         """Ask one tiny question and report whether it was answered. Never raises.
 
         `key`/`model` test a candidate before it is saved (the Settings page
         tests what was typed, so a typo cannot replace a key that works); left
         out, the saved ones are used. What is being checked is the whole path —
         the key, the credits behind it, and the model name — which is why it
-        asks a real question rather than calling an account endpoint.
+        asks a real question rather than calling an account endpoint. One
+        attempt with a short timeout by default (`CHECK_ATTEMPTS`,
+        `CHECK_TIMEOUT_SEC`): a check is asked while someone waits.
         """
         started = time.monotonic()
         try:
@@ -227,6 +246,7 @@ class TypeSafeClient:
             reply = await self._call(
                 key, model, "Hello, is this thing on?",
                 {"check": {"type": "noul", "instructions": "The text is a greeting"}},
+                attempts=attempts, timeout=timeout,
             )
         except TypeSafeError as exc:
             return TypeSafeCheck(ok=False, message=str(exc), model=model or "", error=exc)
@@ -267,16 +287,19 @@ class TypeSafeClient:
         return self._sem
 
     async def _call(self, key: str, model: str, state: Any,
-                    questions: dict[str, dict[str, Any]]) -> _Reply:
+                    questions: dict[str, dict[str, Any]], *, attempts: int | None = None,
+                    timeout: float | None = None) -> _Reply:
         if not questions:
             raise ValueError("ask at least one question")
+        attempts = max(1, int(attempts)) if attempts is not None else _MAX_ATTEMPTS
+        timeout = float(timeout) if timeout is not None else _TIMEOUT_SEC
         body = {"model": model, "state": state, "questions": questions}
         headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
         sem = self._semaphore()
         last_error = "no attempt was made"
 
-        async with httpx.AsyncClient(timeout=_TIMEOUT_SEC) as client:
-            for attempt in range(1, _MAX_ATTEMPTS + 1):
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            for attempt in range(1, attempts + 1):
                 delay = _BACKOFF_SEC * 2 ** (attempt - 1)
                 try:
                     async with sem:
@@ -294,17 +317,17 @@ class TypeSafeClient:
                     else:
                         return self._decode(resp, key, model, questions)
 
-                if attempt < _MAX_ATTEMPTS:
+                if attempt < attempts:
                     logger.warning(
                         "typesafe: %s; retrying in %.1fs (attempt %d/%d)",
-                        last_error, delay, attempt, _MAX_ATTEMPTS,
+                        last_error, delay, attempt, attempts,
                     )
                     await _sleep(delay)
 
+        tried = "after 1 attempt" if attempts == 1 else f"after {attempts} attempts"
         raise TypeSafeUnavailable(
-            f"The TypeSafe Classifier did not answer after {_MAX_ATTEMPTS} attempts "
-            f"({last_error}). OpenRouter or TypeSafe may be having trouble; try again "
-            f"in a few minutes."
+            f"The TypeSafe Classifier did not answer {tried} ({last_error}). OpenRouter or "
+            f"TypeSafe may be having trouble; try again in a few minutes."
         )
 
     def _decode(self, resp: httpx.Response, key: str, model: str,

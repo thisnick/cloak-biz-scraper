@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import asyncio
 
+import httpx
 import pytest
+import respx
 
 from app.models import ArchiveTask
 from app.services.archive import ArchiveService, describe
@@ -558,9 +560,11 @@ class FakeTypeSafe:
         self.p = p
         self.error = error
         self.calls: list[tuple[object, str]] = []
+        self.budgets: list[dict] = []
 
-    async def noul(self, state, instructions):
+    async def noul(self, state, instructions, **budget):
         self.calls.append((state, instructions))
+        self.budgets.append(budget)
         if self.error is not None:
             raise self.error
         return self.p
@@ -844,6 +848,32 @@ class TestTheGuard:
         assert instructions == GUARD_QUESTION
         assert state == {"page_text": "# A Laundromat\n\nCash flow $120,000.\n"}
         assert "could not run" not in result.summary
+        # Best-effort, so one short attempt — not the client's two minutes of
+        # retries before archiving unchecked anyway.
+        assert classifier.budgets == [{"attempts": 1, "timeout": 10.0}]
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_an_outage_costs_one_short_attempt_on_the_wire(
+        self, manager, settings, jobs, monkeypatch,
+    ):
+        from app.services import typesafe as typesafe_module
+        from app.services.typesafe import API as TYPESAFE_API
+        from app.services.typesafe import TypeSafeClient
+
+        slept: list[float] = []
+
+        async def _record(seconds):
+            slept.append(seconds)
+
+        monkeypatch.setattr(typesafe_module, "_sleep", _record)
+        route = respx.post(TYPESAFE_API).mock(return_value=httpx.Response(503))
+        client = TypeSafeClient(lambda: "sk-or-v1-archive-guard-test", lambda: "jev-latest")
+        svc = _service(manager, _with_key(settings), jobs, monkeypatch, _ok(),
+                       notion=FakeNotion(), typesafe=client)
+        result = await svc.archive(URL, "page-1")
+        assert result.ok and "archived unchecked" in result.summary
+        assert route.call_count == 1 and slept == []
 
     @pytest.mark.asyncio
     async def test_a_page_below_the_threshold_writes_nothing(
@@ -955,9 +985,6 @@ class TestTheGuardHelpers:
 
 
 # ── a failed append is taken back; one page, one writer ─────────────────────
-
-import httpx  # noqa: E402
-import respx  # noqa: E402
 
 from app.stores import notion as notion_module  # noqa: E402
 from app.stores.notion import API as NOTION_API  # noqa: E402

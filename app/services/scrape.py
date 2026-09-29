@@ -89,6 +89,10 @@ _MAX_PAGES_CEILING = 20
 _WAITING_SUMMARY = "Waiting for a free browser slot…"
 _SCRAPING_SUMMARY = "Sweeping the search results…"
 
+# Detail pages one sweep's triage reads, at most. Each is about a minute of a
+# pooled browser; a first sweep of a big new site could otherwise hold the pool
+# for an hour. The card REVIEWs past it stay blank, and a later sweep reads them.
+MAX_DETAIL_READS = 25
 # Card-stage triage questions in flight at once, per sweep. Each row is gated
 # BEFORE it checks whether triage has stopped, so an outage costs this many
 # rows' retries, not every row's.
@@ -327,7 +331,12 @@ class ScrapeService:
         With a `triage_prompt`, the Notion database is read once more to find
         where Bot Triage goes (`prepare_triage`); a database with nowhere to
         record a decision refuses the call before anything starts.
+
+        A blank `triage_prompt` ("" or whitespace) is no prompt at all: agents
+        fill optional string parameters with "" as often as they leave them
+        out, and either way they asked for no triage.
         """
+        triage_prompt = _prompt_or_none(triage_prompt)
         plan = None
         if triage_prompt is not None:
             self._admit(urls, max_pages, sync)
@@ -387,8 +396,10 @@ class ScrapeService:
         `triage_prompt` gets the checks that cost nothing (see `_triage_plan`);
         the classifier's check and the Notion column are `submit`'s, which
         hands over what it prepared as `triage_plan`. A run started here with
-        only a prompt prepares its triage target itself.
+        only a prompt prepares its triage target itself. A blank prompt is no
+        prompt (see `submit`).
         """
+        triage_prompt = _prompt_or_none(triage_prompt)
         max_pages, targets, target_db = self._admit(urls, max_pages, sync, refused)
         plan = triage_plan
         if plan is None and triage_prompt is not None:
@@ -846,6 +857,9 @@ class ScrapeService:
                 seg = f"triaged: {t.review} review, {t.reject} reject"
                 if t.undecided:
                     seg += f", {t.undecided} left blank for a later sweep"
+                    if t.deferred:
+                        seg += (f" ({t.deferred} past the {MAX_DETAIL_READS} detail pages a "
+                                f"sweep reads)")
                 if t.in_flight:
                     seg += f", {t.in_flight} left to another sweep triaging them"
                 parts.append(seg)
@@ -1093,6 +1107,11 @@ class ScrapeService:
         return {"blocked": False, "error": None, "data": data()}
 
 
+def _prompt_or_none(prompt: str | None) -> str | None:
+    """A triage prompt with some text in it, or None — a blank one asks for nothing."""
+    return prompt if prompt is not None and prompt.strip() else None
+
+
 def _site(url: str) -> str:
     """A URL's host without `www.` — how a site is named to a person."""
     try:
@@ -1215,7 +1234,11 @@ def _triage_note(triage: TriageSummary | None) -> str:
     if triage.error:
         return (f"Triage stopped before deciding every row: {triage.error} Rows without a "
                 f"decision stay blank and are triaged on a later sweep.")
-    n = triage.undecided or len(triage.failures)
+    # Rows past the detail-page limit are not a failure: the summary counts
+    # them, and a later sweep reads them.
+    n = len(triage.failures) or triage.undecided - triage.deferred
+    if n <= 0:
+        return ""
     return (f"Triage couldn't decide {n} row{'' if n == 1 else 's'} (see triage.failures); "
             f"they stay blank and are triaged on a later sweep.")
 
@@ -1290,6 +1313,8 @@ class _TriagePhase:
         # holds in the service's in-flight set until it finishes.
         self._in_flight: list[Listing] = []
         self._claimed: set[str] = set()
+        # Card REVIEWs past MAX_DETAIL_READS, left blank for a later sweep.
+        self._deferred = 0
         # What each row went through, for the run's evidence (triage.json).
         self._records: dict[str, dict[str, Any]] = {}
         self._evidence = CONFIG.evidence_dir / job.id
@@ -1332,6 +1357,17 @@ class _TriagePhase:
                        for i, ((listing, _), card) in enumerate(zip(self._rows, cards), 1)
                        if card is not None and card.decision == REVIEW]
             if reviews and not self._stopped:
+                if len(reviews) > MAX_DETAIL_READS:
+                    later = reviews[MAX_DETAIL_READS:]
+                    reviews = reviews[:MAX_DETAIL_READS]
+                    self._deferred = len(later)
+                    for _, listing, _ in later:
+                        self._note(listing, deferred=(
+                            f"REVIEW on the card; its detail page is past this sweep's "
+                            f"{MAX_DETAIL_READS}, so it is left blank for a later sweep"))
+                    logger.info("triage for sweep %s: %d card REVIEW(s) past the %d detail "
+                                "pages a sweep reads, left for a later sweep", self._job.id,
+                                len(later), MAX_DETAIL_READS)
                 await self._details(reviews)
         finally:
             self._finish()
@@ -1485,6 +1521,7 @@ class _TriagePhase:
         self._claimed = set()
         summary = self._summary
         summary.in_flight = len(self._in_flight)
+        summary.deferred = self._deferred
         summary.criteria_version = self._plan.version
         decisions = [d.decision for d in self._decided.values()]
         summary.review = decisions.count(REVIEW)

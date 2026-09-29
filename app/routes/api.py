@@ -65,8 +65,9 @@ class ScrapeRequest(BaseModel):
     urls: list[str]
     max_pages: int = 1
     sync: bool = False
-    # Triage criteria as plain text; see the scrape_listings tool. Absent: no
-    # triage, and the sweep is exactly what it was before triage existed.
+    # Triage criteria as plain text; see the scrape_listings tool. Absent or
+    # blank: no triage, and the sweep is exactly what it was before triage
+    # existed.
     triage_prompt: str | None = None
 
 

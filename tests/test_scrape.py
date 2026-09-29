@@ -2237,6 +2237,33 @@ class TestTriageFailures:
             in failure.error
 
 
+class TestDetailReadCap:
+    @pytest.mark.asyncio
+    async def test_a_sweep_reads_at_most_25_detail_pages_and_leaves_the_rest_for_later(
+        self, settings, jobs,
+    ):
+        """Each read is about a minute of a pooled browser: a first sweep of a big
+        site would otherwise hold the pool for an hour."""
+        from app.services.scrape import MAX_DETAIL_READS
+
+        assert MAX_DETAIL_READS == 25
+        rows = [_tl(i, f"Business {i}") for i in range(1, MAX_DETAIL_READS + 4)]
+        rig = Rig(settings, jobs, rows + [_tl(99, "Taqueria")], card={"Taqueria": 0.04})
+        result, job = await rig.run()
+
+        assert len(rig.archive.reads) == MAX_DETAIL_READS
+        assert [u for u, _, _ in rig.archive.reads] == [r.url for r in rows[:MAX_DETAIL_READS]]
+        assert list(rig.writes().values()).count("REVIEW") == MAX_DETAIL_READS
+        assert rig.writes()["row-t99"] == "REJECT", "card REJECTs are not capped"
+        t = result.triage
+        assert (t.review, t.reject, t.deferred, t.undecided) == (MAX_DETAIL_READS, 1, 3, 3)
+        assert not t.ok and t.error is None and t.failures == []
+        assert result.status == "completed" and result.error is None, "a limit, not a failure"
+        assert "3 left blank for a later sweep (3 past the 25 detail pages a sweep reads)" \
+            in result.summary
+        assert [l.bot_triage for l in result.listings[-4:-1]] == ["", "", ""]
+
+
 class TestOverlappingSweeps:
     @pytest.mark.asyncio
     async def test_a_row_another_sweep_is_triaging_is_left_to_it(self, settings, jobs):
@@ -2404,11 +2431,24 @@ class TestTriageRefusals:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("prompt", ["", "   \n\t "])
-    async def test_a_blank_prompt(self, settings, jobs, prompt):
+    @pytest.mark.parametrize("sync", [True, False])
+    async def test_a_blank_prompt_is_no_prompt(self, settings, jobs, prompt, sync):
+        """Agents fill optional string parameters with "" as often as they leave
+        them out: either way no triage was asked for, so nothing is refused —
+        not even sync=false, which triage alone would need."""
         rig = Rig(settings, jobs, [_tl(1, "x")])
-        exc = await self._refused(rig, triage_prompt=prompt)
-        assert "triage_prompt is empty" in str(exc)
-        assert rig.classifier.checks == 0
+        result, job = await rig.run(prompt=prompt, sync=sync)
+        assert result.status == "completed" and result.error is None
+        assert result.triage is None and job.triage is None
+        assert rig.classifier.checks == 0 and rig.classifier.asked == []
+        assert rig.store.prepared == 0 and rig.store.writes == []
+
+    @pytest.mark.asyncio
+    async def test_start_treats_a_blank_prompt_as_none_too(self, settings, jobs):
+        rig = Rig(settings, jobs, [_tl(1, "x")])
+        job = rig.svc.start([SERP], sync=False, triage_prompt="  ")
+        await _drain(rig.svc)
+        assert job.triage is None and rig.svc.result(job.id).status == "completed"
 
     @pytest.mark.asyncio
     async def test_sync_false(self, settings, jobs):

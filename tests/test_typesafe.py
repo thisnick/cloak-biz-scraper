@@ -419,6 +419,51 @@ class TestCheck:
         assert result.ok is False and isinstance(result.error, TypeSafeUnavailable)
 
 
+class TestPerCallBudget:
+    """A call can trade the retry budget for an answer now."""
+
+    @pytest.fixture
+    def timeouts(self, monkeypatch):
+        seen: list[float] = []
+        real = httpx.AsyncClient
+
+        def client(*args, **kwargs):
+            seen.append(kwargs.get("timeout"))
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(typesafe.httpx, "AsyncClient", client)
+        return seen
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_check_makes_one_attempt_with_a_ten_second_timeout(self, slept, timeouts):
+        """A check is asked while someone waits: before a sweep starts, or on the
+        Settings page. With the full budget a dead service took two minutes."""
+        route = respx.post(API).mock(return_value=httpx.Response(503))
+        result = await _client().check()
+        assert route.call_count == 1 and slept == []
+        assert timeouts == [10.0]
+        assert "did not answer after 1 attempt (HTTP 503)" in result.message
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_a_call_can_name_its_own_budget(self, slept, timeouts):
+        route = respx.post(API).mock(return_value=httpx.Response(503))
+        with pytest.raises(TypeSafeUnavailable):
+            await _client().noul("x", "y", attempts=2, timeout=5)
+        assert route.call_count == 2 and len(slept) == 1
+        assert timeouts == [5.0]
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_the_default_budget_is_unchanged(self, slept, timeouts):
+        route = respx.post(API).mock(return_value=httpx.Response(503))
+        with pytest.raises(TypeSafeUnavailable):
+            await _client().ask("x", {"q": {"type": "noul", "instructions": "y"}})
+        assert route.call_count == typesafe._MAX_ATTEMPTS == 4
+        assert timeouts == [30.0]
+
+
 class TestConcurrency:
     @respx.mock
     @pytest.mark.asyncio

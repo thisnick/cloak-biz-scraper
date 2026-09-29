@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import ipaddress
 import json
 import logging
 import re
@@ -205,6 +206,12 @@ _LISTING_FIELD = {
 #    clickable one is marked data-cbs-next="<id>" so a script-only control
 #    (href="#", a button) can be clicked from Python.
 #
+# The answer is bounded, so a pathological page (tens of thousands of links, a
+# "card" that is the whole page) cannot build an enormous one: at most 60
+# groups (pinned ones always kept), 200 cards read per group, 80 fields per
+# card and 4000 characters of excerpt per card (the Listing keeps 2000). Python
+# gives the probe PROBE_TIMEOUT_S to return at all.
+#
 # Called with {next_number, patterns} (the page number to look for in a pager,
 # and any pinned listing patterns). Returns JSON:
 #   {url, title, body (first 5000 chars), body_chars,
@@ -220,6 +227,7 @@ JS_PROBE = r"""
   const nextNumber = String(opts.next_number || 2);
   const wanted = new Set(opts.patterns || []);
   const MAX_DETAILED = 12;
+  const MAX_GROUPS = 60, MAX_CARDS = 200, MAX_FIELDS = 80, MAX_EXCERPT = 4000;
   const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
   const pageUrl = /^https?:/.test(location.href) ? location.href : document.baseURI;
   const here = (() => { try { const u = new URL(pageUrl); u.hash = ''; return u; } catch (_) { return null; } })();
@@ -424,6 +432,9 @@ JS_PROBE = r"""
     });
   }
   groups.sort((a, b) => b.links * b.text_chars - a.links * a.text_chars);
+  for (let i = groups.length - 1; i >= MAX_GROUPS; i--) {
+    if (!wanted.has(groups[i].pattern)) groups.splice(i, 1);
+  }
 
   // ── 3. fields ──
   const visible = (el) => (el.checkVisibility ? el.checkVisibility() : el.offsetParent !== null);
@@ -531,7 +542,10 @@ JS_PROBE = r"""
     }
     const out = all.map((lines, ci) => {
       const labeled = {}, slots = {}, seen = new Map();
+      let fieldCount = 0;
       const put = (obj, key, value) => {
+        if (fieldCount >= MAX_FIELDS) return;
+        fieldCount++;
         let k = key, i = 2;
         while (k in obj) k = `${key} (${i++})`;
         obj[k] = value.slice(0, 500);
@@ -581,8 +595,9 @@ JS_PROBE = r"""
     return out;
   };
   const detail = (g, gi) => {
-    const fields = fieldsFor(g._cards);
-    return g._cards.map((c, i) => {
+    const read = g._cards.slice(0, MAX_CARDS);
+    const fields = fieldsFor(read);
+    return read.map((c, i) => {
       if (!c.el.hasAttribute('data-cbs-card')) c.el.setAttribute('data-cbs-card', `g${gi}c${i}`);
       let linkText = '';
       const own = c.el.matches('a[href]') ? [c.el, ...c.el.querySelectorAll('a[href]')] : [...c.el.querySelectorAll('a[href]')];
@@ -613,7 +628,7 @@ JS_PROBE = r"""
         link_text: linkText.slice(0, 500),
         heading: h ? clean(h.innerText || h.textContent).slice(0, 500) : '',
         text: c.text.slice(0, 2000),
-        excerpt,
+        excerpt: excerpt.slice(0, MAX_EXCERPT),
         labeled: fields[i].labeled,
         slots: fields[i].slots,
       };
@@ -1123,9 +1138,15 @@ class GenericSource:
         best_p, best = max(scored, key=lambda s: s[0])
         chosen = links[best]
         step: _Next | None = None
+        refused = ""
         if best_p >= NEXT_MIN:
             if chosen.get("url"):
-                step = _Next("goto", chosen["url"])
+                # The address came from the page, so it is checked here before
+                # the browser is sent to it: a web address, on this site.
+                target = listing_url(str(chosen["url"]))
+                refused = _off_site(target, self.host)
+                if not refused:
+                    step = _Next("goto", target)
             else:
                 step = _Next("click", f'[data-cbs-next="{chosen["id"]}"]',
                              selector=None if chosen.get("numbered") else chosen.get("selector"),
@@ -1136,6 +1157,10 @@ class GenericSource:
             "probability": round(best_p, 3),
             "candidates": len(candidates),
         }
+        if refused:
+            decided["refused"] = {"url": str(chosen["url"])[:300], "why": refused}
+            logger.warning("generic: next page %s on %s not followed: %s",
+                           str(chosen["url"])[:300], self.url, refused)
         if step is not None and step.kind == "click":
             decided["appears_as"] = list(chosen.get("appears_as") or [])
             # A selector someone could pin: only for a Next-style control, never
@@ -1764,6 +1789,45 @@ def _described_title(card: _Card, roles: dict[str, tuple[str, float]]) -> str:
         return ""
     number = best.get("listing_id", ("", 0.0))[0]
     return " · ".join(p for p in (what, number) if p)[:_TITLE_MAX_CHARS]
+
+
+# Second-level labels under a two-letter country code that are not a site of
+# their own ("example.co.uk", "example.com.au"): the registrable domain is one
+# label longer there. A heuristic, not the public-suffix list — it only has to
+# tell a site's own subdomains from somewhere else.
+_SECOND_LEVEL = frozenset({"co", "com", "net", "org", "gov", "edu", "ac", "or", "ne", "go",
+                           "ltd", "plc", "gen", "biz"})
+
+
+def _registrable(host: str) -> str:
+    labels = host.lower().rstrip(".").split(".")
+    if len(labels) >= 3 and len(labels[-1]) == 2 and labels[-2] in _SECOND_LEVEL:
+        return ".".join(labels[-3:])
+    return ".".join(labels[-2:])
+
+
+def _off_site(url: str | None, host: str) -> str:
+    """Why the browser must not follow `url` from a page on `host`; "" when it may.
+
+    It may when `url` is a web address on the same site: the same host, or
+    another host under the same registrable domain (www.fcbb.com and
+    sfbay.fcbb.com). An IP address only matches itself.
+    """
+    if not url:
+        return "not a web address (only http and https links are followed)"
+    other = (urlparse(url).hostname or "").lower()
+    here = host.lower()
+    if other == here:
+        return ""
+    for name in (other, here):
+        try:
+            ipaddress.ip_address(name)
+            return f"on another site ({other}), not {here}"
+        except ValueError:
+            pass
+    if _registrable(other) == _registrable(here):
+        return ""
+    return f"on another site ({other}), not {here}"
 
 
 def _page_template(url: str, page: int) -> str | None:

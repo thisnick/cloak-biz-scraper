@@ -478,10 +478,26 @@ class TestTriageRefusalsReachBothDoors:
         assert "needs sync=true" in text
         assert rest.status_code == 409 and rest.json()["detail"] in text
 
-    def test_a_blank_prompt(self, client, configured):
-        text, rest = self._both(client, {"urls": [SERP], "sync": True, "triage_prompt": " "})
-        assert "triage_prompt is empty" in text
-        assert rest.status_code == 409
+    def test_a_blank_prompt_is_no_prompt_on_either_door(self, client, configured, monkeypatch):
+        """Agents fill optional strings with "": that is no triage, not a
+        refusal — here not even the "needs sync=true" one triage alone makes."""
+        from app.models import SweepTask
+
+        started: list[dict] = []
+
+        def start(urls, **kw):
+            started.append(kw)
+            return SweepTask(id=f"job-{len(started)}", urls=urls, status="working")
+
+        monkeypatch.setattr(app.state.scrape, "start", start)
+        for prompt in ("", "  \n"):
+            r = rpc(client, "tools/call", {"name": "scrape_listings", "arguments": {
+                "urls": [SERP], "triage_prompt": prompt}})
+            assert r.json()["result"].get("isError") is not True, r.text
+            rest = client.post("/api/scrape", json={"urls": [SERP], "triage_prompt": prompt})
+            assert rest.status_code == 200, rest.text
+        assert len(started) == 4
+        assert all("triage_plan" not in kw and not kw.get("triage_prompt") for kw in started)
 
     def test_no_key(self, client, configured):
         configured.update(typesafe_openrouter_api_key="")
