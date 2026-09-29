@@ -352,10 +352,12 @@ class TestListingGroup:
     async def test_none_on_a_later_page_says_so_and_ends_the_list(self):
         """Reached through a link judged to be the next page, a page with no list
         is worth a word: the sweep keeps the pages before it and warns (see
-        test_scrape.py's TestLaterPageFailures), rather than ending silently."""
+        test_scrape.py's TestLaterPageFailures), rather than ending silently.
+        (Page 1's list is not on it, so it is asked about afresh.)"""
         jev = FakeJev()
         source = GenericSource(LIST_URL, jev)
-        page = FakePage(_probe(pager=[_pager(1, NEXT_URL, "rel=next")]), _probe(url=NEXT_URL))
+        page = FakePage(_probe(pager=[_pager(1, NEXT_URL, "rel=next")]),
+                        _probe([_nav()], url=NEXT_URL))
         first = await source.cards(page)
         assert len(first.listings) == 4
         assert await source.advance(page, 2) is True
@@ -365,6 +367,8 @@ class TestListingGroup:
         assert second.error == f"Found no list of businesses for sale on {NEXT_URL} (page 2)."
         assert second.retry is False
         assert source.decisions[1]["page"] == 2
+        assert source.decisions[1]["listing_links"]["missing"] == {
+            "decided_on_page": 1, "patterns": [PATTERN]}
         assert await source.advance(page, 3) is False
 
 
@@ -1217,7 +1221,9 @@ class TestNextPage:
 
 class TestRequestsPerPage:
     @pytest.mark.asyncio
-    async def test_each_decision_is_one_request_per_page(self):
+    async def test_each_decision_is_one_request_on_page_one_and_only_next_after(self):
+        """Page 1 asks each question once; a later page with nothing new on it
+        asks only for its own next page (see TestLaterPagesReuse)."""
         jev = FakeJev(fields=STATUS_FIELDS, status={"Sold": 0.9})
         probe = _with_status("Active", "Sold", "Active", "Active")
         probe["pager"] = [_pager(1, NEXT_URL, "rel=next"), _pager(2, None, "text 'Load more'")]
@@ -1227,7 +1233,280 @@ class TestRequestsPerPage:
         assert jev.kinds() == {"group": 1, "fields": 1, "status": 1, "next": 1}
         await source.advance(page, 2)
         await source.cards(page)
-        assert jev.kinds() == {"group": 2, "fields": 2, "status": 2, "next": 2}
+        assert jev.kinds() == {"group": 1, "fields": 1, "status": 1, "next": 2}
+        await source.advance(page, 3)
+        await source.cards(page)
+        assert jev.kinds() == {"group": 1, "fields": 1, "status": 1, "next": 3}
+
+
+# ── the later pages of one sweep ─────────────────────────────────────────────
+
+
+def _page_url(n: int) -> str:
+    return LIST_URL if n == 1 else f"{LIST_URL}page/{n}/"
+
+
+class _Sweep:
+    """Canned probes read as pages 1, 2, … of one sweep, each linking to the next."""
+
+    def __init__(self, *probes: dict, jev: FakeJev | None = None,
+                 override: SiteOverride | None = None):
+        self.jev = jev or FakeJev()
+        self.jev.next = {_page_url(n): 0.97 for n in range(2, len(probes) + 2)}
+        self.source = GenericSource(LIST_URL, self.jev, override)
+        self.source.begin()
+        self.page = FakePage(*[{**p, "url": _page_url(n),
+                                "pager": [_pager(1, _page_url(n + 1), "rel=next")]}
+                               for n, p in enumerate(probes, 1)])
+        self.count = len(probes)
+        self.n = 0
+
+    async def read(self):
+        self.n += 1
+        if self.n > 1:
+            assert await self.source.advance(self.page, self.n) is True
+        return await self.source.cards(self.page)
+
+    async def read_all(self) -> list:
+        return [await self.read() for _ in range(self.count - self.n)]
+
+
+def _cards(ns, **card) -> list[dict]:
+    return [_card(n, **card) for n in ns]
+
+
+def _redesigned(ns) -> dict:
+    """The same site in another layout: other links, other tiles, other fields."""
+    cards = [_card(n, path="/biz/b-{n}", link_text=f"Biz {n}", heading="",
+                   labeled={"Price": f"${n}00,000"}, slots={"li.t#0": f"Biz {n}"})
+             for n in ns]
+    return _probe([_group("brokers.example/biz/{*}", cards), _nav()])
+
+
+def _contact_seller(ns) -> dict:
+    """BusinessesForSale's shape: "Contact seller" on every tile, and the
+    listings' own /us/{*} links shared with the site's menu."""
+    contact = []
+    for n in ns:
+        card = _card(n, path="/us/biz-{n}/contact", link_text="Contact seller", heading="",
+                     card_id=f"g1c{n}")
+        card["hrefs"] = [f"{SITE}/us/biz-{n}.aspx", card["href"]]
+        contact.append(card)
+    menu = [_card(i, path=f"/us/{slug}", link_text=slug, heading="", labeled={}, slots={},
+                  card_id=f"g0m{i}") for i, slug in enumerate(("sell", "login", "faq"))]
+    tiles = [_card(n, path="/us/biz-{n}.aspx", card_id=f"g1c{n}") for n in ns]
+    return _probe([_group("brokers.example/us/{*}", [*menu, *tiles]),
+                   _group(CONTACTS, contact)])
+
+
+CONTACTS = "brokers.example/us/{*}/contact"
+
+
+class TestLaterPagesReuse:
+    """Within one sweep the list and the fields are decided on page 1 and
+    reused on the pages after it; the next page is decided on every page;
+    nothing outlives the attempt (`begin()`)."""
+
+    @pytest.mark.asyncio
+    async def test_page_two_asks_neither_for_the_list_nor_for_fields_page_one_named(self):
+        sweep = _Sweep(_probe(), _probe([_group(cards=_cards(range(5, 9))), _nav()]))
+        first, second = await sweep.read_all()
+        assert sweep.jev.kinds() == {"group": 1, "fields": 1, "next": 2}
+        assert [l.url for l in second.listings] == [f"{SITE}/listing/biz-{n}" for n in range(5, 9)]
+        listing = second.listings[0]
+        assert (listing.title, listing.location, listing.asking_price, listing.cashflow) == (
+            "Business 5", "Austin, TX", "$1,500,000", "$550,000")
+        page2 = sweep.source.decisions[1]
+        assert page2["listing_links"] == {"by": "page 1", "patterns": [PATTERN],
+                                          "cards_by_shape": 0}
+        assert {f["by"] for f in page2["fields"]} == {"page 1"}
+        assert ({f["key"]: (f["role"], f["used"]) for f in page2["fields"]}
+                == {f["key"]: (f["role"], f["used"]) for f in sweep.source.decisions[0]["fields"]})
+        assert page2["next_page"]["by"] == "jev"
+
+    @pytest.mark.asyncio
+    async def test_only_keys_no_earlier_page_had_are_asked_about(self):
+        with_ebitda = _cards(range(5, 9))
+        for card in with_ebitda:
+            card["labeled"]["EBITDA"] = f"${card['href'][-1]}0,000"
+        jev = FakeJev(fields={**FakeJev().fields, "EBITDA": ("ebitda", 0.9)})
+        sweep = _Sweep(_probe(), _probe([_group(cards=with_ebitda)]),
+                       _probe([_group(cards=with_ebitda)]), jev=jev)
+        _, second, third = await sweep.read_all()
+        assert jev.kinds()["fields"] == 2
+        state, questions = jev.of("fields")[1]
+        assert list(questions) == ["field_1"]
+        assert state["fields"]["field_1"]["text_just_before_this_field"] == "EBITDA"
+        assert second.listings[0].ebitda == third.listings[0].ebitda == "$50,000"
+        by = {f["key"]: f["by"] for f in sweep.source.decisions[1]["fields"]}
+        assert by == {"Asking Price": "page 1", "Cash Flow": "page 1", "EBITDA": "jev",
+                      "div.card>h3#0": "page 1", "div.card>p.loc#0": "page 1"}
+        # Page 3 has nothing new: page 2's answer is reused too.
+        by = {f["key"]: f["by"] for f in sweep.source.decisions[2]["fields"]}
+        assert by["EBITDA"] == "page 2" and by["Asking Price"] == "page 1"
+
+    @pytest.mark.asyncio
+    async def test_an_unsure_answer_is_reused_as_unsure(self):
+        jev = FakeJev(fields={**FakeJev().fields, "Asking Price": ("asking_price", 0.6)})
+        sweep = _Sweep(_probe(), _probe())
+        sweep.jev.fields = jev.fields
+        _, second = await sweep.read_all()
+        assert sweep.jev.kinds()["fields"] == 1
+        assert second.listings[0].asking_price == ""
+        [asking] = [f for f in sweep.source.decisions[1]["fields"] if f["key"] == "Asking Price"]
+        assert asking == {"key": "Asking Price", "labeled": True, "role": "asking_price",
+                          "by": "page 1", "confidence": 0.6, "used": False}
+
+    @pytest.mark.asyncio
+    async def test_a_page_without_page_one_s_list_is_decided_afresh_and_that_is_reused(self):
+        jev = FakeJev(fields={**FakeJev().fields, "Price": ("asking_price", 0.95)})
+        sweep = _Sweep(_probe(), _redesigned(range(1, 4)), _redesigned(range(4, 7)), jev=jev)
+        await sweep.read()
+        jev.group = "/biz/"
+        second = await sweep.read()
+        assert [(l.title, l.asking_price) for l in second.listings] == [
+            ("Biz 1", "$100,000"), ("Biz 2", "$200,000"), ("Biz 3", "$300,000")]
+        links = sweep.source.decisions[1]["listing_links"]
+        assert links["by"] == "jev" and links["patterns"] == ["brokers.example/biz/{*}"]
+        assert links["missing"] == {"decided_on_page": 1, "patterns": [PATTERN]}
+        # Its fields were asked afresh too: another layout's keys.
+        assert {f["by"] for f in sweep.source.decisions[1]["fields"]} == {"jev"}
+        third = await sweep.read()
+        assert [l.title for l in third.listings] == ["Biz 4", "Biz 5", "Biz 6"]
+        assert sweep.jev.kinds() == {"group": 2, "fields": 2, "next": 3}
+        assert sweep.source.decisions[2]["listing_links"]["by"] == "page 2"
+        assert {f["by"] for f in sweep.source.decisions[2]["fields"]} == {"page 2"}
+        # The suggestion is still page 1's.
+        assert sweep.source.suggested_override()["listing_links"] == [PATTERN]
+
+    @pytest.mark.asyncio
+    async def test_the_same_links_around_other_tiles_are_decided_afresh(self):
+        """Page 1's cards had a shape; page 2's links of that pattern sit in
+        none of that shape, so they are not assumed to be the same list."""
+        tiles = [{**c, "shape": "ARTICLE.tile", "container": "DIV.grid"}
+                 for c in _cards(range(1, 5))]
+        elsewhere = [{**c, "shape": "LI.menu-item", "container": "UL.menu"}
+                     for c in _cards(range(5, 9))]
+        sweep = _Sweep(_probe([_group(cards=tiles), _nav()]),
+                       _probe([_group(cards=elsewhere), _nav()]))
+        await sweep.read_all()
+        assert sweep.jev.kinds()["group"] == 2
+        assert sweep.source.decisions[1]["listing_links"]["missing"]["patterns"] == [PATTERN]
+
+    @pytest.mark.asyncio
+    async def test_page_two_s_probe_carries_page_one_s_card_shape_and_field_keys(self):
+        tiles = [{**c, "shape": "ARTICLE.tile", "container": "DIV.grid"}
+                 for c in _cards(range(1, 5))]
+        tiles[3]["shape"] = "ARTICLE.featured.tile"  # a minority does not change it
+        last = [{**_card(5), "shape": "ARTICLE.tile", "container": "DIV.grid", "shaped": True}]
+        sweep = _Sweep(_probe([_group(cards=tiles), _nav()]),
+                       _probe([_group(cards=last, links=1), _nav()]))
+        _, second = await sweep.read_all()
+        assert sweep.page.probe_args[0] == {"next_number": 2, "patterns": []}
+        args = sweep.page.probe_args[1]
+        assert args["next_number"] == 3 and args["patterns"] == [PATTERN]
+        # The commonest shape, and every shape page 1's cards had: the one
+        # listing left may be the odd tile ("new", "featured").
+        assert args["shapes"] == {PATTERN: {"card": "ARTICLE.tile",
+                                            "cards": ["ARTICLE.tile", "ARTICLE.featured.tile"],
+                                            "container": "DIV.grid"}}
+        assert set(args["known_keys"]) == {"Asking Price", "Cash Flow", "div.card>h3#0",
+                                           "div.card>p.loc#0"}
+        assert [l.url for l in second.listings] == [f"{SITE}/listing/biz-5"]
+        assert sweep.source.decisions[1]["listing_links"]["cards_by_shape"] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_query_string_identity_survives_a_page_with_one_listing(self):
+        """Business Team: listing.aspx?LID=… for every listing. With one link
+        on the last page nothing varies, so without page 1's say-so the LID
+        was dropped and every such listing would share one address."""
+        def listing(n: int) -> dict:
+            return _card(n, path="/listing.aspx?LID=SF{n}&From=Search")
+        page1 = _group("brokers.example/listing.aspx?From&LID", [listing(n) for n in range(1, 5)],
+                       varying_keys=["LID"], paths_unique=False)
+        last = _group("brokers.example/listing.aspx?From&LID", [listing(9)])
+        sweep = _Sweep(_probe([page1, _nav()]), _probe([last, _nav()]),
+                       jev=FakeJev(group="listing.aspx"))
+        first, second = await sweep.read_all()
+        assert first.listings[0].normalized_url == "brokers.example/listing.aspx?LID=SF1"
+        assert [l.normalized_url for l in second.listings] == [
+            "brokers.example/listing.aspx?LID=SF9"]
+
+    @pytest.mark.asyncio
+    async def test_both_link_shapes_of_one_list_are_reused(self):
+        """Sunbelt: page 1 read two patterns as one list; a last page with
+        only the second shape on it is still read, without asking."""
+        listing, office = _one_list_two_shapes()
+        last = _group(OFFICE, [_card(8, path="/reno/details/biz-{n}", card_id="g1c8")])
+        sweep = _Sweep(_probe([listing, office, _nav()]), _probe([last, _nav()]))
+        _, second = await sweep.read_all()
+        assert [l.url for l in second.listings] == [f"{SITE}/reno/details/biz-8"]
+        assert sweep.jev.kinds()["group"] == 1
+        assert sweep.page.probe_args[1]["patterns"] == [PATTERN, OFFICE]
+        assert sweep.source.decisions[1]["listing_links"]["patterns"] == [OFFICE]
+
+    @pytest.mark.asyncio
+    async def test_an_action_group_is_read_through_its_detail_links_again(self):
+        """BusinessesForSale: page 1's "Contact seller" pick, read through the
+        /us/{*} links inside its tiles — and not the menu's — on a last page
+        with one tile."""
+        sweep = _Sweep(_contact_seller(range(1, 5)), _contact_seller([5]),
+                       jev=FakeJev(group="us/{*}/contact;", fields={}))
+        first, second = await sweep.read_all()
+        assert len(first.listings) == 4
+        assert [(l.url, l.title) for l in second.listings] == [(f"{SITE}/us/biz-5.aspx",
+                                                                "Business 5")]
+        assert sweep.jev.kinds()["group"] == 1
+        assert sweep.page.probe_args[1]["patterns"] == ["brokers.example/us/{*}", CONTACTS]
+        assert sweep.source.decisions[1]["listing_links"] == {
+            "by": "page 1", "patterns": ["brokers.example/us/{*}"], "cards_by_shape": 0,
+            "instead_of": CONTACTS, "left_out": 3}
+        assert sweep.source.suggested_override()["listing_links"] == [CONTACTS]
+
+    @pytest.mark.asyncio
+    async def test_only_new_status_values_are_asked_about(self):
+        jev = FakeJev(fields=STATUS_FIELDS, status={"Sold": 0.94, "Pending": 0.8})
+        sweep = _Sweep(_with_status("Active", "Sold", "Active"),
+                       _with_status("Sold", "Pending", "Active"),
+                       _with_status("Active", "Pending", "Sold"), jev=jev)
+        _, second, third = await sweep.read_all()
+        assert jev.kinds()["status"] == 2
+        assert jev.of("status")[1][0] == {"statuses": {"status_1": "Pending"}}
+        assert [l.url for l in second.listings] == [f"{SITE}/listing/biz-3"]
+        assert sweep.source.decisions[1]["status"] == {
+            "by": "jev", "unavailable": ["Pending", "Sold"],
+            "values": {"Sold": 0.94, "Pending": 0.8, "Active": 0.02},
+            "reused": ["Sold", "Active"]}
+        assert sweep.source.decisions[2]["status"]["by"] == "pages 1, 2"
+        assert [l.url for l in third.listings] == [f"{SITE}/listing/biz-1"]
+        assert sweep.source.suggested_override()["drop_status"] == ["Sold", "Pending"]
+
+    @pytest.mark.asyncio
+    async def test_overrides_still_win_on_every_page(self):
+        override = SiteOverride(match="brokers.example", listing_links=[PATTERN],
+                                fields={"Cash Flow": "ignore"})
+        sweep = _Sweep(_probe(), _probe([_group(cards=_cards(range(5, 9)))]),
+                       override=override)
+        _, second = await sweep.read_all()
+        assert "group" not in sweep.jev.kinds() and sweep.jev.kinds()["fields"] == 1
+        page2 = sweep.source.decisions[1]
+        assert page2["listing_links"] == {"by": "override", "patterns": [PATTERN]}
+        by = {f["key"]: f["by"] for f in page2["fields"]}
+        assert by["Cash Flow"] == "override" and by["Asking Price"] == "page 1"
+        assert second.listings[0].cashflow == ""
+
+    @pytest.mark.asyncio
+    async def test_a_retry_decides_page_one_afresh(self):
+        sweep = _Sweep(_probe(), _probe())
+        await sweep.read_all()
+        assert sweep.jev.kinds() == {"group": 1, "fields": 1, "next": 2}
+        sweep.source.begin()
+        result = await sweep.source.cards(sweep.page)
+        assert len(result.listings) == 4
+        assert sweep.jev.kinds() == {"group": 2, "fields": 2, "next": 3}
+        assert sweep.source.decisions[0]["listing_links"]["by"] == "jev"
+        assert {f["by"] for f in sweep.source.decisions[0]["fields"]} == {"jev"}
+        assert sweep.page.probe_args[-1] == {"next_number": 2, "patterns": []}
 
 
 # ── errors and blocks ────────────────────────────────────────────────────────
@@ -2043,3 +2322,102 @@ class TestGenericSourceOnSavedPages:
         assert jev.kinds() == {"group": 1, "fields": 1, "next": 1}
         assert source.decisions[0]["next_page"]["rule"] == "click"
         assert advanced is True
+
+
+# Every card of the chosen list except those named, removed from the page:
+# what a last page with one or two listings on it leaves. Each card is the
+# element page 1 marked (data-cbs-card) around the listing's link.
+_KEEP_ONLY = r"""(drop) => {
+  const gone = new Set(drop.map((u) => u.replace(/\/+$/, '')));
+  let removed = 0;
+  for (const a of [...document.querySelectorAll('a[href]')]) {
+    let u;
+    try { u = new URL(a.getAttribute('href'), document.baseURI); } catch (_) { continue; }
+    u.hash = '';
+    if (!gone.has(u.href.replace(/\/+$/, ''))) continue;
+    const card = a.closest('[data-cbs-card]');
+    if (card && card.isConnected) { card.remove(); removed++; }
+  }
+  return removed;
+}"""
+
+# What each field's label holds, for every saved page below: enough for the
+# money fields and locations to be filled, so page 2 has something to match.
+_LABELS = {label: (role, 0.97) for label, role in [
+    ("Asking Price", "asking_price"), ("Price", "asking_price"),
+    ("Cash Flow", "cash_flow_sde"), ("SDE", "cash_flow_sde"), ("Total Income", "cash_flow_sde"),
+    ("Adjusted Earnings", "cash_flow_sde"), ("Income", "cash_flow_sde"),
+    ("Net Profit", "cash_flow_sde"), ("Revenue", "revenue"), ("Gross Sales", "revenue"),
+    ("Location", "location"),
+]}
+
+
+@needs_chromium
+class TestLastPageOnSavedPages:
+    """A last page with one or two listings, on real markup.
+
+    One link has no neighbour to stop its card's climb, and fewer than three
+    links make no candidate list at all — so a page like that, read afresh,
+    has "no list of businesses". Read as page 2 of a sweep, it is page 1's
+    list: the same patterns, found by page 1's card shapes, with page 1's
+    field roles. Page 1 is the saved page; page 2 is the same page with all
+    but the first listing or two taken off it.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_scroll_waits(self, monkeypatch):
+        # A saved page loads nothing more when scrolled; three reads per case
+        # would otherwise wait out every scroll pause.
+        monkeypatch.setattr(generic, "SCROLL_PAUSE_MS", 0)
+        monkeypatch.setattr(generic, "SCROLL_BOTTOM_SETTLE_MS", 0)
+
+    @pytest.mark.parametrize("name, group, keep", [
+        ("websiteclosers_list", "websiteclosers.com/businesses/", 1),
+        ("dealonomy_list", "dealonomy.com/s/", 2),
+        ("bizquest_list", "bizquest.com/business-for-sale/", 1),
+        ("fcbb_list", "sfbay.fcbb.com/listing-property/", 1),
+        ("libertygroup_list", "thelibertygroupofnevada.com/listing/", 1),
+        # The listing left is the second link shape of Sunbelt's one list.
+        ("sunbelt_list", "business-search/business-details", 1),
+        # Read through the detail links inside page 1's "Contact seller" and
+        # "Unlock" picks; Empire Flippers' last tile is its one "new" tile.
+        ("businessesforsale_list", "com/us/{*}/contact;", 1),
+        ("empireflippers_list", "unlock/", 1),
+        # The listing is named by its LID query key, which one link cannot vary.
+        ("businessteam_list", "business-for-sale.aspx", 1),
+    ])
+    @pytest.mark.asyncio
+    async def test_a_last_page_with_one_or_two_listings_is_read_as_page_one_read_it(
+            self, name, group, keep):
+        url = _captured_url(name)
+        jev = FakeJev(group=group, fields=_LABELS)
+        source = GenericSource(url, jev)
+        source.begin()
+
+        async def run(page):
+            first = await source.cards(page)
+            assert first.error == "" and len(first.listings) > keep
+            removed = await page.evaluate(
+                _KEEP_ONLY, [l.url for l in first.listings[keep:]])
+            assert removed >= len(first.listings) - keep
+
+            async def to_the_last_page(target, **_kw):
+                pass  # the page is already trimmed in place
+            page.goto = to_the_last_page
+            # However page 1 said to reach page 2, here it is an address.
+            source._next = generic._Next("goto", f"{url}#page-2")
+            assert await source.advance(page, 2) is True
+            second = await source.cards(page)
+            fresh = await GenericSource(url, FakeJev(group=group, fields=_LABELS)).cards(page)
+            return first, second, fresh
+
+        first, second, fresh = await _with_fixture(name, run)
+        assert second.error == "" and not second.blocked
+        # The same listings, read the same way: address, title, money, excerpt.
+        assert second.listings == first.listings[:keep]
+        assert jev.kinds()["group"] == 1
+        page2 = source.decisions[1]
+        assert page2["listing_links"]["by"] == "page 1"
+        assert {f["by"] for f in page2["fields"]} >= {"page 1"}
+        # Read afresh, the same page has no list on it.
+        assert fresh.error.startswith("Found no list of businesses for sale")

@@ -426,7 +426,7 @@ def build(app) -> MCPServer:
             it are kept and returned, and `error` says which page stopped it and why
             (the job still completes). A BizBuySell page other than a search
             or a broker profile is refused; to save one listing's page, use
-            archive_page. How a site's page is read is decided fresh each time; if
+            archive_page. How a site's page is read is decided anew by every sweep; if
             a site keeps being read wrong, the fix is a site override a person
             saves in the server's Settings, not an argument here. If you don't have
             a listings URL, either ask the user for it, OR get one yourself:

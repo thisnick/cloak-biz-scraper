@@ -128,9 +128,10 @@ not answering, a call whose URLs all need the classifier is refused with that re
 the other sites fail and the BizBuySell ones still run. A call with a `triage_prompt` is
 refused whole, BizBuySell or not, because it would save rows it then could not decide.
 
-Cost: a page takes a handful of small classifier requests — which list, the fields, the
-statuses, the next page, the listing check — which together come to fractions of a cent
-per page, billed to your OpenRouter account. Triage adds one request per new listing, and
+Cost: a sweep's first page takes a handful of small classifier requests — which list, the
+fields, the statuses, the next page, the listing check — and its later pages fewer, since
+the list and the fields decided on the first page are reused; together they come to
+fractions of a cent per page, billed to your OpenRouter account. Triage adds one request per new listing, and
 two more for each one that is read on its detail page.
 
 ## Triage prompt
@@ -201,8 +202,9 @@ anything.
 
 ## Site overrides
 
-A generic page is decided fresh every time, so a site that changes its layout is read by
-its new layout. When one decision keeps coming out wrong for one site — the wrong list, a
+A generic site is decided fresh by every sweep — its list and fields on the first page
+(reused for that sweep's later pages), its next page on every page — and nothing is
+remembered between sweeps, so a site that changes its layout is read by its new layout. When one decision keeps coming out wrong for one site — the wrong list, a
 field left empty, paging that stops early or never stops, sold listings kept — pin that
 part in **Settings → Site overrides**. Anything you leave out is still decided by the
 classifier.

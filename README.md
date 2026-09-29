@@ -255,7 +255,9 @@ decides it. Without `triage_prompt` a sweep behaves exactly as before — see
 BizBuySell pages are read by their own adapters. A page on any other site is read
 generically: the list of listings is found by grouping the page's links, and the TypeSafe
 Classifier (e.g. Jev) decides which group is the list, what each card field holds, which
-statuses mean a business is gone, and how to reach the next page — fresh on every page.
+statuses mean a business is gone, and how to reach the next page. The list and the fields are
+decided on a sweep's first page and reused for its later pages; the next page is decided on
+every page; nothing is remembered between sweeps.
 Without a key such a URL is refused with a pointer to Settings; a key that OpenRouter
 rejects or that is out of credits refuses the call before a job starts (in a batch that
 also has BizBuySell URLs, only the other sites fail). A first page with no list of

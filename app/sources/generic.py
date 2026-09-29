@@ -17,17 +17,23 @@ adapter for, a page seen once. It reads a page in two halves.
   group is the list of businesses for sale (and not the menu, the footer, or a
   "similar listings" rail), what each field holds, which statuses mean the
   business is gone, and which candidate is really the next page. Each of those
-  is ONE request per page — the classifier reads the state once and answers
-  every question in it, so a request per field or per link would pay for the
-  same reading many times. (Measured on 2026-09-28: bundled answers were as
+  is ONE request — the classifier reads the state once and answers every
+  question in it, so a request per field or per link would pay for the same
+  reading many times. (Measured on 2026-09-28: bundled answers were as
   accurate as separate ones.) The rest of a chosen list — a second link shape
   on the same tiles, or the detail links behind an "Unlock"/"Watch" group — is
   then found from the probe's own evidence, without asking again
   (`_whole_list`).
 
-**Every decision is made fresh on every page**, and nothing is kept between
-sweeps: a site that changes its layout is read by its new layout, not with last
-month's answers. A person can pin any part of it for one site with a
+**The list and the fields are decided on a sweep's first page and reused for
+the pages after it; the next page is decided on every page; nothing is kept
+between sweeps.** A later page asks only about fields the first page did not
+have, and a later page without the first page's list (a changed layout) is
+decided afresh. Reusing the first page's list is also what reads a last page
+with one or two listings on it: one link has no neighbour to bound its card,
+so it is found by the first page's card shapes instead (`_Decided`). A site
+that changes its layout is read by its new layout on the next sweep, not with
+last month's answers. A person can pin any part of it for one site with a
 `SiteOverride` (`overrides.py`); a pinned part is never asked about.
 
 What this source refuses to do is guess. A page with no list of businesses on it
@@ -48,7 +54,7 @@ import json
 import logging
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlparse
 
@@ -127,6 +133,8 @@ _JS_PAGE_SIZE = (
 )
 
 _GROUP_EXAMPLE_CHARS = 260
+# Card shapes remembered per pattern for later pages (see `_shape_of`).
+_MAX_SHAPES = 8
 _CARD_EXAMPLE_CHARS = 400
 # A Listing's excerpt, at most: the card's own markdown is usually a few lines,
 # but a card that is most of the page would otherwise be stored (and sent to
@@ -230,6 +238,12 @@ JS_PROBE = r"""
   const opts = args || {};
   const nextNumber = String(opts.next_number || 2);
   const wanted = new Set(opts.patterns || []);
+  // What an earlier page of this sweep read (see _Decided): the card shape of
+  // each pinned pattern, and the field keys whose meaning is already known.
+  const pinShapes = opts.shapes || {};
+  const known = new Set(opts.known_keys || []);
+  const NONE = new Set();
+  const MAX_CLIMB = 15;
   const MAX_DETAILED = 12;
   const MAX_GROUPS = 60, MAX_CARDS = 200, MAX_FIELDS = 80, MAX_EXCERPT = 4000;
   const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
@@ -371,7 +385,31 @@ JS_PROBE = r"""
   // A card that climbed past its siblings' shape (its row-mates have no link
   // of the group — a sold tile with no detail page) is brought back down to
   // the shape most cards have.
-  const sig = (el) => el.tagName + '.' + stable(el).sort().join('.');
+  // Bounded, so a page of Tailwind-long class lists cannot bloat the answer.
+  const sig = (el) => (el.tagName + '.' + stable(el).sort().join('.')).slice(0, 300);
+  // A pinned pattern whose cards an earlier page of the sweep read has their
+  // shapes: the nearest element around the link (the link included) with the
+  // tag and classes of one of those cards, sitting in an element shaped like
+  // the one most of them sat in, is the card. Any of the earlier page's
+  // shapes, not only the commonest: the one listing left on a last page may
+  // be the "new" or "featured" tile (Empire Flippers). That needs no
+  // neighbouring link to stop the climb, so the one listing on a last page is
+  // still one card. Never a card holding another link of the group; null when
+  // nothing within MAX_CLIMB levels fits.
+  const shapedCard = (a, shape, keySet, mine) => {
+    const tiles = new Set([shape.card, ...(shape.cards || [])]);
+    let n = a;
+    for (let i = 0; n && i <= MAX_CLIMB && n !== document.body && n !== document.documentElement; i++, n = n.parentElement) {
+      if (!tiles.has(sig(n))) continue;
+      if (shape.container && (!n.parentElement || sig(n.parentElement) !== shape.container)) continue;
+      for (const x of n.querySelectorAll('a[href]')) {
+        const h = keyOfA.get(x);
+        if (h && h !== mine && keySet.has(h)) return null;
+      }
+      return n;
+    }
+    return null;
+  };
   const align = (cards) => {
     const counts = new Map();
     for (const c of cards) counts.set(sig(c.el), (counts.get(sig(c.el)) || 0) + 1);
@@ -379,7 +417,7 @@ JS_PROBE = r"""
     for (const [k, n] of counts) if (n > most) { modal = k; most = n; }
     if (most * 2 < cards.length) return;
     for (const c of cards) {
-      if (sig(c.el) === modal) continue;
+      if (c.shaped || sig(c.el) === modal) continue;
       for (let n = c.anchor; n && n !== c.el; n = n.parentElement) {
         if (sig(n) === modal) { c.el = n; break; }
       }
@@ -396,13 +434,18 @@ JS_PROBE = r"""
   const groups = [];
   for (const g of raw) {
     // One link has no neighbour to bound its card, which would grow to the
-    // whole page; below three, only a pinned pattern is worth reading.
-    if (g.items.length < (wanted.has(g.pattern) ? 2 : 3)) continue;
+    // whole page; below three, only a pinned pattern is worth reading, and
+    // below two only one whose card shape is known.
+    const pinned = wanted.has(g.pattern);
+    const knownShape = pinned && pinShapes[g.pattern] && pinShapes[g.pattern].card ? pinShapes[g.pattern] : null;
+    if (g.items.length < (pinned ? (knownShape ? 1 : 2) : 3)) continue;
     const keySet = new Set(g.items.map((it) => it.key));
     const cards = g.items.map((it) => {
       const anchor = byLink.get(it.key).anchors[0];
-      return { href: it.href, key: it.key, anchor, el: cardFor(anchor, keySet, it.key) };
+      const el = knownShape ? shapedCard(anchor, knownShape, keySet, it.key) : null;
+      return { href: it.href, key: it.key, anchor, el: el || cardFor(anchor, keySet, it.key), shaped: !!el };
     });
+    if (cards.length < 2 && !cards[0].shaped) continue;
     align(cards);
     let chrome = 0, chars = 0;
     const shapes = new Map();
@@ -499,7 +542,10 @@ JS_PROBE = r"""
     const v = lines[i + 1];
     return !!v && !v.isLabel && !isCta(v) && v.text.length <= maxChars && near(lines[i], v, levels);
   };
-  const fieldsFor = (cards) => {
+  // `prior` is the field keys an earlier page of the sweep read on these cards:
+  // a label there is a label here, even on a last page with too few cards for
+  // it to recur, so the field keeps its key (and its known meaning).
+  const fieldsFor = (cards, prior) => {
     const all = cards.map((c) => linesOf(c.el));
     // "Label: value" on one line counts as a label only when the label recurs
     // across cards; a title that happens to contain a colon is still a title.
@@ -517,8 +563,17 @@ JS_PROBE = r"""
     }
     for (const lines of all) {
       for (const l of lines) {
-        if (l.inline && (inlineOn.get(l.inline[0]) || 0) < Math.max(2, 0.3 * cards.length)) l.inline = null;
+        if (l.inline && !prior.has(l.inline[0])
+            && (inlineOn.get(l.inline[0]) || 0) < Math.max(2, 0.3 * cards.length)) l.inline = null;
         l.isLabel = !l.inline && colonLabel(l);
+      }
+    }
+    if (prior.size) {
+      for (const lines of all) {
+        lines.forEach((l, i) => {
+          if (!l.isLabel && !l.inline && l.text.length <= 40 && prior.has(l.text) && !isCta(l)
+              && pairs(lines, i, 2, 80)) l.isLabel = true;
+        });
       }
     }
     // A short text on ≥ 80% of cards is a label — when it sits next to a value
@@ -583,9 +638,11 @@ JS_PROBE = r"""
         members.get(base).add(k);
       }
     }
+    // A last page with one of those cards has one variant only; it is still
+    // the class-less slot an earlier page read.
     const rename = new Map();
     for (const [base, keys] of members) {
-      if (keys.size < 2) continue;
+      if (keys.size < 2 && !(prior.has(base) && ![...keys].some((k) => prior.has(k)))) continue;
       if (out.some((f) => [...keys].filter((k) => k in f.slots).length > 1)) continue;
       for (const k of keys) rename.set(k, base);
     }
@@ -600,7 +657,7 @@ JS_PROBE = r"""
   };
   const detail = (g, gi) => {
     const read = g._cards.slice(0, MAX_CARDS);
-    const fields = fieldsFor(read);
+    const fields = fieldsFor(read, wanted.has(g.pattern) ? known : NONE);
     return read.map((c, i) => {
       if (!c.el.hasAttribute('data-cbs-card')) c.el.setAttribute('data-cbs-card', `g${gi}c${i}`);
       let linkText = '';
@@ -624,7 +681,7 @@ JS_PROBE = r"""
       }
       let excerpt = c.text;
       try { if (window.__cbsMarkdown) excerpt = window.__cbsMarkdown(c.el.innerHTML).trim(); } catch (_) {}
-      return {
+      const out = {
         card: c.el.getAttribute('data-cbs-card'),
         pos: anchorPos.get(c.anchor),
         href: c.href,
@@ -635,7 +692,11 @@ JS_PROBE = r"""
         excerpt: excerpt.slice(0, MAX_EXCERPT),
         labeled: fields[i].labeled,
         slots: fields[i].slots,
+        shape: sig(c.el),
+        container: c.el.parentElement ? sig(c.el.parentElement) : null,
       };
+      if (c.shaped) out.shaped = true;
+      return out;
     });
   };
   let detailed = 0;
@@ -760,6 +821,37 @@ class _Next:
     appears_as: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class _Decided:
+    """The list a page decided on, pinned for the later pages of the same sweep.
+
+    `patterns` are the link patterns that were read, "same list" ones
+    included; `action` is an action pattern that was picked ("Contact seller",
+    "Unlock") and read through the detail links inside its cards, when that is
+    how the list was read (`_whole_list`). `shapes` is each pattern's card
+    shape — the tag and stable classes most of its cards had (`card`), every
+    such shape its cards had (`cards`), and those of the element most of them
+    sat in (`container`) — which is how a later page finds the card around a
+    link with no neighbouring link to stop at: the one listing on a last page.
+    `identity` is each pattern's query keys that named the listing
+    (`varying_keys`) and whether its paths did (`paths_unique`): a last page
+    with one `listing.aspx?LID=…` link has no second link for its LID to vary
+    against, and without them every such listing would be stored under the
+    same address.
+    """
+
+    page: int
+    patterns: tuple[str, ...]
+    action: str | None
+    shapes: dict[str, dict[str, Any]]
+    identity: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    @property
+    def pinned(self) -> list[str]:
+        """Every pattern the probe must read on a later page."""
+        return list(dict.fromkeys([*self.patterns, *([self.action] if self.action else [])]))
+
+
 @dataclass
 class _Card:
     """One card of the chosen list, with the address it will be stored under."""
@@ -777,19 +869,29 @@ class GenericSource:
     Created per swept URL (not registered in `sources.SOURCES`), with the
     classifier it cannot work without and the site's override, if any. It holds
     what it decided on the current attempt — the page it is on, how to reach
-    the next one, a record of every decision — and `begin()` forgets all of it,
-    because the sweep reuses one source object across retries.
+    the next one, the list and field decisions later pages reuse, a record of
+    every decision — and `begin()` forgets all of it, because the sweep reuses
+    one source object across retries.
+
+    Within one attempt, the list and the fields are decided on the first page
+    and reused on the pages after it (`_Decided`, `_known_fields`,
+    `_known_status`): a later page asks only about field keys and status
+    values no earlier page had, and a page that does not have the first page's
+    list at all (a changed layout) is decided afresh, and that decision is
+    the one reused from then on. The next page is decided on every page.
 
     `decisions` has one JSON-safe dict per page read, saying what was decided
-    and by whom ("override", "jev", or "probe" when there was nothing to ask):
-    `page`, `url`; `listing_links` {by, patterns, confidence, model,
-    candidates, and when they apply same_list, instead_of, left_out};
+    and by whom ("override", "jev", "probe" when there was nothing to ask, or
+    "page N" when page N's answer was reused): `page`, `url`; `listing_links`
+    {by, patterns, confidence, model, candidates, and when they apply
+    same_list, instead_of, left_out, cards_by_shape (cards found by the reused
+    card shape), missing (the reused patterns a page did not have)};
     `fields` [{key, labeled, role, by, confidence, used}];
-    `status` {by, unavailable, values} when the cards have a status field;
-    `next_page` {by, rule (a URL, "click" or "none"), probability, candidates,
-    appears_as, selector}; `cards`, `kept`, `dropped_unavailable`; and `blocked`
-    or `error` when the page ended that way. `suggested_override()` turns it
-    into a paste-ready `SiteOverride`.
+    `status` {by, unavailable, values, and reused when some were} when the
+    cards have a status field; `next_page` {by, rule (a URL, "click" or
+    "none"), probability, candidates, appears_as, selector}; `cards`, `kept`,
+    `dropped_unavailable`; and `blocked` or `error` when the page ended that
+    way. `suggested_override()` turns it into a paste-ready `SiteOverride`.
     """
 
     name = GENERIC_NAME
@@ -812,6 +914,10 @@ class GenericSource:
         self.decisions: list[dict[str, Any]] = []
         self._page = 1
         self._next: _Next | None = None
+        # Reused by the later pages of this attempt, never kept past it.
+        self._decided: _Decided | None = None
+        self._known_fields: dict[str, dict[str, Any]] = {}
+        self._known_status: dict[str, tuple[float, int]] = {}
 
     # -- the Source protocol --
 
@@ -820,6 +926,13 @@ class GenericSource:
         self._page = 1
         self._next = None
         self.decisions = []
+        self._forget()
+
+    def _forget(self) -> None:
+        """Drop the list, field and status decisions later pages would reuse."""
+        self._decided = None
+        self._known_fields = {}
+        self._known_status = {}
 
     def matches(self, url: str) -> bool:
         p = urlparse((url or "").strip())
@@ -903,8 +1016,17 @@ class GenericSource:
         await _scroll_through(page)
         await extract.inject(page)
         links = list(self.override.listing_links) if self.override else []
+        args: dict[str, Any] = {"next_number": n + 1, "patterns": links}
+        decided = self._decided
+        if decided is not None and n > decided.page:
+            # The list an earlier page decided on is read here with its card
+            # shape, so a last page with one or two listings is still read,
+            # and with the field keys already known, so they keep their keys.
+            args = {"next_number": n + 1,
+                    "patterns": list(dict.fromkeys([*links, *decided.pinned])),
+                    "shapes": decided.shapes, "known_keys": list(self._known_fields)}
         try:
-            probe = await _run_probe(page, {"next_number": n + 1, "patterns": links})
+            probe = await _run_probe(page, args)
         except asyncio.TimeoutError:
             message = (f"Reading the listings on {record['url']} took longer than "
                        f"{PROBE_TIMEOUT_S:.0f} s, so the page was not used.")
@@ -938,7 +1060,7 @@ class GenericSource:
 
     async def _read(self, probe: dict, n: int, title: str, record: dict) -> CardPage:
         groups = [g for g in probe.get("groups") or [] if isinstance(g, dict)]
-        chosen = await self._choose_groups(groups, title, record)
+        chosen = await self._choose_groups(groups, n, title, record)
         if not chosen:
             # On page 1 the source fails; on a later page — reached through a
             # next-page link that was judged real — the sweep stops there and
@@ -973,18 +1095,30 @@ class GenericSource:
         record["dropped_unavailable"] = dropped
         return CardPage(listings=listings, title=title, seen_urls=[c.url for c in cards])
 
-    async def _choose_groups(self, groups: list[dict], title: str, record: dict) -> list[dict]:
-        """The group(s) that are the page's list of businesses for sale; [] for none."""
+    async def _choose_groups(self, groups: list[dict], n: int, title: str,
+                             record: dict) -> list[dict]:
+        """The group(s) that are the page's list of businesses for sale; [] for none.
+
+        An override decides on every page. Otherwise the first page asks the
+        classifier, and the pages after it read the same patterns without
+        asking (`_reuse`) — unless a page does not have them, which is then
+        decided afresh, and that decision is reused from then on.
+        """
         if self.override and self.override.listing_links:
             wanted = self.override.listing_links
             chosen = [g for g in groups if g.get("pattern") in wanted and g.get("cards")]
-            replaced, left_out = None, 0
+            replaced, left_out, action = None, 0, None
             if len(chosen) == 1 and _looks_like_action(chosen[0]):
                 # One action pattern pinned is read as when the classifier
                 # picks it: through the detail links inside its cards. Never
                 # widened to more of the list — that is what pinning is for.
-                chosen, _, replaced, left_out = _whole_list(chosen[0], _candidates(groups),
+                action = chosen[0]["pattern"]
+                chosen, _, replaced, left_out = _whole_list(chosen[0], self._pool(groups),
                                                             widen=False)
+            if chosen and self._decided is None:
+                self._decided = _decided(n, chosen, action, groups)
+            elif chosen and n > self._decided.page:
+                chosen = _as_before(chosen, self._decided)
             record["listing_links"] = {"by": "override", "patterns": [g["pattern"] for g in chosen]}
             if replaced:
                 record["listing_links"]["instead_of"] = replaced
@@ -1000,9 +1134,24 @@ class GenericSource:
                 )
             return chosen
 
+        missing: dict[str, Any] | None = None
+        decided = self._decided
+        if decided is not None and n > decided.page:
+            chosen = self._reuse(groups, decided, record)
+            if chosen:
+                return chosen
+            # Not this page's layout (a redesign, an A/B page): decided afresh,
+            # fields and statuses too, and what is decided here is reused next.
+            missing = {"decided_on_page": decided.page, "patterns": decided.pinned}
+            logger.info("generic: page %d of %s does not have page %d's list (%s); deciding "
+                        "it afresh", n, self.url, decided.page, ", ".join(decided.pinned))
+            self._forget()
+
         candidates = _candidates(groups)
         if not candidates:
             record["listing_links"] = {"by": "probe", "patterns": [], "candidates": 0}
+            if missing:
+                record["listing_links"]["missing"] = missing
             return []
         options = {f"group_{_letter(i)}": g for i, g in enumerate(candidates)}
         criteria = {
@@ -1029,11 +1178,71 @@ class GenericSource:
             record["listing_links"]["instead_of"] = replaced
         if left_out:
             record["listing_links"]["left_out"] = left_out
+        if missing:
+            record["listing_links"]["missing"] = missing
+        if chosen:
+            action = picked["pattern"] if picked and _looks_like_action(picked) else None
+            self._decided = _decided(n, chosen, action, groups)
+        return chosen
+
+    def _pool(self, groups: list[dict]) -> list[dict]:
+        """Where an action group's detail links are looked for: the patterns an
+        earlier page read them through first (however few links they have
+        here), then the page's candidates."""
+        decided = self._decided
+        mine = [] if decided is None else [
+            g for p in decided.patterns if p != decided.action
+            for g in groups if g.get("pattern") == p and g.get("cards")]
+        return mine + [g for g in _candidates(groups) if all(g is not m for m in mine)]
+
+    def _reuse(self, groups: list[dict], decided: _Decided, record: dict) -> list[dict]:
+        """The groups of `decided`'s list on this page, read the way it was read; [] when
+        the page does not have them.
+
+        A pattern whose card shape is known counts only when at least one of
+        its cards here has that shape: the same link pattern around other
+        tiles is another page layout, which is decided afresh.
+        """
+        pinned = set(decided.pinned)
+        here: dict[str, dict] = {}
+        for g in groups:
+            pattern = g.get("pattern")
+            if pattern not in pinned or pattern in here or not g.get("cards"):
+                continue
+            if decided.shapes.get(pattern) and not any(c.get("shaped") for c in g["cards"]):
+                continue
+            here[pattern] = g
+        replaced, left_out = None, 0
+        if decided.action:
+            picked = here.get(decided.action)
+            if picked is None:
+                return []
+            chosen, _, replaced, left_out = _whole_list(picked, self._pool(groups), widen=False)
+        else:
+            chosen = [here[p] for p in decided.patterns if p in here]
+        if not chosen:
+            return []
+        chosen = _as_before(chosen, decided)
+        record["listing_links"] = {
+            "by": f"page {decided.page}", "patterns": [g["pattern"] for g in chosen],
+            "cards_by_shape": sum(1 for g in chosen for c in g.get("cards") or []
+                                  if c.get("shaped")),
+        }
+        if replaced:
+            record["listing_links"]["instead_of"] = replaced
+        if left_out:
+            record["listing_links"]["left_out"] = left_out
         return chosen
 
     async def _decide_fields(self, cards: list[_Card], title: str,
                              record: dict) -> tuple[dict[str, tuple[str, float]], set[str]]:
-        """What each common field holds (role, confidence), then which statuses mean gone."""
+        """What each common field holds (role, confidence), then which statuses mean gone.
+
+        A key an earlier page of this attempt already decided keeps that
+        answer; only the rest are asked about, and when there is no rest,
+        nothing is asked.
+        """
+        n = int(record.get("page") or 1)
         keys = _field_keys(cards)
         roles: dict[str, tuple[str, float]] = {}
         report: list[dict] = []
@@ -1043,8 +1252,18 @@ class GenericSource:
             rule = _pinned(pinned, key)
             if rule is not None:
                 report.append({"key": key, "labeled": labeled, "role": rule, "by": "override"})
+                self._known_fields.setdefault(key, {"role": rule, "by": "override"})
                 if rule != "ignore":
                     roles[key] = (rule, 1.0)
+                continue
+            before = self._known_fields.get(key)
+            if before is not None and before.get("by") != "override":
+                report.append({"key": key, "labeled": labeled, "role": before["role"],
+                               "by": f"page {before['page']}",
+                               "confidence": round(before["confidence"], 3),
+                               "used": before["used"]})
+                if before["used"]:
+                    roles[key] = (before["role"], before["confidence"])
                 continue
             ask[f"field_{len(ask) + 1}"] = key
 
@@ -1072,6 +1291,8 @@ class GenericSource:
                 report.append({"key": key, "labeled": labeled_keys[key], "role": answer.choice,
                                "by": "jev", "confidence": round(answer.confidence, 3),
                                "used": used})
+                self._known_fields[key] = {"role": answer.choice, "by": "jev", "page": n,
+                                           "confidence": answer.confidence, "used": used}
                 if used:
                     roles[key] = (answer.choice, answer.confidence)
         record["fields"] = report
@@ -1081,7 +1302,11 @@ class GenericSource:
 
     async def _decide_status(self, cards: list[_Card], roles: dict[str, tuple[str, float]],
                              record: dict) -> set[str]:
-        """The status values on this page that mean the business is gone."""
+        """The status values on this page that mean the business is gone.
+
+        A value an earlier page of this attempt judged keeps its answer; only
+        new ones are asked about.
+        """
         status_keys = [k for k, (role, _) in roles.items() if role == "status"]
         values = _distinct([c.values[k] for c in cards for k in status_keys if c.values.get(k)],
                            MAX_STATUS_VALUES, None)
@@ -1093,16 +1318,27 @@ class GenericSource:
             gone = {v for v in values if any(d in v.lower() for d in needles)}
             record["status"] = {"by": "override", "unavailable": sorted(gone), "values": values}
             return gone
-        names = {f"status_{i}": v for i, v in enumerate(values, 1)}
-        answers = await self._ask(
-            {"statuses": names},
-            {name: {"type": "noul", "instructions": STATUS_QUESTION.format(status=name)}
-             for name in names},
-        )
-        probabilities = {value: _noul(answers, name) for name, value in names.items()}
+        n = int(record.get("page") or 1)
+        reused = [v for v in values if v in self._known_status]
+        names = {f"status_{i}": v for i, v in
+                 enumerate((v for v in values if v not in self._known_status), 1)}
+        if names:
+            answers = await self._ask(
+                {"statuses": names},
+                {name: {"type": "noul", "instructions": STATUS_QUESTION.format(status=name)}
+                 for name in names},
+            )
+            for name, value in names.items():
+                self._known_status[value] = (_noul(answers, name), n)
+        probabilities = {v: self._known_status[v][0] for v in values}
         gone = {v for v, p in probabilities.items() if p >= UNAVAILABLE_MIN}
-        record["status"] = {"by": "jev", "unavailable": sorted(gone),
+        pages = sorted({self._known_status[v][1] for v in reused})
+        by = ("jev" if names else
+              f"page{'s' if len(pages) > 1 else ''} {', '.join(map(str, pages))}")
+        record["status"] = {"by": by, "unavailable": sorted(gone),
                             "values": {v: round(p, 3) for v, p in probabilities.items()}}
+        if names and reused:
+            record["status"]["reused"] = reused
         return gone
 
     async def _decide_next(self, probe: dict, n: int, title: str, listing_hrefs: set[str],
@@ -1391,6 +1627,67 @@ def _candidates(groups: list[dict]) -> list[dict]:
               and g.get("cards")]
     usable.sort(key=lambda g: -int(g.get("links") or 0) * int(g.get("text_chars") or 0))
     return usable[:MAX_CANDIDATES]
+
+
+def _decided(page: int, chosen: list[dict], action: str | None,
+             groups: list[dict]) -> _Decided:
+    """What later pages reuse of this page's list: its patterns, how it was read,
+    each pattern's card shape (from the cards actually read) and what in its
+    links names a listing."""
+    shapes: dict[str, dict[str, Any]] = {}
+    identity: dict[str, dict[str, Any]] = {}
+    for g in [*chosen, *(g for g in groups if action and g.get("pattern") == action)]:
+        shape = _shape_of(g.get("cards") or [])
+        if shape and g["pattern"] not in shapes:
+            shapes[g["pattern"]] = shape
+        identity.setdefault(g["pattern"], {
+            "varying_keys": list(g.get("varying_keys") or []),
+            "paths_unique": bool(g.get("paths_unique", True)),
+        })
+    return _Decided(page=page, patterns=tuple(g["pattern"] for g in chosen), action=action,
+                    shapes=shapes, identity=identity)
+
+
+def _as_before(groups: list[dict], decided: _Decided | None) -> list[dict]:
+    """`groups` with what an earlier page learned about their links' identity.
+
+    A query key that named the listing there still does here, and paths that
+    were shared there still are, however few links this page has to show it.
+    """
+    if decided is None:
+        return groups
+    out = []
+    for g in groups:
+        before = decided.identity.get(str(g.get("pattern") or ""))
+        if before:
+            keys = list(dict.fromkeys([*(g.get("varying_keys") or []), *before["varying_keys"]]))
+            g = {**g, "varying_keys": keys,
+                 "paths_unique": bool(g.get("paths_unique", True)) and before["paths_unique"]}
+        out.append(g)
+    return out
+
+
+def _shape_of(cards: list[dict]) -> dict[str, Any] | None:
+    """The shape most of these cards have (`card`), every shape they have
+    (`cards`, the commonest first), and the element most of the commonest sit
+    in (`container`).
+
+    None when no shape is on at least half the cards: then there is no one
+    tile to look for. The container is left out (None) the same way. Every
+    shape is kept, not only the commonest, because the listing a later page is
+    left with may be the odd one out ("new", "featured").
+    """
+    shapes = collections.Counter(str(c["shape"]) for c in cards if c.get("shape"))
+    if not shapes:
+        return None
+    card, count = shapes.most_common(1)[0]
+    if count * 2 < len(cards):
+        return None
+    homes = collections.Counter(str(c.get("container") or "") for c in cards
+                                if c.get("shape") == card)
+    home, most = homes.most_common(1)[0]
+    return {"card": card, "cards": [s for s, _ in shapes.most_common(_MAX_SHAPES)],
+            "container": home if home and most * 2 >= count else None}
 
 
 def _whole_list(picked: dict, candidates: list[dict], *,

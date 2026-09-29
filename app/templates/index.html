@@ -693,7 +693,7 @@
               </div>
             </button>
             <div class="acc-body">
-              <p class="lead-help">Sites other than BizBuySell are read fresh on every page: the TypeSafe Classifier (e.g. Jev) decides which links are the listings, what each field on a card holds, which statuses mean a business is gone, and how to reach the next page. When one of those keeps coming out wrong for a site, pin it here. Anything you leave out is still decided by the classifier.</p>
+              <p class="lead-help">Sites other than BizBuySell are read fresh by every sweep: the TypeSafe Classifier (e.g. Jev) decides which links are the listings and what each field on a card holds on the sweep's first page (and reuses that for its later pages), which statuses mean a business is gone, and how to reach the next page on every page. When one of those keeps coming out wrong for a site, pin it here. Anything you leave out is still decided by the classifier.</p>
               <ul class="lead-help">
                 <li><code>match</code> — the site: a host (<code>bizquest.com</code>) or a URL prefix. <code>www.</code> never matters; the longest match wins.</li>
                 <li><code>listing_links</code> — the link patterns that are the listings, as a run reports them, e.g. <code>www.bizquest.com/business-for-sale/{*}/{*}</code>.</li>
