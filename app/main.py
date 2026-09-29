@@ -176,7 +176,7 @@ async def lifespan(app: FastAPI):
     # Notion page (it asks nothing without a key).
     app.state.archive = ArchiveService(app.state.instances, settings_service, jobs,
                                        typesafe=app.state.typesafe)
-    # The classifier goes in so every sweep's legibility check can sample
+    # The classifier goes in so every sweep's legibility check can judge its
     # cards with it once a key is saved (it asks nothing without one), and for
     # triage. The archive goes in for triage too: a card REVIEW's detail page is
     # read through its gate and pooled identities, and filed with its append.

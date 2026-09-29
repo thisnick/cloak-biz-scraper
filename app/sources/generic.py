@@ -134,8 +134,12 @@ STATUS_QUESTION = (
     "{status} in the state means the business is no longer available: sold, pending, or under "
     "contract"
 )
+# Its second half is from the second live gate, where Empire Flippers' "Load
+# More Listings" scored 0.46–0.49 read literally as "goes to page N".
 NEXT_QUESTION = (
-    "{link} in the state goes to the next page (page {page}) of the same list as the current page."
+    "{link} in the state goes to the next page (page {page}) of the same list of businesses, or "
+    "loads more businesses into this list (for example a 'Load more' or 'Show more listings' "
+    "button)."
 )
 # How a candidate with no address of its own is described in the next-page
 # state: it can only be clicked.
@@ -605,7 +609,37 @@ JS_PROBE = r"""
   for (const g of groups) delete g._cards;
 
   // ── 4. next-page candidates ──
-  const PAGERISH = '[class*=pag i], [id*=pag i], [aria-label*=pag i], nav, [role=navigation], ul, ol';
+  // A pager is a nav, a list, or an element whose class, id or label says
+  // pagination — as a word, not a substring: WordPress puts "page-template"
+  // and "page-id-253146" on <body> and "#page" around everything, and a
+  // substring match made every control on QuietLight "in a pagination block".
+  // The walk stops below <body> for the same reason.
+  const PAGER_NAME = /pagina|pager|paging|pagenav|(^|[\s_-])pages([\s_-]|$)|page-?numbers?|page-?(item|link)s?([\s_-]|$)/i;
+  const PAGER_LABEL = /pagina|pager|paging|\bpages\b|page navigation|\bpage\s*\d/i;
+  const pagerBlock = (el) => {
+    for (let n = el; n && n !== document.body && n !== document.documentElement; n = n.parentElement) {
+      if (/^(NAV|UL|OL)$/.test(n.tagName) || n.getAttribute('role') === 'navigation') return n;
+      if (PAGER_NAME.test(typeof n.className === 'string' ? n.className : '') || PAGER_NAME.test(n.id || '')) return n;
+      if (PAGER_LABEL.test(n.getAttribute('aria-label') || '')) return n;
+    }
+    return null;
+  };
+  // A cookie or privacy banner's own buttons ("Show more", "Accept") are never
+  // the next page (QuietLight's CookieYes "Show more" was clicked as one).
+  // Known consent tools and the words they use, in an id, a class or a data-*
+  // attribute of the control or anything around it. `cmp` only as a whole
+  // word or a known tool's prefix: Adobe's components are all "cmp-…".
+  const CONSENT = /cookie|consent|gdpr|ccpa|onetrust|optanon|ot-sdk|didomi|osano|truste([^a-z]|$)|trustarc|iubenda|termly|usercentrics|cmplz|sp_message|(^|[^a-z])cky([^a-z]|$)|cc-(window|banner|revoke)|(^|[\s_-])cmp([\s_-]*$|\s)|cmpbox|qc-cmp/i;
+  const inConsent = (el) => {
+    for (let n = el; n && n !== document.body && n !== document.documentElement; n = n.parentElement) {
+      if (CONSENT.test(n.id || '') || CONSENT.test(typeof n.className === 'string' ? n.className : '')) return true;
+      for (const a of n.attributes) {
+        if (a.name.startsWith('data-') && (CONSENT.test(a.name) || (a.value.length <= 60 && CONSENT.test(a.value)))) return true;
+      }
+      if (/cookie|consent|privacy/i.test(n.getAttribute('aria-label') || '') && n.getAttribute('role') === 'dialog') return true;
+    }
+    return false;
+  };
   const NEXT = /^(next( page)?|next\s*[›»>→]|[›»>→]|>>|older( posts| entries)?|(load|show|view|see) more.*|more results)$/i;
   const selectorFor = (el) => {
     if (el.id && !/\d{3,}/.test(el.id)) return '#' + CSS.escape(el.id);
@@ -619,7 +653,8 @@ JS_PROBE = r"""
     const u = rawHref && !/^\s*(#|javascript:)/i.test(rawHref) ? resolve(rawHref) : null;
     const real = !!u && /^https?:$/.test(u.protocol) && !isHere(u);
     if (!real && (el.tagName === 'LINK' || !visible(el))) return;
-    const inPager = !!el.closest(PAGERISH);
+    if (el.tagName !== 'LINK' && inConsent(el)) return;
+    const inPager = !!pagerBlock(el);
     const key = real ? 'url:' + u.href : `script:${how}:${inPager}`;
     let cand = byKey.get(key);
     if (!cand) {
@@ -638,8 +673,11 @@ JS_PROBE = r"""
     if (!cand.appears_as.includes(note)) cand.appears_as.push(note);
   };
   // A carousel's own Next arrow and numbered dots (Empire Flippers'
-  // testimonials) turn the carousel, never the page.
-  const CAROUSEL = '[class*=carousel i], [class*=slick-slider], [class*=swiper], .glide, .splide, .flickity-enabled, [aria-roledescription=carousel i]';
+  // testimonials) turn the carousel, never the page; so does a photo
+  // lightbox's (FCBB's PhotoSwipe "Next (arrow right)" scored 0.80 against its
+  // pager's 0.82 on the saved page).
+  const CAROUSEL = '[class*=carousel i], [class*=slick-slider], [class*=swiper], .glide, .splide, .flickity-enabled, [aria-roledescription=carousel i], '
+    + '[class*=lightbox i], #lightbox, .pswp, [class*=fancybox], .lg-outer, .lg-container, .mfp-wrap, [class*=glightbox]';
   for (const l of document.querySelectorAll('link[rel~=next][href], a[rel~=next]')) add(l, 'rel=next');
   for (const el of document.querySelectorAll('a, button, [role=button], [role=link]')) {
     if (pager.length >= 30) break;
@@ -648,7 +686,7 @@ JS_PROBE = r"""
     const aria = clean(el.getAttribute('aria-label') || el.getAttribute('title'));
     if (t && NEXT.test(t)) add(el, `text '${t.slice(0, 40)}'`);
     else if (!t && aria && /\bnext\b|load more|show more/i.test(aria)) add(el, `label '${aria.slice(0, 40)}'`);
-    else if (t === nextNumber && el.closest(PAGERISH)) add(el, `text '${t}'`);
+    else if (t === nextNumber && pagerBlock(el)) add(el, `text '${t}'`);
     else if (!t && /(^|[\s_-])next([\s_-]|$)/i.test(typeof el.className === 'string' ? el.className : '')) add(el, `class '${el.className.slice(0, 60)}'`);
   }
 
@@ -699,7 +737,8 @@ class GenericSource:
     `decisions` has one JSON-safe dict per page read, saying what was decided
     and by whom ("override", "jev", or "probe" when there was nothing to ask):
     `page`, `url`; `listing_links` {by, patterns, confidence, model,
-    candidates}; `fields` [{key, labeled, role, by, confidence, used}];
+    candidates, and when they apply same_list, instead_of, left_out};
+    `fields` [{key, labeled, role, by, confidence, used}];
     `status` {by, unavailable, values} when the cards have a status field;
     `next_page` {by, rule (a URL, "click" or "none"), probability, candidates,
     appears_as, selector}; `cards`, `kept`, `dropped_unavailable`; and `blocked`
@@ -844,7 +883,18 @@ class GenericSource:
         if self.override and self.override.listing_links:
             wanted = self.override.listing_links
             chosen = [g for g in groups if g.get("pattern") in wanted and g.get("cards")]
+            replaced, left_out = None, 0
+            if len(chosen) == 1 and _looks_like_action(chosen[0]):
+                # One action pattern pinned is read as when the classifier
+                # picks it: through the detail links inside its cards. Never
+                # widened to more of the list — that is what pinning is for.
+                chosen, _, replaced, left_out = _whole_list(chosen[0], _candidates(groups),
+                                                            widen=False)
             record["listing_links"] = {"by": "override", "patterns": [g["pattern"] for g in chosen]}
+            if replaced:
+                record["listing_links"]["instead_of"] = replaced
+            if left_out:
+                record["listing_links"]["left_out"] = left_out
             if not chosen:
                 on_page = [g.get("pattern") for g in _candidates(groups)]
                 record["listing_links"]["error"] = (
@@ -871,7 +921,8 @@ class GenericSource:
             state, {"listing_group": {"type": "choice", "instructions": GROUP_QUESTION,
                                       "criteria": criteria}}), "listing_group")
         picked = options.get(answer.choice)
-        chosen, same, replaced = _whole_list(picked, candidates) if picked else ([], [], None)
+        chosen, same, replaced, left_out = (_whole_list(picked, candidates) if picked
+                                            else ([], [], None, 0))
         record["listing_links"] = {
             "by": "jev", "patterns": [g["pattern"] for g in chosen],
             "confidence": round(answer.confidence, 3), "model": answer.model,
@@ -881,6 +932,8 @@ class GenericSource:
             record["listing_links"]["same_list"] = same
         if replaced:
             record["listing_links"]["instead_of"] = replaced
+        if left_out:
+            record["listing_links"]["left_out"] = left_out
         return chosen
 
     async def _decide_fields(self, cards: list[_Card], title: str,
@@ -1069,9 +1122,15 @@ class GenericSource:
         first = next((d for d in self.decisions if d.get("listing_links")), None)
         if first is None:
             return out
-        patterns = first["listing_links"].get("patterns") or []
+        links = first["listing_links"]
+        patterns = list(links.get("patterns") or [])
+        # Detail links read only inside an action group's cards are pinned as
+        # that action pattern, which is read the same way (`_whole_list`):
+        # the detail pattern pinned would bring back the menu links of its shape.
+        if links.get("left_out") and links.get("instead_of"):
+            patterns = [links["instead_of"]]
         if patterns:
-            out["listing_links"] = list(patterns)
+            out["listing_links"] = patterns
         fields = {f["key"]: (f["role"] if f.get("by") == "override" or f.get("used") else "ignore")
                   for f in first.get("fields") or []}
         if fields:
@@ -1146,7 +1205,8 @@ def _candidates(groups: list[dict]) -> list[dict]:
     return usable[:MAX_CANDIDATES]
 
 
-def _whole_list(picked: dict, candidates: list[dict]) -> tuple[list[dict], list[str], str | None]:
+def _whole_list(picked: dict, candidates: list[dict], *,
+                widen: bool = True) -> tuple[list[dict], list[str], str | None, int]:
     """The chosen group and the rest of its list, read through detail links.
 
     The classifier picks one group, but a list is not always one group:
@@ -1156,24 +1216,33 @@ def _whole_list(picked: dict, candidates: list[dict]) -> tuple[list[dict], list[
       A candidate whose cards are the same tile (`card_shape`), in the same
       element, with the same fields, is the rest of the list, and is read with
       it — decided here, without asking again.
-    * **An action link** ("Watch", "Unlock Listing") on every card is a group of
-      its own, and can be the one picked (Flippa's `watch_item?…`, whose every
-      "title" was "Watch"). When another group links the same cards, those
-      links are the listings' addresses and titles; the action group only
-      adds what they do not cover.
+    * **An action link** ("Watch", "Unlock Listing", "Contact seller") on every
+      card is a group of its own, and can be the one picked (Flippa's
+      `watch_item?…`, whose every "title" was "Watch"). When another group
+      links the same cards, those links are the listings' addresses and
+      titles; the action group only adds what they do not cover. Only the
+      detail links *inside* the action group's cards are read, one per card
+      (`_inside`): the rest of that group is whatever else on the site has the
+      same URL shape — BusinessesForSale's `/us/{*}` is its listings and also
+      "Sell Your Business", "Login" and "FAQs" in its menu.
+
+    `widen=False` skips the first (a pinned pattern is the whole list).
 
     Returns (groups to read, patterns read as the same list, the picked pattern
-    when it was an action link replaced by the detail links).
+    when it was an action link replaced by the detail links, and how many
+    detail links were left out for being outside the action group's cards).
     """
-    same = [g for g in candidates if g is not picked and _one_list(picked, g)]
+    same = [g for g in candidates if widen and g is not picked and _one_list(picked, g)]
     groups = [picked, *same]
-    if _looks_like_action(picked) and not any(
-            _covers(g, picked) >= 0.5 for g in groups if not _looks_like_action(g)):
-        partner = next((g for g in candidates
-                        if g not in groups and not _looks_like_action(g)
-                        and _covers(g, picked) >= 0.5), None)
-        if partner is not None:
-            groups.append(partner)
+    left_out = 0
+    if _looks_like_action(picked):
+        if not any(_covers(g, picked) >= 0.5 for g in groups if not _looks_like_action(g)):
+            partner = next((g for g in candidates
+                            if g not in groups and not _looks_like_action(g)
+                            and _covers(g, picked) >= 0.5), None)
+            if partner is not None:
+                groups.append(partner)
+        groups, left_out = _bounded(groups)
     details = [g for g in groups if not _looks_like_action(g)]
     kept = []
     for g in groups:
@@ -1181,8 +1250,52 @@ def _whole_list(picked: dict, candidates: list[dict]) -> tuple[list[dict], list[
         if _looks_like_action(g) and details and _covers_all(details, g):
             continue
         kept.append(g)
-    replaced = picked["pattern"] if picked not in kept else None
-    return kept, [g["pattern"] for g in kept[1:] if g in same], replaced
+    patterns = [g["pattern"] for g in kept]
+    same_patterns = {g["pattern"] for g in same}
+    replaced = picked["pattern"] if picked["pattern"] not in patterns else None
+    return kept, [p for p in patterns[1:] if p in same_patterns], replaced, left_out
+
+
+def _bounded(groups: list[dict]) -> tuple[list[dict], int]:
+    """Each detail group cut down to its links inside the action groups' cards.
+
+    Returns the groups (a detail group with nothing left inside is dropped) and
+    how many detail cards were left out. Without an action group, or without a
+    detail group, the groups are returned as they are.
+    """
+    actions = [g for g in groups if _looks_like_action(g)]
+    if not actions or len(actions) == len(groups):
+        return groups, 0
+    out: list[dict] = []
+    left_out = 0
+    for g in groups:
+        if not _looks_like_action(g):
+            inside = _inside(g, actions)
+            left_out += len(g.get("cards") or []) - len(inside["cards"])
+            g = inside
+        if g.get("cards"):
+            out.append(g)
+    return out, left_out
+
+
+def _inside(group: dict, actions: list[dict]) -> dict:
+    """`group` with only its cards inside the action groups' cards, one per card.
+
+    A detail card is inside an action card when it is the same element, links
+    to the action link, or is linked from it (`_linked`). The first such detail
+    card (page order) is the one an action card is read through; another
+    detail link in the same action card is not a second listing.
+    """
+    owners = [_index_of([card]) for a in actions for card in a.get("cards") or []]
+    taken: set[int] = set()
+    cards = []
+    for card in group.get("cards") or []:
+        hits = {i for i, owner in enumerate(owners) if _linked(card, *owner)}
+        if not hits or hits <= taken:
+            continue
+        taken |= hits
+        cards.append(card)
+    return {**group, "cards": cards, "links": len(cards)}
 
 
 def _one_list(group: dict, other: dict) -> bool:
@@ -1245,16 +1358,20 @@ def _linked(card: dict, ids: set[str], hrefs: set[str], links: set[str]) -> bool
 
 
 def _index(groups: list[dict]) -> tuple[set[str], set[str], set[str]]:
+    return _index_of([c for g in groups for c in g.get("cards") or []])
+
+
+def _index_of(cards: list[dict]) -> tuple[set[str], set[str], set[str]]:
+    """(card ids, card links, every link inside the cards) — what `_linked` matches."""
     ids: set[str] = set()
     hrefs: set[str] = set()
     links: set[str] = set()
-    for g in groups:
-        for c in g.get("cards") or []:
-            if c.get("card"):
-                ids.add(c["card"])
-            if c.get("href"):
-                hrefs.add(c["href"])
-            links.update(c.get("hrefs") or [])
+    for c in cards:
+        if c.get("card"):
+            ids.add(c["card"])
+        if c.get("href"):
+            hrefs.add(c["href"])
+        links.update(c.get("hrefs") or [])
     return ids, hrefs, links
 
 

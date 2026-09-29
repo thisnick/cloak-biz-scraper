@@ -10,8 +10,8 @@ ONE request per page, not one per field or per link.
 
 The last classes need a Playwright chromium: they run the real `JS_PROBE` on
 listing pages saved on 2026-09-28 (tests/fixtures/generic; the Empire Flippers,
-Flippa, BusinessBroker.net and Sunbelt pages and the QuietLight detail page
-were saved through the cloaked browser after scrolling to the bottom), with the
+Flippa, BusinessBroker.net, Sunbelt, BusinessesForSale and QuietLight pages were
+saved through the cloaked browser after scrolling to the bottom), with the
 network blocked, and pin what the probe finds on markup it has never been tuned
 to — the whole point of the source.
 """
@@ -474,6 +474,51 @@ class TestActionLinks:
         assert source.suggested_override()["listing_links"] == [PATTERN]
 
     @pytest.mark.asyncio
+    async def test_only_the_detail_links_inside_the_action_cards_are_read(self):
+        """BusinessesForSale: the classifier picked the "Contact seller" links,
+        and the listings' own shape, /us/{*}, is also the site's menu — "Sell
+        Your Business", "Login" and "FAQs" were read as 12 more listings."""
+        contact = []
+        for n in range(1, 5):
+            card = _card(n, path="/us/biz-{n}/contact", link_text="Contact seller", heading="",
+                         card_id=f"g1c{n}")
+            card["hrefs"] = [f"{SITE}/us/biz-{n}.aspx", card["href"]]
+            if n == 2:  # a second detail link in the same tile is not a second listing
+                card["hrefs"].append(f"{SITE}/us/biz-2-photos")
+            contact.append(card)
+        menu = [_card(i, path=f"/us/{slug}", link_text=title, heading="", labeled={}, slots={},
+                      card_id=f"g0m{i}")
+                for i, (slug, title) in enumerate([("sell-your-business", "Sell Your Business"),
+                                                   ("login", "Login"), ("faq", "FAQs")])]
+        tiles = [_card(n, path="/us/biz-{n}.aspx", card_id=f"g1c{n}") for n in range(1, 5)]
+        photos = _card(2, path="/us/biz-2-photos", link_text="12 photos", card_id="g0p2")
+        detail = _group("brokers.example/us/{*}", [*menu[:2], *tiles[:2], photos, *tiles[2:],
+                                                    menu[2]])
+        contacts = "brokers.example/us/{*}/contact"
+        probe = _probe([detail, _group(contacts, contact)])
+        result, source, _, _ = await _read(probe, FakeJev(group="us/{*}/contact;", fields={}))
+
+        assert [l.url for l in result.listings] == [f"{SITE}/us/biz-{n}.aspx" for n in range(1, 5)]
+        assert [l.title for l in result.listings] == [f"Business {n}" for n in range(1, 5)]
+        links = source.decisions[0]["listing_links"]
+        assert links["patterns"] == ["brokers.example/us/{*}"]
+        assert (links["instead_of"], links["left_out"]) == (contacts, 4)
+        # Pinned, the detail pattern would bring the menu back: the suggestion
+        # pins the action pattern, which is read the same way — pasted back,
+        # the same four listings, without asking.
+        suggested = source.suggested_override()["listing_links"]
+        assert suggested == [contacts]
+        again = FakeJev(fields={})
+        pinned = SiteOverride(match="brokers.example", listing_links=suggested)
+        result, source, _, _ = await _read(probe, again, pinned)
+        assert [l.url for l in result.listings] == [f"{SITE}/us/biz-{n}.aspx" for n in range(1, 5)]
+        assert "group" not in again.kinds()
+        assert source.decisions[0]["listing_links"] == {
+            "by": "override", "patterns": ["brokers.example/us/{*}"], "instead_of": contacts,
+            "left_out": 4}
+        assert source.suggested_override()["listing_links"] == [contacts]
+
+    @pytest.mark.asyncio
     async def test_a_tile_with_only_an_action_link_is_still_read(self):
         watch = _group(WATCH, _watch_cards(range(1, 5), same_tiles=False))
         detail = _group(PATTERN, [_card(n, card_id=f"g1c{n}") for n in range(1, 4)])
@@ -840,10 +885,13 @@ class TestNextPage:
                 "link_2": {"url": f"{SITE}/about", "appears_as": ["text 'Next'"]},
             },
         }
+        # A load-more control is a next page too: read literally, "goes to page
+        # 2" left Empire Flippers' "Load More Listings" just under one half.
         assert questions["link_1"] == {
             "type": "noul",
             "instructions": ("link_1 in the state goes to the next page (page 2) of the same "
-                             "list as the current page."),
+                             "list of businesses, or loads more businesses into this list (for "
+                             "example a 'Load more' or 'Show more listings' button)."),
         }
         assert source.decisions[0]["next_page"] == {"by": "jev", "rule": NEXT_URL,
                                                     "probability": 0.97, "candidates": 2}
@@ -852,8 +900,8 @@ class TestNextPage:
         # Page 2 asks for page 3.
         await source.cards(page)
         assert page.probe_args[1]["next_number"] == 3
-        assert jev.of("next")[1][1]["link_1"]["instructions"].endswith(
-            "next page (page 3) of the same list as the current page.")
+        assert "next page (page 3) of the same list" in jev.of("next")[1][1]["link_1"][
+            "instructions"]
 
     @pytest.mark.asyncio
     async def test_a_script_only_control_is_clicked_by_its_mark(self):
@@ -1358,7 +1406,7 @@ class TestProbeOnSavedPages:
     async def test_a_list_takes_in_no_other_group(self, name):
         candidates = generic._candidates((await _probe_of(name))["groups"])
         top = candidates[0]
-        assert generic._whole_list(top, candidates) == ([top], [], None)
+        assert generic._whole_list(top, candidates) == ([top], [], None, 0)
 
     @pytest.mark.parametrize("name, ads", [
         ("bizquest_list", "www.bizquest.com/{*}?q"),
@@ -1380,6 +1428,60 @@ class TestProbeOnSavedPages:
         seen = [a for c in probe["pager"] for a in c["appears_as"]]
         assert any("Load More Listings" in a for a in seen)
         assert not any("'Next'" in a or "'2'" in a for a in seen)
+
+    @pytest.mark.asyncio
+    async def test_a_photo_lightbox_is_not_a_pager(self):
+        """FCBB's PhotoSwipe "Next (arrow right)" scored 0.80 against its pager's 0.82."""
+        probe = await _probe_of("fcbb_list")
+        assert [c["appears_as"] for c in probe["pager"]] == [
+            ["text '2' (in a pagination block)"], ["text '»' (in a pagination block)"]]
+
+    @pytest.mark.parametrize("name", ["quietlight_list", "quietlight_detail",
+                                      "businessesforsale_list"])
+    @pytest.mark.asyncio
+    async def test_a_cookie_banner_is_not_a_pager(self, name):
+        """CookieYes' "Show more" (button.cky-show-desc-btn) was clicked as
+        QuietLight's next page in the second live gate."""
+        probe = await _probe_of(name)
+        seen = [a for c in probe["pager"] for a in c["appears_as"]]
+        assert not any("Show more" in a for a in seen)
+        assert not any("cky" in (c["selector"] or "") for c in probe["pager"])
+
+    @pytest.mark.asyncio
+    async def test_a_wordpress_body_is_not_a_pagination_block(self):
+        """<body class="page-template …"> matched a "pag" substring, so every
+        control on QuietLight was reported as inside a pager. It has none: all
+        its listings are on one page, and its one candidate is an FAQ's."""
+        probe = await _probe_of("quietlight_list")
+        assert [c["appears_as"] for c in probe["pager"]] == [
+            ["text 'See more questions & answers'"]]
+
+    @pytest.mark.asyncio
+    async def test_consent_tools_are_passed_over_and_pagers_are_named_by_words(self):
+        tiles = "".join(f'<div class="tile"><h3><a href="/listing/biz-{n}">Business {n}</a>'
+                        f'</h3></div>' for n in range(1, 4))
+        html = (
+            '<html><head><base href="https://brokers.example/list/"></head>'
+            '<body class="page page-template-default"><div id="page"><main>' + tiles
+            # Adobe's components are all "cmp-…", and "trusted" is not TrustArc.
+            + '<div class="trusted-sellers cmp-container">'
+              '<a class="more" href="/list/?page=2">Load more</a></div>'
+            # A "2" in no pager is not a page number, #page and body.page or not
+            # — unless it says so itself.
+            + '<p><a href="/list/?page=3">2</a></p>'
+              '<p><a aria-label="Go to page 2" href="/list/?p=2">2</a></p></main></div>'
+            '<div id="onetrust-banner-sdk"><button>Show more</button></div>'
+            '<div class="cky-consent-container"><button class="cky-show-desc-btn">Show more'
+            '</button></div>'
+            '<div class="cc-window"><a href="/cookie-policy/2">Next</a></div>'
+            '<div class="qc-cmp2-ui"><button>View more</button></div>'
+            '<div role="dialog" aria-label="Cookie consent"><button>Load more</button></div>'
+            '<div data-testid="cookie-banner"><a href="/privacy?p=2">Next page</a></div>'
+            '</body></html>')
+        probe = await _probe_of("inline", html=html)
+        assert [(c["url"], c["appears_as"]) for c in probe["pager"]] == [
+            ("https://brokers.example/list/?page=2", ["text 'Load more'"]),
+            ("https://brokers.example/list/?p=2", ["text '2' (in a pagination block)"])]
 
     @pytest.mark.asyncio
     async def test_a_query_string_identity_is_reported_as_varying(self):
@@ -1559,6 +1661,48 @@ class TestGenericSourceOnSavedPages:
         assert all(re.match(r"https://flippa\.com/\d{8}-", l.url) for l in result.listings)
         assert all(l.title and l.title != "Watch" for l in result.listings)
         assert source.decisions[0]["listing_links"]["patterns"] == ["flippa.com/{id}"]
+
+    @pytest.mark.asyncio
+    async def test_businessesforsale_reads_its_listings_not_its_menu(self):
+        """The classifier picked the cards' "Contact seller" links (/us/{*}/contact);
+        the listings' own links, /us/{*}, are also the site's menu and footer."""
+        jev = FakeJev(group="com/us/{*}/contact;", fields={})
+        result, source = await self._cards("businessesforsale_list", jev)
+        titles = [l.title for l in result.listings]
+        assert 16 <= len(titles) <= 19
+        assert "Established San Diego Property Management Book Of Business" in titles
+        assert "Popular Korean Soft Tofu Restaurant in Rancho Cucamonga" in titles
+        assert not set(titles) & {"Sell Your Business", "Login", "FAQs", "Register as a Buyer",
+                                  "Email Alerts", "Contact Us", ""}
+        assert all(re.fullmatch(r"https://us\.businessesforsale\.com/us/[a-z0-9-]+\.aspx", l.url)
+                   for l in result.listings)
+        links = source.decisions[0]["listing_links"]
+        assert links["patterns"] == ["us.businessesforsale.com/us/{*}"]
+        assert links["instead_of"] == "us.businessesforsale.com/us/{*}/contact"
+        assert links["left_out"] == 12
+        # Its only next-page candidate is its pager: the cookie banner's
+        # "Show more" is not offered.
+        [(state, _)] = jev.of("next")
+        assert [link["url"] for link in state["links"].values()] == [
+            "https://us.businessesforsale.com/us/search/businesses-for-sale-in-california-2"]
+        # The suggestion pins the contact links, read the same way when pasted.
+        suggested = source.suggested_override()["listing_links"]
+        assert suggested == ["us.businessesforsale.com/us/{*}/contact"]
+        pinned = GenericSource(_captured_url("businessesforsale_list"), FakeJev(fields={}),
+                               SiteOverride(match="us.businessesforsale.com",
+                                            listing_links=suggested))
+        again = await _with_fixture("businessesforsale_list", pinned.cards)
+        assert [l.title for l in again.listings] == titles
+
+    @pytest.mark.asyncio
+    async def test_quietlight_is_one_page_of_listings(self):
+        jev = FakeJev(group="quietlight.com/listings/", fields={})
+        result, source = await self._cards("quietlight_list", jev)
+        assert len(result.listings) == 85
+        [(state, _)] = jev.of("next")
+        assert [link["appears_as"] for link in state["links"].values()] == [
+            ["text 'See more questions & answers'"]]
+        assert source.decisions[0]["next_page"]["rule"] == "none"
 
     @pytest.mark.asyncio
     async def test_sunbelt_is_one_list_with_two_link_shapes(self):

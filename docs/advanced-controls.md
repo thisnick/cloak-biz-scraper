@@ -99,9 +99,10 @@ those questions and nothing else.
 With a key saved:
 
 - `scrape_listings` accepts any site's listings page, alongside BizBuySell URLs.
-- Every sweep page, BizBuySell included, also gets a quick check that its cards read as
-  business listings. A page that fails it (or a page with no list on it at all) fails that
-  source with screenshots, instead of filing garbage or reporting "no listings".
+- Every sweep page, BizBuySell included, also gets a check that its cards read as business
+  listings. A card that doesn't (a menu link, an ad) is left out; a page where fewer than half
+  do (or a page with no list on it at all) fails that source with screenshots, instead of
+  filing garbage or reporting "no listings".
 - A synced sweep can triage the rows it saves: pass your criteria as `triage_prompt` (see
   [Triage prompt](#triage-prompt)).
 
@@ -200,7 +201,7 @@ for no overrides.
 | Key | What it pins |
 |---|---|
 | `match` | The site: a host (`bizquest.com`, any page on it) or a URL prefix (`https://www.bizquest.com/businesses-for-sale-in-`). `www.` and http/https never matter; the longest match wins; `fcbb.com` does not cover `sfbay.fcbb.com`. Required. |
-| `listing_links` | The link patterns that are the listings, exactly as a run reports them, e.g. `www.bizquest.com/business-for-sale/{*}/{*}` (`{*}` is any one path segment). Several patterns are read as one list. |
+| `listing_links` | The link patterns that are the listings, exactly as a run reports them, e.g. `www.bizquest.com/business-for-sale/{*}/{*}` (`{*}` is any one path segment). Several patterns are read as one list. A single pattern of links that act on each card (`…/{*}/contact`, "Watch", "Unlock") is read through the listing links inside those cards. |
 | `fields` | A card field — its label, or the slot key a run reports for an unlabelled one — mapped to what it holds, or to `ignore`. |
 | `next_page` | How to reach the next page: see below. |
 | `drop_status` | Status texts that mean a listing is gone, matched as case-insensitive substrings, e.g. `["sold", "under contract"]`. An empty list drops nothing. |
@@ -224,7 +225,8 @@ sweep of the site. Each generically read URL in `decisions` has:
 - `pages` — what was decided on each page and by whom (`jev` or `override`): the chosen
   `listing_links` pattern with its confidence, each field's role and whether it was
   confident enough to use, the `next_page` rule, and how many cards were dropped as sold.
-- `legibility` — whether each page's cards read as business listings.
+- `legibility` — whether each page's cards read as business listings, and which cards were
+  left out as not listings.
 - `suggested_override` — a ready-to-paste override that pins what was decided on page 1.
 
 Paste the `suggested_override` into the list, change the part that was wrong, delete the

@@ -18,12 +18,17 @@ Two layers, both conservative:
   a digit mostly do not read as an amount, the "price" is some other text.
   Only the asking price is judged: revenue and cash flow are legitimately
   ranges on some sites ("$250K - $500K"), which is not a sign of anything.
-* **The TypeSafe Classifier (e.g. Jev)**, when a key is saved: a yes/no on a
-  few sampled cards. It catches what the code cannot see — well-formed cards
-  that are blog posts, franchise ads, or a site's own navigation. The sample
-  goes in ONE request — every card in one state, one question per card —
-  because the classifier reads the state once and answers every question in
-  it; a request per card would pay for the reading three times.
+* **The TypeSafe Classifier (e.g. Jev)**, when a key is saved: a yes/no on
+  every card that passed the code checks. It catches what the code cannot see —
+  well-formed cards that are blog posts, franchise ads, or a site's own
+  navigation. A card it judges not to be a listing is dropped, and only a page
+  where fewer than half pass fails: two menu links at the ends of a list are
+  two cards to leave out, not a reason to throw away the seventeen listings
+  between them (BusinessesForSale, second live gate, where a sample of three
+  failed the page). The cards go in ONE request — every card in one state, one
+  question per card — because the classifier reads the state once and answers
+  every question in it; a request per card would pay for that reading again
+  and again.
 
 The classifier half is best-effort here. BizBuySell pages do not depend on it,
 so a classifier outage must not fail them: the error is logged and recorded on
@@ -46,23 +51,30 @@ from .typesafe import Noul, TypeSafeError
 
 logger = logging.getLogger("cloakbiz.legibility")
 
-# The statement put to the classifier about each sampled card, by its key in
-# the state ("card_1", "card_2", …).
-QUESTION = "{card} in the state is a legible listing of a business for sale."
+# The statement put to the classifier about each card, by its key in the state
+# ("card_1", "card_2", …).
+QUESTION = "{card} in the state is a listing of a business for sale."
 
 # At least this share of cards must have both a title and a link.
 MIN_COMPLETE = 0.7
 # At least this share of digit-bearing asking prices must read as an amount.
 MIN_PRICES_READ = 0.5
-# The page fails when the classifier's mean over the sample is below this.
-MIN_CLASSIFIER_MEAN = 0.5
-# Cards asked about per page. Three spread across the page are enough to tell a
-# list of listings from a list of something else; the rest would only add cost.
-SAMPLE_SIZE = 3
-# Enough of a card's excerpt to recognise it; a card is not a detail page.
-_EXCERPT_CHARS = 1500
+# A card the classifier gives less than this is not a listing, and is dropped.
+MIN_CARD = 0.5
+# The page fails when fewer than this share of the cards asked about pass.
+MIN_PASSING = 0.5
+# Cards asked about per page, all in one request. A longer page has its first
+# and last MAX_CARDS / 2 asked about — cards that are not listings come from
+# the menu above the list and the footer below it — and the ones between kept
+# on the strength of the code checks.
+MAX_CARDS = 40
+# Enough of a card's excerpt to recognise it: forty of them share one request.
+_EXCERPT_CHARS = 300
 # How much of an unreadable price to quote in the failure message.
 _QUOTE_CHARS = 40
+# Dropped cards named in the record, for someone checking the classifier's call.
+_REJECTS_SHOWN = 10
+_REJECT_TITLE_CHARS = 80
 
 _DIGIT = re.compile(r"\d")
 # A currency before an amount: a code ("USD", "CAD"), a sign ("$", "€", "£"),
@@ -76,20 +88,28 @@ _CURRENCY = re.compile(
 class Verdict:
     """What the check decided about one page.
 
-    `listings` are the cards that survive (those with a title and a link) — the
-    only ones the sweep keeps. `reason` is set when `ok` is False and is written
-    for the person reading the job's error: what was wrong, on which page, and
-    that nothing from it was kept.
+    `listings` are the cards that survive — those with a title and a link, less
+    any the classifier judged not to be listings — and the only ones the sweep
+    keeps. `reason` is set when `ok` is False and is written for the person
+    reading the job's error: what was wrong, on which page, and that nothing
+    from it was kept.
     """
 
     listings: list[Listing]
     ok: bool = True
     reason: str = ""
+    # Cards the code checks dropped (no title or no link).
     dropped: int = 0
-    # The classifier's mean over the sample; None when it was not asked (no key)
-    # or could not answer.
+    # Cards the classifier was asked about, and how many of those it judged
+    # not to be listings (dropped, or the page failed); 0 when it was not
+    # asked (no key) or could not answer.
+    classifier_asked: int = 0
+    classifier_dropped: int = 0
+    # The classifier's mean over the cards it was asked about; None when it
+    # was not asked or could not answer.
     classifier_mean: float | None = None
-    classifier_samples: int = 0
+    # The cards it judged not to be listings, as (title, probability), page order.
+    classifier_rejected: tuple[tuple[str, float], ...] = ()
     # Why the classifier half was skipped, when it was asked and failed.
     classifier_error: str = ""
 
@@ -99,9 +119,16 @@ class Verdict:
                                "dropped": self.dropped}
         if self.reason:
             out["reason"] = self.reason
-        if self.classifier_mean is not None:
-            out["classifier_mean"] = round(self.classifier_mean, 3)
-            out["classifier_samples"] = self.classifier_samples
+        if self.classifier_asked:
+            out["classifier_asked"] = self.classifier_asked
+            out["classifier_dropped"] = self.classifier_dropped
+            if self.classifier_mean is not None:
+                out["classifier_mean"] = round(self.classifier_mean, 3)
+            if self.classifier_rejected:
+                out["classifier_rejected"] = [
+                    {"title": title[:_REJECT_TITLE_CHARS], "p": round(p, 3)}
+                    for title, p in self.classifier_rejected[:_REJECTS_SHOWN]
+                ]
         if self.classifier_error:
             out["classifier_error"] = self.classifier_error
         return out
@@ -147,9 +174,9 @@ async def check(listings: list[Listing], *, page: int, classifier=None) -> Verdi
     if classifier is None:
         return Verdict(listings=complete, dropped=dropped)
 
-    sample = _sample(complete)
-    names = [f"card_{i}" for i in range(1, len(sample) + 1)]
-    state = {"cards": {name: _state(card) for name, card in zip(names, sample)}}
+    asked = _asked(len(complete))
+    names = [f"card_{i}" for i in range(1, len(asked) + 1)]
+    state = {"cards": {name: _state(complete[i]) for name, i in zip(names, asked)}}
     questions = {name: {"type": "noul", "instructions": QUESTION.format(card=name)}
                  for name in names}
     try:
@@ -167,19 +194,27 @@ async def check(listings: list[Listing], *, page: int, classifier=None) -> Verdi
         logger.warning("legibility: classifier skipped on page %d: %s", page, exc)
         return Verdict(listings=complete, dropped=dropped, classifier_error=str(exc))
 
-    mean = sum(answers) / len(answers)
-    if mean < MIN_CLASSIFIER_MEAN:
+    low = {i: p for i, p in zip(asked, answers) if p < MIN_CARD}
+    passing = len(asked) - len(low)
+    judged = {
+        "classifier_asked": len(asked),
+        "classifier_dropped": len(low),
+        "classifier_mean": sum(answers) / len(answers),
+        "classifier_rejected": tuple((complete[i].title.strip(), p) for i, p in low.items()),
+    }
+    if passing < MIN_PASSING * len(asked):
         return Verdict(
-            listings=[], ok=False, dropped=dropped,
-            classifier_mean=mean, classifier_samples=len(answers),
+            listings=[], ok=False, dropped=dropped, **judged,
             reason=(
-                f"The cards on page {page} don't read as business listings (mean "
-                f"{mean:.2f} on {len(answers)} sample{'s' if len(answers) != 1 else ''}) — "
-                f"nothing from this page was kept."
+                f"Only {passing} of {len(asked)} cards on page {page} read as business "
+                f"listings (at least half should) — nothing from this page was kept."
             ),
         )
-    return Verdict(listings=complete, dropped=dropped,
-                   classifier_mean=mean, classifier_samples=len(answers))
+    if low:
+        logger.info("legibility: page %d: %d of %d cards dropped as not listings",
+                    page, len(low), len(asked))
+    kept = [c for i, c in enumerate(complete) if i not in low]
+    return Verdict(listings=kept, dropped=dropped, **judged)
 
 
 def _reads_as_amount(value: str) -> bool:
@@ -198,18 +233,17 @@ def _reads_as_amount(value: str) -> bool:
     return parse_money(amount) is not None or parse_money(amount.split("+", 1)[0]) is not None
 
 
-def _sample(cards: list[Listing]) -> list[Listing]:
-    """Up to SAMPLE_SIZE cards, spread from the first to the last.
+def _asked(n: int) -> list[int]:
+    """The positions of the cards asked about: all of them, up to MAX_CARDS.
 
-    Spread rather than the first few, because a page's top cards are the ones
-    most likely to be something else (a featured ad, a promoted broker); and
-    fixed rather than random, so the same page gets the same verdict twice.
+    On a longer page, the first and the last MAX_CARDS / 2 — the ends are where
+    a menu or a footer read as cards would be — and in page order, so the same
+    page gets the same verdict twice.
     """
-    n = len(cards)
-    if n <= SAMPLE_SIZE:
-        return list(cards)
-    picks = sorted({round(i * (n - 1) / (SAMPLE_SIZE - 1)) for i in range(SAMPLE_SIZE)})
-    return [cards[i] for i in picks]
+    if n <= MAX_CARDS:
+        return list(range(n))
+    head = MAX_CARDS // 2
+    return list(range(head)) + list(range(n - (MAX_CARDS - head), n))
 
 
 def _state(card: Listing) -> dict[str, str]:

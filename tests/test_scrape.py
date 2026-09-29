@@ -1180,9 +1180,9 @@ class TestPageFailures:
         settings.update(typesafe_openrouter_api_key="sk-or-test")
         res, _, _ = await _once(svc, _job(jobs, max_pages=1), _PlainSource(
             [CardPage([_gen(1), _gen(2)])]), tmp_path)
-        assert fake.calls == 1, "one request for the page's sample"
+        assert fake.calls == 1, "one request for the page's cards"
         assert res["retry"] is False
-        assert "don't read as business listings" in res["error"]
+        assert "Only 0 of 2 cards on page 1 read as business listings" in res["error"]
         assert (tmp_path / "ev" / "page-01-illegible").is_dir()
 
     @pytest.mark.asyncio

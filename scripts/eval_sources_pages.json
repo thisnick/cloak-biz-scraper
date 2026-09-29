@@ -129,7 +129,7 @@
     "synergybb.com/listings/"
    ],
    "min_cards": 15,
-   "next": "click"
+   "next": "none"
   },
   {
    "name": "FEInternational (landing page)",
@@ -150,7 +150,7 @@
     "flippa.com/"
    ],
    "min_cards": 4,
-   "next": "none"
+   "next": "url:page=2"
   },
   {
    "name": "WebsiteClosers listing (detail page)",

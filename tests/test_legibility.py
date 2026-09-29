@@ -41,7 +41,8 @@ def _card(i: int, **fields) -> Listing:
 
 class FakeClassifier:
     """Answers every question in one `ask` from a list of probabilities (one per
-    question, in order), or raises `error`. `calls` is one entry per request."""
+    question, in order; 0.95 past its end), or raises `error`. `calls` is one
+    entry per request."""
 
     def __init__(self, answers=None, error: Exception | None = None):
         self._answers = list(answers or [])
@@ -52,7 +53,7 @@ class FakeClassifier:
         self.calls.append((state, questions))
         if self._error is not None:
             raise self._error
-        return {name: Noul(probability=self._answers[i] if self._answers else 0.95)
+        return {name: Noul(probability=self._answers[i] if i < len(self._answers) else 0.95)
                 for i, name in enumerate(questions)}
 
 
@@ -153,58 +154,96 @@ class TestClassifier:
     async def test_without_a_classifier_nothing_is_asked(self):
         verdict = await legibility.check([_card(i) for i in range(5)], page=1)
         assert verdict.ok
-        assert verdict.classifier_mean is None
-        assert "classifier_mean" not in verdict.record(1)
+        assert verdict.classifier_mean is None and verdict.classifier_asked == 0
+        assert not {"classifier_asked", "classifier_dropped", "classifier_mean"} & set(
+            verdict.record(1))
 
     @pytest.mark.asyncio
-    async def test_three_cards_spread_across_the_page_go_in_one_request(self):
-        """One state holding the sample, one yes/no per card: the classifier
+    async def test_every_card_goes_in_one_request(self):
+        """One state holding every card, one yes/no per card: the classifier
         reads the state once and answers every question in it."""
-        cards = [_card(i) for i in range(10)]
+        cards = [_card(i, excerpt="An established business. " * 40) for i in range(10)]
         fake = FakeClassifier([0.9, 0.8, 0.95])
         verdict = await legibility.check(cards, page=1, classifier=fake)
 
-        assert verdict.ok
-        assert len(fake.calls) == 1, "one request for the whole sample"
-        assert verdict.classifier_samples == 3
-        assert verdict.classifier_mean == pytest.approx((0.9 + 0.8 + 0.95) / 3)
+        assert verdict.ok and verdict.listings == cards
+        assert len(fake.calls) == 1, "one request for the whole page"
+        assert (verdict.classifier_asked, verdict.classifier_dropped) == (10, 0)
+        assert verdict.classifier_mean == pytest.approx((0.9 + 0.8 + 0.95 + 7 * 0.95) / 10)
 
         state, questions = fake.calls[0]
-        assert list(state["cards"]) == ["card_1", "card_2", "card_3"]
+        names = [f"card_{i}" for i in range(1, 11)]
+        assert list(state["cards"]) == names and list(questions) == names
         titles = [card["title"] for card in state["cards"].values()]
-        assert titles == ["Profitable Business 0", "Profitable Business 4",
-                          "Profitable Business 9"], "first, middle and last"
-        assert list(questions) == ["card_1", "card_2", "card_3"]
+        assert titles == [f"Profitable Business {i}" for i in range(10)], "page order"
         for name, question in questions.items():
             assert question["type"] == "noul"
             assert question["instructions"] == legibility.QUESTION.format(card=name)
-            assert name in question["instructions"]
-            assert "business for sale" in question["instructions"]
+            assert question["instructions"] == (
+                f"{name} in the state is a listing of a business for sale.")
         first = state["cards"]["card_1"]
         assert first["asking_price"] == "$1,250,000"
         assert first["cash_flow"] == "$300,000"
         assert first["location"] == "Sacramento, CA"
-        assert "loyal customers" in first["excerpt"]
+        assert first["excerpt"] == cards[0].excerpt[:300].strip(), "forty cards, one request"
         assert "revenue" not in first, "blank fields are left out"
 
     @pytest.mark.asyncio
-    async def test_a_short_page_is_asked_about_every_card(self):
-        fake = FakeClassifier()
-        await legibility.check([_card(1), _card(2)], page=1, classifier=fake)
-        assert len(fake.calls) == 1
-        assert list(fake.calls[0][1]) == ["card_1", "card_2"]
+    async def test_cards_that_are_not_listings_are_dropped_and_the_page_kept(self):
+        """BusinessesForSale's menu links at both ends of its list: two cards to
+        leave out, not a reason to throw away the listings between them."""
+        cards = ([_card(0, title="Sell Your Business"), _card(1, title="Login")]
+                 + [_card(i) for i in range(2, 9)] + [_card(9, title="Email Alerts")])
+        fake = FakeClassifier([0.04, 0.12] + [0.93] * 7 + [0.31])
+        verdict = await legibility.check(cards, page=1, classifier=fake)
+
+        assert verdict.ok and verdict.reason == ""
+        assert verdict.listings == cards[2:9]
+        assert verdict.dropped == 0, "the code checks dropped nothing"
+        assert (verdict.classifier_asked, verdict.classifier_dropped) == (10, 3)
+        record = verdict.record(1)
+        assert record["kept"] == 7
+        assert (record["classifier_asked"], record["classifier_dropped"]) == (10, 3)
+        assert record["classifier_rejected"] == [
+            {"title": "Sell Your Business", "p": 0.04}, {"title": "Login", "p": 0.12},
+            {"title": "Email Alerts", "p": 0.31}]
 
     @pytest.mark.asyncio
-    async def test_a_low_mean_fails_the_page_in_plain_words(self):
-        fake = FakeClassifier([0.1, 0.3, 0.23])
+    async def test_fewer_than_half_passing_fails_the_page_in_plain_words(self):
+        fake = FakeClassifier([0.1, 0.3, 0.23, 0.9, 0.8, 0.49])
         verdict = await legibility.check([_card(i) for i in range(6)], page=2, classifier=fake)
         assert not verdict.ok
         assert verdict.listings == []
         assert verdict.reason == (
-            "The cards on page 2 don't read as business listings (mean 0.21 on 3 samples) "
+            "Only 2 of 6 cards on page 2 read as business listings (at least half should) "
             "— nothing from this page was kept."
         )
-        assert verdict.record(2)["classifier_mean"] == pytest.approx(0.21, abs=0.001)
+        record = verdict.record(2)
+        assert (record["classifier_asked"], record["classifier_dropped"]) == (6, 4)
+        assert record["classifier_mean"] == pytest.approx(0.47, abs=0.001)
+
+    @pytest.mark.asyncio
+    async def test_exactly_half_passing_is_enough(self):
+        fake = FakeClassifier([0.9, 0.1, 0.5, 0.2])
+        verdict = await legibility.check([_card(i) for i in range(4)], page=1, classifier=fake)
+        assert verdict.ok
+        assert [c.title for c in verdict.listings] == ["Profitable Business 0",
+                                                       "Profitable Business 2"]
+
+    @pytest.mark.asyncio
+    async def test_a_long_page_is_asked_about_its_first_and_last_twenty_cards(self):
+        """Forty cards in one request at most; a menu or footer read as cards
+        sits at the ends. The cards between are kept on the code checks."""
+        cards = [_card(i) for i in range(100)]
+        fake = FakeClassifier([0.02] + [0.9] * 38 + [0.03])
+        verdict = await legibility.check(cards, page=1, classifier=fake)
+
+        state, questions = fake.calls[0]
+        assert len(fake.calls) == 1 and len(questions) == legibility.MAX_CARDS == 40
+        assert [c["title"] for c in state["cards"].values()] == [
+            f"Profitable Business {i}" for i in (*range(20), *range(80, 100))]
+        assert verdict.ok and verdict.listings == cards[1:99]
+        assert (verdict.classifier_asked, verdict.classifier_dropped) == (40, 2)
 
     @pytest.mark.asyncio
     async def test_a_classifier_error_skips_the_classifier_and_keeps_the_page(self, caplog):
@@ -246,24 +285,27 @@ class TestClassifier:
 
 
 class TestOneRequestOnTheWire:
-    """The real client against a faked endpoint: the sample is one POST."""
+    """The real client against a faked endpoint: the whole page is one POST."""
 
     @respx.mock
     @pytest.mark.asyncio
-    async def test_the_sample_is_a_single_request_with_a_question_per_card(self):
+    async def test_the_page_is_a_single_request_with_a_question_per_card(self):
+        names = [f"card_{i}" for i in range(1, 8)]
         route = respx.post(API).mock(return_value=httpx.Response(200, json={
             "model": "typesafe/jev-test",
-            "answers": {f"card_{i}": {"type": "noul", "noul": 0.9} for i in (1, 2, 3)},
+            "answers": {name: {"type": "noul", "noul": 0.1 if name == "card_7" else 0.9}
+                        for name in names},
         }))
         client = TypeSafeClient(lambda: "sk-or-test", lambda: "jev-latest")
-        verdict = await legibility.check([_card(i) for i in range(7)], page=1,
-                                         classifier=client)
+        cards = [_card(i) for i in range(7)]
+        verdict = await legibility.check(cards, page=1, classifier=client)
 
-        assert verdict.ok and verdict.classifier_mean == pytest.approx(0.9)
+        assert verdict.ok and verdict.listings == cards[:6]
+        assert verdict.classifier_dropped == 1
         assert route.call_count == 1
         body = json.loads(route.calls.last.request.content)
-        assert sorted(body["state"]["cards"]) == ["card_1", "card_2", "card_3"]
-        assert sorted(body["questions"]) == ["card_1", "card_2", "card_3"]
+        assert sorted(body["state"]["cards"]) == names
+        assert sorted(body["questions"]) == names
         assert all(q["type"] == "noul" for q in body["questions"].values())
 
 

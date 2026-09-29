@@ -194,10 +194,15 @@ def _print_page(entry: dict[str, Any]) -> None:
         print(f"    next      {nxt.get('rule')}  ← {nxt.get('by')}{prob}{extra}")
     leg = entry["legibility"]
     if leg:
-        mean = (f" · classifier mean {leg['classifier_mean']:.2f} on "
-                f"{leg['classifier_samples']}" if "classifier_mean" in leg else "")
+        judged = ""
+        if leg.get("classifier_asked"):
+            judged = (f" · classifier dropped {leg['classifier_dropped']} of "
+                      f"{leg['classifier_asked']} (mean {leg.get('classifier_mean', 0):.2f})")
         state = "ok" if leg["ok"] else f"FAILED: {leg.get('reason', '')}"
-        print(f"    legible   {state} · kept {leg['kept']} · dropped {leg['dropped']}{mean}")
+        print(f"    legible   {state} · kept {leg['kept']} · dropped {leg['dropped']}{judged}")
+        for reject in leg.get("classifier_rejected") or []:
+            print(f"              not a listing: {reject['title'] or '(no title)'} "
+                  f"p={reject['p']:.2f}")
         if leg.get("classifier_error"):
             print(f"              classifier skipped: {leg['classifier_error']}")
     for row in entry["listings"][:2]:
