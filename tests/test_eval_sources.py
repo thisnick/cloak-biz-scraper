@@ -36,6 +36,15 @@ NONE = {"name": "404", "url": "https://site.example/gone", "group": None, "next"
 
 
 class TestScore:
+    def test_a_label_may_list_alternatives(self):
+        """A load-more page is right with its button still there or with every
+        listing already loaded by the scroll."""
+        either = dict(LIST, next="click|none")
+        for rule in ("click", "none"):
+            assert eval_sources.score(either, {"pages": [_page(rule=rule)]}, 1)["verdict"] == "PASS"
+        wrong = {"pages": [_page(rule="https://site.example/list?page=2")]}
+        assert eval_sources.score(either, wrong, 1)["verdict"] == "FAIL"
+
     def test_the_right_list_cards_legibility_and_next_page_pass(self):
         res = {"pages": [_page(rule="https://site.example/list?page=2")]}
         assert eval_sources.score(LIST, res, pages=1)["verdict"] == "PASS"
@@ -97,6 +106,6 @@ def test_the_labelled_pages_are_well_formed():
     assert len(pages) >= 18
     for page in pages:
         assert page["url"].startswith("https://") and page["name"]
-        nxt = page.get("next", "none")
-        assert nxt in ("none", "click") or nxt.startswith("url:"), page["name"]
+        for nxt in page.get("next", "none").split("|"):
+            assert nxt in ("none", "click") or nxt.startswith("url:"), page["name"]
         assert page["group"] is None or (page["group"] and page.get("min_cards")), page["name"]
