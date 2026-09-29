@@ -134,6 +134,33 @@ class TestCodeChecks:
         assert verdict.ok and len(verdict.listings) == len(prices)
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("price", [
+        "$650,000 USD", "$650,000 usd", "$1.2 Million", "$1.2 million USD", "$850 Thousand",
+        "$3.4 Mil", "$1.5MM", "$2M", "$650K", "$1,250,000 (Firm)", "$1,250,000 (Firm) USD",
+        "$900,000 (negotiable) + Inventory", "CAD $450,000 CAD", "$1.1 Billion",
+    ])
+    async def test_common_price_formats_read_as_amounts(self, price):
+        """Each of these failed a page before; each is plainly a price."""
+        cards = [_card(i, asking_price=price) for i in range(3)]
+        verdict = await legibility.check(cards, page=1)
+        assert verdict.ok, verdict.reason
+
+    @pytest.mark.parametrize("price", ["$650,000 USD", "$1.2 Million", "$1,250,000 (Firm)"])
+    def test_the_store_s_parser_stays_strict(self, price):
+        """Reading past a note is for deciding whether a field is a price; the
+        number the store keeps is still only an exact amount."""
+        from app.stores.money import parse_money
+
+        assert parse_money(price) is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("price", ["Call (555) 010-0100", "Listed (2024)", "3 bedrooms (2 baths)",
+                                       "Million-dollar views, 4 acres"])
+    async def test_a_note_in_brackets_does_not_make_anything_a_price(self, price):
+        cards = [_card(i, asking_price=price) for i in range(3)]
+        assert not (await legibility.check(cards, page=1)).ok
+
+    @pytest.mark.asyncio
     async def test_a_monthly_figure_is_not_an_asking_price(self):
         cards = [_card(i, asking_price="USD $28,274 p/mo") for i in range(3)]
         verdict = await legibility.check(cards, page=1)

@@ -714,6 +714,18 @@ class TestFields:
         assert (listing.asking_price, listing.cashflow) == ("$1,100,000", "$150,000")
 
     @pytest.mark.asyncio
+    async def test_a_card_s_excerpt_is_capped(self):
+        """The excerpt is the card's markdown, which for a card that is most of a
+        page would be stored (and sent to triage) whole."""
+        cards = [_card(n) for n in range(1, 5)]
+        cards[0]["excerpt"] = "**Business 1** " + "lorem ipsum " * 1000
+        result, _, _, _ = await _read(_probe([_group(cards=cards), _nav()]))
+        long, short = result.listings[0].excerpt, result.listings[1].excerpt
+        assert len(long) <= generic.EXCERPT_CHARS == 2000
+        assert long.startswith("**Business 1** lorem ipsum") and long.endswith("…")
+        assert short == "**Business 2**\n\nAsking Price: $1,200,000", "a short one is untouched"
+
+    @pytest.mark.asyncio
     async def test_money_looking_fields_only_choose_among_money_roles(self):
         _, _, jev, _ = await _read(_probe())
         [(state, questions)] = jev.of("fields")
@@ -1635,6 +1647,21 @@ class TestProbeOnSavedPages:
                           "www.business-team.com/buy-a-business/business-for-sale.aspx?From&LID")
         assert group["varying_keys"] == ["LID"]
         assert group["paths_unique"] is False
+
+    @pytest.mark.asyncio
+    async def test_a_ref_query_is_a_listing_id_not_tracking(self):
+        """?ref=<id> names the listing on some sites; read as tracking, the
+        whole page collapsed to one listing."""
+        tile = ('<div class="tile"><h3><a href="/listing.php?ref={n}">Business {n}</a></h3>'
+                '<p>Asking Price: $1,{n}00,000</p></div>')
+        html = ('<html><head><base href="https://brokers.example/list/"></head><body><main>'
+                + "".join(tile.format(n=n) for n in range(101, 106)) + "</main></body></html>")
+        probe = await _probe_of("inline", html=html)
+        group = _group_of(probe, "brokers.example/listing.php?ref")
+        assert group["varying_keys"] == ["ref"] and group["paths_unique"] is False
+        cards = generic._cards_of([group])
+        assert len({c.normalized_url for c in cards}) == 5
+        assert cards[0].url == "https://brokers.example/listing.php?ref=101"
 
     @pytest.mark.asyncio
     async def test_fcbb_fields_are_keyed_by_their_labels(self):

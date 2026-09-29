@@ -64,7 +64,13 @@ from .jobs import JobStore, interrupted
 from .settings import SettingsService
 from .task_profiles import TaskProfilePool
 from .triage import REJECT, REVIEW, TriageDecision, Triager, criteria_version
-from .typesafe import TypeSafeError, TypeSafeUnavailable
+from .typesafe import (
+    TypeSafeAuthError,
+    TypeSafeCreditError,
+    TypeSafeError,
+    TypeSafeNotConfigured,
+    TypeSafeUnavailable,
+)
 
 logger = logging.getLogger("cloakbiz.scrape")
 
@@ -82,6 +88,17 @@ _MAX_PAGES_CEILING = 20
 # moment the browser is obtained (see _sweep's on_launch).
 _WAITING_SUMMARY = "Waiting for a free browser slot…"
 _SCRAPING_SUMMARY = "Sweeping the search results…"
+
+# Card-stage triage questions in flight at once, per sweep. Each row is gated
+# BEFORE it checks whether triage has stopped, so an outage costs this many
+# rows' retries, not every row's.
+TRIAGE_PARALLEL = 4
+# Classifier failures that end a sweep's triage: every later question would
+# fail the same way (no key, a rejected key, no credits, no answer after the
+# client's retries). Any other TypeSafeError — a 400 for one request, an answer
+# in a shape that can't be read — is that one row's failure.
+_TRIAGE_STOPS = (TypeSafeAuthError, TypeSafeCreditError, TypeSafeUnavailable,
+                 TypeSafeNotConfigured)
 
 # Why a site with no adapter is refused when no classifier key is saved. Says
 # where the key goes, because that is the whole fix.
@@ -254,6 +271,11 @@ class ScrapeService:
         if self._task_profiles is None and instances is not None:
             self._task_profiles = instances.task_profiles
         self._running: set[asyncio.Task] = set()
+        # Store rows some sweep's triage is working on right now. Two sweeps that
+        # overlap (a scheduled one and a manual one) both see a row with a
+        # blank Bot Triage; the second to reach it leaves it to the first rather
+        # than judging, archiving and writing it a second time.
+        self._triaging: set[str] = set()
         # The parsed site overrides, keyed by the text they were parsed from, so
         # a sweep start re-parses only after the document was edited.
         self._overrides_text: str | None = None
@@ -824,6 +846,8 @@ class ScrapeService:
                 seg = f"triaged: {t.review} review, {t.reject} reject"
                 if t.undecided:
                     seg += f", {t.undecided} left blank for a later sweep"
+                if t.in_flight:
+                    seg += f", {t.in_flight} left to another sweep triaging them"
                 parts.append(seg)
         if failures:
             parts.append(f"{len(failures)} source(s) failed")
@@ -1225,11 +1249,17 @@ class _TriagePhase:
          written, so every REVIEW with a readable page has its Source Content;
          REJECT → REJECT is written and nothing is archived.
 
-    A TypeSafeError (after the client's own retries) stops the phase: no more
-    questions are asked and the rows not yet decided stay blank. A failed
-    Notion write fails that row only. Neither is raised — the scrape and the
-    save succeeded, and the job says so (`_triage_note`). Only a cancellation
-    propagates, after the record has been brought up to date.
+    A classifier that cannot answer at all (`_TRIAGE_STOPS`: no key, a
+    rejected key, no credits, no answer after the client's own retries) stops
+    the phase: no more questions are asked and the rows not yet decided stay
+    blank. Card questions are gated (`TRIAGE_PARALLEL` at once, each gated
+    before it looks at whether triage has stopped), so an outage costs a few
+    rows' retries rather than every row's. Any other classifier error — a
+    request it refused, an answer that can't be read — and a failed Notion
+    write fail that row only, so one bad row never holds up the rest. None of
+    it is raised — the scrape and the save succeeded, and the job says so
+    (`_triage_note`). Only a cancellation propagates, after the record has been
+    brought up to date.
     """
 
     def __init__(self, service: ScrapeService, job: SweepTask, plan: _TriagePlan,
@@ -1255,12 +1285,36 @@ class _TriagePhase:
         self._decided: dict[str, TriageDecision] = {}
         self._failed: dict[str, TriageFailure] = {}
         self._stopped: str | None = None
+        self._asking = asyncio.Semaphore(TRIAGE_PARALLEL)
+        # Rows another sweep is triaging (left to it), and the ones this phase
+        # holds in the service's in-flight set until it finishes.
+        self._in_flight: list[Listing] = []
+        self._claimed: set[str] = set()
         # What each row went through, for the run's evidence (triage.json).
         self._records: dict[str, dict[str, Any]] = {}
         self._evidence = CONFIG.evidence_dir / job.id
 
+    def _claim(self) -> None:
+        """Take this phase's rows off the table for any other sweep, leaving the
+        ones another sweep already holds to it."""
+        busy = self._svc._triaging
+        mine: list[tuple[Listing, bool]] = []
+        for listing, backlog in self._rows:
+            if listing.synced_row_id in busy:
+                self._in_flight.append(listing)
+                self._note(listing, error="left to another sweep that was triaging this row")
+            else:
+                mine.append((listing, backlog))
+        self._rows = mine
+        self._claimed = {listing.synced_row_id for listing, _ in mine}
+        busy |= self._claimed
+        if self._in_flight:
+            logger.info("triage for sweep %s: %d row(s) left to another sweep triaging them",
+                        self._job.id, len(self._in_flight))
+
     async def run(self) -> None:
         try:
+            self._claim()
             if not self._rows:
                 return
             if self._target is None and not await self._prepare():
@@ -1297,17 +1351,21 @@ class _TriagePhase:
     # -- the two stages --
 
     async def _card(self, listing: Listing) -> TriageDecision | None:
-        if self._stopped:
-            return None
-        try:
-            decision = await self._triager.card(listing)
-        except TypeSafeError as exc:
-            self._stop(exc)
-            return None
-        except Exception as exc:  # noqa: BLE001 — one row's trouble is that row's
-            logger.exception("triage of %s failed", listing.url)
-            self._fail(listing, f"The classifier's answer could not be used: {exc}")
-            return None
+        # The gate comes first and the stop check inside it: every row is
+        # started at once, and a row that only looked at `_stopped` before
+        # waiting would still ask after an outage it had queued behind.
+        async with self._asking:
+            if self._stopped:
+                return None
+            try:
+                decision = await self._triager.card(listing)
+            except TypeSafeError as exc:
+                self._classifier_failed(listing, exc)
+                return None
+            except Exception as exc:  # noqa: BLE001 — one row's trouble is that row's
+                logger.exception("triage of %s failed", listing.url)
+                self._fail(listing, f"The classifier's answer could not be used: {exc}")
+                return None
         self._note(listing, card=decision.record())
         if decision.decision == REJECT:
             await self._write(listing, decision)
@@ -1351,7 +1409,7 @@ class _TriagePhase:
         try:
             p_real = await archive_guard(self._svc._typesafe, read.markdown)
         except TypeSafeError as exc:
-            self._stop(exc)
+            self._classifier_failed(listing, exc)
             return
         self._note(listing, guard=round(p_real, 4))
         if p_real < GUARD_THRESHOLD:
@@ -1362,7 +1420,7 @@ class _TriagePhase:
         try:
             decision = await self._triager.detail(listing, read.markdown)
         except TypeSafeError as exc:
-            self._stop(exc)
+            self._classifier_failed(listing, exc)
             return
         self._note(listing, detail=decision.record())
         if decision.decision == REVIEW:
@@ -1400,6 +1458,15 @@ class _TriagePhase:
         self._failed[row_id] = TriageFailure(row_id=row_id, url=listing.url, error=error)
         self._note(listing, error=error)
 
+    def _classifier_failed(self, listing: Listing, exc: TypeSafeError) -> None:
+        """Stop triage when the classifier cannot answer anything; otherwise
+        this row alone failed, and the rest carry on."""
+        if isinstance(exc, _TRIAGE_STOPS):
+            self._stop(exc)
+        else:
+            logger.warning("the classifier could not judge %s: %s", listing.url, exc)
+            self._fail(listing, f"The classifier couldn't judge this listing: {exc}")
+
     def _stop(self, exc: Exception) -> None:
         if self._stopped is None:
             logger.warning("triage for sweep %s stopped: %s", self._job.id, exc)
@@ -1412,9 +1479,12 @@ class _TriagePhase:
         record.update(fields)
 
     def _finish(self) -> None:
-        """Bring the job's record up to date with what was decided. Runs on
-        every exit, a cancellation included."""
+        """Bring the job's record up to date with what was decided, and let go
+        of this phase's rows. Runs on every exit, a cancellation included."""
+        self._svc._triaging -= self._claimed
+        self._claimed = set()
         summary = self._summary
+        summary.in_flight = len(self._in_flight)
         summary.criteria_version = self._plan.version
         decisions = [d.decision for d in self._decided.values()]
         summary.review = decisions.count(REVIEW)

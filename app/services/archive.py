@@ -29,7 +29,16 @@ gate, pooled identity, retries, extraction; no Notion and no task record) and
 writes (a "Source Content" heading) is left alone, so a repeated call — or a
 triage run over a row someone archived by hand earlier — never files the page
 twice. `archive` looks for the section before it opens a browser at all, so a
-repeat call costs one Notion read instead of a minute of page loading.
+repeat call costs one Notion read instead of a minute of page loading. The
+check and the append run under one lock per Notion page, so an archive_page
+call and a sweep's triage (or two sweeps) filing the same row at the same
+moment cannot both find it empty and both append.
+
+That makes a half-written section dangerous: the heading goes in the first
+request of a long page, so a page whose later request failed would carry the
+heading forever and be skipped as archived. So a failed append takes back what
+it had already written (Notion reports the new blocks' ids; each is deleted),
+and when that is impossible it says the page needs the section removed by hand.
 
 **The guard.** A page can load "successfully" and still be a login wall, a
 cookie screen, a 404, a "this listing has been removed" notice or an anti-bot
@@ -46,6 +55,7 @@ import asyncio
 import json
 import logging
 import uuid
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -217,6 +227,20 @@ class ArchiveService:
         # that is the ceiling on minting, and every one of them is reused after.
         self._gate = asyncio.Condition()
         self._past_gate = 0
+        # One lock per Notion page, held around "has it the section?" and the
+        # append, so two writers of the same page (archive_page, a sweep's
+        # triage) cannot both see it empty and both file it. Weak values: a
+        # lock nobody holds or waits on is dropped, not kept per page forever.
+        self._page_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+            weakref.WeakValueDictionary())
+
+    def _page_lock(self, page_id: str) -> asyncio.Lock:
+        key = page_id.replace("-", "").strip().lower()
+        lock = self._page_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._page_locks[key] = lock
+        return lock
 
     async def _enter_gate(self) -> None:
         async with self._gate:
@@ -361,13 +385,16 @@ class ArchiveService:
         left exactly as it is and `already_archived` says so: the section is
         there, whether this server or an earlier agent put it there. `client` is
         the caller's: archive_page makes one per call, a sweep's triage passes the
-        one it shares for its whole phase. A Notion failure raises; one part-way
-        through says how many blocks had already landed.
+        one it shares for its whole phase. The check and the write hold the
+        page's lock. A Notion failure raises; one part-way through is rolled
+        back first (see `_append_blocks`).
         """
-        if await has_section(client, page_id, heading):
-            return AppendResult(already_archived=True)
-        blocks = prelude(url, heading) + await md_to_blocks(markdown, url)
-        return AppendResult(blocks_appended=await _append_blocks(client, page_id, blocks))
+        async with self._page_lock(page_id):
+            if await has_section(client, page_id, heading):
+                return AppendResult(already_archived=True)
+            blocks = prelude(url, heading) + await md_to_blocks(markdown, url)
+            return AppendResult(
+                blocks_appended=await _append_blocks(client, page_id, blocks, heading))
 
     async def _archive(self, url: str, notion_page_id: str, heading: str,
                        host: str, evidence: Path) -> ArchiveResult:
@@ -555,24 +582,84 @@ async def has_section(client, page_id: str, heading: str = DEFAULT_HEADING) -> b
         cursor = data["next_cursor"]
 
 
-async def _append_blocks(client, page_id: str, blocks: list[dict]) -> int:
-    """Append children to a page — the only Notion mutation this module makes.
+async def _append_blocks(client, page_id: str, blocks: list[dict],
+                         heading: str = DEFAULT_HEADING) -> int:
+    """Append children to a page, all of them or none.
 
-    Chunked to Notion's 100-block cap. A failure mid-way reports how many blocks
-    already landed, because the page is then genuinely half-written and saying
-    otherwise would send someone looking for content that is not there.
+    Chunked to Notion's 100-block cap. The heading is in the first chunk, so a
+    later chunk that fails would leave a section that `has_section` finds on
+    every later call — a half-archived page skipped as archived for good. So a
+    failure after the first chunk deletes what this call appended (the ids
+    Notion returned for each chunk) and raises saying the page is as it was;
+    when that cannot be done, it raises saying the page is partly written and
+    the section must be removed by hand.
     """
     from ..stores.notion import NotionError
 
     appended = 0
+    written: list[str] | None = []   # ids of the blocks this call added; None: unknown
     for i in range(0, len(blocks), _BLOCKS_PER_REQUEST):
         chunk = blocks[i:i + _BLOCKS_PER_REQUEST]
         try:
-            await client.request("PATCH", f"/blocks/{page_id}/children", json={"children": chunk})
+            reply = await client.request("PATCH", f"/blocks/{page_id}/children",
+                                         json={"children": chunk})
         except NotionError as exc:
-            raise NotionError(
-                f"Notion accepted {appended} block(s) and then refused the rest, so the page "
-                f"is partly written: {exc}"
-            ) from exc
+            if not appended:
+                raise NotionError(f"Notion refused the append, so nothing was written: {exc}"
+                                  ) from exc
+            raise await _roll_back(client, written, appended, heading, exc) from exc
+        ids = _new_ids(reply, chunk)
+        written = None if written is None or ids is None else written + ids
         appended += len(chunk)
     return appended
+
+
+def _new_ids(reply: Any, chunk: list[dict]) -> list[str] | None:
+    """The ids of the blocks one append created, or None when the reply does not
+    say which they are.
+
+    Notion answers an append with the new blocks. Only a reply that is exactly
+    those — as many as were sent, of the same types, in order — is trusted: a
+    reply listing anything else (an older API answered with the page's
+    children) would have the rollback delete someone's own blocks.
+    """
+    results = reply.get("results") if isinstance(reply, dict) else None
+    if not isinstance(results, list) or len(results) != len(chunk):
+        return None
+    ids = []
+    for sent, got in zip(chunk, results):
+        if not isinstance(got, dict) or not got.get("id") or got.get("type") != sent.get("type"):
+            return None
+        ids.append(str(got["id"]))
+    return ids
+
+
+async def _roll_back(client, written: list[str] | None, appended: int, heading: str,
+                     exc: Exception) -> Exception:
+    """Delete the blocks a failed append had written; the error to raise either way."""
+    from ..stores.notion import NotionError, NotionNotFound
+
+    left = appended
+    if written is not None:
+        left = 0
+        for block_id in reversed(written):
+            try:
+                await client.request("DELETE", f"/blocks/{block_id}")
+            except NotionNotFound:
+                pass  # already gone
+            except Exception as err:  # noqa: BLE001 — counted, and said below
+                logger.warning("could not delete block %s while rolling back: %s", block_id, err)
+                left += 1
+        if not left:
+            return NotionError(
+                f"Notion accepted {appended} block(s) and then refused the rest, so the "
+                f"{appended} it had accepted were deleted again: the page is as it was, and "
+                f"archiving it again is safe. ({exc})"
+            )
+    return NotionError(
+        f"Notion accepted {appended} block(s) and then refused the rest, and "
+        f"{'they' if left == appended else f'{left} of them'} could not be removed again, so "
+        f"the page is partly written: its '{heading}' section holds only part of the page. "
+        f"Delete that section from the Notion page by hand — until then the page counts as "
+        f"archived and is skipped. ({exc})"
+    )

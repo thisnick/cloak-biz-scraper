@@ -94,6 +94,18 @@ _DIGIT = re.compile(r"\d")
 _CURRENCY = re.compile(
     r"^\s*(?:(?:USD|US|CAD|AUD|NZD|EUR|GBP)\s*)?(?:US|CA|C|AU|A|NZ)?[$€£]?\s*(?=\d)"
 )
+# What a price can carry after the amount that says nothing against it being
+# one: a currency code ("$650,000 USD") and a note in brackets ("(Firm)",
+# "(negotiable)").
+_TRAILING_CODE = re.compile(r"\s*(?:USD|US\$|CAD|AUD|NZD|EUR|GBP)\.?\s*$", re.IGNORECASE)
+_TRAILING_NOTE = re.compile(r"\s*\([^()]*\)\s*$")
+# A multiplier spelled out ("$1.2 Million", "$850 Thousand", "$3.4 Mil"), as
+# the letter `parse_money` reads.
+_WORD_MULTIPLIERS = (
+    (re.compile(r"\s*\b(?:billions?|bn)\b\.?", re.IGNORECASE), "B"),
+    (re.compile(r"\s*\b(?:millions?|mill?)\b\.?", re.IGNORECASE), "M"),
+    (re.compile(r"\s*\b(?:thousands?)\b", re.IGNORECASE), "K"),
+)
 
 
 @dataclass(frozen=True)
@@ -249,13 +261,28 @@ def _reads_as_amount(value: str) -> bool:
     *store* it would understate the price. But the question here is only
     whether the field holds a price at all, and a qualified price is one: a
     one-listing broker page quoting "+ Inventory" is a perfectly good page. So
-    is a price in another currency, or with its currency spelled out before it
-    ("USD $650,000" on Flippa, "CAD $450,000", "€300,000"): the currency is
-    read past here, where `parse_money`, which stores the number, keeps to US
-    dollars.
+    is a price in another currency, or with its currency spelled out before or
+    after it ("USD $650,000" on Flippa, "CAD $450,000", "€300,000", "$650,000
+    USD"), with its multiplier spelled out ("$1.2 Million", "$850 Thousand"),
+    or with a note in brackets ("$1,250,000 (Firm)"): each is read past here,
+    where `parse_money`, which stores the number, stays strict.
     """
     amount = _CURRENCY.sub("", value, count=1)
-    return parse_money(amount) is not None or parse_money(amount.split("+", 1)[0]) is not None
+    return any(parse_money(_bare(text)) is not None
+               for text in (amount, amount.split("+", 1)[0]))
+
+
+def _bare(text: str) -> str:
+    """An amount without what `_reads_as_amount` reads past after it."""
+    text = text.strip()
+    while True:
+        shorter = _TRAILING_CODE.sub("", _TRAILING_NOTE.sub("", text)).strip()
+        if shorter == text:
+            break
+        text = shorter
+    for pattern, letter in _WORD_MULTIPLIERS:
+        text = pattern.sub(letter, text)
+    return text.strip()
 
 
 def _asked(n: int) -> list[int]:

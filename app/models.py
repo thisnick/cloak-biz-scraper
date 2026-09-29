@@ -116,6 +116,11 @@ class TriageSummary(BaseModel):
     undecided: int = Field(
         default=0, description="Rows left without a decision, each triaged on a later sweep.",
     )
+    in_flight: int = Field(
+        default=0,
+        description="Rows this sweep left to another sweep that was triaging them at the same "
+        "moment; that sweep decides them. Not counted in `undecided`.",
+    )
     backlog: list[TriagedRow] = Field(
         default_factory=list,
         description="Rows already in the store, seen by this sweep with a blank Bot Triage, "

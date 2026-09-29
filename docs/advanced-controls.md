@@ -162,9 +162,16 @@ refuses the call. **Triage Reason** (e.g. `REVIEW · P(review)=0.91 · card + de
 or where **Settings → Notion** maps them to columns of your own — Triage Reason to an
 existing "Why Review", say. Nothing else on the row is touched.
 
-If the classifier stops answering part-way, the sweep still completes (the rows are saved);
-the rows it had not decided stay blank, the result's `triage.error` says why, and the next
-sweep that sees them decides them.
+If the classifier stops answering part-way — or OpenRouter rejects the key or runs out of
+credits — the sweep still completes (the rows are saved); the rows it had not decided stay
+blank, the result's `triage.error` says why, and the next sweep that sees them decides them.
+A question the classifier refuses for one listing only (an answer it can't give for that
+card) fails that row alone, listed in `triage.failures`; the others are still decided.
+
+Two sweeps that run at the same time never triage the same row twice: a row the other sweep
+is already on is left to it and counted in `triage.in_flight`. And a page archived into a row
+is written whole or not at all — if Notion refuses part of it, the part already written is
+deleted again, so the next sweep (or `archive_page`) can file it cleanly.
 
 **Writing the text.** The classifier judges; it cannot follow a procedure or write an
 explanation. So:

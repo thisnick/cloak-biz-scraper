@@ -123,6 +123,10 @@ _JS_PAGE_SIZE = (
 
 _GROUP_EXAMPLE_CHARS = 260
 _CARD_EXAMPLE_CHARS = 400
+# A Listing's excerpt, at most: the card's own markdown is usually a few lines,
+# but a card that is most of the page would otherwise be stored (and sent to
+# triage) whole.
+EXCERPT_CHARS = 2000
 _FIELD_VALUE_CHARS = 70
 _TITLE_MAX_CHARS = 150
 
@@ -226,7 +230,9 @@ JS_PROBE = r"""
   for (const el of document.querySelectorAll('[data-cbs-next]')) el.removeAttribute('data-cbs-next');
   for (const el of document.querySelectorAll('[data-cbs-card]')) el.removeAttribute('data-cbs-card');
 
-  const TRACKING = /^(utm_.*|gclid|gbraid|wbraid|dclid|fbclid|msclkid|yclid|twclid|igshid|mc_cid|mc_eid|_ga|_gl|_hsenc|_hsmi|mkt_tok|ref|ref_src)$/i;
+  // The same list as urls.py's _TRACKING — and, like it, not `ref`, which
+  // sites use as the listing id (?ref=1234).
+  const TRACKING = /^(utm_.*|gclid|gbraid|wbraid|dclid|fbclid|msclkid|yclid|twclid|igshid|mc_cid|mc_eid|_ga|_gl|_hsenc|_hsmi|mkt_tok)$/i;
   const resolve = (raw) => {
     if (raw == null) return null;
     try { const u = new URL(raw, document.baseURI); u.hash = ''; return u; } catch (_) { return null; }
@@ -1167,7 +1173,7 @@ class GenericSource:
             revenue=filled.get("revenue", ""),
             cashflow=filled.get("cashflow", ""),
             ebitda=filled.get("ebitda", ""),
-            excerpt=str(card.raw.get("excerpt") or card.raw.get("text") or ""),
+            excerpt=_excerpt(str(card.raw.get("excerpt") or card.raw.get("text") or "")),
             source=self.site,
         )
 
@@ -1717,6 +1723,18 @@ def _fallback_title(card: dict) -> str:
     if heading and (not usable or (heading in link and heading != link)):
         return heading
     return link if usable else heading
+
+
+def _excerpt(text: str) -> str:
+    """`text` cut to EXCERPT_CHARS, at a word where there is one, marked with "…"."""
+    text = text.strip()
+    if len(text) <= EXCERPT_CHARS:
+        return text
+    cut = text[: EXCERPT_CHARS - 1]
+    space = cut.rfind(" ")
+    if space > EXCERPT_CHARS // 2:
+        cut = cut[:space]
+    return cut.rstrip() + "…"
 
 
 _DESCRIBED_CHARS = 100

@@ -952,3 +952,175 @@ class TestTheGuardHelpers:
             "not-found page, a removed or no-longer-available notice, or an anti-bot check."
         )
         assert GUARD_THRESHOLD == 0.3
+
+
+# ── a failed append is taken back; one page, one writer ─────────────────────
+
+import httpx  # noqa: E402
+import respx  # noqa: E402
+
+from app.stores import notion as notion_module  # noqa: E402
+from app.stores.notion import API as NOTION_API  # noqa: E402
+from app.stores.notion import NotionClient, NotionError  # noqa: E402
+
+PAGE = "0f5e3c1a-page"
+
+
+async def _many_blocks(markdown: str, base_url: str) -> list[dict]:
+    """150 paragraphs: with the prelude, two requests of Notion's 100-block cap."""
+    return [{"object": "block", "type": "paragraph",
+             "paragraph": {"rich_text": [{"type": "text", "text": {"content": f"p{i}"}}]}}
+            for i in range(150)]
+
+
+def _created(request: httpx.Request, prefix: str) -> httpx.Response:
+    """Notion's answer to an append: the new blocks, each with its id."""
+    import json
+
+    children = json.loads(request.content)["children"]
+    return httpx.Response(200, json={"object": "list", "results": [
+        {"object": "block", "id": f"{prefix}-{i}", "type": c["type"]}
+        for i, c in enumerate(children)]})
+
+
+class TestAHalfWrittenAppendIsTakenBack:
+    """The heading is in the first request; a page whose second request failed
+    would otherwise read as archived forever (has_section finds the heading)."""
+
+    @pytest.fixture(autouse=True)
+    def _fast(self, monkeypatch):
+        monkeypatch.setattr(notion_module, "_MIN_REQUEST_INTERVAL_SEC", 0)
+        monkeypatch.setattr("app.services.archive.md_to_blocks", _many_blocks)
+
+    def _svc(self, manager, settings, jobs):
+        return ArchiveService(manager, settings, jobs, notion_client=NotionClient)
+
+    def _page(self, *, second: httpx.Response, delete=None):
+        respx.get(f"{NOTION_API}/blocks/{PAGE}/children").mock(
+            return_value=httpx.Response(200, json={"results": [], "has_more": False}))
+        replies = iter([None, second])
+
+        def patch(request):
+            reply = next(replies)
+            return _created(request, "new") if reply is None else reply
+
+        respx.patch(f"{NOTION_API}/blocks/{PAGE}/children").mock(side_effect=patch)
+        return respx.delete(url__regex=rf"{NOTION_API}/blocks/new-\d+").mock(
+            return_value=delete or httpx.Response(200, json={"object": "block"}))
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_the_blocks_already_written_are_deleted_again(self, manager, settings, jobs):
+        deletes = self._page(second=httpx.Response(
+            400, json={"code": "validation_error", "message": "body failed validation"}))
+        svc = self._svc(manager, settings, jobs)
+
+        with pytest.raises(NotionError) as exc:
+            await svc.append(NotionClient("ntn_x"), PAGE, "body", URL)
+
+        assert deletes.call_count == 100, "every block of the first request, and only those"
+        deleted = {str(c.request.url).rsplit("/", 1)[1] for c in deletes.calls}
+        assert deleted == {f"new-{i}" for i in range(100)}
+        assert "the 100 it had accepted were deleted again: the page is as it was" in str(exc.value)
+        assert "body failed validation" in str(exc.value)
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_archive_page_reports_the_rollback(self, manager, settings, jobs, monkeypatch):
+        self._page(second=httpx.Response(400, json={"code": "validation_error",
+                                                    "message": "too long"}))
+        monkeypatch.setattr("app.services.archive.scrape_with_retry", _ok())
+        settings.update(notion_api_token="ntn_x")
+        result = await self._svc(manager, settings, jobs).archive(URL, PAGE)
+        assert not result.ok
+        assert "deleted again: the page is as it was, and archiving it again is safe" \
+            in result.error
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_when_the_rollback_fails_it_says_the_page_needs_fixing_by_hand(
+        self, manager, settings, jobs,
+    ):
+        self._page(second=httpx.Response(400, json={"code": "validation_error",
+                                                    "message": "nope"}),
+                   delete=httpx.Response(400, json={"code": "validation_error",
+                                                    "message": "cannot delete"}))
+        with pytest.raises(NotionError) as exc:
+            await self._svc(manager, settings, jobs).append(NotionClient("ntn_x"), PAGE, "b", URL)
+        text = str(exc.value)
+        assert "could not be removed again, so the page is partly written" in text
+        assert "its 'Source Content' section holds only part of the page" in text
+        assert "Delete that section from the Notion page by hand" in text
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_a_reply_that_does_not_name_the_new_blocks_deletes_nothing(
+        self, manager, settings, jobs,
+    ):
+        """An answer listing anything but exactly the blocks sent could be the
+        page's own blocks; deleting by it could remove someone's notes."""
+        respx.get(f"{NOTION_API}/blocks/{PAGE}/children").mock(
+            return_value=httpx.Response(200, json={"results": [], "has_more": False}))
+        respx.patch(f"{NOTION_API}/blocks/{PAGE}/children").mock(side_effect=[
+            httpx.Response(200, json={"results": [{"id": "mine", "type": "paragraph"}]}),
+            httpx.Response(400, json={"code": "validation_error", "message": "nope"}),
+        ])
+        deletes = respx.delete(url__regex=rf"{NOTION_API}/blocks/.*").mock(
+            return_value=httpx.Response(200, json={}))
+        with pytest.raises(NotionError) as exc:
+            await self._svc(manager, settings, jobs).append(NotionClient("ntn_x"), PAGE, "b", URL)
+        assert deletes.call_count == 0
+        assert "partly written" in str(exc.value)
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_a_first_request_refused_wrote_nothing(self, manager, settings, jobs):
+        respx.get(f"{NOTION_API}/blocks/{PAGE}/children").mock(
+            return_value=httpx.Response(200, json={"results": [], "has_more": False}))
+        respx.patch(f"{NOTION_API}/blocks/{PAGE}/children").mock(
+            return_value=httpx.Response(400, json={"code": "validation_error",
+                                                   "message": "nope"}))
+        deletes = respx.delete(url__regex=rf"{NOTION_API}/blocks/.*").mock(
+            return_value=httpx.Response(200, json={}))
+        with pytest.raises(NotionError) as exc:
+            await self._svc(manager, settings, jobs).append(NotionClient("ntn_x"), PAGE, "b", URL)
+        assert deletes.call_count == 0
+        assert "nothing was written" in str(exc.value)
+        assert "partly written" not in str(exc.value)
+
+
+class TestOneWriterPerPage:
+    @pytest.mark.asyncio
+    async def test_two_appends_to_one_page_at_once_file_it_once(
+        self, manager, settings, jobs, monkeypatch,
+    ):
+        """archive_page and a sweep's triage (or two sweeps) filing the same row
+        at the same moment: without the lock both find it empty, both append."""
+        class SlowNotion(FakeNotion):
+            async def request(self, method, path, **kw):
+                await asyncio.sleep(0.01)  # a real round trip: the other writer runs
+                return await super().request(method, path, **kw)
+
+        notion = SlowNotion()
+        svc = _service(manager, settings, jobs, monkeypatch, _ok(), notion=notion)
+        results = await asyncio.gather(
+            svc.append(notion, "page-1", "Body.", URL),
+            svc.append(notion, "page-1", "Body.", URL),
+        )
+        assert len(notion.patches) == 1, "filed once"
+        assert sorted(r.already_archived for r in results) == [False, True]
+
+    @pytest.mark.asyncio
+    async def test_different_pages_do_not_wait_on_each_other(
+        self, manager, settings, jobs, monkeypatch,
+    ):
+        notion = FakeNotion()
+        svc = _service(manager, settings, jobs, monkeypatch, _ok(), notion=notion)
+        await asyncio.gather(svc.append(notion, "page-1", "a", URL),
+                             svc.append(notion, "page-2", "b", URL))
+        assert len(notion.patches) == 2
+
+    def test_a_page_id_with_or_without_dashes_is_one_lock(self, manager, settings, jobs):
+        svc = ArchiveService(manager, settings, jobs)
+        lock = svc._page_lock("0f5e3c1a-1234-5678-9abc-def012345678")
+        assert svc._page_lock("0F5E3C1A123456789ABCDEF012345678") is lock

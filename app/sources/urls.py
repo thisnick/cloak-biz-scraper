@@ -18,11 +18,14 @@ from typing import Iterable
 from urllib.parse import parse_qsl, unquote_plus, urlencode, urlparse, urlunparse
 
 # Query parameters that say how someone arrived, never which listing they are
-# looking at. Matched case-insensitively; `utm_*` is matched as a prefix.
+# looking at. Matched case-insensitively; `utm_*` is matched as a prefix. Not
+# `ref`: sites use `?ref=<id>` as the listing's own id, and dropping it stores
+# every listing on the page as one address. (A `ref` that is the same on every
+# link of a list — "?ref=home" — is still left out of `normalize_url`'s key,
+# which keeps only the query keys that vary across the list.)
 _TRACKING = frozenset({
     "gclid", "gbraid", "wbraid", "dclid", "fbclid", "msclkid", "yclid", "twclid",
     "igshid", "mc_cid", "mc_eid", "_ga", "_gl", "_hsenc", "_hsmi", "mkt_tok",
-    "ref", "ref_src",
 })
 
 
@@ -86,8 +89,8 @@ def listing_url(href: str | None) -> str | None:
     Unlike `canonical_url`, the query stays: on many sites it is the only thing
     naming the listing (`listing.php?LID=5`), and dropping it stores a link
     that opens the wrong page, or none. What goes is what cannot be the
-    listing — the fragment, and tracking parameters (`utm_*`, `gclid`, `ref`,
-    …) — so a link clicked from a newsletter and the same link on the results
+    listing — the fragment, and tracking parameters (`utm_*`, `gclid`,
+    `fbclid`, …) — so a link clicked from a newsletter and the same link on the results
     page store the same address. The remaining parameters are kept exactly as
     the site wrote them (order and encoding), because this is a URL to open,
     not a key to compare; `normalize_url` is the key.

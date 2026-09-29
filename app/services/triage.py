@@ -63,6 +63,10 @@ TRIAGE_BATCH = 1
 # and the criteria and card take a few thousand of them; 60k characters of
 # page markdown stays under that with room to spare.
 DETAIL_CHARS = 60_000
+# The card's excerpt, at most. A card is a few lines; an "excerpt" longer than
+# this is a whole page read as one card, and sent in full it would crowd the
+# detail page out of the stage-2 state (which holds the card too).
+EXCERPT_CHARS = 2_000
 
 # What a decision was made on — the last part of the recorded reason.
 STAGE_CARD = "card"
@@ -97,7 +101,8 @@ def price_to_earnings(listing: Listing) -> str | None:
 
 def card_state(listing: Listing) -> dict[str, str]:
     """The listing as its card showed it, for the classifier. Blank fields are
-    left out rather than sent empty — an empty "ebitda" reads as a claim."""
+    left out rather than sent empty — an empty "ebitda" reads as a claim — and
+    the excerpt is cut to `EXCERPT_CHARS`."""
     fields = {
         "title": listing.title,
         "location": listing.location,
@@ -105,7 +110,7 @@ def card_state(listing: Listing) -> dict[str, str]:
         "cash_flow_sde": listing.cashflow,
         "ebitda": listing.ebitda,
         "revenue": listing.revenue,
-        "listing_excerpt": listing.excerpt,
+        "listing_excerpt": (listing.excerpt or "").strip()[:EXCERPT_CHARS],
     }
     state = {k: v.strip() for k, v in fields.items() if v and v.strip()}
     multiple = price_to_earnings(listing)

@@ -117,8 +117,33 @@ class TestKeepQuery:
 class TestListingUrl:
     def test_fragment_and_tracking_go_but_the_listing_id_stays(self):
         url = ("https://www.example.com/listing.php?utm_source=news&LID=5&gclid=abc"
-               "&ref=home&fbclid=z&mc_cid=1&mc_eid=2&_ga=3#photos")
+               "&fbclid=z&mc_cid=1&mc_eid=2&_ga=3#photos")
         assert listing_url(url) == "https://www.example.com/listing.php?LID=5"
+
+    @pytest.mark.parametrize("key", ["ref", "ref_src", "REF"])
+    def test_ref_is_not_tracking_it_can_be_the_listing_id(self, key):
+        """Sites use ?ref=<id> as the listing id; dropped, every listing on the
+        page would be stored as one address."""
+        assert listing_url(f"https://example.com/listing.php?{key}=1234&utm_source=x") == (
+            f"https://example.com/listing.php?{key}=1234")
+        a = normalize_url(listing_url("https://example.com/listing.php?ref=1234"),
+                          keep_query=["ref"])
+        b = normalize_url(listing_url("https://example.com/listing.php?ref=5678"),
+                          keep_query=["ref"])
+        assert a != b
+
+    def test_the_probe_treats_the_same_keys_as_tracking(self):
+        """JS_PROBE carries its own copy of the list (it runs in the page)."""
+        import re
+
+        from app.sources import generic, urls
+
+        source = re.search(r"const TRACKING = /\^\((.*?)\)\$/i;", generic.JS_PROBE).group(1)
+        probe = re.compile(rf"^({source})$", re.IGNORECASE)
+        for key in ("utm_source", "gclid", "fbclid", "_ga", "mkt_tok"):
+            assert probe.match(key) and urls._is_tracking(key)
+        for key in ("ref", "ref_src", "LID", "id"):
+            assert not probe.match(key) and not urls._is_tracking(key)
 
     def test_the_remaining_query_is_kept_exactly_as_written(self):
         """A URL to open, not a key: order and encoding are the site's."""

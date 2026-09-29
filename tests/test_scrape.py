@@ -1771,12 +1771,15 @@ from app.services.typesafe import (  # noqa: E402
     TypeSafeAuthError,
     TypeSafeCheck,
     TypeSafeCreditError,
+    TypeSafeError,
+    TypeSafeNotConfigured,
     TypeSafeUnavailable,
 )
 from app.stores.base import TriageTarget, TriageUnavailable  # noqa: E402
 
 PROMPT = "Reject restaurants.\nReject if the asking price is below $1M."
 OUTAGE = "The TypeSafe Classifier did not answer after 4 attempts (HTTP 503)."
+REFUSED = "The TypeSafe Classifier refused this request (HTTP 400: state too large)."
 
 
 def _tl(n: int, title: str) -> Listing:
@@ -1847,14 +1850,21 @@ class TriageStore:
 class TriageClassifier:
     """Answers by listing title: `card`/`detail` give P(review) per title
     (default 0.9), `guard` gives P(real content) per title (default 0.96).
-    A title in `down` makes the classifier fail at that question."""
+    A (stage, title) in `down` makes the classifier fail at that question with
+    `down_error` (an outage by default); one in `refuse` makes it refuse that
+    one request (a plain TypeSafeError, e.g. a 400). Every answer yields to the
+    loop first, as a real request does — without that, questions started "at
+    once" would each run to completion before the next began."""
 
-    def __init__(self, events, *, card=None, detail=None, guard=None, down=(), check_error=None):
+    def __init__(self, events, *, card=None, detail=None, guard=None, down=(), check_error=None,
+                 refuse=(), down_error=None):
         self.events = events
         self.card = dict(card or {})
         self.detail = dict(detail or {})
         self.guard = dict(guard or {})
         self.down = set(down)
+        self.refuse = set(refuse)
+        self.down_error = down_error or TypeSafeUnavailable(OUTAGE)
         self.check_error = check_error
         self.checks = 0
         self.asked: list[tuple[str, str]] = []
@@ -1870,8 +1880,11 @@ class TriageClassifier:
         title = state["title"]
         self.asked.append((stage, title))
         self.events.append(("ask", stage, title))
+        await asyncio.sleep(0)
         if (stage, title) in self.down:
-            raise TypeSafeUnavailable(OUTAGE)
+            raise self.down_error
+        if (stage, title) in self.refuse:
+            raise TypeSafeError(REFUSED)
         p = (self.card if stage == "card" else self.detail).get(title, 0.9)
         return Choice(choice="REVIEW" if p > 0.5 else "REJECT",
                       probabilities={"REVIEW": p, "REJECT": round(1 - p, 6)},
@@ -1884,8 +1897,11 @@ class TriageClassifier:
         title = state["page_text"].splitlines()[0].lstrip("# ")
         self.asked.append(("guard", title))
         self.events.append(("guard", title))
+        await asyncio.sleep(0)
         if ("guard", title) in self.down:
-            raise TypeSafeUnavailable(OUTAGE)
+            raise self.down_error
+        if ("guard", title) in self.refuse:
+            raise TypeSafeError(REFUSED)
         return self.guard.get(title, 0.96)
 
 
@@ -1930,7 +1946,8 @@ class Rig:
 
     def __init__(self, settings, jobs, listings, *, key=True, notion=True, archive=True,
                  existing=None, fail_writes=(), prepare_error=None, card=None, detail=None,
-                 guard=None, down=(), check_error=None, pages=None, fail_appends=(), hang=None):
+                 guard=None, down=(), check_error=None, pages=None, fail_appends=(), hang=None,
+                 refuse=(), down_error=None):
         if notion:
             settings.update(notion_api_token="ntn_x", notion_db_id="db-1")
         if key:
@@ -1947,7 +1964,8 @@ class Rig:
             return self.store
 
         self.classifier = TriageClassifier(self.events, card=card, detail=detail, guard=guard,
-                                           down=down, check_error=check_error)
+                                           down=down, check_error=check_error, refuse=refuse,
+                                           down_error=down_error)
         self.archive = TriageArchive(self.events, jobs, {l.url: l.title for l in listings},
                                      pages=pages, fail_appends=fail_appends, hang=hang)
         self.svc = ScrapeService(instances=None, jobs=jobs, settings=settings,
@@ -2116,18 +2134,72 @@ class TestTriageFailures:
     async def test_an_outage_mid_run_completes_the_job_and_leaves_the_rest_blank(
         self, settings, jobs,
     ):
-        rows = [_tl(1, "First"), _tl(2, "Second"), _tl(3, "Third")]
+        """Every row's question is started at once; only the ones already in
+        flight when the classifier went down are asked — the rest never spend
+        the client's retries on an outage."""
+        from app.services.scrape import TRIAGE_PARALLEL
+
+        titles = ["First", "Second"] + [f"Row {i}" for i in range(3, TRIAGE_PARALLEL + 6)]
+        rows = [_tl(i, t) for i, t in enumerate(titles, 1)]
         rig = Rig(settings, jobs, rows, card={"First": 0.05}, down={("card", "Second")})
         result, _ = await rig.run()
 
         assert rig.writes() == {"row-t1": "REJECT"}, "what was decided before it went down stays"
-        assert ("card", "Third") not in rig.classifier.asked, "no question after the outage"
+        asked = [t for stage, t in rig.classifier.asked if stage == "card"]
+        assert asked == titles[:TRIAGE_PARALLEL], "no question after the outage"
         assert rig.archive.reads == []
         assert result.status == "completed", "the scrape and the save succeeded"
         assert result.triage.error == OUTAGE and not result.triage.ok
-        assert result.triage.undecided == 2
+        assert result.triage.undecided == len(rows) - 1
         assert "Triage stopped before deciding every row" in result.error and OUTAGE in result.error
-        assert [l.bot_triage for l in result.listings] == ["REJECT", "", ""]
+        assert [l.bot_triage for l in result.listings] == ["REJECT"] + [""] * (len(rows) - 1)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("error", [
+        TypeSafeAuthError("OpenRouter rejected the key (HTTP 401)."),
+        TypeSafeCreditError("The OpenRouter account is out of credits (HTTP 402)."),
+        TypeSafeUnavailable(OUTAGE),
+        TypeSafeNotConfigured("No OpenRouter API key is saved."),
+    ])
+    async def test_a_classifier_that_cannot_answer_anything_stops_triage(
+        self, settings, jobs, error,
+    ):
+        rows = [_tl(1, "First"), _tl(2, "Second")]
+        rig = Rig(settings, jobs, rows, down={("card", "First")}, down_error=error)
+        result, _ = await rig.run()
+        assert result.triage.error == str(error)
+        assert rig.archive.reads == [], "a stop skips the detail stage"
+        assert result.triage.failures == []
+
+    @pytest.mark.asyncio
+    async def test_a_request_refused_for_one_row_fails_that_row_only(self, settings, jobs):
+        """A 400 for one listing (say its state is too large) recurs on every
+        sweep while the row stays blank; stopping all of triage for it would
+        stall every other row with it."""
+        rows = [_tl(1, "Bad Row"), _tl(2, "Good Row"), _tl(3, "Taqueria")]
+        rig = Rig(settings, jobs, rows, card={"Taqueria": 0.04},
+                  refuse={("card", "Bad Row")})
+        result, _ = await rig.run()
+
+        assert rig.writes() == {"row-t2": "REVIEW", "row-t3": "REJECT"}
+        assert [p for _, p, _, _ in rig.archive.appends] == ["row-t2"], "the detail stage ran"
+        (failure,) = result.triage.failures
+        assert failure.row_id == "row-t1"
+        assert failure.error == f"The classifier couldn't judge this listing: {REFUSED}"
+        assert result.triage.error is None and result.triage.undecided == 1
+        assert "Triage couldn't decide 1 row (see triage.failures)" in result.error
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stage", ["guard", "detail"])
+    async def test_a_refusal_at_the_detail_stage_is_that_row_s_too(self, settings, jobs, stage):
+        rows = [_tl(1, "Bad Row"), _tl(2, "Good Row")]
+        rig = Rig(settings, jobs, rows, refuse={(stage, "Bad Row")})
+        result, _ = await rig.run()
+
+        assert rig.writes() == {"row-t2": "REVIEW"}
+        (failure,) = result.triage.failures
+        assert failure.row_id == "row-t1" and REFUSED in failure.error
+        assert result.triage.error is None
 
     @pytest.mark.asyncio
     async def test_an_outage_at_the_guard_stops_triage_too(self, settings, jobs):
@@ -2163,6 +2235,50 @@ class TestTriageFailures:
         (failure,) = result.triage.failures
         assert "Archiving the detail page into the row failed, so REVIEW was not written" \
             in failure.error
+
+
+class TestOverlappingSweeps:
+    @pytest.mark.asyncio
+    async def test_a_row_another_sweep_is_triaging_is_left_to_it(self, settings, jobs):
+        """Two sweeps that overlap both see a blank row; the second leaves it to
+        the first rather than judging, archiving and writing it twice."""
+        reading, release = asyncio.Event(), asyncio.Event()
+        rig = Rig(settings, jobs, [_tl(1, "Shared Row")], existing={"t1": ""},
+                  hang=(reading, release))
+        first = await rig.svc.submit([SERP], sync=True, triage_prompt=PROMPT)
+        await asyncio.wait_for(reading.wait(), 2)
+        assert rig.svc._triaging == {"row-t1"}
+
+        second = await rig.svc.submit([SERP], sync=True, triage_prompt=PROMPT)
+        for _ in range(200):
+            if jobs.get(second.id).status != "working":
+                break
+            await asyncio.sleep(0.01)
+        other = rig.svc.result(second.id)
+        assert other.status == "completed" and other.error is None
+        assert other.triage.in_flight == 1 and other.triage.undecided == 0 and other.triage.ok
+        assert other.triage.backlog == []
+        assert "1 left to another sweep triaging them" in other.summary
+        assert rig.classifier.asked.count(("card", "Shared Row")) == 1, "asked by the first only"
+
+        release.set()
+        await _drain(rig.svc)
+        assert rig.writes() == {"row-t1": "REVIEW"} and len(rig.store.writes) == 1
+        assert len(rig.archive.appends) == 1
+        assert rig.svc.result(first.id).triage.in_flight == 0
+        assert rig.svc._triaging == set(), "released when the phase ends"
+
+    @pytest.mark.asyncio
+    async def test_a_row_is_released_when_its_phase_is_cancelled(self, settings, jobs):
+        reading, release = asyncio.Event(), asyncio.Event()
+        rig = Rig(settings, jobs, [_tl(1, "Taqueria")], hang=(reading, release))
+        await rig.svc.submit([SERP], sync=True, triage_prompt=PROMPT)
+        await asyncio.wait_for(reading.wait(), 2)
+        (task,) = rig.svc._running
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert rig.svc._triaging == set()
 
 
 class TestTriageLifecycle:

@@ -465,7 +465,8 @@ def build(app) -> MCPServer:
             would not load, the classifier stopped answering) stays blank, is
             listed in `triage.failures` or `triage.error`, and is triaged by a
             later sweep — the job still completes, because the rows were saved.
-            Leave it out to sweep exactly as without triage.
+            A row another sweep is triaging at that moment is left to it
+            (`triage.in_flight`). Leave it out to sweep exactly as without triage.
         """
         job = await app.state.scrape.submit(urls, max_pages=max_pages, sync=sync,
                                             triage_prompt=triage_prompt)
@@ -504,7 +505,9 @@ def build(app) -> MCPServer:
         listing's own page. Appends to the page you name and touches nothing
         else — it never creates a page or edits a property. A page that already
         has a Source Content section gets nothing appended, so calling this again
-        for the same page is safe. When a TypeSafe Classifier (e.g. Jev) key is
+        for the same page is safe. If Notion refuses part of a long page, what was
+        already written is deleted again (or, if that fails, the error says to
+        delete the partial section by hand). When a TypeSafe Classifier (e.g. Jev) key is
         set, a page that turns out to be a login wall, error, removed listing or
         anti-bot page is not written, and the result says so.
         """

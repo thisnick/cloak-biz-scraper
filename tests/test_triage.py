@@ -106,6 +106,16 @@ class TestTheState:
         assert price_to_earnings(listing) is None
         assert "price_to_earnings_multiple" not in card_state(listing)
 
+    def test_a_long_excerpt_is_cut_to_2000_characters(self):
+        """A generic card can be most of a page; sent whole it would crowd the
+        detail page out of the stage-2 state, which carries the card too."""
+        assert triage.EXCERPT_CHARS == 2000
+        state = card_state(_listing(excerpt="  " + "word " * 1000))
+        assert 1990 <= len(state["listing_excerpt"]) <= 2000
+        assert state["listing_excerpt"].startswith("word word")
+        page = detail_state(_listing(excerpt="y" * 9000), "the page")
+        assert len(page["listing_excerpt"]) == 2000 and page["detail_page_text"] == "the page"
+
     def test_the_detail_state_is_the_card_plus_the_page_cut_to_size(self):
         page = "x" * (DETAIL_CHARS + 500)
         state = detail_state(_listing(), page)
