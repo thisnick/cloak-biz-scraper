@@ -105,8 +105,11 @@ With a key saved:
   pending or under contract, and not a menu link, an ad or other page furniture), and, with
   a `triage_prompt`, REVIEW or REJECT. Only listings your Notion database does not have yet
   are asked about (plus, when triaging, rows whose Bot Triage is still blank), so a daily
-  sweep of mostly-known listings asks little; with `sync=false` every listing is asked. Up
-  to five requests are in flight at once — the one limit every classifier call shares.
+  sweep of mostly-known listings asks little; with `sync=false` every listing is asked. A
+  sweep has up to five of these requests in flight at once, or as many as the call's
+  `classifier_parallel` asks for (1 to 20). Each sweep keeps to its own number, and the
+  server holds every classifier request together — all sweeps, archive guards and Settings
+  checks — to 20 at once.
 - On other sites a listing that is not for sale now is left out, and the result's summary
   counts them ("N left out as not currently for sale / not listings"); there is no separate
   handling of sold listings. On BizBuySell every card the adapter read is kept.
@@ -173,9 +176,17 @@ still blank:
    and a later sweep tries it again.
 
 A row that already has a Bot Triage value — the bot's or yours — is never judged again. A
-sweep reads at most 25 detail pages: card REVIEWs past that stay blank, are counted in the
-result's `triage.deferred`, and are read by the next sweep. An empty `triage_prompt` is the
-same as leaving it out.
+sweep reads at most 25 detail pages, or as many as the call's `max_detail_reads` says (1 to
+200): card REVIEWs past that stay blank, are counted in the result's `triage.deferred`, and
+are read by the next sweep. Each read holds a pooled browser for about a minute, and reads
+run as many at a time as the pool gives tasks (see
+[Set the number and mix of browsers](#set-the-number-and-mix-of-browsers)) — two or three on
+most setups — so raising it makes the sweep take longer: 100 reads adds roughly 35–50
+minutes. An empty `triage_prompt` is the same as leaving it out.
+
+Both per-call limits, `max_detail_reads` and `classifier_parallel`, are refused before the
+sweep starts when out of range — the message gives the range — rather than quietly raised
+or lowered to fit. Each sweep's Details (Tasks → History) show the two values it ran with.
 
 The decision goes to the **Bot Triage** column (Select or Text); a database without one
 refuses the call. **Triage Reason** (e.g. `REVIEW · P(review)=0.91 · card + detail page`),

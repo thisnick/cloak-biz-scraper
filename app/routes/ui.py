@@ -551,6 +551,11 @@ async def get_run(request: Request, job_id: str) -> dict[str, Any]:
         # override. Here and not in /runs (every row) or in the ScrapeResult an
         # agent polls: it is for a person working out why a site read wrong.
         detail["decisions"] = job.decisions
+        # The limits this sweep ran with — the call's, or the defaults — so a
+        # run with many deferred REVIEWs, or a slow page of classifier
+        # requests, can be read against what it was allowed.
+        detail["max_detail_reads"] = job.max_detail_reads
+        detail["classifier_parallel"] = job.classifier_parallel
     return detail
 
 

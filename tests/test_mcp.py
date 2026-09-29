@@ -188,6 +188,26 @@ class TestStateless:
         assert "triage" in output["properties"]
         assert {"bot_triage", "triage_p_review"} <= set(output["$defs"]["Listing"]["properties"])
 
+    def test_the_sweep_describes_its_two_limits(self, client):
+        """What each limit controls, its default and range, and the cost of a
+        higher detail-read limit — so a model can choose a value on purpose."""
+        tool = {t["name"]: t for t in rpc(client, "tools/list").json()["result"]["tools"]}[
+            "scrape_listings"]
+        description = " ".join(tool["description"].split())
+        assert "max_detail_reads: how many listings judged REVIEW on their card" in description
+        assert "Default 25; allowed 1 to 200" in description
+        assert "about a minute of browser time" in description
+        assert "classifier_parallel: how many" in description
+        assert "Default 5; allowed 1 to 20" in description
+        assert "refused" in description
+        props = tool["inputSchema"]["properties"]
+        assert props["max_detail_reads"]["type"] == "integer"
+        assert props["max_detail_reads"]["default"] == 25
+        assert props["classifier_parallel"]["type"] == "integer"
+        assert props["classifier_parallel"]["default"] == 5
+        assert "max_detail_reads" not in tool["outputSchema"]["properties"], (
+            "recorded on the task, not in the payload a poll returns")
+
     def test_archive_page_describes_the_guard_and_the_repeat(self, client):
         """Behaviour only: what a repeat call does, and what happens to a page
         that turns out to be a wall or an error."""
@@ -441,6 +461,65 @@ class TestSweepRefusalsReachBothDoors:
 
 
 SERP = "https://www.bizbuysell.com/california/sacramento-area-businesses-for-sale/"
+
+
+class TestSweepLimitsReachBothDoors:
+    """`max_detail_reads` and `classifier_parallel` go through the one `submit`
+    from both doors: the same values reach the sweep, and a value out of range
+    is refused on both with the same sentence — the service's, not a schema
+    validator's."""
+
+    @pytest.fixture
+    def started(self, client, monkeypatch):
+        from app.models import SweepTask
+
+        calls: list[dict] = []
+
+        def start(urls, **kw):
+            calls.append(kw)
+            return SweepTask(id=f"job-{len(calls)}", urls=urls, status="working")
+
+        monkeypatch.setattr(app.state.scrape, "start", start)
+        return calls
+
+    def _limits(self, started):
+        return [(kw["max_detail_reads"], kw["classifier_parallel"]) for kw in started]
+
+    def test_each_door_passes_the_values_through(self, client, started):
+        arguments = {"urls": [SERP], "max_detail_reads": 60, "classifier_parallel": 8}
+        r = rpc(client, "tools/call", {"name": "scrape_listings", "arguments": arguments})
+        assert r.json()["result"].get("isError") is not True, r.text
+        rest = client.post("/api/scrape", json=arguments)
+        assert rest.status_code == 200, rest.text
+        assert self._limits(started) == [(60, 8), (60, 8)]
+
+    def test_left_out_they_are_the_defaults(self, client, started):
+        r = rpc(client, "tools/call", {"name": "scrape_listings", "arguments": {"urls": [SERP]}})
+        assert r.json()["result"].get("isError") is not True, r.text
+        assert client.post("/api/scrape", json={"urls": [SERP]}).status_code == 200
+        assert self._limits(started) == [(25, 5), (25, 5)]
+
+    @pytest.mark.parametrize("name,value,bounds", [
+        ("max_detail_reads", 0, "from 1 to 200"),
+        ("max_detail_reads", 500, "from 1 to 200"),
+        ("classifier_parallel", 0, "from 1 to 20"),
+        ("classifier_parallel", 50, "from 1 to 20"),
+    ])
+    def test_out_of_range_is_refused_on_both_doors_in_one_sentence(
+        self, client, started, name, value, bounds,
+    ):
+        arguments = {"urls": [SERP], name: value}
+        r = rpc(client, "tools/call", {"name": "scrape_listings", "arguments": arguments})
+        assert r.status_code == 200, r.text
+        result = r.json()["result"]
+        assert result["isError"] is True, result
+        text = result["content"][0]["text"]
+        rest = client.post("/api/scrape", json=arguments)
+        assert rest.status_code == 422
+        detail = rest.json()["detail"]
+        assert isinstance(detail, str) and detail in text, "the same sentence on both doors"
+        assert f"{name}={value} is out of range" in detail and bounds in detail
+        assert started == [], "refused before a sweep starts"
 
 
 class TestTriageRefusalsReachBothDoors:

@@ -125,8 +125,9 @@ class TriageSummary(BaseModel):
     deferred: int = Field(
         default=0,
         description="Rows judged REVIEW on their card whose detail page this sweep did not "
-        "read, because a sweep reads at most 25 detail pages. They stay blank and a later "
-        "sweep decides them. Counted in `undecided`.",
+        "read, because it reads at most `max_detail_reads` detail pages (25 unless the call "
+        "said otherwise). They stay blank and a later sweep decides them. Counted in "
+        "`undecided`.",
     )
     backlog: list[TriagedRow] = Field(
         default_factory=list,
@@ -195,6 +196,15 @@ class SweepTask(TaskBase):
     kind: Literal["sweep"] = "sweep"
     source: str = ""
     max_pages: int = 1
+    # The two limits the call could set for this sweep (see scrape_listings):
+    # how many card REVIEWs get their detail page read, and how many classifier
+    # requests it had in flight at once. Recorded so the run's detail says what
+    # it ran with; deliberately not in ScrapeResult, which an agent polls. The
+    # defaults are services.scrape.MAX_DETAIL_READS and
+    # services.typesafe.TYPESAFE_PARALLEL — what every sweep used before a call
+    # could choose, so an older record reads right.
+    max_detail_reads: int = 25
+    classifier_parallel: int = 5
     sync: bool = False
     db_id: str = ""
     pages_crawled: int = 0

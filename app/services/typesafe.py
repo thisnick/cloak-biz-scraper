@@ -58,13 +58,17 @@ _BACKOFF_SEC = 0.5
 # A Retry-After longer than this is a server asking us to go away for a while;
 # waiting it out inside one request would just look like a hang.
 _MAX_RETRY_AFTER_SEC = 20.0
-# Classifier requests in flight at once — the one parallelism limit for
-# everything that asks the classifier. The client holds every caller to it
-# (one shared ceiling per process), and the callers that fan out — a sweep's
-# per-listing requests above all — gate themselves on the same number, so a
+# Classifier requests one sweep has in flight at once, unless the call names
+# its own (`scrape_listings(classifier_parallel=…)`). The callers that fan out —
+# a sweep's per-listing requests above all — gate themselves on it, so a
 # 50-listing page never opens 50 connections at once and earns 429s for all
 # of them, and an outage is met by at most this many requests.
 TYPESAFE_PARALLEL = 5
+# Classifier requests in flight at once across the whole process, and the most
+# a call may ask for as its sweep's own limit. The client holds every caller to
+# it (one shared ceiling per process): two sweeps each at their own limit, plus
+# archive guards and Settings checks, never have more than this out together.
+TYPESAFE_MAX_PARALLEL = 20
 # TypeSafe's documented ceiling for one choice question.
 _MAX_CHOICE_OPTIONS = 255
 # Upstream error text shown to a person, at most. Enough for "Model x does not
@@ -275,7 +279,8 @@ class TypeSafeClient:
         return key, model
 
     def _semaphore(self) -> asyncio.Semaphore:
-        """The shared ceiling, made in (and for) the loop that is running now.
+        """The shared ceiling (`TYPESAFE_MAX_PARALLEL`), made in (and for) the
+        loop that is running now.
 
         An asyncio.Semaphore belongs to the first loop that waits on it, and this
         client outlives loops: it sits on app.state, and every TestClient (and
@@ -285,7 +290,7 @@ class TypeSafeClient:
         """
         loop = asyncio.get_running_loop()
         if self._sem is None or self._sem_loop is not loop:
-            self._sem = asyncio.Semaphore(TYPESAFE_PARALLEL)
+            self._sem = asyncio.Semaphore(TYPESAFE_MAX_PARALLEL)
             self._sem_loop = loop
         return self._sem
 

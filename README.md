@@ -185,7 +185,7 @@ any behavioural change.
 | Tool | What it does |
 | --- | --- |
 | `server_info()` | Read proxy, browser-build, pool-capacity, Notion connection, and TypeSafe Classifier status without exposing secrets. |
-| `scrape_listings(urls, max_pages=1, sync=false, triage_prompt=null)` | Start one asynchronous sweep across one or more listings pages — BizBuySell search results and broker profiles natively, any other site's listings page with a TypeSafe Classifier (e.g. Jev) key saved; results are merged and de-duplicated. With `sync=true` and your criteria as `triage_prompt`, every saved row is also decided REVIEW or REJECT, and REVIEW rows get their detail page archived. |
+| `scrape_listings(urls, max_pages=1, sync=false, triage_prompt=null, max_detail_reads=25, classifier_parallel=5)` | Start one asynchronous sweep across one or more listings pages — BizBuySell search results and broker profiles natively, any other site's listings page with a TypeSafe Classifier (e.g. Jev) key saved; results are merged and de-duplicated. With `sync=true` and your criteria as `triage_prompt`, every saved row is also decided REVIEW or REJECT, and REVIEW rows get their detail page archived. `max_detail_reads` (1–200) sets how many card REVIEWs this sweep reads on their detail page, about a minute of browser time each; `classifier_parallel` (1–20) how many classifier requests it has in flight at once. Out of range is refused. |
 | `get_scrape_listing_results(job_id)` | Poll a sweep without blocking. Completed results are retained for two weeks. |
 | `archive_page(url, notion_page_id)` | Read a page and append its readable content to an existing Notion page. It takes roughly a minute; a page that already has a Source Content section gets nothing appended, so a repeat call is safe. With a TypeSafe Classifier (e.g. Jev) key saved, a login wall, error, removed listing or anti-bot page is not written. |
 | `create_instance(profile="Default", country=null, region=null, geoip=true)` | Launch a browser with a durable profile and return a short-lived CDP URL plus a live-view URL when available. In chat apps that support MCP Apps, a live view appears in the conversation. It closes after 15 minutes idle or 60 minutes total. |
@@ -250,7 +250,10 @@ and Criteria Version columns where they exist or are mapped. A row that already 
 Triage is never judged again. A missing key, a key that fails its check, `sync=false` or a
 database with no Bot Triage column refuses the call up front; a row that could not be
 decided stays blank and is reported in the result's `triage.failures`, and a later sweep
-decides it. Without `triage_prompt` a sweep behaves exactly as before — see
+decides it. A sweep reads at most 25 detail pages, or the call's `max_detail_reads` (1 to
+200); each is about a minute of a pooled browser, two or three at a time, so a higher value
+makes the sweep longer, and the card REVIEWs past it stay blank (`triage.deferred`) for a
+later sweep. Without `triage_prompt` a sweep behaves exactly as before — see
 [triage prompt](docs/advanced-controls.md#triage-prompt).
 
 BizBuySell pages are read by their own adapters. A page on any other site is read
@@ -261,7 +264,9 @@ reused for its later pages; the next page is decided on every page; nothing is r
 between sweeps. Once a page is down to its listings, each listing the store does not have yet
 (or, when triaging, has with a blank Bot Triage) gets one request carrying every question
 about it: is it a business for sale now — not sold, pending or under contract, not a menu
-link or an ad — and, with a `triage_prompt`, REVIEW or REJECT. On other sites a listing that
+link or an ad — and, with a `triage_prompt`, REVIEW or REJECT. A sweep has five of these
+in flight at once, or the call's `classifier_parallel` (1 to 20); the server holds every
+classifier request together to 20. On other sites a listing that
 is not for sale now is left out and counted in the summary; BizBuySell's cards are always
 kept. Listings already decided in Notion cost nothing, and without a key nothing is asked.
 Without a key a URL on another site is refused with a pointer to Settings; a key that

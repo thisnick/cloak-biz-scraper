@@ -23,7 +23,7 @@ import base64
 import logging
 
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from ..models import (
     AgentBrowserResult,
@@ -43,8 +43,14 @@ from ..services.geo import GeoUnresolved, ProxyUnreachable
 from ..services.instances import BrowserUnavailable, CapExceeded
 from ..services.license import LicenseNotPro
 from ..services.proxy import ProxyNotConfigured
-from ..services.scrape import ClassifierNotReady, NotASweep, NotionNotConfigured
+from ..services.scrape import (
+    MAX_DETAIL_READS,
+    ClassifierNotReady,
+    NotASweep,
+    NotionNotConfigured,
+)
 from ..services.tokens import OWNER
+from ..services.typesafe import TYPESAFE_PARALLEL
 from ..services.urls import public_base
 from ..services.views import (
     download_message,
@@ -69,6 +75,25 @@ class ScrapeRequest(BaseModel):
     # blank: no triage, and the sweep is exactly what it was before triage
     # existed.
     triage_prompt: str | None = None
+    # The sweep's two per-call limits, as on the tool. Ranges are not in the
+    # schema on purpose: the service refuses an out-of-range value with one
+    # sentence (a 422 here, the tool's error over MCP), and a schema check
+    # would answer first, in pydantic's words, on this door only.
+    max_detail_reads: int = Field(
+        default=MAX_DETAIL_READS,
+        description="How many listings judged REVIEW on their card get their detail page read "
+        "(and, when the verdict stays REVIEW, archived into the row) in this sweep; only "
+        "matters with a triage_prompt. Default 25, allowed 1 to 200 — out of range is a 422. "
+        "Card REVIEWs past it stay blank (`triage.deferred`) for a later sweep. Each read is "
+        "about a minute of browser time, two or three at a time, so a higher value makes the "
+        "sweep take longer.",
+    )
+    classifier_parallel: int = Field(
+        default=TYPESAFE_PARALLEL,
+        description="How many TypeSafe Classifier (e.g. Jev) requests this sweep has in flight "
+        "at once — the one request per new listing. Default 5, allowed 1 to 20 — out of range "
+        "is a 422. The server holds all classifier requests together to 20 at once.",
+    )
 
 
 class ArchiveRequest(BaseModel):
@@ -114,11 +139,14 @@ async def scrape_listings(request: Request, body: ScrapeRequest) -> ScrapeResult
     archive_page); rows already present are omitted but counted in
     synced.existing. With `triage_prompt` (needs sync=true and the TypeSafe
     Classifier key) every saved row, and every seen row whose Bot Triage is
-    blank, is decided REVIEW or REJECT; see `triage` on the result."""
+    blank, is decided REVIEW or REJECT; see `triage` on the result.
+    `max_detail_reads` and `classifier_parallel` are this sweep's own limits
+    (see the body's field descriptions); out of range is a 422."""
     try:
         job = await request.app.state.scrape.submit(
             body.urls, max_pages=body.max_pages, sync=body.sync,
-            triage_prompt=body.triage_prompt,
+            triage_prompt=body.triage_prompt, max_detail_reads=body.max_detail_reads,
+            classifier_parallel=body.classifier_parallel,
         )
     except UnsupportedURL as exc:
         # UnsupportedURL is a ValueError subclass, so it must be caught before the
