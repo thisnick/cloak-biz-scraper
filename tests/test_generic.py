@@ -209,12 +209,21 @@ class FakeLocator:
     async def is_visible(self) -> bool:
         return self.selector not in self.page.hidden
 
-    async def click(self, **_kw) -> None:
+    async def click(self, **kw) -> None:
         if self.selector in self.page.lost:
             # What a humanized click reports when the site re-renders the
             # element it had just scrolled into view (FacetWP on Synergy).
             raise RuntimeError("Element lost after scrolling into view")
+        if self.selector in self.page.moving and not kw.get("force"):
+            raise RuntimeError("element position is still changing")
+        if self.selector in self.page.no_pointer:
+            raise RuntimeError("element is outside of the viewport")
         self.page.clicks.append(self.selector)
+
+    async def evaluate(self, script, arg=None):
+        if self.selector in self.page.lost:
+            raise RuntimeError("Element is not attached to the DOM")
+        self.page.clicks.append(f"script:{self.selector}")
 
 
 class FakePage:
@@ -229,6 +238,8 @@ class FakePage:
         self.missing: set[str] = set()
         self.lost: set[str] = set()      # found, but the click fails
         self.hidden: set[str] = set()    # found, not visible
+        self.moving: set[str] = set()    # fails the "stable" check unless forced
+        self.no_pointer: set[str] = set()  # any pointer click fails; el.click() works
         self.counts: dict[str, int] = {}  # how many elements a selector finds (default 1)
 
     async def evaluate(self, script, arg=None):
@@ -651,7 +662,7 @@ class TestScrolling:
         result = await GenericSource(LIST_URL, FakeJev()).cards(page)
         assert len(result.listings) == 4
         assert page.steps == ["wheel 2500"] * 3 + ["top", "probe"]
-        assert page.waits == [generic.SCROLL_PAUSE_MS] * 3
+        assert page.waits == [generic.SCROLL_PAUSE_MS] * 3 + [generic.SCROLL_BOTTOM_SETTLE_MS]
 
     @pytest.mark.asyncio
     async def test_a_short_page_costs_one_step(self):
@@ -679,6 +690,24 @@ class TestScrolling:
         assert await generic._scroll_through(page) == 3
         assert clock[0] == 12.0 and generic.SCROLL_BUDGET_S == 10.0
         assert page.steps[-1] == "top"
+
+    @pytest.mark.asyncio
+    async def test_a_bottom_is_believed_only_after_one_longer_wait(self):
+        """A lazy list that loads its next batch slower than a step's pause:
+        the settle wait at the bottom sees it grow, so the scroll goes on."""
+
+        class LateBatch(ScrollPage):
+            async def wait_for_timeout(self, ms):
+                await super().wait_for_timeout(ms)
+                if ms == generic.SCROLL_BOTTOM_SETTLE_MS and self.late:
+                    self.heights = self.late
+                    self.late = None
+
+        page = LateBatch(_probe(), heights=[3000])
+        page.late = [6000, 6000]
+        await generic._scroll_through(page)
+        assert page.waits.count(generic.SCROLL_BOTTOM_SETTLE_MS) == 2, page.waits
+        assert page.steps.count("wheel 2500") >= 2, "the scroll went on after the late batch"
 
     @pytest.mark.asyncio
     async def test_a_page_that_cannot_be_scrolled_is_read_as_it_is(self):
@@ -894,6 +923,31 @@ class TestUnavailable:
 
 
 # ── next page ────────────────────────────────────────────────────────────────
+
+
+class TestClickFallbacks:
+    """A next-page control that is there but fails the humanized click."""
+
+    @pytest.mark.asyncio
+    async def test_a_control_on_a_page_that_never_stops_moving_gets_a_forced_click(self):
+        page = FakePage(_probe())
+        page.moving.add("button.facetwp-load-more")
+        assert await generic._try_click(page, "button.facetwp-load-more", LIST_URL)
+        assert page.clicks == ["button.facetwp-load-more"]
+
+    @pytest.mark.asyncio
+    async def test_a_control_no_pointer_can_reach_is_clicked_by_its_own_click(self):
+        page = FakePage(_probe())
+        page.no_pointer.add("button.more")
+        assert await generic._try_click(page, "button.more", LIST_URL)
+        assert page.clicks == ["script:button.more"]
+
+    @pytest.mark.asyncio
+    async def test_a_control_that_is_gone_is_reported_as_not_clicked(self):
+        page = FakePage(_probe())
+        page.lost.add('[data-cbs-next="n1"]')
+        assert not await generic._try_click(page, '[data-cbs-next="n1"]', LIST_URL)
+        assert page.clicks == []
 
 
 class TestNextPage:

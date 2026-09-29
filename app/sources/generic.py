@@ -103,6 +103,10 @@ SCROLL_STEP_PX = 2500
 SCROLL_PAUSE_MS = 800
 SCROLL_MAX_STEPS = 10
 SCROLL_BUDGET_S = 10.0
+# At a bottom that did not grow, one longer wait before believing it: a lazy
+# list that fetches its next batch slower than a step's pause (BusinessBroker.net
+# once showed 23 of its 53 listings this way) would otherwise end the scroll.
+SCROLL_BOTTOM_SETTLE_MS = 2000
 _JS_SCROLL_STATE = (
     "() => [window.scrollY, window.innerHeight, Math.max("
     "document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0)]"
@@ -1283,11 +1287,30 @@ async def _try_click(page, selector: str, url: str, *, exactly_one: bool = False
             logger.info("generic: next-page control %s is not there on %s (%d found)",
                         selector, url, count)
             return False
-        await target.first.click(timeout=15_000)
     except Exception as exc:  # noqa: BLE001 — the caller tries the next way to find it
-        logger.info("generic: could not click %s on %s: %s", selector, url, exc)
+        logger.info("generic: could not find %s on %s: %s", selector, url, exc)
         return False
-    return True
+    # A control on a page that never stops moving (an infinite scroll still
+    # loading, an animated sticky bar) fails Playwright's "stable" check on
+    # every try although it is there and works (Synergy's Load more). The
+    # humanized click comes first; then the same click without the waits;
+    # then the element's own click(), which fires its handlers without the
+    # pointer at all.
+    ways = (
+        ("click", lambda: target.first.click(timeout=15_000)),
+        ("forced click", lambda: target.first.click(force=True, timeout=5_000)),
+        ("script click", lambda: target.first.evaluate("(el) => el.click()")),
+    )
+    for how, attempt in ways:
+        try:
+            await attempt()
+        except Exception as exc:  # noqa: BLE001 — the next way, then the caller's next way
+            logger.info("generic: could not %s %s on %s: %s", how, selector, url, exc)
+            continue
+        if how != "click":
+            logger.info("generic: %s worked for %s on %s", how, selector, url)
+        return True
+    return False
 
 
 async def _page_size(page) -> list | None:
@@ -1348,7 +1371,11 @@ async def _scroll_through(page) -> int:
                 break
             top, view, grown = state
             if top + view >= grown - 2 and grown == height:
-                break
+                await page.wait_for_timeout(SCROLL_BOTTOM_SETTLE_MS)
+                state = await page.evaluate(_JS_SCROLL_STATE)
+                if not state or state[2] == height:
+                    break
+                grown = state[2]
             height = grown
         await page.evaluate(_JS_SCROLL_TOP)
     except Exception as exc:  # noqa: BLE001 — an unscrollable page is still read
