@@ -467,9 +467,13 @@ class TestPerCallBudget:
 class TestConcurrency:
     @respx.mock
     @pytest.mark.asyncio
-    async def test_no_more_than_five_requests_are_in_flight(self):
-        """One limit, five, for everything that asks the classifier."""
+    async def test_no_more_than_twenty_requests_are_in_flight(self):
+        """One ceiling, twenty, for everything that asks the classifier in this
+        process. Five is each sweep's own default (`TYPESAFE_PARALLEL`); the
+        ceiling is what lets a sweep asking for more actually get it, and what
+        still bounds two sweeps together."""
         assert typesafe.TYPESAFE_PARALLEL == 5
+        assert typesafe.TYPESAFE_MAX_PARALLEL == 20
         in_flight = peak = 0
 
         async def answer(request):
@@ -482,8 +486,8 @@ class TestConcurrency:
 
         respx.post(API).mock(side_effect=answer)
         client = _client()
-        await asyncio.gather(*(client.noul("x", "y") for _ in range(30)))
-        assert peak == typesafe.TYPESAFE_PARALLEL
+        await asyncio.gather(*(client.noul("x", "y") for _ in range(50)))
+        assert peak == typesafe.TYPESAFE_MAX_PARALLEL
 
     def test_one_client_survives_a_new_event_loop(self):
         """The client lives on app.state and outlives loops (every TestClient,

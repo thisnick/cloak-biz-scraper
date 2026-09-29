@@ -53,8 +53,9 @@ from .services.geo import GeoUnresolved, ProxyUnreachable
 from .services.instances import BrowserUnavailable, CapExceeded
 from .services.license import LicenseNotPro
 from .services.proxy import ProxyNotConfigured
-from .services.scrape import ClassifierNotReady, NotionNotConfigured
+from .services.scrape import MAX_DETAIL_READS, ClassifierNotReady, NotionNotConfigured
 from .services.tokens import OWNER
+from .services.typesafe import TYPESAFE_PARALLEL
 from .services.urls import public_base
 from .services.views import (
     download_message,
@@ -388,7 +389,8 @@ def build(app) -> MCPServer:
     @tool(annotations=ADDITIVE_OPEN_WORLD)
     async def scrape_listings(
         urls: list[str], max_pages: int = 1, sync: bool = False,
-        triage_prompt: str | None = None,
+        triage_prompt: str | None = None, max_detail_reads: int = MAX_DETAIL_READS,
+        classifier_parallel: int = TYPESAFE_PARALLEL,
     ) -> ScrapeResult:
         """Start sweeping one or more listings pages for business listings.
 
@@ -470,13 +472,37 @@ def build(app) -> MCPServer:
             would not load, the classifier stopped answering) stays blank, is
             listed in `triage.failures` or `triage.error`, and is triaged by a
             later sweep — the job still completes, because the rows were saved.
-            A sweep reads at most 25 detail pages; REVIEWs past that stay blank
-            for the next sweep (`triage.deferred`). A row another sweep is
-            triaging at that moment is left to it (`triage.in_flight`). Leave it
-            out (or pass an empty string) to sweep exactly as without triage.
+            A sweep reads at most `max_detail_reads` detail pages (25 unless you
+            say otherwise); REVIEWs past that stay blank for the next sweep
+            (`triage.deferred`). A row another sweep is triaging at that moment
+            is left to it (`triage.in_flight`). Leave it out (or pass an empty
+            string) to sweep exactly as without triage.
+        max_detail_reads: how many listings judged REVIEW on their card get their
+            detail page read (and, when the verdict stays REVIEW, archived into
+            the row) in this sweep. Only matters with a triage_prompt. Default 25;
+            allowed 1 to 200. Card REVIEWs past it stay blank, are counted in
+            `triage.deferred`, and are read by a later sweep. A higher value makes
+            the sweep take longer: each read is about a minute of browser time,
+            and reads run two or three at a time (as many as the server's
+            browser pool gives tasks), so 100 reads adds roughly 35–50 minutes
+            before the sweep completes.
+        classifier_parallel: how many requests to the TypeSafe Classifier (e.g.
+            Jev) this sweep has in flight at once — the one request per new
+            listing that asks whether it is for sale now (and, with a
+            triage_prompt, REVIEW or REJECT on its card). Default 5; allowed 1 to
+            20. Higher gets through a page of many new listings sooner; lower is
+            gentler on OpenRouter's rate limit. The server holds all classifier
+            requests together to 20 at once, so sweeps running at the same time
+            share that. Without the classifier key it has no effect.
+
+        A max_detail_reads or classifier_parallel outside its range is refused
+        before the sweep starts, with the allowed range in the message — it is
+        never quietly raised or lowered to fit.
         """
         job = await app.state.scrape.submit(urls, max_pages=max_pages, sync=sync,
-                                            triage_prompt=triage_prompt)
+                                            triage_prompt=triage_prompt,
+                                            max_detail_reads=max_detail_reads,
+                                            classifier_parallel=classifier_parallel)
         return ScrapeResult.of(job)
 
     @tool(annotations=READ_ONLY)

@@ -1967,6 +1967,8 @@ class TriageClassifier:
         self.check_error = check_error
         self.checks = 0
         self.asked: list[tuple[str, str]] = []
+        # Card requests in flight right now, and the most there ever were.
+        self.in_flight = self.peak = 0
 
     async def check(self, key=None, model=None):
         self.checks += 1
@@ -1981,7 +1983,12 @@ class TriageClassifier:
         assert "detail_page_text" not in state, "the card, and only the card"
         self.asked.append((stage, title))
         self.events.append(("ask", stage, title))
-        await asyncio.sleep(0)
+        self.in_flight += 1
+        self.peak = max(self.peak, self.in_flight)
+        try:
+            await asyncio.sleep(0)
+        finally:
+            self.in_flight -= 1
         if (stage, title) in self.down:
             raise self.down_error
         if (stage, title) in self.refuse:
@@ -2108,8 +2115,8 @@ class Rig:
 
         self.svc._sweep = sweep
 
-    async def run(self, prompt=PROMPT, urls=(SERP,), sync=True):
-        job = await self.svc.submit(list(urls), sync=sync, triage_prompt=prompt)
+    async def run(self, prompt=PROMPT, urls=(SERP,), sync=True, **limits):
+        job = await self.svc.submit(list(urls), sync=sync, triage_prompt=prompt, **limits)
         await _drain(self.svc)
         return self.svc.result(job.id), self.jobs.get(job.id)
 
@@ -2487,9 +2494,245 @@ class TestDetailReadCap:
         assert (t.review, t.reject, t.deferred, t.undecided) == (MAX_DETAIL_READS, 1, 3, 3)
         assert not t.ok and t.error is None and t.failures == []
         assert result.status == "completed" and result.error is None, "a limit, not a failure"
-        assert "3 left blank for a later sweep (3 past the 25 detail pages a sweep reads)" \
+        assert "3 left blank for a later sweep (3 past the 25 detail pages this sweep reads)" \
             in result.summary
         assert [l.bot_triage for l in result.listings[-4:-1]] == ["", "", ""]
+
+
+def _cards_by_url(svc, cards_for: dict[str, list[Listing]]) -> None:
+    """Sweep each URL with the real page loop over one page of its own cards."""
+
+    async def sweep(job, i, url, source, prog):
+        page = _FakePage()
+        return await svc._sweep_once(_FakeInst(1, page), page, job, url,
+                                     _PlainSource([CardPage(list(cards_for[url]))]),
+                                     svc._evidence_dir(job, i))
+
+    svc._sweep = sweep
+
+
+async def _until(condition, what: str) -> None:
+    for _ in range(300):
+        if condition():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"never happened: {what}")
+
+
+class _HeldClassifier:
+    """Holds every card request until `release` is set, counting what is in
+    flight per sweep (the first word of the card's title) and in all."""
+
+    def __init__(self):
+        from collections import Counter
+
+        self.release = asyncio.Event()
+        self.in_flight: Counter = Counter()
+        self.peak: Counter = Counter()
+
+    async def ask(self, state, questions):
+        who = state["title"].split()[0]
+        for key in (who, "all"):
+            self.in_flight[key] += 1
+            self.peak[key] = max(self.peak[key], self.in_flight[key])
+        try:
+            await self.release.wait()
+            return {"eligible": Noul(0.95, "typesafe/jev-test")}
+        finally:
+            for key in (who, "all"):
+                self.in_flight[key] -= 1
+
+
+class TestPerCallLimits:
+    """`max_detail_reads` and `classifier_parallel`: two limits a call may set
+    for its own sweep. The defaults are what a sweep always did; each value is
+    recorded on the task; a value out of range is refused before anything
+    starts, never clamped."""
+
+    def test_the_defaults_are_unchanged(self):
+        import inspect
+
+        from app.services.scrape import MAX_DETAIL_READS, MAX_DETAIL_READS_CEILING
+        from app.services.typesafe import TYPESAFE_MAX_PARALLEL
+
+        assert (MAX_DETAIL_READS, MAX_DETAIL_READS_CEILING) == (25, 200)
+        assert (TYPESAFE_PARALLEL, TYPESAFE_MAX_PARALLEL) == (5, 20)
+        for method in (ScrapeService.submit, ScrapeService.start):
+            params = inspect.signature(method).parameters
+            assert params["max_detail_reads"].default == MAX_DETAIL_READS
+            assert params["classifier_parallel"].default == TYPESAFE_PARALLEL
+        # A record written before the fields existed ran with the defaults.
+        old = SweepTask.model_validate({"id": "old"})
+        assert (old.max_detail_reads, old.classifier_parallel) == (MAX_DETAIL_READS,
+                                                                   TYPESAFE_PARALLEL)
+
+    @pytest.mark.asyncio
+    async def test_a_sweep_that_names_neither_runs_and_records_the_defaults(
+        self, settings, jobs,
+    ):
+        rows = [_tl(i, f"Business {i}") for i in range(1, 13)]
+        rig = Rig(settings, jobs, rows)
+        result, job = await rig.run()
+        assert (job.max_detail_reads, job.classifier_parallel) == (25, 5)
+        assert rig.classifier.peak == TYPESAFE_PARALLEL
+        assert len(rig.archive.reads) == 12 and result.triage.ok
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("n", [2, 8])
+    async def test_classifier_parallel_is_this_sweep_s_gate(self, settings, jobs, n):
+        rows = [_tl(i, f"Business {i}") for i in range(1, 21)]
+        rig = Rig(settings, jobs, rows)
+        job = await rig.svc.submit([SERP], classifier_parallel=n)
+        await _drain(rig.svc)
+        assert len(rig.asked("eligible")) == 20
+        assert rig.classifier.peak == n
+        stored = jobs.get(job.id)
+        assert (stored.classifier_parallel, stored.max_detail_reads) == (n, 25)
+
+    @pytest.mark.asyncio
+    async def test_classifier_parallel_gates_a_triaging_sweep_too(self, settings, jobs):
+        rows = [_tl(i, f"Business {i}") for i in range(1, 21)]
+        rig = Rig(settings, jobs, rows)
+        result, job = await rig.run(classifier_parallel=8)
+        assert len(rig.asked("card")) == 20 and rig.classifier.peak == 8
+        assert job.classifier_parallel == 8 and result.triage.ok
+
+    @pytest.mark.asyncio
+    async def test_max_detail_reads_reads_that_many_and_leaves_the_rest_for_later(
+        self, settings, jobs,
+    ):
+        rows = [_tl(i, f"Business {i}") for i in range(1, 5)]
+        rig = Rig(settings, jobs, rows)
+        result, job = await rig.run(max_detail_reads=2)
+
+        assert [u for u, _, _ in rig.archive.reads] == [r.url for r in rows[:2]]
+        assert rig.writes() == {"row-t1": "REVIEW", "row-t2": "REVIEW"}
+        t = result.triage
+        assert (t.review, t.reject, t.deferred, t.undecided) == (2, 0, 2, 2)
+        assert not t.ok and t.error is None and t.failures == []
+        assert result.status == "completed" and result.error is None, "a limit, not a failure"
+        assert "2 left blank for a later sweep (2 past the 2 detail pages this sweep reads)" \
+            in result.summary
+        assert [l.bot_triage for l in result.listings] == ["REVIEW", "REVIEW", "", ""]
+        assert (job.max_detail_reads, job.classifier_parallel) == (2, TYPESAFE_PARALLEL)
+
+    @pytest.mark.asyncio
+    async def test_a_higher_max_detail_reads_reads_past_25(self, settings, jobs):
+        rows = [_tl(i, f"Business {i}") for i in range(1, 29)]
+        rig = Rig(settings, jobs, rows)
+        result, job = await rig.run(max_detail_reads=30)
+        assert len(rig.archive.reads) == 28
+        assert result.triage.deferred == 0 and result.triage.ok and result.triage.review == 28
+        assert job.max_detail_reads == 30
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("name,value,bounds", [
+        ("max_detail_reads", 0, "from 1 to 200"),
+        ("max_detail_reads", 201, "from 1 to 200"),
+        ("max_detail_reads", -3, "from 1 to 200"),
+        ("classifier_parallel", 0, "from 1 to 20"),
+        ("classifier_parallel", 21, "from 1 to 20"),
+    ])
+    async def test_out_of_range_is_refused_before_anything_starts(
+        self, settings, jobs, name, value, bounds,
+    ):
+        rig = Rig(settings, jobs, [_tl(1, "Only")])
+        with pytest.raises(ValueError) as exc:
+            await rig.svc.submit([SERP], sync=True, triage_prompt=PROMPT, **{name: value})
+        message = str(exc.value)
+        assert f"{name}={value} is out of range" in message and bounds in message
+        with pytest.raises(ValueError, match=f"{name}={value} is out of range"):
+            rig.svc.start([SERP], **{name: value})
+        assert jobs.all() == [], "no job was written"
+        assert rig.classifier.checks == 0 and rig.store.prepared == 0, "refused first, for free"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("value", [2.5, "8", True, None])
+    async def test_a_value_that_is_not_a_whole_number_is_refused(self, settings, jobs, value):
+        rig = Rig(settings, jobs, [_tl(1, "Only")])
+        with pytest.raises(ValueError, match="classifier_parallel must be a whole number"):
+            await rig.svc.submit([SERP], classifier_parallel=value)
+        assert jobs.all() == []
+
+    @pytest.mark.asyncio
+    async def test_the_bounds_themselves_are_allowed(self, settings, jobs):
+        rig = Rig(settings, jobs, [_tl(1, "Only")])
+        for reads, parallel in ((1, 1), (200, 20)):
+            job = await rig.svc.submit([SERP], max_detail_reads=reads,
+                                       classifier_parallel=parallel)
+            assert (job.max_detail_reads, job.classifier_parallel) == (reads, parallel)
+        await _drain(rig.svc)
+
+    @pytest.mark.asyncio
+    async def test_two_sweeps_each_get_their_own_gate(self, settings, jobs):
+        """A per-sweep limit is per sweep: two running at once with
+        classifier_parallel=2 each have four requests in flight — two of each,
+        and no more — rather than sharing one gate of two."""
+        settings.update(typesafe_openrouter_api_key="sk-or-test")
+        held = _HeldClassifier()
+        svc = ScrapeService(instances=None, jobs=jobs, settings=settings, typesafe=held)
+        _cards_by_url(svc, {SERP: [_tl(i, f"A {i}") for i in range(1, 11)],
+                            SERP2: [_tl(i, f"B {i}") for i in range(101, 111)]})
+
+        await svc.submit([SERP], classifier_parallel=2)
+        await svc.submit([SERP2], classifier_parallel=2)
+        await _until(lambda: held.in_flight["all"] == 4, "four requests in flight")
+        await asyncio.sleep(0.05)
+        assert (held.in_flight["A"], held.in_flight["B"], held.in_flight["all"]) == (2, 2, 4)
+        held.release.set()
+        await _drain(svc)
+        assert (held.peak["A"], held.peak["B"], held.peak["all"]) == (2, 2, 4)
+
+    @pytest.mark.asyncio
+    async def test_the_process_wide_ceiling_bounds_two_sweeps(self, settings, jobs):
+        """The real client, one per process, with two sweeps at 15 each: the
+        client's ceiling holds the total to 20, both sweeps among them."""
+        import json
+
+        import httpx
+        import respx
+        from collections import Counter
+
+        from app.services.typesafe import API, TYPESAFE_MAX_PARALLEL, TypeSafeClient
+
+        release = asyncio.Event()
+        in_flight: Counter = Counter()
+        peak: Counter = Counter()
+
+        async def answer(request):
+            who = json.loads(request.content)["state"]["title"].split()[0]
+            for key in (who, "all"):
+                in_flight[key] += 1
+                peak[key] = max(peak[key], in_flight[key])
+            try:
+                await release.wait()
+            finally:
+                for key in (who, "all"):
+                    in_flight[key] -= 1
+            return httpx.Response(200, json={
+                "model": "typesafe/jev-test",
+                "answers": {"eligible": {"type": "noul", "noul": 0.95}}})
+
+        settings.update(typesafe_openrouter_api_key="sk-or-test")
+        client = TypeSafeClient(lambda: "sk-or-test", lambda: "jev-latest")
+        svc = ScrapeService(instances=None, jobs=jobs, settings=settings, typesafe=client)
+        _cards_by_url(svc, {SERP: [_tl(i, f"A {i}") for i in range(1, 31)],
+                            SERP2: [_tl(i, f"B {i}") for i in range(101, 131)]})
+
+        with respx.mock:
+            route = respx.post(API).mock(side_effect=answer)
+            await svc.submit([SERP], classifier_parallel=15)
+            await svc.submit([SERP2], classifier_parallel=15)
+            await _until(lambda: in_flight["all"] == TYPESAFE_MAX_PARALLEL,
+                         "the ceiling reached")
+            await asyncio.sleep(0.05)
+            assert in_flight["all"] == TYPESAFE_MAX_PARALLEL == 20, "never past the ceiling"
+            assert 0 < in_flight["A"] <= 15 and 0 < in_flight["B"] <= 15
+            release.set()
+            await _drain(svc)
+
+        assert route.call_count == 60
+        assert peak["all"] == 20 and peak["A"] <= 15 and peak["B"] <= 15
 
 
 class TestOverlappingSweeps:

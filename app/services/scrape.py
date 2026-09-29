@@ -27,12 +27,14 @@ card. Only elements the store does not have are asked (plus, when triaging,
 stored rows whose Bot Triage is still blank), so a synced sweep reads the
 store's index once, before its first page. The same answers drop what is not
 for sale from the generic reader's pages and fail a page that does not read as
-listings.
+listings. They go out `classifier_parallel` at a time, a limit the call may set
+for its own sweep (`TYPESAFE_PARALLEL` by default).
 
 **Triage** then runs after a synced sweep's save: every row this sweep inserted,
 plus every row it saw whose Bot Triage is still blank, gets the REVIEW or REJECT
 decided on its card; a card REVIEW is judged again on the listing's detail
-page, which is archived into the row when the verdict stays REVIEW. A row that
+page — at most `max_detail_reads` of them per sweep, another limit the call may
+set — which is archived into the row when the verdict stays REVIEW. A row that
 already has a decision is never judged again. See `_TriagePhase` for the order
 of writes, and services/triage.py for the question itself. Without a prompt
 none of it runs.
@@ -74,7 +76,12 @@ from .legibility import ListingAnswer, ListingCheck
 from .settings import SettingsService
 from .task_profiles import TaskProfilePool
 from .triage import REJECT, REVIEW, TriageDecision, Triager, criteria_version
-from .typesafe import TypeSafeError, TypeSafeUnavailable
+from .typesafe import (
+    TYPESAFE_MAX_PARALLEL,
+    TYPESAFE_PARALLEL,
+    TypeSafeError,
+    TypeSafeUnavailable,
+)
 
 logger = logging.getLogger("cloakbiz.scrape")
 
@@ -93,10 +100,13 @@ _MAX_PAGES_CEILING = 20
 _WAITING_SUMMARY = "Waiting for a free browser slot…"
 _SCRAPING_SUMMARY = "Sweeping the search results…"
 
-# Detail pages one sweep's triage reads, at most. Each is about a minute of a
-# pooled browser; a first sweep of a big new site could otherwise hold the pool
-# for an hour. The card REVIEWs past it stay blank, and a later sweep reads them.
+# Detail pages one sweep's triage reads, at most, unless the call names its own
+# `max_detail_reads` (up to MAX_DETAIL_READS_CEILING). Each is about a minute of
+# a pooled browser; a first sweep of a big new site could otherwise hold the
+# pool for an hour. The card REVIEWs past it stay blank, and a later sweep
+# reads them.
 MAX_DETAIL_READS = 25
+MAX_DETAIL_READS_CEILING = 200
 # Classifier failures that end a sweep's triage (and its per-listing requests):
 # every later question would fail the same way (no key, a rejected key, no
 # credits, no answer after the client's retries). Any other TypeSafeError — a
@@ -310,8 +320,14 @@ class ScrapeService:
         return len(self._running)
 
     async def submit(self, urls: list[str], *, max_pages: int = 1,
-                     sync: bool = False, triage_prompt: str | None = None) -> SweepTask:
+                     sync: bool = False, triage_prompt: str | None = None,
+                     max_detail_reads: int = MAX_DETAIL_READS,
+                     classifier_parallel: int = TYPESAFE_PARALLEL) -> SweepTask:
         """Start a sweep the way the tools and the dashboard do: preflight, then `start`.
+
+        `max_detail_reads` and `classifier_parallel` are this sweep's own limits
+        (see `_limits`); one out of range is refused first of all, before
+        anything that costs a request.
 
         With a `triage_prompt`, `start`'s own refusals (an empty list, nothing
         readable, a sync with no database) and triage's (see `_triage_plan`)
@@ -341,6 +357,7 @@ class ScrapeService:
         fill optional string parameters with "" as often as they leave them
         out, and either way they asked for no triage.
         """
+        limits = _limits(max_detail_reads, classifier_parallel)
         triage_prompt = _prompt_or_none(triage_prompt)
         plan = None
         if triage_prompt is not None:
@@ -374,15 +391,17 @@ class ScrapeService:
         if plan is not None:
             await self._prepare_triage(plan)
             return self.start(urls, max_pages=max_pages, sync=sync, refused=refused or None,
-                              triage_plan=plan)
+                              triage_plan=plan, **limits)
         if refused:
-            return self.start(urls, max_pages=max_pages, sync=sync, refused=refused)
-        return self.start(urls, max_pages=max_pages, sync=sync)
+            return self.start(urls, max_pages=max_pages, sync=sync, refused=refused, **limits)
+        return self.start(urls, max_pages=max_pages, sync=sync, **limits)
 
     def start(self, urls: list[str], *, max_pages: int = 1, sync: bool = False,
               refused: Mapping[str, str] | None = None,
               triage_prompt: str | None = None,
-              triage_plan: _TriagePlan | None = None) -> SweepTask:
+              triage_plan: _TriagePlan | None = None,
+              max_detail_reads: int = MAX_DETAIL_READS,
+              classifier_parallel: int = TYPESAFE_PARALLEL) -> SweepTask:
         """Validate, write the job down, and return without waiting for it.
 
         Everything that can be known to be wrong before the browser starts is
@@ -403,7 +422,12 @@ class ScrapeService:
         hands over what it prepared as `triage_plan`. A run started here with
         only a prompt prepares its triage target itself. A blank prompt is no
         prompt (see `submit`).
+
+        `max_detail_reads` and `classifier_parallel` are refused out of range
+        (`_limits`), never clamped, and recorded on the job: the run's detail
+        says what the sweep ran with, and the run reads them from there.
         """
+        limits = _limits(max_detail_reads, classifier_parallel)
         triage_prompt = _prompt_or_none(triage_prompt)
         max_pages, targets, target_db = self._admit(urls, max_pages, sync, refused)
         plan = triage_plan
@@ -417,7 +441,7 @@ class ScrapeService:
         source_name = next(t.source.name for t in targets if t.source is not None)
         job = self._jobs.create(
             source=source_name, urls=urls, max_pages=max_pages, sync=sync, db_id=target_db,
-            status="working", summary=_collect_message,
+            **limits, status="working", summary=_collect_message,
             triage=TriageSummary(criteria_version=plan.version) if plan is not None else None,
         )
 
@@ -793,7 +817,10 @@ class ScrapeService:
 
             # Read while the browsers start; the first page's check waits for it.
             known = asyncio.create_task(read_index())
-        return ListingCheck(classifier or self._typesafe, triager=triager, known=known), store
+        # Its own gate, at the call's classifier_parallel: this sweep's limit,
+        # whatever another sweep running alongside asked for.
+        return ListingCheck(classifier or self._typesafe, triager=triager, known=known,
+                            parallel=job.classifier_parallel), store
 
     def _phase(self, job: SweepTask, text: str) -> None:
         """Say what a still-working sweep is doing now, where a poll and the
@@ -918,8 +945,8 @@ class ScrapeService:
                 if t.undecided:
                     seg += f", {t.undecided} left blank for a later sweep"
                     if t.deferred:
-                        seg += (f" ({t.deferred} past the {MAX_DETAIL_READS} detail pages a "
-                                f"sweep reads)")
+                        seg += (f" ({t.deferred} past the {job.max_detail_reads} detail pages "
+                                f"this sweep reads)")
                 if t.in_flight:
                     seg += f", {t.in_flight} left to another sweep triaging them"
                 parts.append(seg)
@@ -1048,7 +1075,9 @@ class ScrapeService:
         if job.id in self._checks:
             return self._checks[job.id]
         classifier = self._classifier()
-        return ListingCheck(classifier) if classifier is not None else None
+        if classifier is None:
+            return None
+        return ListingCheck(classifier, parallel=job.classifier_parallel)
 
     async def _sweep_once(self, inst, page, job: SweepTask, url: str, source, evidence: Path) -> dict:
         """One attempt at one URL: page 1, then each later page until the end.
@@ -1190,6 +1219,34 @@ class ScrapeService:
 def _prompt_or_none(prompt: str | None) -> str | None:
     """A triage prompt with some text in it, or None — a blank one asks for nothing."""
     return prompt if prompt is not None and prompt.strip() else None
+
+
+def _limits(max_detail_reads: Any, classifier_parallel: Any) -> dict[str, int]:
+    """A sweep's two per-call limits, checked; raises ValueError for either.
+
+    Refused, never clamped: a caller who asked for 500 detail reads and got 200
+    would be told the sweep ran as asked. A ValueError is every façade's
+    refusal already (a ToolError over MCP, a 422 over REST) with this sentence.
+    """
+    return {
+        "max_detail_reads": _within(
+            "max_detail_reads", max_detail_reads, MAX_DETAIL_READS_CEILING, MAX_DETAIL_READS,
+            "how many listings judged REVIEW on their card get their detail page read in this "
+            "sweep"),
+        "classifier_parallel": _within(
+            "classifier_parallel", classifier_parallel, TYPESAFE_MAX_PARALLEL, TYPESAFE_PARALLEL,
+            "how many classifier requests this sweep runs at once"),
+    }
+
+
+def _within(name: str, value: Any, high: int, default: int, what: str) -> int:
+    bounds = f"from 1 to {high} ({what}; {default} if left out)"
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be a whole number {bounds}, but it was {value!r}.")
+    if not 1 <= value <= high:
+        raise ValueError(f"{name}={value} is out of range: it must be {bounds}. Call again "
+                         f"with a value in that range, or leave {name} out.")
+    return value
 
 
 def _site(url: str) -> str:
@@ -1362,9 +1419,11 @@ class _TriagePhase:
     rejected key, no credits, no answer after the client's own retries) stops
     the phase — whether it went down while the pages were read or here: no
     more questions are asked, the detail stage is skipped, and the rows not yet
-    decided stay blank. (The per-listing requests are gated, `TYPESAFE_PARALLEL`
-    at once, each gated before it looks at whether the classifier has stopped,
-    so an outage costs a few rows' retries rather than every row's.) Any other
+    decided stay blank. (The per-listing requests are gated, the sweep's
+    `classifier_parallel` at once, each gated before it looks at whether the
+    classifier has stopped, so an outage costs a few rows' retries rather than
+    every row's.) The detail stage reads at most the sweep's `max_detail_reads`
+    pages; the card REVIEWs past it stay blank for a later sweep. Any other
     classifier error — a request it refused, an answer that can't be read — and
     a failed Notion write fail that row only, so one bad row never holds up the
     rest. None of it is raised — the scrape and the save succeeded, and the job
@@ -1403,7 +1462,9 @@ class _TriagePhase:
         # holds in the service's in-flight set until it finishes.
         self._in_flight: list[Listing] = []
         self._claimed: set[str] = set()
-        # Card REVIEWs past MAX_DETAIL_READS, left blank for a later sweep.
+        # Card REVIEWs past the sweep's max_detail_reads, left blank for a later
+        # sweep.
+        self._max_reads = job.max_detail_reads
         self._deferred = 0
         # What each row went through, for the run's evidence (triage.json).
         self._records: dict[str, dict[str, Any]] = {}
@@ -1452,17 +1513,18 @@ class _TriagePhase:
                        for i, ((listing, _), card) in enumerate(zip(self._rows, cards), 1)
                        if card is not None and card.decision == REVIEW]
             if reviews and not self._stopped:
-                if len(reviews) > MAX_DETAIL_READS:
-                    later = reviews[MAX_DETAIL_READS:]
-                    reviews = reviews[:MAX_DETAIL_READS]
+                cap = self._max_reads
+                if len(reviews) > cap:
+                    later = reviews[cap:]
+                    reviews = reviews[:cap]
                     self._deferred = len(later)
                     for _, listing, _ in later:
                         self._note(listing, deferred=(
                             f"REVIEW on the card; its detail page is past this sweep's "
-                            f"{MAX_DETAIL_READS}, so it is left blank for a later sweep"))
+                            f"{cap} (max_detail_reads), so it is left blank for a later sweep"))
                     logger.info("triage for sweep %s: %d card REVIEW(s) past the %d detail "
-                                "pages a sweep reads, left for a later sweep", self._job.id,
-                                len(later), MAX_DETAIL_READS)
+                                "pages this sweep reads, left for a later sweep", self._job.id,
+                                len(later), cap)
                 await self._details(reviews)
         finally:
             self._finish()
@@ -1494,7 +1556,8 @@ class _TriagePhase:
         if self._stopped:
             return None
         if self._check is None or self._check.triager is None:
-            self._check = ListingCheck(self._svc._typesafe, triager=self._triager)
+            self._check = ListingCheck(self._svc._typesafe, triager=self._triager,
+                                       parallel=self._job.classifier_parallel)
         try:
             answer = await self._check.ask_one(listing)
         except Exception as exc:  # noqa: BLE001 — one row's trouble is that row's

@@ -23,8 +23,10 @@ checked before anything from it is kept, in two layers.
   REVIEW or REJECT with the caller's criteria. One card per request because
   that is what the triage answers were measured on (bundling several cards
   lost agreement, see `triage.py`); adding the eligibility question to it
-  changed none of 219 triage answers. Requests go out `TYPESAFE_PARALLEL` at a
-  time, the one limit every classifier caller shares.
+  changed none of 219 triage answers. Requests go out the sweep's own
+  `classifier_parallel` at a time (`TYPESAFE_PARALLEL`, five, unless the call
+  names another), each sweep behind its own gate, and all of them under the
+  client's one ceiling for the process (`TYPESAFE_MAX_PARALLEL`).
 
 Only elements the store does not have are asked about — plus, in a triaging
 sweep, stored rows whose Bot Triage is still blank (the backlog triage heals).
@@ -301,13 +303,18 @@ class ListingCheck:
     listing identity for the whole sweep, so a listing seen on two pages or
     under two URLs — or a page retried from a new exit IP — is asked once, and
     the triage phase reads each row's card decision from here (`answer`).
+    `parallel` is how many requests it has in flight at once — the sweep's
+    `classifier_parallel`. The gate is this check's own, so two sweeps running
+    together each get their full limit; the client's ceiling bounds the sum.
     """
 
-    def __init__(self, classifier, *, triager: Triager | None = None, known=None) -> None:
+    def __init__(self, classifier, *, triager: Triager | None = None, known=None,
+                 parallel: int = TYPESAFE_PARALLEL) -> None:
         self._classifier = classifier
         self.triager = triager
         self._known = known
-        self._gate = asyncio.Semaphore(TYPESAFE_PARALLEL)
+        self.parallel = max(1, int(parallel))
+        self._gate = asyncio.Semaphore(self.parallel)
         self._answers: dict[str, ListingAnswer] = {}
         # One lock per listing, so two pages showing it at once (two URLs of
         # one sweep) wait for one request rather than making two.
@@ -334,7 +341,7 @@ class ListingCheck:
     async def ask_one(self, listing: Listing) -> ListingAnswer | None:
         """`listing`'s answer, asked now unless it already was; None once stopped.
 
-        Gated `TYPESAFE_PARALLEL` at a time, and the stop is looked at inside
+        Gated `parallel` at a time, and the stop is looked at inside
         the gate: every card of a page is started at once, and one that only
         looked before waiting would still ask after an outage it had queued
         behind.

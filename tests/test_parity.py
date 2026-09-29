@@ -150,6 +150,38 @@ class TestScrapeResultParity:
         assert _rest_payload(client, job.id) == _mcp_payload(client, job.id)
 
 
+class TestScrapeArgumentsParity:
+    """The tool's arguments and the REST body are one set of parameters: the
+    same names and the same defaults, so a limit added on one door and not the
+    other shows up here."""
+
+    def test_the_tool_and_the_rest_body_take_the_same_arguments(self, client):
+        from app.routes.api import ScrapeRequest
+
+        r = client.post("/mcp", headers=HEADERS, json={
+            "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
+        assert r.status_code == 200, r.text
+        tool = next(t for t in r.json()["result"]["tools"] if t["name"] == "scrape_listings")
+        mcp = tool["inputSchema"]["properties"]
+        rest = ScrapeRequest.model_json_schema()["properties"]
+        assert {"max_detail_reads", "classifier_parallel"} <= set(mcp), mcp
+        assert set(mcp) == set(rest)
+        for name in mcp:
+            assert mcp[name].get("default") == rest[name].get("default"), name
+            assert mcp[name].get("type") == rest[name].get("type"), name
+        assert (rest["max_detail_reads"]["default"], rest["classifier_parallel"]["default"]) \
+            == (25, 5)
+
+    def test_the_limits_stay_out_of_the_polled_payload(self, client):
+        """Recorded on the task for the run's detail; the payload an agent
+        polls stays what it was, on both doors."""
+        job = app.state.jobs.create(url="https://www.bizbuysell.com/x", source="bizbuysell_serp",
+                                    max_detail_reads=60, classifier_parallel=8)
+        rest, mcp = _rest_payload(client, job.id), _mcp_payload(client, job.id)
+        assert rest == mcp
+        assert "max_detail_reads" not in rest and "classifier_parallel" not in rest
+
+
 def _rest_info(client) -> dict:
     r = client.get("/api/server-info")
     assert r.status_code == 200, r.text
