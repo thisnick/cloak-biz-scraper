@@ -90,7 +90,7 @@ class ScrapeRequest(BaseModel):
     )
     classifier_parallel: int = Field(
         default=TYPESAFE_PARALLEL,
-        description="How many TypeSafe Classifier (e.g. Jev) requests this sweep has in flight "
+        description="How many Decision API requests this sweep has in flight "
         "at once — the one request per new listing. Default 5, allowed 1 to 20 — out of range "
         "is a 422. The server holds all classifier requests together to 20 at once.",
     )
@@ -137,8 +137,8 @@ async def scrape_listings(request: Request, body: ScrapeRequest) -> ScrapeResult
     synced_row_id empty. With sync=true they hold only the listings newly added to
     Notion, each carrying the synced_row_id of its new row (ready for
     archive_page); rows already present are omitted but counted in
-    synced.existing. With `triage_prompt` (needs sync=true and the TypeSafe
-    Classifier key) every saved row, and every seen row whose Bot Triage is
+    synced.existing. With `triage_prompt` (needs sync=true and the Decision API
+    key) every saved row, and every seen row whose Bot Triage is
     blank, is decided REVIEW or REJECT; see `triage` on the result.
     `max_detail_reads` and `classifier_parallel` are this sweep's own limits
     (see the body's field descriptions); out of range is a 422."""
@@ -194,7 +194,7 @@ async def archive_page(request: Request, body: ArchiveRequest) -> ArchiveResult:
     """Read a page and append it to a Notion page. Blocking, ~40-60s.
 
     Appends nothing when the page already has a Source Content section, so a
-    repeat call is safe. With a TypeSafe Classifier (e.g. Jev) key set, a page
+    repeat call is safe. With a Decision API key set, a page
     that is a login wall, error, removed listing or anti-bot page is not written
     and the result says so."""
     return await request.app.state.archive.archive(body.url, body.notion_page_id)

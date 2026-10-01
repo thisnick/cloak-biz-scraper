@@ -200,13 +200,8 @@ def _job_label(job) -> str:
 
 def _render(request: Request, result: Result | None = None, status: int = 200,
             active: str | None = None, notion_mapping: Any = None,
-            focus: str | None = None, overrides_draft: str | None = None) -> Response:
-    """The dashboard, with an optional banner.
-
-    `overrides_draft` is a Site overrides document that failed to save: the box
-    shows it (not the saved one) so the person fixes their text instead of
-    retyping it.
-    """
+            focus: str | None = None) -> Response:
+    """The dashboard, with an optional banner."""
     settings: Settings = request.app.state.settings.load()
     from ..services.urls import public_base
     from ..services.views import browser_info, instance_view
@@ -241,13 +236,10 @@ def _render(request: Request, result: Result | None = None, status: int = 200,
             "browser": browser_info(settings, request.app.state.instances),
             "has_proxy_password": bool(settings.proxy_password),
             "has_notion_token": bool(settings.notion_api_token),
-            "has_typesafe_key": settings.typesafe_configured(),
+            "has_decision_api_key": settings.decision_api_configured(),
             "connected_apps": request.app.state.oauth.list_clients(),
             "proxy_checked_at": _when(settings.proxy_last_check_at),
-            "typesafe_checked_at": _when(settings.typesafe_last_check_at),
-            "overrides_text": (settings.site_overrides_json if overrides_draft is None
-                               else overrides_draft),
-            "overrides_count": _overrides_count(settings.site_overrides_json),
+            "decision_api_checked_at": _when(settings.decision_api_last_check_at),
             # dashboard sections
             "instances": instances,
             "running_jobs": running,
@@ -293,21 +285,6 @@ def _first_error(exc: Exception) -> str:
     if isinstance(exc, ValidationError) and exc.errors():
         return exc.errors()[0]["msg"].removeprefix("Value error, ")
     return str(exc)
-
-
-def _overrides_count(text: str) -> int | None:
-    """How many site overrides are saved; None when the saved text doesn't parse.
-
-    Only for the section's chip. A saved document can stop parsing without
-    anyone touching it (a later version tightens the schema), and the page
-    must still render to let them fix it.
-    """
-    from ..sources.overrides import OverridesInvalid, parse_overrides
-
-    try:
-        return len(parse_overrides(text))
-    except OverridesInvalid:
-        return None
 
 
 def _keep(new: str, existing: str) -> str:
@@ -547,9 +524,10 @@ async def get_run(request: Request, job_id: str) -> dict[str, Any]:
     if job.kind == "sweep":
         # How each URL was read — the chosen link pattern and who chose it,
         # field roles, the next-page rule, legibility and each page's
-        # per-listing eligibility, and a paste-ready site
-        # override. Here and not in /runs (every row) or in the ScrapeResult an
-        # agent polls: it is for a person working out why a site read wrong.
+        # per-listing eligibility, and what was decided in the shape of a site
+        # override (for pinning a site in code). Here and not in /runs (every
+        # row) or in the ScrapeResult an agent polls: it is for a person working
+        # out why a site read wrong.
         detail["decisions"] = job.decisions
         # The limits this sweep ran with — the call's, or the defaults — so a
         # run with many deferred REVIEWs, or a slow page of classifier
@@ -1690,22 +1668,22 @@ async def create_database(
                    notion_mapping=mapping)
 
 
-# ── TypeSafe Classifier (e.g. Jev) ────────────────────────────────────────────
+# ── Decision API ──────────────────────────────────────────────────────────────
 
 
 # What turning it off costs, said wherever it is turned off.
-_TYPESAFE_OFF = (
+_DECISION_API_OFF = (
     "reading listing sites other than BizBuySell, triage, and the archive guard are "
     "off; everything else works as before."
 )
 
 
-@router.post("/settings/typesafe", response_class=HTMLResponse)
-async def save_typesafe(
+@router.post("/settings/decision-api", response_class=HTMLResponse)
+async def save_decision_api(
     request: Request,
     action: str = Form("save"),
-    typesafe_openrouter_api_key: str = Form(""),
-    typesafe_model: str = Form(""),
+    openrouter_api_key: str = Form(""),
+    decision_api_model: str = Form(""),
 ) -> Response:
     """Save, test, or remove the OpenRouter key the classifier is asked with.
 
@@ -1720,128 +1698,87 @@ async def save_typesafe(
     store = request.app.state.settings
     current = store.load()
     no_verdict = dict(
-        typesafe_last_check_at=0.0, typesafe_last_check_ok=None, typesafe_last_check_summary="",
+        decision_api_last_check_at=0.0, decision_api_last_check_ok=None,
+        decision_api_last_check_summary="",
     )
 
     if action == "clear":
         # The key field is write-only and blank keeps it, so removing a key needs
         # its own button — as the licence key's "Clear" does.
-        store.update(typesafe_openrouter_api_key="", **no_verdict)
+        store.update(openrouter_api_key="", **no_verdict)
         return _render(
-            request, Result("typesafe", True, f"Key removed. Without it, {_TYPESAFE_OFF}")
+            request, Result("decision_api", True, f"Key removed. Without it, {_DECISION_API_OFF}")
         )
 
     try:
         candidate = Settings.model_validate({
             **current.model_dump(),
-            "typesafe_openrouter_api_key": _keep(
-                typesafe_openrouter_api_key, current.typesafe_openrouter_api_key),
-            "typesafe_model": typesafe_model,
+            "openrouter_api_key": _keep(
+                openrouter_api_key, current.openrouter_api_key),
+            "decision_api_model": decision_api_model,
         })
     except ValueError as exc:
-        return _render(request, Result("typesafe", False, _first_error(exc)), status=400)
+        return _render(request, Result("decision_api", False, _first_error(exc)), status=400)
     changes = dict(
-        typesafe_openrouter_api_key=candidate.typesafe_openrouter_api_key,
-        typesafe_model=candidate.typesafe_model,
+        openrouter_api_key=candidate.openrouter_api_key,
+        decision_api_model=candidate.decision_api_model,
     )
     unchanged = (
-        candidate.typesafe_openrouter_api_key == current.typesafe_openrouter_api_key
-        and candidate.typesafe_model == current.typesafe_model
+        candidate.openrouter_api_key == current.openrouter_api_key
+        and candidate.decision_api_model == current.decision_api_model
     )
 
     if action != "test":
         # A save that changes nothing keeps its verdict; one that changes the key
         # or model has not been measured yet, so it must not inherit a "working".
         settings = store.update(**changes, **({} if unchanged else no_verdict))
-        status = settings.typesafe_status()
+        status = settings.decision_api_status()
         if status == "unset":
             return _render(
-                request, Result("typesafe", True, f"Saved. Without a key, {_TYPESAFE_OFF}")
+                request, Result("decision_api", True, f"Saved. Without a key, {_DECISION_API_OFF}")
             )
         if status == "untested":
-            return _render(request, Result(
-                "typesafe", True,
+            return _render(request, Result("decision_api", True,
                 "Saved — but not tested. Use 'Save & test' to check OpenRouter accepts the key.",
                 level="warn",
             ))
-        return _render(request, Result("typesafe", True, "Saved."))
+        return _render(request, Result("decision_api", True, "Saved."))
 
     # action == "test": ask with the SUBMITTED values before writing anything.
-    if not candidate.typesafe_configured():
+    if not candidate.decision_api_configured():
         return _render(
-            request, Result("typesafe", False, "Enter an OpenRouter API key first."), status=400
+            request, Result("decision_api", False, "Enter an OpenRouter API key first."),
+            status=400
         )
     check = await request.app.state.typesafe.check(
-        key=candidate.typesafe_openrouter_api_key, model=candidate.typesafe_model
+        key=candidate.openrouter_api_key, model=candidate.decision_api_model
     )
     if not check.ok:
-        if current.typesafe_last_check_ok and not unchanged:
+        if current.decision_api_last_check_ok and not unchanged:
             # A working key is at stake and this failure measured something else:
             # keep what works rather than replace it with the typo.
             return _render(
                 request,
-                Result("typesafe", False,
+                Result("decision_api", False,
                        check.message + " Your previously working key and model were kept "
                        "unchanged."),
                 status=400,
             )
         store.update(
             **changes,
-            typesafe_last_check_at=time.time(),
-            typesafe_last_check_ok=False,
-            typesafe_last_check_summary=_first_sentence(check.message),
+            decision_api_last_check_at=time.time(),
+            decision_api_last_check_ok=False,
+            decision_api_last_check_summary=_first_sentence(check.message),
         )
-        return _render(request, Result("typesafe", False, check.message), status=400)
+        return _render(request, Result("decision_api", False, check.message), status=400)
 
     store.update(
         **changes,
-        typesafe_last_check_at=time.time(),
-        typesafe_last_check_ok=True,
-        typesafe_last_check_summary=check.message,
+        decision_api_last_check_at=time.time(),
+        decision_api_last_check_ok=True,
+        decision_api_last_check_summary=check.message,
     )
-    return _render(request, Result("typesafe", True, check.message))
-
-
-# ── Site overrides ────────────────────────────────────────────────────────────
-
-
-@router.post("/settings/overrides", response_class=HTMLResponse)
-async def save_overrides(request: Request, site_overrides_json: str = Form("")) -> Response:
-    """Save the site overrides document — checked here, stored exactly as typed.
-
-    The app's first free-form editor, so the check is the part that matters: a
-    document is saved only when every override in it is valid, and a refusal
-    says where the problem is (a line and column for broken JSON, the override
-    and field for a bad value) and puts the person's text back in the box. The
-    text itself is stored, not a re-serialised copy, so their formatting and
-    order survive. Blank clears every override.
-    """
-    _require(request)
-    _require_same_origin(request)
-    from ..sources.overrides import OverridesInvalid, parse_overrides
-
-    # Browsers submit a textarea with CRLF line endings; the person typed LF.
-    text = site_overrides_json.replace("\r\n", "\n")
-    if not text.strip():
-        request.app.state.settings.update(site_overrides_json="")
-        return _render(request, Result(
-            "overrides", True,
-            "Cleared. Every site is read with the classifier's own decisions."))
-    try:
-        overrides = parse_overrides(text)
-    except OverridesInvalid as exc:
-        return _render(request, Result("overrides", False, f"Not saved. {exc}"),
-                       status=400, overrides_draft=text)
-    settings = request.app.state.settings.update(site_overrides_json=text)
-    n = len(overrides)
-    message = f"Saved {n} site override{'' if n == 1 else 's'}."
-    if not settings.typesafe_configured():
-        # Overrides steer the generic reader, which does not run without a key.
-        return _render(request, Result(
-            "overrides", True,
-            message + " They apply once a TypeSafe Classifier (e.g. Jev) key is saved — "
-            "until then only BizBuySell pages are read.", level="warn"))
-    return _render(request, Result("overrides", True, message))
+    return _render(request, Result("decision_api", True, check.message))
 
 
 # ── Connected apps ────────────────────────────────────────────────────────────

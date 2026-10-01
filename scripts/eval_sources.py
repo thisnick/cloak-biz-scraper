@@ -2,12 +2,13 @@
 
 The unit tests drive `GenericSource` with canned probe output and a fake
 classifier, which pins the contract but not the thing that matters: whether, on
-real pages it was never tuned to, the TypeSafe Classifier (e.g. Jev) picks the
+real pages it was never tuned to, the Decision API picks the
 list of businesses (and "none" where there is none), names the fields, and finds
 the next page — and whether each card it read is a business for sale now, asked
 the way a sweep asks it (one request per card, `legibility.ListingCheck`, as
 with sync=false: every card is new). This script answers that, page by page,
-and prints what a site override pinning those decisions would look like. It is
+and prints what a site override (in code: sources/overrides.py) pinning those
+decisions would look like. It is
 not run in CI: it needs a browser, the live sites and an OpenRouter key.
 
     set -a; source .env; set +a          # OPENROUTER_API_KEY — never printed
@@ -51,7 +52,7 @@ from app.services.legibility import ListingCheck  # noqa: E402
 from app.services.typesafe import DEFAULT_MODEL, TypeSafeClient  # noqa: E402
 from app.sources import owner_of  # noqa: E402
 from app.sources.generic import GenericSource  # noqa: E402
-from app.sources.overrides import override_for, parse_overrides  # noqa: E402
+from app.sources.overrides import SITE_OVERRIDES, override_for  # noqa: E402
 
 _VIEWPORT = {"width": 1440, "height": 900}
 
@@ -363,14 +364,16 @@ async def main() -> int:
     ap.add_argument("--fixtures", type=Path,
                     help="serve saved pages from this directory; nothing touches the network "
                          "except the classifier")
-    ap.add_argument("--overrides", type=Path, help="a site overrides document to apply (JSON)")
-    ap.add_argument("--model", default=os.environ.get("TYPESAFE_MODEL") or DEFAULT_MODEL)
+    ap.add_argument("--no-overrides", action="store_true",
+                    help="ignore the site overrides in code (sources/overrides.py), to see "
+                         "what the classifier decides on its own")
+    ap.add_argument("--model", default=os.environ.get("DECISION_API_MODEL") or DEFAULT_MODEL)
     ap.add_argument("--json", type=Path, help="also write every result to this file")
     args = ap.parse_args()
 
     key = os.environ.get("OPENROUTER_API_KEY", "").strip()
     if not key:
-        print("Set OPENROUTER_API_KEY (the TypeSafe Classifier's OpenRouter key) first.",
+        print("Set OPENROUTER_API_KEY (the Decision API's OpenRouter key) first.",
               file=sys.stderr)
         return 2
     classifier = TypeSafeClient(key_getter=lambda: key, model_getter=lambda: args.model)
@@ -379,7 +382,7 @@ async def main() -> int:
     if not check.ok:
         return 2
 
-    overrides = parse_overrides(args.overrides.read_text()) if args.overrides else []
+    overrides = [] if args.no_overrides else list(SITE_OVERRIDES)
     targets: list[tuple[str, str, dict | None]] = [(u, u, None) for u in args.urls]
     if args.truth:
         for item in json.loads(args.truth.read_text())["pages"]:

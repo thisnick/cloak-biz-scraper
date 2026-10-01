@@ -5,7 +5,7 @@
 A **cloaked cloud browser your AI assistant can drive** — patched Chromium designed to
 reduce anti-bot blocks, with optional routing through your own residential proxy. On top
 of it are built-in tasks that scrape business-for-sale listings pages — BizBuySell out of
-the box, any other broker or marketplace with the optional TypeSafe Classifier (e.g. Jev)
+the box, any other broker or marketplace with the optional Decision API
 — and archive listings into your Notion. Your server, your data: one-click deploy,
 everything else configured in a web UI. Core setup needs no terminal.
 
@@ -30,7 +30,7 @@ https://github.com/user-attachments/assets/8bc957ef-130d-4516-a356-9efdcedeb60d
   including the Default profile, which cannot be deleted. Settings shows what each
   profile is using on disk.
 - **Built-in listing tasks** — sweep BizBuySell search or broker pages, or any other
-  site's listings page once a TypeSafe Classifier (e.g. Jev) key is saved, into structured
+  site's listings page once a Decision API key is saved, into structured
   listings, dedupe into a Notion database, triage each new row REVIEW or REJECT against
   your written criteria, and append readable page content to a listing's existing Notion
   page.
@@ -78,7 +78,7 @@ https://github.com/user-attachments/assets/3c86899d-9f1b-4946-b1ca-4b11a53514b5
    - **Evomi proxy** — required for the documented workflows because target sites commonly
      block Railway's datacenter IP.
    - **Notion** — optional; needed only to save listings into a database.
-   - **TypeSafe Classifier (e.g. Jev)** — optional; an OpenRouter key lets sweeps read
+   - **Decision API** — optional; an OpenRouter key lets sweeps read
      listing sites other than BizBuySell, and triage the listings they save. **Site
      overrides** pin how one of those sites is read when the automatic reading keeps
      getting it wrong.
@@ -138,7 +138,7 @@ Once it's connected, just ask:
 - *"Search BizBuySell for California businesses with an asking price under $2M, then sweep the first five pages using cloaked scraper."*
 - *"Sweep this search and save new listings to my Notion, skipping ones already there."*
 - *"Scrape the first two pages of https://www.websiteclosers.com/businesses-for-sale/."* —
-  any broker's or marketplace's listings page, once the TypeSafe Classifier key is saved.
+  any broker's or marketplace's listings page, once the Decision API key is saved.
 - *"Archive this listing's readable page content into its Notion page."*
 - *"Upload this photo to the listing form on that page."* — this requires an assistant
   that can send the file to the temporary HTTP upload URL before controlling the browser.
@@ -184,10 +184,10 @@ any behavioural change.
 
 | Tool | What it does |
 | --- | --- |
-| `server_info()` | Read proxy, browser-build, pool-capacity, Notion connection, and TypeSafe Classifier status without exposing secrets. |
-| `scrape_listings(urls, max_pages=1, sync=false, triage_prompt=null, max_detail_reads=25, classifier_parallel=5)` | Start one asynchronous sweep across one or more listings pages — BizBuySell search results and broker profiles natively, any other site's listings page with a TypeSafe Classifier (e.g. Jev) key saved; results are merged and de-duplicated. With `sync=true` and your criteria as `triage_prompt`, every saved row is also decided REVIEW or REJECT, and REVIEW rows get their detail page archived. `max_detail_reads` (1–200) sets how many card REVIEWs this sweep reads on their detail page, about a minute of browser time each; `classifier_parallel` (1–20) how many classifier requests it has in flight at once. Out of range is refused. |
+| `server_info()` | Read proxy, browser-build, pool-capacity, Notion connection, and Decision API status without exposing secrets. |
+| `scrape_listings(urls, max_pages=1, sync=false, triage_prompt=null, max_detail_reads=25, classifier_parallel=5)` | Start one asynchronous sweep across one or more listings pages — BizBuySell search results and broker profiles natively, any other site's listings page with a Decision API key saved; results are merged and de-duplicated. With `sync=true` and your criteria as `triage_prompt`, every saved row is also decided REVIEW or REJECT, and REVIEW rows get their detail page archived. `max_detail_reads` (1–200) sets how many card REVIEWs this sweep reads on their detail page, about a minute of browser time each; `classifier_parallel` (1–20) how many classifier requests it has in flight at once. Out of range is refused. |
 | `get_scrape_listing_results(job_id)` | Poll a sweep without blocking. Completed results are retained for two weeks. |
-| `archive_page(url, notion_page_id)` | Read a page and append its readable content to an existing Notion page. It takes roughly a minute; a page that already has a Source Content section gets nothing appended, so a repeat call is safe. With a TypeSafe Classifier (e.g. Jev) key saved, a login wall, error, removed listing or anti-bot page is not written. |
+| `archive_page(url, notion_page_id)` | Read a page and append its readable content to an existing Notion page. It takes roughly a minute; a page that already has a Source Content section gets nothing appended, so a repeat call is safe. With a Decision API key saved, a login wall, error, removed listing or anti-bot page is not written. |
 | `create_instance(profile="Default", country=null, region=null, geoip=true)` | Launch a browser with a durable profile and return a short-lived CDP URL plus a live-view URL when available. In chat apps that support MCP Apps, a live view appears in the conversation. It closes after 15 minutes idle or 60 minutes total. |
 | `list_instances()` | List running browsers with fresh CDP and live-view URLs. |
 | `get_instance(instance_id)` | Get one running browser and refresh its short-lived connection URLs. |
@@ -241,7 +241,7 @@ parsed into numbers only when written to Notion.
 
 A synced sweep given a `triage_prompt` — your screening criteria as plain text — also
 triages, in the server: every new row, and every row it saw whose Bot Triage is still blank,
-is decided REVIEW or REJECT by the TypeSafe Classifier (e.g. Jev), first on the card (in the
+is decided REVIEW or REJECT by the Decision API, first on the card (in the
 same one request per listing that asks whether it is for sale now) and then, for a REVIEW,
 on the listing's detail page. A REVIEW row gets that page appended as a Source
 Content section before REVIEW is written; the decision, a templated reason, the time and a
@@ -257,9 +257,9 @@ later sweep. Without `triage_prompt` a sweep behaves exactly as before — see
 [triage prompt](docs/advanced-controls.md#triage-prompt).
 
 BizBuySell pages are read by their own adapters. A page on any other site is read
-generically: the list of listings is found by grouping the page's links, and the TypeSafe
-Classifier (e.g. Jev) decides which group is the list, what each card field holds, and how
-to reach the next page. The list and the fields are decided on a sweep's first page and
+generically: the list of listings is found by grouping the page's links, and the Decision
+API decides which group is the list, what each card field holds, and how to reach the next
+page. The list and the fields are decided on a sweep's first page and
 reused for its later pages; the next page is decided on every page; nothing is remembered
 between sweeps. Once a page is down to its listings, each listing the store does not have yet
 (or, when triaging, has with a blank Bot Triage) gets one request carrying every question
@@ -281,10 +281,10 @@ error: the URL is named in the result's `not_fully_crawled` and in its summary. 
 page whose cards are mostly sold keeps the ones for sale; one with none for sale ends
 paging quietly. A BizBuySell page other than a search or broker profile never falls
 through to the generic reader. Listings from other sites carry their site as `source` and
-an empty `listing_id`. **Settings → Site overrides** pins any part of those decisions for
-one site, and each sweep's **Details** (Tasks → History, or `/runs/<job_id>`) shows what
-was decided with a paste-ready suggested override — see
-[advanced controls](docs/advanced-controls.md#site-overrides).
+an empty `listing_id`. Each sweep's **Details** (Tasks → History, or `/runs/<job_id>`)
+shows what was decided; a site that keeps being read wrong is pinned in code
+(`app/sources/overrides.py`) — see
+[advanced controls](docs/advanced-controls.md#when-a-site-is-read-wrong).
 
 **How do I pin the browser version?** Settings has an optional version pin. Leave it empty
 for the latest build. To pin, use a **full dotted version** (`148.0.7778.215.5`); a partial

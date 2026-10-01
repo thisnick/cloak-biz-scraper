@@ -217,8 +217,8 @@ class SweepTask(TaskBase):
     # dropped), `legibility` (each page's verdict: the code checks, and with a
     # classifier key `eligibility` — how many cards were asked about, known,
     # judged not for sale now and dropped, the first of those by title and
-    # probability, and why the classifier stopped if it did), `suggested_override` (a
-    # paste-ready site override pinning what was decided, generic sources
+    # probability, and why the classifier stopped if it did), `suggested_override` (what
+    # was decided, as a code site override — sources/overrides.py — generic sources
     # only), and `error` when the source failed. For a person diagnosing a run
     # (/runs/{id}); deliberately not in ScrapeResult, which an agent polls.
     decisions: list[dict] = Field(default_factory=list)
@@ -591,15 +591,15 @@ class NotionInfo(BaseModel):
     connected: bool = Field(description="Whether a Notion token and database are set.")
 
 
-class TypeSafeInfo(BaseModel):
+class DecisionApiInfo(BaseModel):
     configured: bool = Field(
-        description="Whether an OpenRouter key is saved for the optional TypeSafe Classifier "
+        description="Whether an OpenRouter key is saved for the optional Decision API "
                     "(e.g. Jev). Says nothing about whether it works; see status."
     )
     status: Literal["unset", "untested", "working", "broken"] = Field(
         description="unset / untested / working / broken, as of the last test in Settings."
     )
-    model: str = Field(description="The TypeSafe model asked, e.g. 'jev-latest'.")
+    model: str = Field(description="The model the Decision API asks, e.g. 'jev-latest'.")
 
 
 class ServerInfo(BaseModel):
@@ -611,7 +611,7 @@ class ServerInfo(BaseModel):
     browser: BrowserInfo
     pool: PoolInfo
     notion: NotionInfo
-    typesafe: TypeSafeInfo
+    decision_api: DecisionApiInfo
 
 
 class Health(BaseModel):

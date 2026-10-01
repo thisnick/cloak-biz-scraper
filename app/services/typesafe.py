@@ -1,4 +1,5 @@
-"""The TypeSafe Classifier (e.g. Jev): yes/no and multiple-choice answers about text.
+"""The Decision API — TypeSafe's Jev, through OpenRouter: yes/no and multiple-choice
+answers about text.
 
 Jev is a classifier, not a language model, and that difference is the reason it
 is here. It cannot write anything: it takes some text (the "state") and named
@@ -75,7 +76,7 @@ _MAX_CHOICE_OPTIONS = 255
 # exist"; not enough to paste a whole HTML error page into a banner.
 _ERROR_TEXT_LIMIT = 200
 
-_SETTINGS_PATH = "Settings → TypeSafe Classifier (e.g. Jev)"
+_SETTINGS_PATH = "Settings → Decision API"
 
 # The backoff's sleep, by name, so a test can skip the waiting without
 # replacing asyncio.sleep for everything else running on the loop.
@@ -173,7 +174,7 @@ class _Reply:
 
 
 class TypeSafeClient:
-    """The one way this app asks the TypeSafe Classifier anything.
+    """The one way this app asks the Decision API anything.
 
     Built once, on app.state, with *getters* for the key and model rather than
     the values: a key saved in Settings then applies to the next question with
@@ -219,7 +220,7 @@ class TypeSafeClient:
         answer = (await self.ask(state, {"q": question}, attempts=attempts, timeout=timeout))["q"]
         if not isinstance(answer, Choice):
             raise TypeSafeError(
-                "The TypeSafe Classifier answered a choice question with something else."
+                "The Decision API answered a choice question with something else."
             )
         return answer
 
@@ -230,7 +231,7 @@ class TypeSafeClient:
                                  attempts=attempts, timeout=timeout))["q"]
         if not isinstance(answer, Noul):
             raise TypeSafeError(
-                "The TypeSafe Classifier answered a yes/no question with something else."
+                "The Decision API answered a yes/no question with something else."
             )
         return answer.probability
 
@@ -273,7 +274,7 @@ class TypeSafeClient:
         key, model = key.strip(), model.strip() or DEFAULT_MODEL
         if not key:
             raise TypeSafeNotConfigured(
-                "No OpenRouter API key is saved for the TypeSafe Classifier (e.g. Jev). "
+                "No OpenRouter API key is saved for the Decision API. "
                 f"Add one under {_SETTINGS_PATH}."
             )
         return key, model
@@ -334,7 +335,7 @@ class TypeSafeClient:
 
         tried = "after 1 attempt" if attempts == 1 else f"after {attempts} attempts"
         raise TypeSafeUnavailable(
-            f"The TypeSafe Classifier did not answer {tried} ({last_error}). OpenRouter or "
+            f"The Decision API did not answer {tried} ({last_error}). OpenRouter or "
             f"TypeSafe may be having trouble; try again in a few minutes."
         )
 
@@ -359,17 +360,17 @@ class TypeSafeClient:
                 detail = err
             raise _error_for(code, _scrub(detail, key))
         if not isinstance(payload, dict):
-            raise TypeSafeError("The TypeSafe Classifier sent a reply this app cannot read.")
+            raise TypeSafeError("The Decision API sent a reply this app cannot read.")
 
         answers_raw = payload.get("answers")
         if not isinstance(answers_raw, dict):
-            raise TypeSafeError("The TypeSafe Classifier replied without any answers.")
+            raise TypeSafeError("The Decision API replied without any answers.")
         answered_by = str(payload.get("model") or model)
         answers: dict[str, Answer] = {}
         for name in questions:
             raw = answers_raw.get(name)
             if not isinstance(raw, dict):
-                raise TypeSafeError(f"The TypeSafe Classifier returned no answer for {name!r}.")
+                raise TypeSafeError(f"The Decision API returned no answer for {name!r}.")
             answers[name] = _answer(name, raw, answered_by)
 
         usage = payload.get("usage")
@@ -400,7 +401,7 @@ def _answer(name: str, raw: dict[str, Any], model: str) -> Answer:
             return Noul(probability=float(raw["noul"]), model=model)
     except (KeyError, TypeError, ValueError, AttributeError):
         raise TypeSafeError(
-            f"The TypeSafe Classifier's answer to {name!r} was not in a shape this app can read."
+            f"The Decision API's answer to {name!r} was not in a shape this app can read."
         ) from None
     return RawAnswer(type=kind, data=dict(raw), model=model)
 
@@ -423,7 +424,7 @@ def _error_for(status: int, detail: str) -> TypeSafeError:
         # Only reachable as an error inside a 200 — a real status like these is
         # retried in _call — and it is the same kind of trouble.
         return TypeSafeUnavailable(
-            f"The TypeSafe Classifier could not answer (code {status}); try again in a "
+            f"The Decision API could not answer (code {status}); try again in a "
             f"few minutes.{said}"
         )
     # The upstream reason goes inside the first sentence, which is the part the
@@ -432,7 +433,7 @@ def _error_for(status: int, detail: str) -> TypeSafeError:
     if "model" in detail.lower():
         hint = f" Check the Model under {_SETTINGS_PATH} (the default is {DEFAULT_MODEL})."
     reason = f"HTTP {status}: {detail}" if detail else f"HTTP {status}"
-    return TypeSafeError(f"The TypeSafe Classifier refused this request ({reason}).{hint}")
+    return TypeSafeError(f"The Decision API refused this request ({reason}).{hint}")
 
 
 def _retry_after(value: str | None, fallback: float) -> float:

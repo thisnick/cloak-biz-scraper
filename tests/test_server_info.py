@@ -26,7 +26,7 @@ def _settings() -> Settings:
         proxy_user="u", proxy_password=PROXY_PW, proxy_host="h", proxy_port="1000",
         proxy_country="US", proxy_region="california",
         notion_api_token=NOTION_TOK, notion_db_id="db-1",
-        typesafe_openrouter_api_key=OPENROUTER_KEY, typesafe_last_check_ok=True,
+        openrouter_api_key=OPENROUTER_KEY, decision_api_last_check_ok=True,
         max_instances=4, interactive_reserve=1,
     )
 
@@ -62,7 +62,7 @@ class TestNoSecretLeaks:
         assert info.browser.pro is True
         assert info.browser.build == "pro"
         assert info.notion.connected is True
-        assert info.typesafe.configured is True and info.typesafe.status == "working"
+        assert info.decision_api.configured is True and info.decision_api.status == "working"
 
 
 class TestSnapshotContent:
@@ -82,16 +82,16 @@ class TestSnapshotContent:
         assert info.browser.pro is False
         assert info.browser.build == "public"
         assert info.notion.connected is False
-        assert info.typesafe.configured is False and info.typesafe.status == "unset"
-        assert info.typesafe.model == "jev-latest"
+        assert info.decision_api.configured is False and info.decision_api.status == "unset"
+        assert info.decision_api.model == "jev-latest"
 
-    def test_typesafe_status_comes_from_the_last_test_not_the_key(self):
-        untested = Settings(typesafe_openrouter_api_key="k", typesafe_model="jev-2")
+    def test_decision_api_status_comes_from_the_last_test_not_the_key(self):
+        untested = Settings(openrouter_api_key="k", decision_api_model="jev-2")
         info = server_info(untested, _FakeInstances())
-        assert (info.typesafe.configured, info.typesafe.status, info.typesafe.model) == (
+        assert (info.decision_api.configured, info.decision_api.status, info.decision_api.model) == (
             True, "untested", "jev-2")
-        broken = untested.model_copy(update={"typesafe_last_check_ok": False})
-        assert server_info(broken, _FakeInstances()).typesafe.status == "broken"
+        broken = untested.model_copy(update={"decision_api_last_check_ok": False})
+        assert server_info(broken, _FakeInstances()).decision_api.status == "broken"
 
     def test_a_saved_key_is_not_called_pro_before_its_artifact_resolves(self):
         info = server_info(_settings(), _FakeInstances(binary_path=None))
@@ -130,8 +130,8 @@ class TestRestEndpoint:
         r = client.get("/api/server-info", headers={"Authorization": f"Bearer {mint_access(app)}"})
         assert r.status_code == 200
         body = r.json()
-        assert set(body) == {"proxy", "browser", "pool", "notion", "typesafe"}
-        assert set(body["typesafe"]) == {"configured", "status", "model"}
+        assert set(body) == {"proxy", "browser", "pool", "notion", "decision_api"}
+        assert set(body["decision_api"]) == {"configured", "status", "model"}
         assert "windows_fonts" in body["browser"]
 
     def test_no_token_is_refused(self, client):

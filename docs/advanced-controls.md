@@ -86,11 +86,11 @@ An AI can use `list_profiles`, `create_profile`, `update_profile`, `new_proxy_se
 `delete_profile`. Make destructive intent explicit. For example, do not ask an agent to
 “clean profiles”; name the profile and whether you mean rotate, clear, or delete.
 
-## TypeSafe Classifier (e.g. Jev)
+## Decision API
 
 The sweep reads BizBuySell with adapters written for its pages. Every other listing site —
 a broker's own site, WebsiteClosers, Dealonomy, BizQuest, and so on — is read generically:
-the app groups the page's links by their shape, and the **TypeSafe Classifier (e.g. Jev)**
+the app groups the page's links by their shape, and the **Decision API**
 decides which group is the list of businesses for sale, what each field on a card holds
 (asking price, cash flow, revenue, location…), and which link or button is the next page.
 The list and the fields are decided on a sweep's first page and reused for its later pages;
@@ -127,7 +127,7 @@ To set it up:
 
 1. Create a key at [openrouter.ai/settings/keys](https://openrouter.ai/settings/keys) and
    add a few dollars of credit to the account.
-2. Open **Settings → TypeSafe Classifier (e.g. Jev)**, paste the key into
+2. Open **Settings → Decision API**, paste the key into
    **OpenRouter API key**, leave **Model** as `jev-latest`, and select **Save & test**.
 3. The section shows **Working** once OpenRouter answers.
 
@@ -156,9 +156,9 @@ makes only the listing requests; without a key, none.
 ## Triage prompt
 
 `scrape_listings(urls, max_pages, sync=true, triage_prompt="…")` saves the new listings
-and then decides **REVIEW** or **REJECT** for each one, in the server, with the TypeSafe
-Classifier (e.g. Jev). It needs `sync=true` and a working classifier key; a call without
-either is refused before anything starts.
+and then decides **REVIEW** or **REJECT** for each one, in the server, with the Decision
+API. It needs `sync=true` and a working Decision API key; a call without either is refused
+before anything starts.
 
 What it does, for every row the sweep inserted and every row it saw whose Bot Triage is
 still blank:
@@ -229,95 +229,34 @@ plain text, the same way, to check what the classifier will be given; and
 reports how often it agrees with the Bot Triage values already there, without writing
 anything.
 
-## Site overrides
+## When a site is read wrong
 
 A generic site is decided fresh by every sweep — its list and fields on the first page
 (reused for that sweep's later pages), its next page on every page — and nothing is
-remembered between sweeps, so a site that changes its layout is read by its new layout. When one decision keeps coming out wrong for one site — the wrong list, a
-field left empty, paging that stops early or never stops, sold listings kept — pin that
-part in **Settings → Site overrides**. Anything you leave out is still decided by the
-classifier.
+remembered between sweeps, so a site that changes its layout is read by its new layout.
+When one decision keeps coming out wrong for one site — the wrong list, a field left
+empty, paging that stops early or never stops, sold listings kept — that part is pinned in
+the server's code (`SITE_OVERRIDES` in `app/sources/overrides.py`), not in Settings.
 
-The setting is a JSON list with one entry per site. It is saved only when every entry is
-valid; otherwise the page shows where the problem is (a line and column for broken JSON,
-or the override and field for a bad value) and keeps your text in the box. Leave it empty
-for no overrides.
+To see what was decided, open **Tasks → History** and select **Details** on a sweep of the
+site. Each generically read URL in `decisions` has:
 
-| Key | What it pins |
-|---|---|
-| `match` | The site: a host (`bizquest.com`, any page on it) or a URL prefix (`https://www.bizquest.com/businesses-for-sale-in-`). `www.` and http/https never matter; the longest match wins; `fcbb.com` does not cover `sfbay.fcbb.com`. Required. |
-| `listing_links` | The link patterns that are the listings, exactly as a run reports them, e.g. `www.bizquest.com/business-for-sale/{*}/{*}` (`{*}` is any one path segment). Several patterns are read as one list. A single pattern of links that act on each card (`…/{*}/contact`, "Watch", "Unlock") is read through the listing links inside those cards. |
-| `fields` | A card field — its label, or the slot key a run reports for an unlabelled one — mapped to what it holds, or to `ignore`. |
-| `next_page` | How to reach the next page: see below. |
-| `drop_status` | Status texts that mean a listing is gone, matched as case-insensitive substrings, e.g. `["sold", "under contract"]`, and dropped before any listing is asked about. Without it, each listing's own request decides whether it is still for sale. An empty list drops nothing here. |
-
-`next_page` takes one of three forms:
-
-- **A URL with `{page}` in it** — `"https://example.com/listings?page={page}"` — for a site
-  that pages by address. Page 2 is that URL with `2`, and so on.
-- **`click:<css selector>`** — `"click:a.pagination-next"` — for a Next or Load more
-  button with no address of its own.
-- **`none`** — the site has one page; stop after page 1.
-
-The values for `fields` are `title`, `location`, `asking_price`, `cash_flow_sde`, `ebitda`,
-`revenue`, `status`, `category`, `description`, `listing_id`, `other` and `ignore`. The first
-six fill the listing's columns; the rest stay in the listing's excerpt only. Money is always
-kept exactly as the card printed it.
-
-The easiest way to write one is to copy it. In **Tasks → History**, select **Details** on a
-sweep of the site. Each generically read URL in `decisions` has:
-
-- `pages` — what was decided on each page and by whom (`jev` or `override`): the chosen
-  `listing_links` pattern with its confidence, each field's role and whether it was
-  confident enough to use, the `next_page` rule (and, for a button, `clicked_by`: its
-  `mark`, its `selector`, or a `re-probe` when the site had re-drawn it; for a link that
-  pointed off the site, `refused` with where it went — it is not followed), and how many
-  cards a `drop_status` override dropped.
+- `pages` — what was decided on each page and by whom (`jev`, or `override` for a site
+  pinned in code): the chosen `listing_links` pattern with its confidence, each field's
+  role and whether it was confident enough to use, the `next_page` rule (and, for a
+  button, `clicked_by`: its `mark`, its `selector`, or a `re-probe` when the site had
+  re-drawn it, plus `clicked_again_by` when the first click changed nothing; for a link
+  that pointed off the site, `refused` with where it went — it is not followed), and how
+  many cards a `drop_status` override dropped.
 - `legibility` — for each page, the code checks (cards without a title or link) and
   `eligibility`: how many listings were asked about and how many were already in Notion,
   how many were judged not for sale now (the first ten by title and probability) and how
   many of those were left out, and why the classifier stopped if it did.
 - `warning` — when the sweep stopped at a later page it could not use, which page and why
   (the pages before it were kept).
-- `suggested_override` — a ready-to-paste override that pins what was decided on page 1.
-
-Paste the `suggested_override` into the list, change the part that was wrong, delete the
-parts you are happy to leave to the classifier, and save.
-
-A site that pages by address, like WebsiteClosers (illustrative — copy the real values from
-your own run's details):
-
-```json
-[
-  {
-    "match": "websiteclosers.com",
-    "listing_links": ["www.websiteclosers.com/businesses/{*}/{*}"],
-    "next_page": "https://www.websiteclosers.com/businesses-for-sale/page/{page}/",
-    "drop_status": ["sold", "under contract"]
-  }
-]
-```
-
-A site with a script-only Next button and labelled card fields, like an FCBB office:
-
-```json
-[
-  {
-    "match": "https://sfbay.fcbb.com/silicon-valley",
-    "next_page": "click:a.pagination-next",
-    "fields": {
-      "Asking Price": "asking_price",
-      "Cash Flow": "cash_flow_sde",
-      "Gross Revenue": "revenue",
-      "Listing #": "ignore"
-    }
-  }
-]
-```
-
-Overrides only change how a site is read, so they apply once a TypeSafe Classifier key is
-saved. If a saved document ever stops being valid, sweeps of other sites are refused until
-it is fixed or cleared; BizBuySell sweeps are never affected.
+- `not_fully_crawled` — the site's list went on past `max_pages`.
+- `suggested_override` — what was decided on page 1, in the shape of a code override:
+  the starting point for pinning the site.
 
 ## Clean up the Railway volume
 

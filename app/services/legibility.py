@@ -14,7 +14,7 @@ checked before anything from it is kept, in two layers.
   that contain a digit mostly do not read as an amount, the "price" is some
   other text. Only the asking price is judged: revenue and cash flow are
   legitimately ranges on some sites ("$250K - $500K").
-* **One request per listing** (`ListingCheck`), when the TypeSafe Classifier
+* **One request per listing** (`ListingCheck`), when the Decision API
   (e.g. Jev) has a key. Once a page is down to its array of listing elements,
   every question about one element is asked together, in ONE request whose
   state is that card (`triage.card_state`): is it one listing of a business
@@ -270,13 +270,13 @@ async def ask(classifier, listing: Listing, triager: Triager | None = None) -> L
     replies = await classifier.ask(card_state(listing), questions)
     eligible = replies.get("eligible") if isinstance(replies, dict) else None
     if not isinstance(eligible, Noul):
-        raise TypeSafeError("The TypeSafe Classifier did not answer whether this is a listing "
+        raise TypeSafeError("The Decision API did not answer whether this is a listing "
                             "of a business for sale.")
     decision = None
     if triager is not None:
         answer = replies.get("triage")
         if not isinstance(answer, Choice):
-            raise TypeSafeError("The TypeSafe Classifier did not answer the triage question.")
+            raise TypeSafeError("The Decision API did not answer the triage question.")
         decision = triager.decision(answer, STAGE_CARD)
     return ListingAnswer(eligible=eligible.probability, triage=decision)
 

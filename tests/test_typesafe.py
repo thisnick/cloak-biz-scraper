@@ -1,4 +1,4 @@
-"""The TypeSafe Classifier client: what it sends, what it reads back, and how it fails.
+"""The Decision API client: what it sends, what it reads back, and how it fails.
 
 Every call is faked with respx at the real endpoint, so these tests exercise the
 real request/response shapes (captured from a live call on 2026-09-28) without a
@@ -269,7 +269,7 @@ class TestPlainLanguageErrors:
         with pytest.raises(TypeSafeAuthError) as caught:
             await _client().noul("x", "y")
         assert "OpenRouter rejected the key" in str(caught.value)
-        assert "Settings → TypeSafe Classifier (e.g. Jev)" in str(caught.value)
+        assert "Settings → Decision API" in str(caught.value)
 
     @respx.mock
     @pytest.mark.asyncio
@@ -297,7 +297,7 @@ class TestPlainLanguageErrors:
         message = str(caught.value)
         # The upstream reason is in the first sentence — the part Settings keeps.
         assert message.startswith(
-            "The TypeSafe Classifier refused this request "
+            "The Decision API refused this request "
             "(HTTP 400: Model typesafe/jev-nope does not exist).")
         assert "Check the Model" in message
 
@@ -308,7 +308,7 @@ class TestPlainLanguageErrors:
         route = respx.post(API).mock(return_value=_noul())
         with pytest.raises(TypeSafeNotConfigured) as caught:
             await _client(key=blank).noul("x", "y")
-        assert "Settings → TypeSafe Classifier (e.g. Jev)" in str(caught.value)
+        assert "Settings → Decision API" in str(caught.value)
         assert route.call_count == 0
 
     def test_every_error_is_a_typesafe_error(self):

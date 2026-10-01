@@ -1,4 +1,4 @@
-"""Site overrides: a person pinning part of how a generic listing page is read.
+"""Site overrides: pinning in code part of how one site's listing page is read.
 
 The generic reader (`sources/generic.py`) decides everything about a page
 fresh on every sweep: which links are the listings and what each field on a
@@ -6,28 +6,27 @@ card holds (on the sweep's first page, reused for its later pages), and which
 link is the next page (on every page). Nothing is remembered between sweeps,
 because a site that changes its layout would otherwise be read with last
 month's answers. Whether each card is still for sale is asked per card by the
-sweep; `drop_status` is a person's deterministic rule for it on one site. An override is the one exception,
-and it is a person's, not the reader's: when a decision keeps coming out wrong
-for one site, whoever runs the scraper pins that part and the reader stops
-asking about it. Every part is optional — anything left out is still decided
-fresh — so an override can be as small as the one thing that was wrong.
+sweep; `drop_status` is a deterministic rule for it on one site. An override is the one exception,
+and it is code, not something a user sets: when a decision keeps coming out
+wrong for one site, an entry in `SITE_OVERRIDES` below pins that part and the
+reader stops asking about it. Every part is optional — anything left out is
+still decided fresh — so an override can be as small as the one thing that was
+wrong.
 
 The values are copied from what the reader reports it decided (the link
 pattern string, a field's label, a next-page URL), which is why the pattern
 format and field keys are human-readable and stable: an override is meant to be
-pasted, not written from scratch.
-
-This module is the shape, the matching, and reading the document a person
-wrote. Where that document is stored and edited belongs to Settings
-(`site_overrides_json`, kept as the raw text so their formatting survives).
+pasted, not written from scratch. A sweep's run detail (`/runs/<job_id>`) has a
+`suggested_override` for every site the reader read — what it decided, in this
+shape — and `scripts/eval_sources.py` prints the same for any URL.
 """
 from __future__ import annotations
 
-import json
-from typing import Any, Literal, get_args
+from collections.abc import Sequence
+from typing import Literal, get_args
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator
 
 # What a field on a listing card can hold. The descriptions are the option
 # wording the classifier is asked with, so they are written for it, and they are
@@ -69,7 +68,7 @@ NEXT_PAGE_HELP = (
 
 
 class SiteOverride(BaseModel):
-    """The parts of reading one site that a person has pinned.
+    """The parts of reading one site that are pinned in code.
 
     `match` is a URL prefix ("https://www.bizquest.com/businesses-for-sale-in-")
     or a bare host ("bizquest.com", any page on it); `www.` never matters and
@@ -161,7 +160,7 @@ def _site_key(value: str) -> tuple[str, str] | None:
     return host, rest.lower()
 
 
-def override_for(url: str, overrides: list[SiteOverride] | None) -> SiteOverride | None:
+def override_for(url: str, overrides: Sequence[SiteOverride] | None) -> SiteOverride | None:
     """The override that applies to `url`: the longest matching `match`, or None.
 
     A bare host matches every page on that host; a URL prefix matches pages
@@ -187,68 +186,7 @@ def override_for(url: str, overrides: list[SiteOverride] | None) -> SiteOverride
     return best
 
 
-# ── the document ─────────────────────────────────────────────────────────────
-
-
-class OverridesInvalid(ValueError):
-    """The saved overrides document cannot be read; the message says where."""
-
-
-_DOCUMENT = TypeAdapter(list[SiteOverride])
-
-EXAMPLE = '[{"match": "bizquest.com", "next_page": "none"}]'
-
-
-def parse_overrides(text: str | None) -> list[SiteOverride]:
-    """The overrides in a document a person typed. Blank means none.
-
-    Raises `OverridesInvalid` with the first problem and where it is: a line
-    and column for broken JSON (which is where an editor puts the cursor), and
-    the override and field for a value that is not allowed ("Override 2
-    (bizquest.com) → next_page: …"). A person fixing a document in a text box
-    needs to know which line to look at more than they need every problem at
-    once, so only the first is spelled out and the rest are counted.
-    """
-    if not (text or "").strip():
-        return []
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise OverridesInvalid(
-            f"Line {exc.lineno}, column {exc.colno}: {exc.msg}. The overrides must be "
-            f"JSON, e.g. {EXAMPLE}."
-        ) from None
-    try:
-        return _DOCUMENT.validate_python(data)
-    except ValidationError as exc:
-        errors = exc.errors()
-        first = _located(errors[0], data)
-        more = len(errors) - 1
-        if more:
-            first += f" (and {more} more problem{'' if more == 1 else 's'})"
-        raise OverridesInvalid(first) from None
-
-
-def _located(error: dict[str, Any], data: Any) -> str:
-    loc = tuple(error.get("loc") or ())
-    msg = str(error.get("msg") or "is not valid").removeprefix("Value error, ")
-    if not loc:
-        return (f"The overrides must be a JSON list with one entry per site, "
-                f"e.g. {EXAMPLE}.")
-    index, path = loc[0], [str(part) for part in loc[1:]]
-    where = f"Override {index + 1}" if isinstance(index, int) else str(index)
-    if isinstance(index, int) and isinstance(data, list) and index < len(data):
-        entry = data[index]
-        if isinstance(entry, dict) and isinstance(entry.get("match"), str) and entry["match"]:
-            where += f" ({entry['match']})"
-    kind = error.get("type")
-    if kind == "extra_forbidden":
-        msg = ("is not something an override can set (it takes "
-               + ", ".join(SiteOverride.model_fields) + ")")
-    elif kind == "missing":
-        msg = "is required"
-    elif kind == "model_type":
-        msg = 'must be an object like {"match": "example.com", …}'
-    if path:
-        return f"{where} → {' → '.join(path)}: {msg}"
-    return f"{where}: {msg}"
+# The sites whose reading is pinned (`override_for` picks the longest match).
+# Empty until a site needs one; an entry is a code change like any other, made
+# with the run detail of the sweep that read the site wrong.
+SITE_OVERRIDES: tuple[SiteOverride, ...] = ()
