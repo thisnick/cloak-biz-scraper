@@ -1,4 +1,4 @@
-"""Triage: REVIEW or REJECT for one listing, decided by the TypeSafe Classifier (e.g. Jev).
+"""Triage: REVIEW or REJECT for one listing, decided by the Decision API.
 
 **One question, two answers.** The caller's criteria text — a person's own
 words, read from wherever they keep them — becomes the question's

@@ -42,8 +42,8 @@ and when that is impossible it says the page needs the section removed by hand.
 
 **The guard.** A page can load "successfully" and still be a login wall, a
 cookie screen, a 404, a "this listing has been removed" notice or an anti-bot
-interstitial that the blocker's phrase list does not know. When a TypeSafe
-Classifier key is saved, one yes/no question about the first few thousand
+interstitial that the blocker's phrase list does not know. When a Decision API
+key is saved, one yes/no question about the first few thousand
 characters decides whether this is the page's real content, and below
 GUARD_THRESHOLD nothing is written. Without a key there is no guard, and an
 unreachable classifier never stops an archive: the guard protects the Notion
@@ -338,7 +338,7 @@ class ArchiveService:
         key added or removed in Settings applies to the next archive."""
         if self._typesafe is None:
             return None
-        return self._typesafe if self._settings.load().typesafe_configured() else None
+        return self._typesafe if self._settings.load().decision_api_configured() else None
 
     async def read(self, url: str, evidence_dir: Path, *, owner: str | None = None) -> PageRead:
         """Load `url` on a pooled identity and extract its readable content.

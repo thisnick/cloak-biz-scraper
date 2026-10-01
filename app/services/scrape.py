@@ -15,7 +15,7 @@ Notion at all.
 Which source reads a URL is decided here too, because only this service knows
 what the Settings say. A URL a site adapter matches is read by it. A URL on a
 site with no adapter is read by the generic reader (`sources/generic.py`) —
-when the TypeSafe Classifier (e.g. Jev) key is saved, since the reader cannot
+when the Decision API key is saved, since the reader cannot
 decide anything without it, and with that site's override if the code pins
 one (`sources/overrides.SITE_OVERRIDES`). A
 URL on a site that HAS an adapter, which the adapter does not read, is refused:
@@ -118,8 +118,8 @@ _TRIAGE_STOPS = legibility.STOPS
 # Why a site with no adapter is refused when no classifier key is saved. Says
 # where the key goes, because that is the whole fix.
 NEEDS_CLASSIFIER = (
-    "Reading sites other than BizBuySell needs the TypeSafe Classifier (e.g. Jev) — add an "
-    "OpenRouter key under Settings → TypeSafe Classifier (e.g. Jev)."
+    "Reading sites other than BizBuySell needs the Decision API — add an "
+    "OpenRouter key under Settings → Decision API."
 )
 
 
@@ -168,7 +168,7 @@ class _TriagePlan:
 
 
 class ClassifierNotReady(RuntimeError):
-    """The sweep needs the TypeSafe Classifier (e.g. Jev), and it failed its check.
+    """The sweep needs the Decision API, and it failed its check.
 
     Raised by `submit` before anything starts, when every readable URL in the
     call is read by the generic reader: each would fail on its first question,
@@ -194,7 +194,7 @@ class _Target:
 
     The reason travels with the URL because a batch is not refused for one bad
     URL: that URL becomes its own source's failure, and the job's error should
-    say what was wrong with it ("needs the TypeSafe Classifier…"), not a
+    say what was wrong with it ("needs the Decision API…"), not a
     generic "not supported".
     """
 
@@ -269,7 +269,7 @@ class ScrapeService:
         # archive_page call uses — and files it with its idempotent `append`.
         # Optional: without it a triage_prompt is refused up front.
         self._archive = archive
-        # The shared TypeSafe Classifier client (app.state.typesafe). Optional:
+        # The shared Decision API client (app.state.typesafe). Optional:
         # without it — or without a saved key, checked at sweep time so a key
         # added in Settings applies to the next sweep — pages get the code
         # checks only, and no per-listing request is made.
@@ -331,7 +331,7 @@ class ScrapeService:
         come first, because they cost nothing to find out.
 
         The preflight is the classifier's key. A URL read by the generic reader
-        asks the TypeSafe Classifier (e.g. Jev) about every page, so a key that
+        asks the Decision API about every page, so a key that
         OpenRouter rejects, an account out of credits, or a service that is not
         answering would fail each such source on its first question — minutes
         into a job the caller has already been told is running. One tiny check
@@ -368,7 +368,7 @@ class ScrapeService:
             check = await self._typesafe.check()
             if not check.ok and plan is not None:
                 raise TriageNotConfigured(
-                    "Can't start this sweep with triage: triage asks the TypeSafe Classifier "
+                    "Can't start this sweep with triage: triage asks the Decision API "
                     "(e.g. Jev) about every new listing, and it failed its check just now. "
                     f"{check.message}",
                     check.error,
@@ -378,11 +378,11 @@ class ScrapeService:
                 if len(generic) == len(readable):
                     what = "this page" if len(generic) == 1 else f"these {len(generic)} pages"
                     raise ClassifierNotReady(
-                        f"Can't start this sweep: reading {what} needs the TypeSafe Classifier "
+                        f"Can't start this sweep: reading {what} needs the Decision API "
                         f"(e.g. Jev), and it failed its check just now. {check.message}",
                         check.error,
                     )
-                reason = ("needs the TypeSafe Classifier (e.g. Jev), which failed its check "
+                reason = ("needs the Decision API, which failed its check "
                           f"just now: {check.message}")
                 refused = {t.url: reason for t in generic}
         if plan is not None:
@@ -499,8 +499,8 @@ class ScrapeService:
             )
         if self._classifier() is None:
             raise TriageNotConfigured(
-                "Triage needs the TypeSafe Classifier (e.g. Jev), and no OpenRouter key is "
-                "saved for it. Add one under Settings → TypeSafe Classifier (e.g. Jev), or "
+                "Triage needs the Decision API, and no OpenRouter key is "
+                "saved for it. Add one under Settings → Decision API, or "
                 "leave triage_prompt out."
             )
         if self._archive is None:
@@ -1050,7 +1050,7 @@ class ScrapeService:
         """The TypeSafe client when a key is saved right now, else None."""
         if self._typesafe is None:
             return None
-        return self._typesafe if self._settings.load().typesafe_configured() else None
+        return self._typesafe if self._settings.load().decision_api_configured() else None
 
     def _check_for(self, job: SweepTask) -> ListingCheck | None:
         """The running sweep's per-listing requests. An attempt run on its own

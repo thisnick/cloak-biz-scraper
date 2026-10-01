@@ -86,11 +86,11 @@ An AI can use `list_profiles`, `create_profile`, `update_profile`, `new_proxy_se
 `delete_profile`. Make destructive intent explicit. For example, do not ask an agent to
 “clean profiles”; name the profile and whether you mean rotate, clear, or delete.
 
-## TypeSafe Classifier (e.g. Jev)
+## Decision API
 
 The sweep reads BizBuySell with adapters written for its pages. Every other listing site —
 a broker's own site, WebsiteClosers, Dealonomy, BizQuest, and so on — is read generically:
-the app groups the page's links by their shape, and the **TypeSafe Classifier (e.g. Jev)**
+the app groups the page's links by their shape, and the **Decision API**
 decides which group is the list of businesses for sale, what each field on a card holds
 (asking price, cash flow, revenue, location…), and which link or button is the next page.
 The list and the fields are decided on a sweep's first page and reused for its later pages;
@@ -127,7 +127,7 @@ To set it up:
 
 1. Create a key at [openrouter.ai/settings/keys](https://openrouter.ai/settings/keys) and
    add a few dollars of credit to the account.
-2. Open **Settings → TypeSafe Classifier (e.g. Jev)**, paste the key into
+2. Open **Settings → Decision API**, paste the key into
    **OpenRouter API key**, leave **Model** as `jev-latest`, and select **Save & test**.
 3. The section shows **Working** once OpenRouter answers.
 
@@ -156,9 +156,9 @@ makes only the listing requests; without a key, none.
 ## Triage prompt
 
 `scrape_listings(urls, max_pages, sync=true, triage_prompt="…")` saves the new listings
-and then decides **REVIEW** or **REJECT** for each one, in the server, with the TypeSafe
-Classifier (e.g. Jev). It needs `sync=true` and a working classifier key; a call without
-either is refused before anything starts.
+and then decides **REVIEW** or **REJECT** for each one, in the server, with the Decision
+API. It needs `sync=true` and a working Decision API key; a call without either is refused
+before anything starts.
 
 What it does, for every row the sweep inserted and every row it saw whose Bot Triage is
 still blank:

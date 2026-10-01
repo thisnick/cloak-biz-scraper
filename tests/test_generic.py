@@ -1675,7 +1675,7 @@ class TestErrorsAndBlocks:
         source = GenericSource(LIST_URL, None)
         result = await source.cards(FakePage(_probe()))
         assert result.retry is False
-        assert "needs the TypeSafe Classifier (e.g. Jev)" in result.error
+        assert "needs the Decision API" in result.error
 
     @pytest.mark.asyncio
     async def test_a_challenge_page_is_a_block_and_nothing_is_asked(self):

@@ -11,7 +11,7 @@ asking them to tell us something the URL already says, and would let them get it
 wrong.
 
 A site with no adapter of its own is read by the generic reader
-(`sources/generic.py`), when the TypeSafe Classifier (e.g. Jev) is set up to make
+(`sources/generic.py`), when the Decision API is set up to make
 the decisions an adapter would have hard-coded. What that reader never does is
 guess: a page with no list of businesses on it is a loud error for that source,
 with evidence, never an empty result an agent would report as "no listings

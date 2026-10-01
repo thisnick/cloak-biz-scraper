@@ -19,7 +19,7 @@ logger = logging.getLogger("cloakbiz.config")
 # process env they would silently outrank the user's settings — see purge_binary_env().
 _BINARY_ENV_VARS = ("CLOAKBROWSER_LICENSE_KEY", "CLOAKBROWSER_VERSION")
 # Seed-only secrets with no reason to outlive seeding — see purge_secret_env().
-_SEED_SECRET_ENV_VARS = ("OPENROUTER_API_KEY",)
+_SEED_SECRET_ENV_VARS = ("DECISION_API_KEY",)
 
 
 def _int(name: str, default: int) -> int:

@@ -3,7 +3,7 @@
 Two kinds of source read a page. A site adapter (`SOURCES`) knows its site's
 markup and is chosen by URL pattern. Every other site is read by the generic
 reader (`generic.GenericSource`), which finds the list on the page by its links
-and asks the TypeSafe Classifier (e.g. Jev) what code cannot see. The sweep
+and asks the Decision API what code cannot see. The sweep
 (`services/scrape.py`) makes that choice, because only it knows whether a
 classifier key is saved; this module answers
 the two questions it asks first: does an adapter read this URL (`for_url`), and

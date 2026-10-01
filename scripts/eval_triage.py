@@ -17,7 +17,7 @@ sale now) — a generic site's sweep drops those before they are ever saved.
 **Read-only.** It reads the database schema and queries its rows; it never
 writes to Notion. It is not run in CI: it needs a real database and a key.
 
-    set -a; source .env; set +a      # NOTION_API_TOKEN and OPENROUTER_API_KEY — never printed
+    set -a; source .env; set +a      # NOTION_API_TOKEN and DECISION_API_KEY — never printed
     python scripts/eval_triage.py <listings db id or URL> --prompt criteria.txt --since 2026-08-30
 
     # a database whose columns have other names than the app's defaults
@@ -271,9 +271,9 @@ async def main() -> int:
     a = ap.parse_args()
 
     token = os.environ.get("NOTION_API_TOKEN", "")
-    key = os.environ.get("OPENROUTER_API_KEY", "")
+    key = os.environ.get("DECISION_API_KEY", "")
     if not token or not key:
-        print("Set NOTION_API_TOKEN and OPENROUTER_API_KEY (e.g. set -a; source .env; set +a).",
+        print("Set NOTION_API_TOKEN and DECISION_API_KEY (e.g. set -a; source .env; set +a).",
               file=sys.stderr)
         return 2
     overrides = dict(c.split("=", 1) for c in a.column)

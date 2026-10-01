@@ -2,7 +2,7 @@
 
 The unit tests drive `GenericSource` with canned probe output and a fake
 classifier, which pins the contract but not the thing that matters: whether, on
-real pages it was never tuned to, the TypeSafe Classifier (e.g. Jev) picks the
+real pages it was never tuned to, the Decision API picks the
 list of businesses (and "none" where there is none), names the fields, and finds
 the next page — and whether each card it read is a business for sale now, asked
 the way a sweep asks it (one request per card, `legibility.ListingCheck`, as
@@ -11,7 +11,7 @@ and prints what a site override (in code: sources/overrides.py) pinning those
 decisions would look like. It is
 not run in CI: it needs a browser, the live sites and an OpenRouter key.
 
-    set -a; source .env; set +a          # OPENROUTER_API_KEY — never printed
+    set -a; source .env; set +a          # DECISION_API_KEY — never printed
     python scripts/eval_sources.py https://www.websiteclosers.com/businesses-for-sale/ --pages 2
 
     # the gate: every labelled page, scored (scripts/eval_sources_pages.json
@@ -367,13 +367,13 @@ async def main() -> int:
     ap.add_argument("--no-overrides", action="store_true",
                     help="ignore the site overrides in code (sources/overrides.py), to see "
                          "what the classifier decides on its own")
-    ap.add_argument("--model", default=os.environ.get("TYPESAFE_MODEL") or DEFAULT_MODEL)
+    ap.add_argument("--model", default=os.environ.get("DECISION_API_MODEL") or DEFAULT_MODEL)
     ap.add_argument("--json", type=Path, help="also write every result to this file")
     args = ap.parse_args()
 
-    key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    key = os.environ.get("DECISION_API_KEY", "").strip()
     if not key:
-        print("Set OPENROUTER_API_KEY (the TypeSafe Classifier's OpenRouter key) first.",
+        print("Set DECISION_API_KEY (the Decision API's OpenRouter key) first.",
               file=sys.stderr)
         return 2
     classifier = TypeSafeClient(key_getter=lambda: key, model_getter=lambda: args.model)

@@ -571,7 +571,7 @@ class FakeTypeSafe:
 
 
 def _with_key(settings):
-    settings.update(typesafe_openrouter_api_key="sk-or-v1-archive-guard-test")
+    settings.update(decision_api_key="sk-or-v1-archive-guard-test")
     return settings
 
 
@@ -927,7 +927,7 @@ class TestTheGuard:
         from app.services.typesafe import TypeSafeUnavailable
 
         classifier = FakeTypeSafe(error=TypeSafeUnavailable(
-            "The TypeSafe Classifier (e.g. Jev) did not answer after 4 attempts."))
+            "The Decision API did not answer after 4 attempts."))
         notion = FakeNotion()
         svc = _service(manager, _with_key(settings), jobs, monkeypatch, _ok(), notion=notion,
                        typesafe=classifier)

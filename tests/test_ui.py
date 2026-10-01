@@ -159,7 +159,7 @@ class TestWriteRoutesRequireAuth:
             "/settings/notion/verify",
             "/settings/notion/create",
             "/settings/notion/mapping",
-            "/settings/typesafe",
+            "/settings/decision-api",
             "/settings/connections/disconnect",
         ],
     )
@@ -636,7 +636,7 @@ class TestProxyTest:
 
 
 class TestTypeSafeUi:
-    """Settings → TypeSafe Classifier (e.g. Jev): the proxy's rules for a key.
+    """Settings → Decision API: the proxy's rules for a key.
 
     Write-only secret, blank keeps it, Test checks what was typed before saving
     it, and the chip comes from the remembered verdict — not from the form."""
@@ -658,21 +658,21 @@ class TestTypeSafeUi:
     def test_off_by_default_and_says_what_it_is_for(self, auth):
         response = auth.get("/")
         page = shown(response)
-        assert "TypeSafe Classifier (e.g. Jev)" in page
+        assert "Decision API" in page
         assert '<span class="chip">Not set</span>' in response.text
         assert "read listing sites other than BizBuySell" in page
         assert "Without one, everything else works as it does today" in page
         # Listed on Overview, and marked optional there.
-        assert ("<b>TypeSafe Classifier (e.g. Jev) "
+        assert ("<b>Decision API "
                 '<span class="opt-tag">optional</span></b>') in response.text
         assert 'value="jev-latest"' in response.text
 
     def test_a_saved_key_is_never_rendered_back(self, auth):
-        response = auth.post("/settings/typesafe", data={
-            "action": "save", "typesafe_openrouter_api_key": self.KEY,
-            "typesafe_model": "jev-latest"})
+        response = auth.post("/settings/decision-api", data={
+            "action": "save", "decision_api_key": self.KEY,
+            "decision_api_model": "jev-latest"})
         assert response.status_code == 200
-        assert app.state.settings.load().typesafe_openrouter_api_key == self.KEY
+        assert app.state.settings.load().decision_api_key == self.KEY
         for page in (response.text, auth.get("/").text):
             assert self.KEY not in page
             assert "(saved — leave blank to keep it)" in page
@@ -680,30 +680,30 @@ class TestTypeSafeUi:
         assert "not tested" in shown(response)
 
     def test_a_blank_key_field_keeps_the_saved_key(self, auth):
-        auth.post("/settings/typesafe", data={"typesafe_openrouter_api_key": self.KEY})
-        auth.post("/settings/typesafe", data={"typesafe_openrouter_api_key": "",
-                                              "typesafe_model": "jev-2"})
+        auth.post("/settings/decision-api", data={"decision_api_key": self.KEY})
+        auth.post("/settings/decision-api", data={"decision_api_key": "",
+                                              "decision_api_model": "jev-2"})
         settings = app.state.settings.load()
-        assert settings.typesafe_openrouter_api_key == self.KEY
-        assert settings.typesafe_model == "jev-2"
+        assert settings.decision_api_key == self.KEY
+        assert settings.decision_api_model == "jev-2"
 
     def test_a_cleared_model_goes_back_to_the_default(self, auth):
-        auth.post("/settings/typesafe", data={"typesafe_openrouter_api_key": self.KEY,
-                                              "typesafe_model": "jev-2"})
-        auth.post("/settings/typesafe", data={"typesafe_model": "  "})
-        assert app.state.settings.load().typesafe_model == "jev-latest"
+        auth.post("/settings/decision-api", data={"decision_api_key": self.KEY,
+                                              "decision_api_model": "jev-2"})
+        auth.post("/settings/decision-api", data={"decision_api_model": "  "})
+        assert app.state.settings.load().decision_api_model == "jev-latest"
 
     @respx.mock
     def test_a_passing_test_saves_and_is_remembered(self, auth):
         route = respx.post(TYPESAFE_API).mock(return_value=self._ok())
-        response = auth.post("/settings/typesafe", data={
-            "action": "test", "typesafe_openrouter_api_key": self.KEY,
-            "typesafe_model": "jev-latest"})
+        response = auth.post("/settings/decision-api", data={
+            "action": "test", "decision_api_key": self.KEY,
+            "decision_api_model": "jev-latest"})
         assert response.status_code == 200
         assert route.calls.last.request.headers["Authorization"] == f"Bearer {self.KEY}"
         settings = app.state.settings.load()
-        assert settings.typesafe_openrouter_api_key == self.KEY
-        assert settings.typesafe_status() == "working"
+        assert settings.decision_api_key == self.KEY
+        assert settings.decision_api_status() == "working"
         # Come back later: the verdict is still there, the key is not.
         later = auth.get("/")
         assert '<span class="chip ok">Working</span>' in later.text
@@ -714,13 +714,13 @@ class TestTypeSafeUi:
     def test_a_rejected_key_is_reported_and_stays_broken(self, auth):
         respx.post(TYPESAFE_API).mock(
             return_value=self._rejected(401, f"Invalid key {self.KEY}"))
-        response = auth.post("/settings/typesafe", data={
-            "action": "test", "typesafe_openrouter_api_key": self.KEY})
+        response = auth.post("/settings/decision-api", data={
+            "action": "test", "decision_api_key": self.KEY})
         assert response.status_code == 400
         assert "OpenRouter rejected the key" in shown(response)
         assert self.KEY not in response.text
         # Nothing working was at stake, so the attempt is recorded as broken.
-        assert app.state.settings.load().typesafe_status() == "broken"
+        assert app.state.settings.load().decision_api_status() == "broken"
         later = auth.get("/")
         assert '<span class="chip bad">Broken</span>' in later.text
         assert "did not work when it was last tested" in shown(later)
@@ -729,69 +729,69 @@ class TestTypeSafeUi:
     @respx.mock
     def test_an_empty_account_says_so(self, auth):
         respx.post(TYPESAFE_API).mock(return_value=self._rejected(402, "Insufficient credits"))
-        response = auth.post("/settings/typesafe", data={
-            "action": "test", "typesafe_openrouter_api_key": self.KEY})
+        response = auth.post("/settings/decision-api", data={
+            "action": "test", "decision_api_key": self.KEY})
         assert response.status_code == 400
         assert "out of credits" in shown(response)
 
     @respx.mock
     def test_a_failed_test_of_a_new_key_keeps_the_working_one(self, auth):
         respx.post(TYPESAFE_API).mock(return_value=self._ok())
-        auth.post("/settings/typesafe", data={
-            "action": "test", "typesafe_openrouter_api_key": self.KEY})
-        assert app.state.settings.load().typesafe_status() == "working"
+        auth.post("/settings/decision-api", data={
+            "action": "test", "decision_api_key": self.KEY})
+        assert app.state.settings.load().decision_api_status() == "working"
 
         respx.post(TYPESAFE_API).mock(return_value=self._rejected())
-        response = auth.post("/settings/typesafe", data={
-            "action": "test", "typesafe_openrouter_api_key": "sk-or-v1-typo"})
+        response = auth.post("/settings/decision-api", data={
+            "action": "test", "decision_api_key": "sk-or-v1-typo"})
         assert response.status_code == 400
         assert "were kept unchanged" in shown(response)
         after = app.state.settings.load()
-        assert after.typesafe_openrouter_api_key == self.KEY, "a typo replaced a working key"
-        assert after.typesafe_status() == "working"
+        assert after.decision_api_key == self.KEY, "a typo replaced a working key"
+        assert after.decision_api_status() == "working"
 
     @respx.mock
     def test_retesting_the_saved_key_records_that_it_stopped_working(self, auth):
         """Keeping the old config only protects a working key from a DIFFERENT
         candidate. Re-testing the saved key measures the saved key."""
         respx.post(TYPESAFE_API).mock(return_value=self._ok())
-        auth.post("/settings/typesafe", data={
-            "action": "test", "typesafe_openrouter_api_key": self.KEY})
+        auth.post("/settings/decision-api", data={
+            "action": "test", "decision_api_key": self.KEY})
 
         respx.post(TYPESAFE_API).mock(return_value=self._rejected(402, "Insufficient credits"))
-        response = auth.post("/settings/typesafe", data={
-            "action": "test", "typesafe_openrouter_api_key": ""})
+        response = auth.post("/settings/decision-api", data={
+            "action": "test", "decision_api_key": ""})
         assert response.status_code == 400
         assert "kept unchanged" not in shown(response)
-        assert app.state.settings.load().typesafe_status() == "broken"
+        assert app.state.settings.load().decision_api_status() == "broken"
 
     @respx.mock
     def test_editing_the_key_retires_the_verdict_and_saving_nothing_keeps_it(self, auth):
         respx.post(TYPESAFE_API).mock(return_value=self._ok())
-        auth.post("/settings/typesafe", data={
-            "action": "test", "typesafe_openrouter_api_key": self.KEY})
-        auth.post("/settings/typesafe", data={"typesafe_model": "jev-latest"})
-        assert app.state.settings.load().typesafe_status() == "working"
+        auth.post("/settings/decision-api", data={
+            "action": "test", "decision_api_key": self.KEY})
+        auth.post("/settings/decision-api", data={"decision_api_model": "jev-latest"})
+        assert app.state.settings.load().decision_api_status() == "working"
 
-        auth.post("/settings/typesafe", data={"typesafe_openrouter_api_key": "sk-or-v1-new",
-                                              "typesafe_model": "jev-latest"})
-        assert app.state.settings.load().typesafe_status() == "untested"
+        auth.post("/settings/decision-api", data={"decision_api_key": "sk-or-v1-new",
+                                              "decision_api_model": "jev-latest"})
+        assert app.state.settings.load().decision_api_status() == "untested"
 
     def test_testing_without_a_key_asks_for_one(self, auth):
-        response = auth.post("/settings/typesafe", data={"action": "test"})
+        response = auth.post("/settings/decision-api", data={"action": "test"})
         assert response.status_code == 400
         assert "Enter an OpenRouter API key first" in response.text
 
     def test_remove_key_clears_it_and_its_verdict(self, auth):
-        app.state.settings.update(typesafe_openrouter_api_key=self.KEY,
-                                  typesafe_last_check_ok=True, typesafe_last_check_at=1.0,
-                                  typesafe_last_check_summary="Working.")
+        app.state.settings.update(decision_api_key=self.KEY,
+                                  decision_api_last_check_ok=True, decision_api_last_check_at=1.0,
+                                  decision_api_last_check_summary="Working.")
         assert "Remove key" in auth.get("/").text
-        response = auth.post("/settings/typesafe", data={"action": "clear"})
+        response = auth.post("/settings/decision-api", data={"action": "clear"})
         assert response.status_code == 200
         settings = app.state.settings.load()
-        assert settings.typesafe_openrouter_api_key == ""
-        assert settings.typesafe_status() == "unset"
+        assert settings.decision_api_key == ""
+        assert settings.decision_api_status() == "unset"
         assert "Key removed" in shown(response)
         assert '<span class="chip">Not set</span>' in response.text
 
@@ -801,12 +801,12 @@ class TestTypeSafeUi:
         assert app.state.archive._typesafe is app.state.typesafe
 
     def test_a_foreign_origin_is_refused(self, auth):
-        response = auth.post("/settings/typesafe",
-                             data={"typesafe_openrouter_api_key": self.KEY},
+        response = auth.post("/settings/decision-api",
+                             data={"decision_api_key": self.KEY},
                              headers={"Origin": "https://evil.example"},
                              follow_redirects=False)
         assert response.status_code == 403
-        assert app.state.settings.load().typesafe_openrouter_api_key == ""
+        assert app.state.settings.load().decision_api_key == ""
 
 
 class TestNotionUi:
@@ -3545,7 +3545,7 @@ class TestSweepPreflightOnTheDashboard:
         # The per-test volume is app.state.settings; point the sweep at it too.
         monkeypatch.setattr(app.state.scrape, "_settings", app.state.settings)
         monkeypatch.setattr(app.state.typesafe, "check", check)
-        app.state.settings.update(typesafe_openrouter_api_key="sk-or-test")
+        app.state.settings.update(decision_api_key="sk-or-test")
         return calls
 
     def test_a_rejected_key_is_a_banner_on_the_tasks_tab(self, auth, monkeypatch):
@@ -3571,7 +3571,7 @@ class TestSweepPreflightOnTheDashboard:
         monkeypatch.setattr(app.state.scrape, "_settings", app.state.settings)
         r = auth.post("/sessions/sweep", data={"url": self.WC}, follow_redirects=False)
         assert r.status_code == 422
-        assert "add an OpenRouter key under Settings → TypeSafe Classifier (e.g. Jev)" in shown(r)
+        assert "add an OpenRouter key under Settings → Decision API" in shown(r)
 
 
 class TestRunDecisions:

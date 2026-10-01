@@ -591,15 +591,15 @@ class NotionInfo(BaseModel):
     connected: bool = Field(description="Whether a Notion token and database are set.")
 
 
-class TypeSafeInfo(BaseModel):
+class DecisionApiInfo(BaseModel):
     configured: bool = Field(
-        description="Whether an OpenRouter key is saved for the optional TypeSafe Classifier "
+        description="Whether an OpenRouter key is saved for the optional Decision API "
                     "(e.g. Jev). Says nothing about whether it works; see status."
     )
     status: Literal["unset", "untested", "working", "broken"] = Field(
         description="unset / untested / working / broken, as of the last test in Settings."
     )
-    model: str = Field(description="The TypeSafe model asked, e.g. 'jev-latest'.")
+    model: str = Field(description="The model the Decision API asks, e.g. 'jev-latest'.")
 
 
 class ServerInfo(BaseModel):
@@ -611,7 +611,7 @@ class ServerInfo(BaseModel):
     browser: BrowserInfo
     pool: PoolInfo
     notion: NotionInfo
-    typesafe: TypeSafeInfo
+    decision_api: DecisionApiInfo
 
 
 class Health(BaseModel):

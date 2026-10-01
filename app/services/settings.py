@@ -101,18 +101,18 @@ class Settings(BaseModel):
     # exactly one database, so this map belongs to notion_db_id.
     notion_column_map: dict[str, str | None] = Field(default_factory=dict)
 
-    # The TypeSafe Classifier (e.g. Jev), reached through OpenRouter — see
+    # The Decision API (TypeSafe's Jev, reached through OpenRouter) — see
     # services/typesafe.py. Optional: without a key nothing asks it, and the app
     # behaves exactly as it did before it existed. The model is a setting rather
     # than a constant so a later TypeSafe model needs no release.
-    typesafe_openrouter_api_key: str = ""
-    typesafe_model: str = TYPESAFE_DEFAULT_MODEL
+    decision_api_key: str = ""
+    decision_api_model: str = TYPESAFE_DEFAULT_MODEL
     # The last "Test" verdict, for the proxy's reason above: a saved key is not
     # a working key (it can be revoked, or its account can run out of credits),
     # and the page must still say so after the banner is gone.
-    typesafe_last_check_at: float = 0.0
-    typesafe_last_check_ok: bool | None = None
-    typesafe_last_check_summary: str = ""
+    decision_api_last_check_at: float = 0.0
+    decision_api_last_check_ok: bool | None = None
+    decision_api_last_check_summary: str = ""
 
     # Pool budget. Task budget = max_instances - interactive_reserve; interactive
     # sessions are never starved by a running sweep.
@@ -131,16 +131,16 @@ class Settings(BaseModel):
         """
         return "" if v is None else str(v).strip()
 
-    @field_validator("typesafe_openrouter_api_key", mode="before")
+    @field_validator("decision_api_key", mode="before")
     @classmethod
-    def _normalize_typesafe_key(cls, v: Any) -> str:
+    def _normalize_decision_api_key(cls, v: Any) -> str:
         """Pasted keys arrive with a trailing newline often enough to matter,
         and whitespace-only must read as "no key", not as a key that fails."""
         return "" if v is None else str(v).strip()
 
-    @field_validator("typesafe_model", mode="before")
+    @field_validator("decision_api_model", mode="before")
     @classmethod
-    def _default_typesafe_model(cls, v: Any) -> str:
+    def _default_decision_api_model(cls, v: Any) -> str:
         """A cleared Model box means the default, not a request for model ""."""
         return ("" if v is None else str(v).strip()) or TYPESAFE_DEFAULT_MODEL
 
@@ -257,23 +257,23 @@ class Settings(BaseModel):
         nowhere to sync, and we will not pick one for the user."""
         return bool(self.notion_api_token and self.notion_db_id)
 
-    def typesafe_configured(self) -> bool:
+    def decision_api_configured(self) -> bool:
         """Whether a key is saved. Says nothing about whether it works."""
-        return bool(self.typesafe_openrouter_api_key)
+        return bool(self.decision_api_key)
 
-    def typesafe_status(self) -> str:
+    def decision_api_status(self) -> str:
         """unset | untested | working | broken — what we know, as for the proxy."""
-        if not self.typesafe_configured():
+        if not self.decision_api_configured():
             return "unset"
-        if self.typesafe_last_check_ok is None:
+        if self.decision_api_last_check_ok is None:
             return "untested"
-        return "working" if self.typesafe_last_check_ok else "broken"
+        return "working" if self.decision_api_last_check_ok else "broken"
 
     def redacted(self) -> dict[str, Any]:
         """A view safe to log or return over the wire."""
         data = self.model_dump()
         for secret in ("cloakbrowser_license_key", "proxy_password", "notion_api_token",
-                       "typesafe_openrouter_api_key"):
+                       "decision_api_key"):
             data[secret] = "***" if data[secret] else ""
         return data
 
@@ -293,7 +293,7 @@ _ENV_SEEDS: dict[str, tuple[str, ...]] = {
     "notion_api_token": ("NOTION_API_TOKEN",),
     "notion_db_id": ("NOTION_DB_ID",),
     # Removed from the process env once seeded — see config.purge_secret_env().
-    "typesafe_openrouter_api_key": ("OPENROUTER_API_KEY",),
+    "decision_api_key": ("DECISION_API_KEY",),
     "max_instances": ("MAX_INSTANCES",),
     "interactive_reserve": ("INTERACTIVE_RESERVE",),
 }
