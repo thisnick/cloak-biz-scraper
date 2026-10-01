@@ -685,6 +685,8 @@ class ScrapeService:
             )
             listings, pages, ok, failures, warnings = self._merge(targets, outcomes)
             job.decisions = self._decisions(targets, outcomes)
+            job.not_fully_crawled = [t.url for t, res in zip(targets, outcomes)
+                                     if res.get("more_pages")]
             job.listings = listings
             job.pages_crawled = pages
             if ok == 0:
@@ -885,6 +887,8 @@ class ScrapeService:
                 entry["error"] = error
             elif res.get("warning"):
                 entry["warning"] = res["warning"]
+            if res.get("more_pages"):
+                entry["not_fully_crawled"] = True
             entries.append(entry)
         return entries
 
@@ -922,6 +926,10 @@ class ScrapeService:
         # whole find, not only the new ones.
         pages = f"{job.pages_crawled} page{'s' if job.pages_crawled != 1 else ''}"
         parts = [f"{ok} of {total} source(s) swept · {found} listing(s) across {pages}"]
+        if job.not_fully_crawled:
+            hosts = ", ".join(urlparse(u).hostname or u for u in job.not_fully_crawled)
+            parts.append(f"not fully crawled (more pages than max_pages={job.max_pages}): "
+                         f"{hosts}")
         if left_out:
             # Cards left out one by one: judged not a business for sale now (a
             # sold tile, a menu link read as a card, an ad in the list) on the
@@ -1154,8 +1162,12 @@ class ScrapeService:
             if n == 1 or advance is None:
                 await page.goto(source.page_url(url, n), wait_until="domcontentloaded",
                                 timeout=120_000)
-            elif not await advance(page, n):
-                break
+            else:
+                try:
+                    if not await advance(page, n):
+                        break
+                except sources.PageNotReached as exc:
+                    return await stopped(n, _evidence_tag(str(exc)), str(exc))
             await page.wait_for_timeout(_WAIT_MS)
             await gesture(page)
 
@@ -1172,6 +1184,7 @@ class ScrapeService:
                                     result.retry)
 
             page_listings = result.listings
+            sold_out = False
             if page_listings:
                 verdict = legibility.check(page_listings, page=n)
                 record = verdict.record(n)
@@ -1183,6 +1196,14 @@ class ScrapeService:
                     record.update(ok=ok, kept=len(page_listings))
                     if reason:
                         record["reason"] = reason
+                    # A later page of the reader's list with no card on it for
+                    # sale: the list has run into its sold ones (an infinite
+                    # scroll's "– Sold" tiles), and paging on would only read
+                    # more of them. Not a failure; the end of what is for sale.
+                    sold_out = (ok and chooses and n > 1 and not page_listings
+                                and bool(judged.record.get("not_eligible")))
+                    if sold_out:
+                        record["sold_out"] = True
                 checks.append(record)
                 if not ok:
                     # An adapter's page that reads wrong is retried from a new
@@ -1206,8 +1227,23 @@ class ScrapeService:
                     continue
                 kept.add(listing.url)
                 listings.append(listing)
-            if fresh == 0 and n > 1:
+            if (fresh == 0 and n > 1) or sold_out:
                 break
+        else:
+            # Every page the call allowed was read. A source that can tell
+            # whether the last one led further says so — not as an error (the
+            # call asked for that many pages; FCBB's list runs past page 20 and
+            # its first 6 are the ones wanted), but so the result never reads
+            # as the whole list.
+            more = getattr(source, "has_next_page", None)
+            if more is not None and more():
+                await capture(page, evidence / "final",
+                              {"url": url, "page_url": page.url, "reason": "page limit",
+                               "found": len(listings), "pages_crawled": pages_done,
+                               "legibility": checks, "proxy_ip": inst.proxy_ip})
+                logger.info("job %s: %s has more pages than max_pages=%d", job.id, url,
+                            job.max_pages)
+                return {"blocked": False, "error": None, "more_pages": True, "data": data()}
 
         await capture(page, evidence / "final",
                       {"url": url, "page_url": page.url, "reason": "success",

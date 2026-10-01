@@ -443,7 +443,10 @@ def build(app) -> MCPServer:
             them). Later pages are reached the way the site pages them — a page
             link, or a Next / Load more button — and a URL with no next page stops
             early. A broker profile pages its for-sale tab too, so raise this to
-            sweep a broker with many listings.
+            sweep a broker with many listings. A URL whose list goes on past
+            max_pages is named in the result's `not_fully_crawled` (sites other
+            than BizBuySell; not an error): only its first max_pages pages were
+            read, so don't report that site as fully swept.
         sync: false (default) just reads the listings back — no Notion involved,
             and the collected result holds ALL listings found with an empty
             synced_row_id on each. true also saves new ones to your Notion
