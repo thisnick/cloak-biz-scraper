@@ -912,7 +912,7 @@ class _ScriptedSource:
     label = "Fake"
 
     def __init__(self, *attempts: list[CardPage], advance_to: str | None = None,
-                 advance_result: bool = True):
+                 advance_result: bool = True, advance_raises: Exception | None = None):
         self._attempts = list(attempts)
         self.begins = 0
         self.reads = 0
@@ -920,6 +920,8 @@ class _ScriptedSource:
         if advance_to is not None:
             async def advance(page, n):
                 self.advanced.append(n)
+                if advance_raises is not None:
+                    raise advance_raises
                 if advance_result:
                     page.url = f"{advance_to}#page-{n}"
                 return advance_result
@@ -1010,6 +1012,65 @@ class TestPagingHooks:
         assert res["error"] is None and res["blocked"] is False
         assert res["data"]["pages_crawled"] == 1
         assert [l.url for l in res["data"]["listings"]] == [_gen(1).url]
+
+    @pytest.mark.asyncio
+    async def test_a_next_page_that_cannot_be_reached_is_said_and_earlier_pages_kept(
+        self, settings, jobs, tmp_path,
+    ):
+        """Not the end of the list: the pages after it exist and were not read."""
+        from app.sources import PageNotReached
+
+        why = "the next-page control on page 1 (text 'Next') could not be clicked"
+        source = _ScriptedSource([CardPage([_gen(1), _gen(2)]), CardPage([_gen(3)])],
+                                 advance_to="https://example.com/x",
+                                 advance_raises=PageNotReached(why))
+        svc = ScrapeService(instances=None, jobs=jobs, settings=settings)
+        res, _, _ = await _once(svc, _job(jobs), source, tmp_path)
+
+        assert res["error"] is None and res["blocked"] is False
+        assert res["warning"] == f"stopped at page 2 and kept the 2 listing(s) from page 1: {why}"
+        assert [l.url for l in res["data"]["listings"]] == [_gen(1).url, _gen(2).url]
+        assert source.reads == 1
+
+    @pytest.mark.asyncio
+    async def test_the_page_limit_of_a_longer_list_is_said(self, settings, jobs, tmp_path):
+        """FCBB's list runs past page 20; a limit of 6 read 6 and said nothing."""
+        source = _ScriptedSource([CardPage([_gen(1)]), CardPage([_gen(2)]), CardPage([_gen(3)])],
+                                 advance_to="https://example.com/x")
+        source.has_next_page = lambda: True
+        svc = ScrapeService(instances=None, jobs=jobs, settings=settings)
+        res, _, _ = await _once(svc, _job(jobs, max_pages=2), source, tmp_path)
+
+        assert res["error"] is None
+        assert res["warning"] == (
+            "read 2 page(s), the most this call asked for (max_pages=2), and the site has "
+            "more — the listings on them were not read")
+        assert len(res["data"]["listings"]) == 2
+        assert _meta(tmp_path / "ev" / "final")["reason"] == "page limit"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("more", [False, None])
+    async def test_a_limit_reached_at_the_end_or_by_a_source_that_cannot_tell_is_silent(
+        self, settings, jobs, tmp_path, more,
+    ):
+        source = _ScriptedSource([CardPage([_gen(1)]), CardPage([_gen(2)])],
+                                 advance_to="https://example.com/x")
+        if more is not None:
+            source.has_next_page = lambda: more
+        svc = ScrapeService(instances=None, jobs=jobs, settings=settings)
+        res, _, _ = await _once(svc, _job(jobs, max_pages=2), source, tmp_path)
+        assert res["error"] is None and "warning" not in res
+
+    @pytest.mark.asyncio
+    async def test_a_list_that_ended_before_the_limit_is_silent(self, settings, jobs, tmp_path):
+        """Paging stopped on a page of listings already seen, not at the limit."""
+        source = _ScriptedSource([CardPage([_gen(1)]), CardPage([_gen(1)])],
+                                 advance_to="https://example.com/x")
+        source.has_next_page = lambda: True
+        svc = ScrapeService(instances=None, jobs=jobs, settings=settings)
+        res, _, _ = await _once(svc, _job(jobs, max_pages=3), source, tmp_path)
+        assert res["error"] is None and "warning" not in res
+        assert source.reads == 2
 
     @pytest.mark.asyncio
     async def test_evidence_records_where_the_browser_is_not_page_url(
@@ -1452,7 +1513,7 @@ class TestWhoMayDropCards:
         assert (CONFIG.evidence_dir / job.id / "source-01" / "page-01-illegible").is_dir()
 
     @pytest.mark.asyncio
-    async def test_a_later_page_mostly_not_for_sale_stops_paging_and_keeps_the_rest(
+    async def test_a_later_page_with_nothing_for_sale_ends_paging_quietly(
         self, settings, jobs, monkeypatch,
     ):
         """An infinite scroll that runs from its listings into its sold ones."""
@@ -1471,8 +1532,32 @@ class TestWhoMayDropCards:
         result = svc.result(job.id)
         assert result.status == "completed" and source.reads == 2
         assert [l.url for l in result.listings] == [_gen(i).url for i in (1, 2, 3)]
-        assert "stopped at page 2 and kept the 3 listing(s) from page 1: Only 0 of 4 cards" \
-            in result.error
+        assert result.error is None, "the end of what is for sale, not a page read wrong"
+        legibility = svc._jobs.get(job.id).decisions[0]["legibility"]
+        assert legibility[1]["sold_out"] is True and legibility[1]["ok"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_later_page_mostly_sold_keeps_its_listings_for_sale(
+        self, settings, jobs, monkeypatch,
+    ):
+        """Dealonomy's page 2 is its closed deals; failing the page as "not
+        listings" would drop a listing for sale among them with the rest."""
+        sold = [_gen(i, title=f"Sold {i}") for i in range(10, 13)]
+        source = _ScriptedSource([CardPage([_gen(1), _gen(2), _gen(3)]),
+                                  CardPage([*sold, _gen(4)]), CardPage([_gen(5)])])
+        source.chooses_cards = True
+        monkeypatch.setattr("app.sources.for_url", lambda url: source)
+        settings.update(typesafe_openrouter_api_key="sk-or-test")
+        svc = ScrapeService(instances=_FakeInstances(), jobs=jobs, settings=settings,
+                            store_factory=FakeStore, task_profiles=_Pool(),
+                            typesafe=_TitleJudge({s.title for s in sold}))
+        job = svc.start([LIST], max_pages=3)
+        await _drain(svc)
+
+        result = svc.result(job.id)
+        assert result.status == "completed" and source.reads == 3
+        assert [l.url for l in result.listings] == [_gen(i).url for i in (1, 2, 3, 4, 5)]
+        assert result.error is None
 
 
 # ── which source reads a URL, the classifier preflight, and diagnostics ──────

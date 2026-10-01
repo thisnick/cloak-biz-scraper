@@ -28,7 +28,7 @@ from pydantic import ValidationError
 
 from app.services import extract
 from app.services.typesafe import Choice, Noul, TypeSafeAuthError
-from app.sources import generic
+from app.sources import PageNotReached, generic
 from app.sources.generic import JS_PROBE, GenericSource
 from app.sources.overrides import (
     MONEY_ROLES,
@@ -254,6 +254,23 @@ class FakePage:
 
     async def wait_for_load_state(self, *_a, **_kw):
         return None
+
+
+class _StillPage(FakePage):
+    """A page whose links, height and address never change after a click —
+    or change as `sizes` says, one measurement at a time (the last repeats)."""
+
+    def __init__(self, *probes: dict, sizes: list[list] | None = None):
+        super().__init__(*probes)
+        self.sizes = list(sizes or [[20, 1500, LIST_URL, 7]])
+
+    async def evaluate(self, script, arg=None):
+        if script == generic._JS_PAGE_SIZE:
+            return self.sizes.pop(0) if len(self.sizes) > 1 else self.sizes[0]
+        return await super().evaluate(script, arg)
+
+    async def wait_for_timeout(self, ms):
+        await asyncio.sleep(0.001)
 
 
 async def _read(probe: dict, jev=None, override=None, url: str = LIST_URL):
@@ -1032,12 +1049,16 @@ class TestNextPage:
         assert page.clicks == ['[data-cbs-next="n1"]']
 
     @pytest.mark.asyncio
-    async def test_a_vanished_control_ends_paging(self):
+    async def test_a_vanished_control_stops_paging_and_says_so(self):
+        """The control was on the page a moment ago: the pages after it exist."""
         source = GenericSource(LIST_URL, FakeJev(next={"text 'Next'": 0.9}))
         page = FakePage(_probe(pager=[_pager(1, None, "text 'Next'")]))
         await source.cards(page)
         page.missing.add('[data-cbs-next="n1"]')
-        assert await source.advance(page, 2) is False
+        with pytest.raises(PageNotReached) as raised:
+            await source.advance(page, 2)
+        assert str(raised.value) == (
+            "the next-page control on page 1 (text 'Next') could not be clicked")
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("url, why", [
@@ -1126,7 +1147,8 @@ class TestNextPage:
         await source.cards(page)
         page.lost.update({'[data-cbs-next="n1"]', "button.more"})
 
-        assert await source.advance(page, 2) is False
+        with pytest.raises(PageNotReached):
+            await source.advance(page, 2)
         assert page.clicks == []
         assert source.decisions[0]["next_page"]["clicked_by"] == "nothing"
 
@@ -1139,7 +1161,8 @@ class TestNextPage:
         page = FakePage(_probe(pager=pager), _probe(pager=[]))
         await source.cards(page)
         page.lost.add('[data-cbs-next="n1"]')
-        assert await source.advance(page, 2) is False
+        with pytest.raises(PageNotReached):
+            await source.advance(page, 2)
         assert page.clicks == []
 
     @pytest.mark.asyncio
@@ -1187,6 +1210,99 @@ class TestNextPage:
         await source.cards(page)
         assert await asyncio.wait_for(source.advance(page, 2), 2) is True, (
             "nothing new is not a failure: the page is read and the sweep decides")
+
+    @pytest.mark.asyncio
+    async def test_a_click_the_page_ignored_is_made_once_more_by_its_mark(self, monkeypatch):
+        """FCBB's "4" once did nothing for the whole wait: page 3 was read again,
+        looked like the end of the list, and pages 4-6 were never read."""
+        monkeypatch.setattr(generic, "CLICK_SETTLE_S", 0.05)
+        source = GenericSource(LIST_URL, FakeJev(next={"text '2'": 0.9}))
+        page = _StillPage(_probe(pager=[_pager(1, None, "text '2' (in a pagination block)")]))
+        await source.cards(page)
+
+        assert await source.advance(page, 2) is True
+        assert page.clicks == ['[data-cbs-next="n1"]', '[data-cbs-next="n1"]']
+        decided = source.decisions[0]["next_page"]
+        assert decided["clicked_by"] == "mark" and decided["clicked_again_by"] == "mark"
+
+    @pytest.mark.asyncio
+    async def test_a_page_that_moved_after_the_wait_is_not_clicked_again(self, monkeypatch):
+        """A slow page that did go on: a second "Next" would skip a page."""
+        async def waited_in_vain(page, before, url):
+            return False
+
+        monkeypatch.setattr(generic, "_settle", waited_in_vain)
+        source = GenericSource(LIST_URL, FakeJev(next={"text 'Next'": 0.9}))
+        page = _StillPage(_probe(pager=[_pager(1, None, "text 'Next'")]),
+                          sizes=[[20, 1500, LIST_URL, 1], [20, 1500, LIST_URL, 2]])
+        await source.cards(page)
+
+        assert await source.advance(page, 2) is True
+        assert page.clicks == ['[data-cbs-next="n1"]']
+        assert source.decisions[0]["next_page"]["clicked_again_by"] == "nothing"
+
+    @pytest.mark.asyncio
+    async def test_a_second_click_is_only_ever_by_the_mark(self, monkeypatch):
+        """Found again by its selector, the "Next" may be the next page's own."""
+        monkeypatch.setattr(generic, "CLICK_SETTLE_S", 0.05)
+        pager = [_pager(1, None, "text 'Next'", selector="a.next")]
+        source = GenericSource(LIST_URL, FakeJev(next={"text 'Next'": 0.9}))
+        page = _StillPage(_probe(pager=pager))
+        await source.cards(page)
+        page.lost.add('[data-cbs-next="n1"]')
+
+        assert await source.advance(page, 2) is True
+        assert page.clicks == ["a.next"], "clicked once, by its selector, and not again"
+        assert source.decisions[0]["next_page"]["clicked_again_by"] == "nothing"
+
+    @pytest.mark.asyncio
+    async def test_a_click_that_left_the_page_as_it_was_is_an_error_not_the_end(self):
+        """Read as the next page, the same listings again end paging with
+        nothing said; the pages after it would go unread."""
+        pager = [_pager(1, None, "text '2' (in a pagination block)")]
+        source = GenericSource(LIST_URL, FakeJev(next={"text '2'": 0.9}))
+        page = FakePage(_probe(pager=pager))
+        await source.cards(page)
+        assert await source.advance(page, 2) is True
+
+        second = await source.cards(page)
+        assert second.listings == [] and second.retry is False
+        assert second.error == (
+            "Page 2 showed the same 4 listings as page 1: clicking the next-page control "
+            "(text '2' (in a pagination block)) did not change the page.")
+        assert source.decisions[1]["error"] == second.error
+
+    @pytest.mark.asyncio
+    async def test_a_load_more_that_added_listings_is_read(self):
+        pager = [_pager(1, None, "text 'Load more'")]
+        more = _group(cards=[_card(n) for n in range(1, 9)])
+        source = GenericSource(LIST_URL, FakeJev(next={"text 'Load more'": 0.9}))
+        page = FakePage(_probe(pager=pager), _probe([more, _nav()], pager=pager))
+        await source.cards(page)
+        assert await source.advance(page, 2) is True
+
+        second = await source.cards(page)
+        assert not second.error and len(second.listings) == 8
+
+    @pytest.mark.asyncio
+    async def test_the_same_listings_at_a_new_address_are_left_to_the_sweep(self):
+        """Reached by its address, a repeat is a site sending page 1 again past
+        its last page — the end of the list, for the sweep's stop rule."""
+        source = GenericSource(LIST_URL, FakeJev(next={NEXT_URL: 0.9}))
+        page = FakePage(_probe(pager=[_pager(1, NEXT_URL, "rel=next")]))
+        await source.cards(page)
+        assert await source.advance(page, 2) is True
+
+        second = await source.cards(page)
+        assert not second.error and len(second.listings) == 4
+
+    @pytest.mark.asyncio
+    async def test_has_next_page_says_whether_the_page_read_showed_one(self):
+        source = GenericSource(LIST_URL, FakeJev(next={"text 'Next'": 0.9}))
+        await source.cards(FakePage(_probe(pager=[_pager(1, None, "text 'Next'")])))
+        assert source.has_next_page() is True
+        await source.cards(FakePage(_probe(pager=[])))
+        assert source.has_next_page() is False
 
     @pytest.mark.asyncio
     async def test_listing_links_are_never_candidates(self):

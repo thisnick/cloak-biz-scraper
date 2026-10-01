@@ -273,9 +273,12 @@ Without a key a URL on another site is refused with a pointer to Settings; a key
 OpenRouter rejects or that is out of credits refuses the call before a job starts (in a
 batch that also has BizBuySell URLs, only the other sites fail). A first page with no list
 of businesses on it, or where fewer than half the listings read as businesses for sale now,
-fails that source with evidence rather than returning nothing; the same on a later page
-stops paging there, keeps the pages before it, and says so in the result's `error`. A BizBuySell page other than a search or
-broker profile never falls
+fails that source with evidence rather than returning nothing. A later page with no list,
+a next-page control that cannot be clicked or that leaves the page as it was, and a sweep
+that reaches `max_pages` on a list with more pages each stop paging there, keep the pages
+before it, and say so in the result's `error` — the listings past that point were never
+read. A later page whose cards are mostly sold keeps the ones for sale; one with none for
+sale ends paging quietly. A BizBuySell page other than a search or broker profile never falls
 through to the generic reader. Listings from other sites carry their site as `source` and
 an empty `listing_id`. **Settings → Site overrides** pins any part of those decisions for
 one site, and each sweep's **Details** (Tasks → History, or `/runs/<job_id>`) shows what

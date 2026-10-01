@@ -83,7 +83,16 @@ class Source(Protocol):
       always `page_url(url, 1)`. Without it, page `n` is `page_url(url, n)`,
       which only works for sites that page by URL; with it, a site that pages
       with a script-only "Next" button can be swept too. Returning False means
-      there is no next page, and paging stops.
+      there is no next page, and paging stops. Raising `PageNotReached` means
+      there is one and it could not be reached (a "Next" that cannot be
+      clicked): paging stops there too, but the sweep says so, keeping the
+      pages before — the listings past it were never seen, which is not the
+      same as there being none.
+    * `has_next_page() -> bool` — after a page was read, whether it showed a
+      way to the page after it. A sweep that reaches `max_pages` asks it, so
+      that stopping at the limit of a longer list is said rather than
+      reported as the whole list. Without it, the sweep cannot tell, and says
+      nothing.
     * `chooses_cards: bool` — True for a source that decides for itself which
       elements of a page it has never seen are the cards (the generic reader).
       Only then are single cards dropped that the per-listing request judges
@@ -119,6 +128,17 @@ class Source(Protocol):
     async def cards(self, page) -> CardPage:
         """Extract the listing cards from the currently loaded page."""
         ...
+
+
+class PageNotReached(Exception):
+    """`advance` knew of a next page and could not get to it.
+
+    Raised rather than returning False, because "there is no next page" and
+    "there is one and we never saw it" call for opposite reports: the first
+    is the end of the list, the second leaves listings unread, and an agent
+    told nothing reports the sweep as complete. The message says what went
+    wrong in a sentence fit for the sweep's warning.
+    """
 
 
 class UnsupportedURL(ValueError):

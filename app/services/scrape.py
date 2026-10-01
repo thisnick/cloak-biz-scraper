@@ -1154,8 +1154,12 @@ class ScrapeService:
             if n == 1 or advance is None:
                 await page.goto(source.page_url(url, n), wait_until="domcontentloaded",
                                 timeout=120_000)
-            elif not await advance(page, n):
-                break
+            else:
+                try:
+                    if not await advance(page, n):
+                        break
+                except sources.PageNotReached as exc:
+                    return await stopped(n, _evidence_tag(str(exc)), str(exc))
             await page.wait_for_timeout(_WAIT_MS)
             await gesture(page)
 
@@ -1172,6 +1176,7 @@ class ScrapeService:
                                     result.retry)
 
             page_listings = result.listings
+            sold_out = False
             if page_listings:
                 verdict = legibility.check(page_listings, page=n)
                 record = verdict.record(n)
@@ -1183,6 +1188,14 @@ class ScrapeService:
                     record.update(ok=ok, kept=len(page_listings))
                     if reason:
                         record["reason"] = reason
+                    # A later page of the reader's list with no card on it for
+                    # sale: the list has run into its sold ones (an infinite
+                    # scroll's "– Sold" tiles), and paging on would only read
+                    # more of them. Not a failure; the end of what is for sale.
+                    sold_out = (ok and chooses and n > 1 and not page_listings
+                                and bool(judged.record.get("not_eligible")))
+                    if sold_out:
+                        record["sold_out"] = True
                 checks.append(record)
                 if not ok:
                     # An adapter's page that reads wrong is retried from a new
@@ -1206,8 +1219,24 @@ class ScrapeService:
                     continue
                 kept.add(listing.url)
                 listings.append(listing)
-            if fresh == 0 and n > 1:
+            if (fresh == 0 and n > 1) or sold_out:
                 break
+        else:
+            # Every page the call allowed was read. A source that can tell
+            # whether the last one led further says so: the listings past the
+            # limit were never seen, and "read 6 pages" is not "read them all"
+            # (FCBB's list runs past page 20 behind a limit of 6).
+            more = getattr(source, "has_next_page", None)
+            if more is not None and more():
+                warning = (f"read {pages_done} page(s), the most this call asked for "
+                           f"(max_pages={job.max_pages}), and the site has more — the "
+                           f"listings on them were not read")
+                await capture(page, evidence / "final",
+                              {"url": url, "page_url": page.url, "reason": "page limit",
+                               "found": len(listings), "pages_crawled": pages_done,
+                               "legibility": checks, "proxy_ip": inst.proxy_ip})
+                logger.warning("job %s: %s %s", job.id, url, warning)
+                return {"blocked": False, "error": None, "warning": warning, "data": data()}
 
         await capture(page, evidence / "final",
                       {"url": url, "page_url": page.url, "reason": "success",

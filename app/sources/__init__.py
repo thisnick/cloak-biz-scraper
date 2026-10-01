@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from urllib.parse import urlparse
 
-from .base import CardPage, Source, UnsupportedURL
+from .base import CardPage, PageNotReached, Source, UnsupportedURL
 from .bizbuysell import BizBuySellBroker, BizBuySellSerp
 
 # The site adapters: BizBuySell, via two — the region search feed and a
@@ -84,6 +84,6 @@ def label_for(name: str) -> str:
 
 
 __all__ = [
-    "CardPage", "Source", "SOURCES", "UnsupportedURL", "GENERIC_NAME", "GENERIC_LABEL",
-    "for_url", "supported", "owner_of", "label_for",
+    "CardPage", "PageNotReached", "Source", "SOURCES", "UnsupportedURL", "GENERIC_NAME",
+    "GENERIC_LABEL", "for_url", "supported", "owner_of", "label_for",
 ]

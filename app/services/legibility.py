@@ -52,7 +52,11 @@ already has counts as passing (it was filed as a listing before, and asking
 about it again would cost a request per known row per sweep), so a page whose
 cards are all known asks nothing and passes. A page with fewer than
 `MIN_JUDGED` cards to go on is never failed by it: one sold listing left on a
-broker's profile is not a page read wrong.
+broker's profile is not a page read wrong. Nor is a later page of a list the
+generic reader chose on its first page: it is read with that page's card
+shape, so its cards are that list's, and a run of sold or under-contract ones
+(a site that lists its closed deals after its open ones) is left out card by
+card without taking the cards for sale between them along.
 
 The classifier half is best-effort. A classifier that cannot answer at all (no
 key, a rejected key, no credits, no answer after the client's retries) stops
@@ -396,7 +400,13 @@ class ListingCheck:
         if any(a is None for a in answers):
             record["unanswered"] = sum(1 for a in answers if a is None)
             record["stopped"] = self.stopped
-        if total >= MIN_JUDGED and passing < MIN_PASSING * total:
+        # A later page of a list the reader chose is read with the first
+        # page's card shape, so its cards are that list's, and one where most
+        # are sold or under contract is a page of listings no longer for sale,
+        # not a wrong list (Dealonomy's page 2: 31 Sold, 3 Under Contract). Its
+        # cards for sale are kept; failing it would drop them with the rest.
+        judges_page = not (drop and page > 1)
+        if judges_page and total >= MIN_JUDGED and passing < MIN_PASSING * total:
             return PageCheck(listings=[], ok=False, record=record, reason=(
                 f"Only {passing} of {total} cards on page {page} read as business listings "
                 f"currently for sale (at least half should) — nothing from this page was kept."))
