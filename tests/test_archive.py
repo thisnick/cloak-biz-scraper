@@ -571,7 +571,7 @@ class FakeTypeSafe:
 
 
 def _with_key(settings):
-    settings.update(decision_api_key="sk-or-v1-archive-guard-test")
+    settings.update(openrouter_api_key="sk-or-v1-archive-guard-test")
     return settings
 
 

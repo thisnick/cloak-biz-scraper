@@ -231,7 +231,7 @@ def server_info(settings, instances) -> ServerInfo:
     Built here so MCP and REST return the identical payload, and so the "no
     secret ever leaves" property is enforced in one place: this reads only the
     booleans, statuses, versions, and counts — never proxy_password,
-    cloakbrowser_license_key, notion_api_token, or decision_api_key.
+    cloakbrowser_license_key, notion_api_token, or openrouter_api_key.
     """
     from .capacity import detect_capacity
 

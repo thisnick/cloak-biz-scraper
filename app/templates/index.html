@@ -664,7 +664,7 @@
               {{ banner('decision_api') }}
               <form method="post" action="/settings/decision-api">
                 <div class="field"><label>OpenRouter API key</label>
-                  <input type="password" name="decision_api_key" autocomplete="off"
+                  <input type="password" name="openrouter_api_key" autocomplete="off"
                          placeholder="{{ '•••••••••• (saved — leave blank to keep it)' if has_decision_api_key else 'sk-or-...' }}"></div>
                 <div class="field"><label>Model</label>
                   <input type="text" name="decision_api_model" value="{{ s.decision_api_model }}" placeholder="jev-latest">

@@ -26,7 +26,7 @@ def _settings() -> Settings:
         proxy_user="u", proxy_password=PROXY_PW, proxy_host="h", proxy_port="1000",
         proxy_country="US", proxy_region="california",
         notion_api_token=NOTION_TOK, notion_db_id="db-1",
-        decision_api_key=OPENROUTER_KEY, decision_api_last_check_ok=True,
+        openrouter_api_key=OPENROUTER_KEY, decision_api_last_check_ok=True,
         max_instances=4, interactive_reserve=1,
     )
 
@@ -86,7 +86,7 @@ class TestSnapshotContent:
         assert info.decision_api.model == "jev-latest"
 
     def test_decision_api_status_comes_from_the_last_test_not_the_key(self):
-        untested = Settings(decision_api_key="k", decision_api_model="jev-2")
+        untested = Settings(openrouter_api_key="k", decision_api_model="jev-2")
         info = server_info(untested, _FakeInstances())
         assert (info.decision_api.configured, info.decision_api.status, info.decision_api.model) == (
             True, "untested", "jev-2")

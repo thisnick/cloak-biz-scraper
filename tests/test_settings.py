@@ -208,56 +208,56 @@ class TestProxyConfigured:
 
 class TestDecisionApiSettings:
     def test_the_key_is_redacted(self, store):
-        s = store().update(decision_api_key="sk-or-v1-secret")
+        s = store().update(openrouter_api_key="sk-or-v1-secret")
         red = s.redacted()
-        assert red["decision_api_key"] == "***"
+        assert red["openrouter_api_key"] == "***"
         assert red["decision_api_model"] == "jev-latest"  # not a secret; kept
-        assert store().load().redacted()["decision_api_key"] == "***"
+        assert store().load().redacted()["openrouter_api_key"] == "***"
 
     def test_an_unset_key_is_not_redacted_into_existence(self):
-        assert Settings().redacted()["decision_api_key"] == ""
+        assert Settings().redacted()["openrouter_api_key"] == ""
 
     def test_the_key_is_encrypted_on_disk(self, store, tmp_path):
-        store().update(decision_api_key="sk-or-v1-on-disk")
+        store().update(openrouter_api_key="sk-or-v1-on-disk")
         assert b"sk-or-v1-on-disk" not in (tmp_path / "settings.json").read_bytes()
 
     @pytest.mark.parametrize("blank", ["", "   ", "\n"])
     def test_whitespace_is_no_key_and_a_blank_model_is_the_default(self, blank):
-        s = Settings(decision_api_key=blank, decision_api_model=blank)
-        assert s.decision_api_key == "" and not s.decision_api_configured()
+        s = Settings(openrouter_api_key=blank, decision_api_model=blank)
+        assert s.openrouter_api_key == "" and not s.decision_api_configured()
         assert s.decision_api_model == "jev-latest"
 
     def test_a_pasted_key_is_trimmed(self):
-        assert Settings(decision_api_key=" sk-or-v1-x\r\n").decision_api_key == (
+        assert Settings(openrouter_api_key=" sk-or-v1-x\r\n").openrouter_api_key == (
             "sk-or-v1-x"
         )
 
     def test_status_is_what_we_know_not_what_the_form_says(self):
         assert Settings().decision_api_status() == "unset"
-        keyed = Settings(decision_api_key="k")
+        keyed = Settings(openrouter_api_key="k")
         assert keyed.decision_api_status() == "untested"
         ok = keyed.model_copy(update={"decision_api_last_check_ok": True})
         assert ok.decision_api_status() == "working"
         bad = keyed.model_copy(update={"decision_api_last_check_ok": False})
         assert bad.decision_api_status() == "broken"
 
-    def test_first_boot_seeds_the_key_from_decision_api_key(self, store, monkeypatch):
-        monkeypatch.setenv("DECISION_API_KEY", "sk-or-v1-seeded")
-        assert store().load().decision_api_key == "sk-or-v1-seeded"
+    def test_first_boot_seeds_the_key_from_openrouter_api_key(self, store, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-v1-seeded")
+        assert store().load().openrouter_api_key == "sk-or-v1-seeded"
         # Only the first boot: afterwards the volume is authoritative.
-        monkeypatch.setenv("DECISION_API_KEY", "sk-or-v1-changed")
-        assert store().load().decision_api_key == "sk-or-v1-seeded"
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-v1-changed")
+        assert store().load().openrouter_api_key == "sk-or-v1-seeded"
 
     def test_the_seed_is_removed_from_the_process_env(self, store, monkeypatch):
         """agent-browser is run with a copy of os.environ, so a key left there
         would be handed to every CLI invocation."""
         from app.config import purge_secret_env
 
-        monkeypatch.setenv("DECISION_API_KEY", "sk-or-v1-seeded")
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-v1-seeded")
         store().load()
         purge_secret_env()
-        assert "DECISION_API_KEY" not in os.environ
-        assert store().load().decision_api_key == "sk-or-v1-seeded"
+        assert "OPENROUTER_API_KEY" not in os.environ
+        assert store().load().openrouter_api_key == "sk-or-v1-seeded"
 
     def test_app_startup_purges_the_seed(self, tmp_path, monkeypatch):
         """The wiring, not just the helper: booting the app consumes the variable."""
@@ -265,9 +265,9 @@ class TestDecisionApiSettings:
 
         from app.main import app
 
-        monkeypatch.setenv("DECISION_API_KEY", "sk-or-v1-boot")
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-v1-boot")
         with TestClient(app, base_url="https://testserver"):
-            assert "DECISION_API_KEY" not in os.environ
+            assert "OPENROUTER_API_KEY" not in os.environ
 
     def test_a_file_saved_before_the_rename_still_loads(self, store, tmp_path):
         """Earlier versions stored the key as `typesafe_openrouter_api_key` and
@@ -285,4 +285,4 @@ class TestDecisionApiSettings:
         }).encode()))
         loaded = store().load()
         assert loaded.proxy_user == "kept"
-        assert loaded.decision_api_key == "" and loaded.decision_api_status() == "unset"
+        assert loaded.openrouter_api_key == "" and loaded.decision_api_status() == "unset"

@@ -11,7 +11,7 @@ and prints what a site override (in code: sources/overrides.py) pinning those
 decisions would look like. It is
 not run in CI: it needs a browser, the live sites and an OpenRouter key.
 
-    set -a; source .env; set +a          # DECISION_API_KEY — never printed
+    set -a; source .env; set +a          # OPENROUTER_API_KEY — never printed
     python scripts/eval_sources.py https://www.websiteclosers.com/businesses-for-sale/ --pages 2
 
     # the gate: every labelled page, scored (scripts/eval_sources_pages.json
@@ -371,9 +371,9 @@ async def main() -> int:
     ap.add_argument("--json", type=Path, help="also write every result to this file")
     args = ap.parse_args()
 
-    key = os.environ.get("DECISION_API_KEY", "").strip()
+    key = os.environ.get("OPENROUTER_API_KEY", "").strip()
     if not key:
-        print("Set DECISION_API_KEY (the Decision API's OpenRouter key) first.",
+        print("Set OPENROUTER_API_KEY (the Decision API's OpenRouter key) first.",
               file=sys.stderr)
         return 2
     classifier = TypeSafeClient(key_getter=lambda: key, model_getter=lambda: args.model)

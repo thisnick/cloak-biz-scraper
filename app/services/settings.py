@@ -105,7 +105,7 @@ class Settings(BaseModel):
     # services/typesafe.py. Optional: without a key nothing asks it, and the app
     # behaves exactly as it did before it existed. The model is a setting rather
     # than a constant so a later TypeSafe model needs no release.
-    decision_api_key: str = ""
+    openrouter_api_key: str = ""
     decision_api_model: str = TYPESAFE_DEFAULT_MODEL
     # The last "Test" verdict, for the proxy's reason above: a saved key is not
     # a working key (it can be revoked, or its account can run out of credits),
@@ -131,9 +131,9 @@ class Settings(BaseModel):
         """
         return "" if v is None else str(v).strip()
 
-    @field_validator("decision_api_key", mode="before")
+    @field_validator("openrouter_api_key", mode="before")
     @classmethod
-    def _normalize_decision_api_key(cls, v: Any) -> str:
+    def _normalize_openrouter_key(cls, v: Any) -> str:
         """Pasted keys arrive with a trailing newline often enough to matter,
         and whitespace-only must read as "no key", not as a key that fails."""
         return "" if v is None else str(v).strip()
@@ -259,7 +259,7 @@ class Settings(BaseModel):
 
     def decision_api_configured(self) -> bool:
         """Whether a key is saved. Says nothing about whether it works."""
-        return bool(self.decision_api_key)
+        return bool(self.openrouter_api_key)
 
     def decision_api_status(self) -> str:
         """unset | untested | working | broken — what we know, as for the proxy."""
@@ -273,7 +273,7 @@ class Settings(BaseModel):
         """A view safe to log or return over the wire."""
         data = self.model_dump()
         for secret in ("cloakbrowser_license_key", "proxy_password", "notion_api_token",
-                       "decision_api_key"):
+                       "openrouter_api_key"):
             data[secret] = "***" if data[secret] else ""
         return data
 
@@ -293,7 +293,7 @@ _ENV_SEEDS: dict[str, tuple[str, ...]] = {
     "notion_api_token": ("NOTION_API_TOKEN",),
     "notion_db_id": ("NOTION_DB_ID",),
     # Removed from the process env once seeded — see config.purge_secret_env().
-    "decision_api_key": ("DECISION_API_KEY",),
+    "openrouter_api_key": ("OPENROUTER_API_KEY",),
     "max_instances": ("MAX_INSTANCES",),
     "interactive_reserve": ("INTERACTIVE_RESERVE",),
 }

@@ -1682,7 +1682,7 @@ _DECISION_API_OFF = (
 async def save_decision_api(
     request: Request,
     action: str = Form("save"),
-    decision_api_key: str = Form(""),
+    openrouter_api_key: str = Form(""),
     decision_api_model: str = Form(""),
 ) -> Response:
     """Save, test, or remove the OpenRouter key the classifier is asked with.
@@ -1705,7 +1705,7 @@ async def save_decision_api(
     if action == "clear":
         # The key field is write-only and blank keeps it, so removing a key needs
         # its own button — as the licence key's "Clear" does.
-        store.update(decision_api_key="", **no_verdict)
+        store.update(openrouter_api_key="", **no_verdict)
         return _render(
             request, Result("decision_api", True, f"Key removed. Without it, {_DECISION_API_OFF}")
         )
@@ -1713,18 +1713,18 @@ async def save_decision_api(
     try:
         candidate = Settings.model_validate({
             **current.model_dump(),
-            "decision_api_key": _keep(
-                decision_api_key, current.decision_api_key),
+            "openrouter_api_key": _keep(
+                openrouter_api_key, current.openrouter_api_key),
             "decision_api_model": decision_api_model,
         })
     except ValueError as exc:
         return _render(request, Result("decision_api", False, _first_error(exc)), status=400)
     changes = dict(
-        decision_api_key=candidate.decision_api_key,
+        openrouter_api_key=candidate.openrouter_api_key,
         decision_api_model=candidate.decision_api_model,
     )
     unchanged = (
-        candidate.decision_api_key == current.decision_api_key
+        candidate.openrouter_api_key == current.openrouter_api_key
         and candidate.decision_api_model == current.decision_api_model
     )
 
@@ -1751,7 +1751,7 @@ async def save_decision_api(
             status=400
         )
     check = await request.app.state.typesafe.check(
-        key=candidate.decision_api_key, model=candidate.decision_api_model
+        key=candidate.openrouter_api_key, model=candidate.decision_api_model
     )
     if not check.ok:
         if current.decision_api_last_check_ok and not unchanged:

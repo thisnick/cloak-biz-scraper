@@ -1372,7 +1372,7 @@ class TestPageFailures:
         assert fake.calls == 0, "no key saved: the code checks alone decide"
         assert res["error"] is None and "eligibility" not in res["data"]["legibility"][0]
 
-        settings.update(decision_api_key="sk-or-test")
+        settings.update(openrouter_api_key="sk-or-test")
         res, _, _ = await _once(svc, _job(jobs, max_pages=1), _PlainSource([CardPage(cards)]),
                                 tmp_path)
         assert fake.calls == 3, "one request per card"
@@ -1394,7 +1394,7 @@ class TestPageFailures:
                 await asyncio.sleep(0)  # in flight, as a real request is
                 raise TypeSafeUnavailable("The Decision API did not answer.")
 
-        settings.update(decision_api_key="sk-or-test")
+        settings.update(openrouter_api_key="sk-or-test")
         svc = self._svc(settings, jobs, None, typesafe=Down())
         res, _, _ = await _once(svc, _job(jobs, max_pages=1),
                                 _PlainSource([CardPage([_gen(i) for i in range(8)])]), tmp_path)
@@ -1420,7 +1420,7 @@ class TestPageFailures:
                     raise TypeSafeError("The Decision API refused this request (HTTP 400).")
                 return {"eligible": Noul(0.9)}
 
-        settings.update(decision_api_key="sk-or-test")
+        settings.update(openrouter_api_key="sk-or-test")
         svc = self._svc(settings, jobs, None, typesafe=Picky())
         res, _, _ = await _once(svc, _job(jobs, max_pages=1),
                                 _PlainSource([CardPage([_gen(i) for i in range(4)])]), tmp_path)
@@ -1481,7 +1481,7 @@ class TestWhoMayDropCards:
                 return json.dumps({"title": "Businesses For Sale", "blocked": False,
                                    "cards": cards})
 
-        settings.update(decision_api_key="sk-or-test")
+        settings.update(openrouter_api_key="sk-or-test")
         judge = _TitleJudge({"Laundromat — Owner Retiring", "Coin Op Car Wash"})
         svc = ScrapeService(instances=None, jobs=jobs, settings=settings, typesafe=judge)
         res, _, _ = await _once(svc, _job(jobs, max_pages=1), BizBuySellSerp(), tmp_path,
@@ -1505,7 +1505,7 @@ class TestWhoMayDropCards:
         source = _ScriptedSource([CardPage(cards)])
         source.chooses_cards = True
         monkeypatch.setattr("app.sources.for_url", lambda url: source)
-        settings.update(decision_api_key="sk-or-test")
+        settings.update(openrouter_api_key="sk-or-test")
         svc = ScrapeService(instances=_FakeInstances(), jobs=jobs, settings=settings,
                             store_factory=FakeStore, task_profiles=_Pool(),
                             typesafe=_TitleJudge({"Sell Your Business", "Pizzeria – Sold"}))
@@ -1531,7 +1531,7 @@ class TestWhoMayDropCards:
         source = _ScriptedSource([CardPage(cards)])
         source.chooses_cards = True
         monkeypatch.setattr("app.sources.for_url", lambda url: source)
-        settings.update(decision_api_key="sk-or-test")
+        settings.update(openrouter_api_key="sk-or-test")
         judge = _TitleJudge({f"Sold {i}" for i in range(4)})
         instances = _FakeInstances()
         svc = ScrapeService(instances=instances, jobs=jobs, settings=settings,
@@ -1555,7 +1555,7 @@ class TestWhoMayDropCards:
                                   CardPage([_gen(4)])])
         source.chooses_cards = True
         monkeypatch.setattr("app.sources.for_url", lambda url: source)
-        settings.update(decision_api_key="sk-or-test")
+        settings.update(openrouter_api_key="sk-or-test")
         svc = ScrapeService(instances=_FakeInstances(), jobs=jobs, settings=settings,
                             store_factory=FakeStore, task_profiles=_Pool(),
                             typesafe=_TitleJudge({s.title for s in sold}))
@@ -1580,7 +1580,7 @@ class TestWhoMayDropCards:
                                   CardPage([*sold, _gen(4)]), CardPage([_gen(5)])])
         source.chooses_cards = True
         monkeypatch.setattr("app.sources.for_url", lambda url: source)
-        settings.update(decision_api_key="sk-or-test")
+        settings.update(openrouter_api_key="sk-or-test")
         svc = ScrapeService(instances=_FakeInstances(), jobs=jobs, settings=settings,
                             store_factory=FakeStore, task_profiles=_Pool(),
                             typesafe=_TitleJudge({s.title for s in sold}))
@@ -1624,7 +1624,7 @@ class FakeTypeSafe:
 def generic_service(settings, jobs, *, typesafe=None, key=True, sweep=None):
     """A service whose `_sweep` records which source each URL was given."""
     if key:
-        settings.update(decision_api_key="sk-or-test")
+        settings.update(openrouter_api_key="sk-or-test")
     svc = ScrapeService(instances=None, jobs=jobs, settings=settings,
                         store_factory=FakeStore, typesafe=typesafe or FakeTypeSafe())
     svc.swept = {}
@@ -2167,7 +2167,7 @@ class Rig:
         if notion:
             settings.update(notion_api_token="ntn_x", notion_db_id="db-1")
         if key:
-            settings.update(decision_api_key="sk-or-test")
+            settings.update(openrouter_api_key="sk-or-test")
         self.events: list[tuple] = []
         self.jobs = jobs
         self.listings = listings
@@ -2753,7 +2753,7 @@ class TestPerCallLimits:
         """A per-sweep limit is per sweep: two running at once with
         classifier_parallel=2 each have four requests in flight — two of each,
         and no more — rather than sharing one gate of two."""
-        settings.update(decision_api_key="sk-or-test")
+        settings.update(openrouter_api_key="sk-or-test")
         held = _HeldClassifier()
         svc = ScrapeService(instances=None, jobs=jobs, settings=settings, typesafe=held)
         _cards_by_url(svc, {SERP: [_tl(i, f"A {i}") for i in range(1, 11)],
@@ -2798,7 +2798,7 @@ class TestPerCallLimits:
                 "model": "typesafe/jev-test",
                 "answers": {"eligible": {"type": "noul", "noul": 0.95}}})
 
-        settings.update(decision_api_key="sk-or-test")
+        settings.update(openrouter_api_key="sk-or-test")
         client = TypeSafeClient(lambda: "sk-or-test", lambda: "jev-latest")
         svc = ScrapeService(instances=None, jobs=jobs, settings=settings, typesafe=client)
         _cards_by_url(svc, {SERP: [_tl(i, f"A {i}") for i in range(1, 31)],

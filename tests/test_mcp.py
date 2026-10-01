@@ -426,7 +426,7 @@ class TestSweepRefusalsReachBothDoors:
     def test_a_rejected_key_is_the_tool_s_answer_and_a_409(self, client, keyed, monkeypatch):
         from app.services.typesafe import TypeSafeAuthError
 
-        keyed.update(decision_api_key="sk-or-test")
+        keyed.update(openrouter_api_key="sk-or-test")
         self._check_fails(monkeypatch, TypeSafeAuthError("OpenRouter rejected the key (HTTP 401)."))
         result = self._mcp_call(client, [self.WC])
         assert result["isError"] is True
@@ -439,7 +439,7 @@ class TestSweepRefusalsReachBothDoors:
     def test_an_outage_is_a_503_over_rest(self, client, keyed, monkeypatch):
         from app.services.typesafe import TypeSafeUnavailable
 
-        keyed.update(decision_api_key="sk-or-test")
+        keyed.update(openrouter_api_key="sk-or-test")
         self._check_fails(monkeypatch, TypeSafeUnavailable("The Decision API could not answer."))
         r = client.post("/api/scrape", json={"urls": [self.WC]})
         assert r.status_code == 503 and "could not answer" in r.json()["detail"]
@@ -453,7 +453,7 @@ class TestSweepRefusalsReachBothDoors:
         assert r.status_code == 422 and hint in r.json()["detail"]
 
     def test_a_bizbuysell_listing_page_is_refused_even_with_a_key(self, client, keyed):
-        keyed.update(decision_api_key="sk-or-test")
+        keyed.update(openrouter_api_key="sk-or-test")
         detail = "https://www.bizbuysell.com/business-opportunity/premier-restoration/2515728/"
         text = self._mcp_call(client, [detail])["content"][0]["text"]
         assert "bizbuysell.com is read by this app's own adapter" in text
@@ -532,7 +532,7 @@ class TestTriageRefusalsReachBothDoors:
 
         settings = SettingsService(tmp_path / "settings.json", tmp_path / ".dek")
         settings.update(notion_api_token="ntn_test", notion_db_id="db-test",
-                        decision_api_key="sk-or-test")
+                        openrouter_api_key="sk-or-test")
         monkeypatch.setattr(app.state.scrape, "_settings", settings)
         return settings
 
@@ -581,7 +581,7 @@ class TestTriageRefusalsReachBothDoors:
         assert all("triage_plan" not in kw and not kw.get("triage_prompt") for kw in started)
 
     def test_no_key(self, client, configured):
-        configured.update(decision_api_key="")
+        configured.update(openrouter_api_key="")
         text, rest = self._both(client, {"urls": [SERP], "sync": True,
                                          "triage_prompt": "Reject restaurants."})
         assert "no OpenRouter key is saved" in text

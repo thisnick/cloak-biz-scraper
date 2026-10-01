@@ -167,7 +167,7 @@ async def lifespan(app: FastAPI):
     # a key saved in Settings applies to the next question without a restart,
     # and a swapped settings store (tests) is never left behind.
     app.state.typesafe = TypeSafeClient(
-        key_getter=lambda: app.state.settings.load().decision_api_key,
+        key_getter=lambda: app.state.settings.load().openrouter_api_key,
         model_getter=lambda: app.state.settings.load().decision_api_model,
     )
     # The same job store the sweeps use: one Tasks list, one retention policy,
