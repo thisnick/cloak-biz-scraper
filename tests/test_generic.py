@@ -33,11 +33,9 @@ from app.sources.generic import JS_PROBE, GenericSource
 from app.sources.overrides import (
     MONEY_ROLES,
     ROLES,
-    OverridesInvalid,
     Role,
     SiteOverride,
     override_for,
-    parse_overrides,
 )
 
 SITE = "https://brokers.example"
@@ -1915,38 +1913,23 @@ class TestOverrideFor:
         assert override_for("https://x.com/list", [a, b]) is a
 
 
-class TestParseOverrides:
-    """The document a person types into Settings → Site overrides."""
+class TestSuggestedOverride:
+    """What a run suggests is the shape a site is pinned with in code."""
 
-    @pytest.mark.parametrize("blank", ["", "   \n", None])
-    def test_blank_is_no_overrides(self, blank):
-        assert parse_overrides(blank) == []
-
-    def test_a_valid_document_parses_in_order(self):
-        doc = '[{"match": "a.com"}, {"match": "b.com", "next_page": "none"}]'
-        assert [o.match for o in parse_overrides(doc)] == ["a.com", "b.com"]
-
-    def test_broken_json_names_its_line_and_column(self):
-        with pytest.raises(OverridesInvalid) as exc:
-            parse_overrides('[\n  {"match": "a.com",}\n]')
-        assert str(exc.value).startswith("Line 2, column 21: Expecting property name")
-
-    def test_only_the_first_problem_is_spelled_out_and_the_rest_counted(self):
-        with pytest.raises(OverridesInvalid) as exc:
-            parse_overrides('[{"match": ""}, {"match": "b.com", "x": 1}, {"y": 2}]')
-        message = str(exc.value)
-        assert message.startswith("Override 1 → match: match must be a URL prefix or a host")
-        assert message.endswith("(and 3 more problems)")
-
-    def test_a_suggested_override_round_trips(self):
-        """What a run suggests must be pasteable as it is."""
+    def test_a_suggested_override_is_a_valid_site_override(self):
         source = GenericSource(LIST_URL, FakeJev())
         source.decisions = [{"page": 1, "listing_links": {"by": "jev", "patterns": [PATTERN]},
                              "fields": [{"key": "Asking Price", "role": "asking_price",
                                          "by": "jev", "used": True}],
                              "next_page": {"by": "jev", "rule": "none"}}]
-        doc = json.dumps([source.suggested_override()])
-        assert parse_overrides(doc)[0].listing_links == [PATTERN]
+        pinned = SiteOverride.model_validate(source.suggested_override())
+        assert pinned.listing_links == [PATTERN]
+
+    def test_the_code_s_overrides_are_valid_and_one_per_match(self):
+        from app.sources.overrides import SITE_OVERRIDES
+
+        matches = [o.match for o in SITE_OVERRIDES]
+        assert len(matches) == len(set(matches))
 
 
 # ── the probe, in a real browser ─────────────────────────────────────────────

@@ -281,10 +281,10 @@ error: the URL is named in the result's `not_fully_crawled` and in its summary. 
 page whose cards are mostly sold keeps the ones for sale; one with none for sale ends
 paging quietly. A BizBuySell page other than a search or broker profile never falls
 through to the generic reader. Listings from other sites carry their site as `source` and
-an empty `listing_id`. **Settings → Site overrides** pins any part of those decisions for
-one site, and each sweep's **Details** (Tasks → History, or `/runs/<job_id>`) shows what
-was decided with a paste-ready suggested override — see
-[advanced controls](docs/advanced-controls.md#site-overrides).
+an empty `listing_id`. Each sweep's **Details** (Tasks → History, or `/runs/<job_id>`)
+shows what was decided; a site that keeps being read wrong is pinned in code
+(`app/sources/overrides.py`) — see
+[advanced controls](docs/advanced-controls.md#when-a-site-is-read-wrong).
 
 **How do I pin the browser version?** Settings has an optional version pin. Leave it empty
 for the latest build. To pin, use a **full dotted version** (`148.0.7778.215.5`); a partial

@@ -217,8 +217,8 @@ class SweepTask(TaskBase):
     # dropped), `legibility` (each page's verdict: the code checks, and with a
     # classifier key `eligibility` — how many cards were asked about, known,
     # judged not for sale now and dropped, the first of those by title and
-    # probability, and why the classifier stopped if it did), `suggested_override` (a
-    # paste-ready site override pinning what was decided, generic sources
+    # probability, and why the classifier stopped if it did), `suggested_override` (what
+    # was decided, as a code site override — sources/overrides.py — generic sources
     # only), and `error` when the source failed. For a person diagnosing a run
     # (/runs/{id}); deliberately not in ScrapeResult, which an agent polls.
     decisions: list[dict] = Field(default_factory=list)

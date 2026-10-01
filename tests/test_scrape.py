@@ -1716,13 +1716,18 @@ class TestWhichSourceReadsAUrl:
         assert list(svc.swept) == [SERP], "refused URLs never reach the browser"
 
     @pytest.mark.asyncio
-    async def test_the_longest_matching_override_is_handed_to_the_reader(self, settings, jobs):
-        settings.update(site_overrides_json="""[
-          {"match": "websiteclosers.com", "next_page": "none"},
-          {"match": "https://www.websiteclosers.com/businesses-for-sale",
-           "next_page": "https://www.websiteclosers.com/businesses-for-sale/page/{page}/"},
-          {"match": "dealonomy.com", "drop_status": ["sold"]}
-        ]""")
+    async def test_the_longest_matching_override_in_code_is_handed_to_the_reader(
+        self, settings, jobs, monkeypatch,
+    ):
+        import app.services.scrape as scrape_module
+        from app.sources.overrides import SiteOverride
+
+        monkeypatch.setattr(scrape_module, "SITE_OVERRIDES", (
+            SiteOverride(match="websiteclosers.com", next_page="none"),
+            SiteOverride(match="https://www.websiteclosers.com/businesses-for-sale",
+                         next_page="https://www.websiteclosers.com/businesses-for-sale/page/{page}/"),
+            SiteOverride(match="dealonomy.com", drop_status=["sold"]),
+        ))
         svc = generic_service(settings, jobs)
         svc.start([WC, "https://www.websiteclosers.com/other/", "https://example.org/list"])
         await _drain(svc)
@@ -1730,44 +1735,6 @@ class TestWhichSourceReadsAUrl:
         assert svc.swept[WC].override.next_page.endswith("/page/{page}/")
         assert svc.swept["https://www.websiteclosers.com/other/"].override.next_page == "none"
         assert svc.swept["https://example.org/list"].override is None
-
-    @pytest.mark.asyncio
-    async def test_unreadable_overrides_refuse_generic_urls_only(self, settings, jobs):
-        """A bad document must not stop BizBuySell sweeps — or the app booting."""
-        settings.update(site_overrides_json='[{"match": "a.com"\n  "next_page": "none"}]')
-        svc = generic_service(settings, jobs)
-        job = svc.start([SERP, WC])
-        await _drain(svc)
-
-        assert list(svc.swept) == [SERP]
-        error = svc.result(job.id).error
-        assert "Site overrides" in error and "Line 2, column 3" in error
-
-        with pytest.raises(UnsupportedURL) as exc:
-            svc.start([WC])
-        assert "Settings → Site overrides can't be read" in str(exc.value)
-
-    @pytest.mark.asyncio
-    async def test_overrides_are_parsed_once_per_edit(self, settings, jobs, monkeypatch):
-        import app.services.scrape as scrape_module
-
-        calls = []
-        real = scrape_module.parse_overrides
-
-        def counting(text):
-            calls.append(text)
-            return real(text)
-
-        monkeypatch.setattr(scrape_module, "parse_overrides", counting)
-        settings.update(site_overrides_json='[{"match": "websiteclosers.com"}]')
-        svc = generic_service(settings, jobs)
-        svc.start([WC])
-        svc.start([WC, DEALONOMY])
-        assert len(calls) == 1
-        settings.update(site_overrides_json="")
-        svc.start([WC])
-        assert len(calls) == 2
-        await _drain(svc)
 
     def test_a_generic_sweep_is_labelled_by_its_site(self):
         one = SweepTask(id="g1", source="generic", urls=[WC])

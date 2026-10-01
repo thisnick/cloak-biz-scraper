@@ -433,8 +433,8 @@ def build(app) -> MCPServer:
             stopped it and why (the job still completes). A BizBuySell page other than a search
             or a broker profile is refused; to save one listing's page, use
             archive_page. How a site's page is read is decided anew by every sweep; if
-            a site keeps being read wrong, the fix is a site override a person
-            saves in the server's Settings, not an argument here. If you don't have
+            a site keeps being read wrong, the fix is in the server's code, not an
+            argument here — tell the user which site. If you don't have
             a listings URL, either ask the user for it, OR get one yourself:
             create_instance a browser, use agent_browser to run the search on the
             site (navigate, fill the search box, apply filters), read the resulting

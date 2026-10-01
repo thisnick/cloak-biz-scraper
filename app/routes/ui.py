@@ -200,13 +200,8 @@ def _job_label(job) -> str:
 
 def _render(request: Request, result: Result | None = None, status: int = 200,
             active: str | None = None, notion_mapping: Any = None,
-            focus: str | None = None, overrides_draft: str | None = None) -> Response:
-    """The dashboard, with an optional banner.
-
-    `overrides_draft` is a Site overrides document that failed to save: the box
-    shows it (not the saved one) so the person fixes their text instead of
-    retyping it.
-    """
+            focus: str | None = None) -> Response:
+    """The dashboard, with an optional banner."""
     settings: Settings = request.app.state.settings.load()
     from ..services.urls import public_base
     from ..services.views import browser_info, instance_view
@@ -245,9 +240,6 @@ def _render(request: Request, result: Result | None = None, status: int = 200,
             "connected_apps": request.app.state.oauth.list_clients(),
             "proxy_checked_at": _when(settings.proxy_last_check_at),
             "typesafe_checked_at": _when(settings.typesafe_last_check_at),
-            "overrides_text": (settings.site_overrides_json if overrides_draft is None
-                               else overrides_draft),
-            "overrides_count": _overrides_count(settings.site_overrides_json),
             # dashboard sections
             "instances": instances,
             "running_jobs": running,
@@ -293,21 +285,6 @@ def _first_error(exc: Exception) -> str:
     if isinstance(exc, ValidationError) and exc.errors():
         return exc.errors()[0]["msg"].removeprefix("Value error, ")
     return str(exc)
-
-
-def _overrides_count(text: str) -> int | None:
-    """How many site overrides are saved; None when the saved text doesn't parse.
-
-    Only for the section's chip. A saved document can stop parsing without
-    anyone touching it (a later version tightens the schema), and the page
-    must still render to let them fix it.
-    """
-    from ..sources.overrides import OverridesInvalid, parse_overrides
-
-    try:
-        return len(parse_overrides(text))
-    except OverridesInvalid:
-        return None
 
 
 def _keep(new: str, existing: str) -> str:
@@ -547,9 +524,10 @@ async def get_run(request: Request, job_id: str) -> dict[str, Any]:
     if job.kind == "sweep":
         # How each URL was read — the chosen link pattern and who chose it,
         # field roles, the next-page rule, legibility and each page's
-        # per-listing eligibility, and a paste-ready site
-        # override. Here and not in /runs (every row) or in the ScrapeResult an
-        # agent polls: it is for a person working out why a site read wrong.
+        # per-listing eligibility, and what was decided in the shape of a site
+        # override (for pinning a site in code). Here and not in /runs (every
+        # row) or in the ScrapeResult an agent polls: it is for a person working
+        # out why a site read wrong.
         detail["decisions"] = job.decisions
         # The limits this sweep ran with — the call's, or the defaults — so a
         # run with many deferred REVIEWs, or a slow page of classifier
@@ -1800,48 +1778,6 @@ async def save_typesafe(
         typesafe_last_check_summary=check.message,
     )
     return _render(request, Result("typesafe", True, check.message))
-
-
-# ── Site overrides ────────────────────────────────────────────────────────────
-
-
-@router.post("/settings/overrides", response_class=HTMLResponse)
-async def save_overrides(request: Request, site_overrides_json: str = Form("")) -> Response:
-    """Save the site overrides document — checked here, stored exactly as typed.
-
-    The app's first free-form editor, so the check is the part that matters: a
-    document is saved only when every override in it is valid, and a refusal
-    says where the problem is (a line and column for broken JSON, the override
-    and field for a bad value) and puts the person's text back in the box. The
-    text itself is stored, not a re-serialised copy, so their formatting and
-    order survive. Blank clears every override.
-    """
-    _require(request)
-    _require_same_origin(request)
-    from ..sources.overrides import OverridesInvalid, parse_overrides
-
-    # Browsers submit a textarea with CRLF line endings; the person typed LF.
-    text = site_overrides_json.replace("\r\n", "\n")
-    if not text.strip():
-        request.app.state.settings.update(site_overrides_json="")
-        return _render(request, Result(
-            "overrides", True,
-            "Cleared. Every site is read with the classifier's own decisions."))
-    try:
-        overrides = parse_overrides(text)
-    except OverridesInvalid as exc:
-        return _render(request, Result("overrides", False, f"Not saved. {exc}"),
-                       status=400, overrides_draft=text)
-    settings = request.app.state.settings.update(site_overrides_json=text)
-    n = len(overrides)
-    message = f"Saved {n} site override{'' if n == 1 else 's'}."
-    if not settings.typesafe_configured():
-        # Overrides steer the generic reader, which does not run without a key.
-        return _render(request, Result(
-            "overrides", True,
-            message + " They apply once a TypeSafe Classifier (e.g. Jev) key is saved — "
-            "until then only BizBuySell pages are read.", level="warn"))
-    return _render(request, Result("overrides", True, message))
 
 
 # ── Connected apps ────────────────────────────────────────────────────────────

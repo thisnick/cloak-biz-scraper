@@ -16,7 +16,8 @@ Which source reads a URL is decided here too, because only this service knows
 what the Settings say. A URL a site adapter matches is read by it. A URL on a
 site with no adapter is read by the generic reader (`sources/generic.py`) —
 when the TypeSafe Classifier (e.g. Jev) key is saved, since the reader cannot
-decide anything without it, and with that site's override if one is pinned. A
+decide anything without it, and with that site's override if the code pins
+one (`sources/overrides.SITE_OVERRIDES`). A
 URL on a site that HAS an adapter, which the adapter does not read, is refused:
 it never falls through.
 
@@ -64,7 +65,7 @@ from ..models import (
     TriageSummary,
 )
 from ..sources.generic import GenericSource
-from ..sources.overrides import OverridesInvalid, SiteOverride, override_for, parse_overrides
+from ..sources.overrides import SITE_OVERRIDES, override_for
 from ..stores.base import ListingStore, TriageUnavailable, UpsertResult
 from . import legibility
 from .archive import GUARD_THRESHOLD
@@ -295,10 +296,6 @@ class ScrapeService:
         # blank Bot Triage; the second to reach it leaves it to the first rather
         # than judging, archiving and writing it a second time.
         self._triaging: set[str] = set()
-        # The parsed site overrides, keyed by the text they were parsed from, so
-        # a sweep start re-parses only after the document was edited.
-        self._overrides_text: str | None = None
-        self._overrides_parsed: list[SiteOverride] = []
         # Admission gate: at most task_budget sweeps run past this point at once.
         # The instance pool's cap only bites INSIDE launch, but start() spawns an
         # unbounded background task per call, so without this every concurrent
@@ -554,9 +551,9 @@ class ScrapeService:
 
         A site adapter first; else the generic reader, unless the URL is not a
         web address, its site already has an adapter (which chose not to read
-        this page), no classifier key is saved, or the saved site overrides
-        cannot be read. A GenericSource is built per URL: it remembers what it
-        decided on the page it is reading, and two URLs must not share that.
+        this page), or no classifier key is saved. A GenericSource is built per
+        URL: it remembers what it decided on the page it is reading, and two
+        URLs must not share that.
         """
         try:
             return sources.for_url(url)
@@ -589,28 +586,7 @@ class ScrapeService:
             )
         if self._classifier() is None:
             raise sources.UnsupportedURL(url, supported, hint=NEEDS_CLASSIFIER)
-        try:
-            overrides = self._overrides()
-        except OverridesInvalid as exc:
-            raise sources.UnsupportedURL(
-                url, supported,
-                hint="the Site overrides saved under Settings → Site overrides can't be read "
-                     f"({exc}). Fix or clear them to read sites other than BizBuySell.",
-            ) from None
-        return GenericSource(url, self._typesafe, override_for(url, overrides))
-
-    def _overrides(self) -> list[SiteOverride]:
-        """The saved site overrides, parsed once per edit. Raises OverridesInvalid.
-
-        Parsed here, when a generic sweep starts, and not when settings load: a
-        document that no longer parses must refuse the URLs that would use it,
-        never stop the app from booting (see `Settings.site_overrides_json`).
-        """
-        text = self._settings.load().site_overrides_json
-        if text != self._overrides_text:
-            parsed = parse_overrides(text)
-            self._overrides_text, self._overrides_parsed = text, parsed
-        return self._overrides_parsed
+        return GenericSource(url, self._typesafe, override_for(url, SITE_OVERRIDES))
 
     def result(self, job_id: str) -> ScrapeResult | None:
         """The sweep as it stands. Never blocks, never waits, never launches anything.
