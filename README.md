@@ -85,8 +85,8 @@ https://github.com/user-attachments/assets/3c86899d-9f1b-4946-b1ca-4b11a53514b5
 
 ### Self-hosting without building
 
-Every release is also published as a ready-made image. To run it yourself (Docker,
-Compose, anything that pulls images), use
+Every release is also published as a ready-made image, for linux/amd64 and linux/arm64. To
+run it yourself (Docker, Compose, anything that pulls images), use
 `ghcr.io/thisnick/cloak-biz-scraper:release` — or, to stay on one version until you
 choose to move, the `image@sha256:…` digest printed at the end of that release's
 **Publish image** run. The image serves plain HTTP on `$PORT`; put TLS in front of it and
