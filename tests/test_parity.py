@@ -208,7 +208,7 @@ class TestServerInfoParity:
         rest = _rest_info(client)
         mcp = _mcp_info(client)
         # Control: a real snapshot with the five sections, not two empty/error bodies.
-        assert set(rest) == {"proxy", "browser", "pool", "notion", "typesafe"} \
+        assert set(rest) == {"proxy", "browser", "pool", "notion", "decision_api"} \
             and rest["pool"]["max"] >= 1, rest
         assert rest == mcp, (
             "MCP and REST disagree about server_info. A field added at one façade "

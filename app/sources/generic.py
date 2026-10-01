@@ -13,7 +13,7 @@ adapter for, a page seen once. It reads a page in two halves.
   does not. Next-page candidates are collected the same way. Before the probe
   runs, the page is scrolled to its bottom and back, so lazily rendered cards
   and pagers are there to be found.
-* **What code cannot see, the TypeSafe Classifier (e.g. Jev) decides**: which
+* **What code cannot see, the Decision API decides**: which
   group is the list of businesses for sale (and not the menu, the footer, or a
   "similar listings" rail), what each field holds, and which candidate is
   really the next page. Each of those is ONE request — the classifier reads the
@@ -910,8 +910,7 @@ class GenericSource:
 
     name = GENERIC_NAME
     label = GENERIC_LABEL
-    describes = ("Any other site's page of businesses for sale, read with the TypeSafe "
-                 "Classifier (e.g. Jev)")
+    describes = ("Any other site's page of businesses for sale, read with the Decision API")
     example = "https://www.websiteclosers.com/businesses-for-sale/"
     # It picks the cards itself, so the sweep may drop single cards its
     # per-listing request judges not to be a business for sale now (see `Source`).
@@ -1099,7 +1098,7 @@ class GenericSource:
     async def _ask(self, state: Any, questions: dict[str, dict[str, Any]]) -> dict:
         if self._classifier is None:
             raise TypeSafeNotConfigured(
-                "Reading this site needs the TypeSafe Classifier (e.g. Jev), and none is set up."
+                "Reading this site needs the Decision API, and none is set up."
             )
         return await self._classifier.ask(state, questions)
 
@@ -1955,14 +1954,14 @@ def _letter(i: int) -> str:
 def _choice(answers: dict, name: str) -> Choice:
     answer = answers.get(name) if isinstance(answers, dict) else None
     if not isinstance(answer, Choice):
-        raise TypeSafeError(f"The TypeSafe Classifier did not answer the question {name!r}.")
+        raise TypeSafeError(f"The Decision API did not answer the question {name!r}.")
     return answer
 
 
 def _noul(answers: dict, name: str) -> float:
     answer = answers.get(name) if isinstance(answers, dict) else None
     if not isinstance(answer, Noul):
-        raise TypeSafeError(f"The TypeSafe Classifier did not answer the question {name!r}.")
+        raise TypeSafeError(f"The Decision API did not answer the question {name!r}.")
     return answer.probability
 
 

@@ -20,7 +20,7 @@ from ..models import (
     PoolInfo,
     ProxyInfo,
     ServerInfo,
-    TypeSafeInfo,
+    DecisionApiInfo,
     UploadTicket,
 )
 from . import downloads, tokens, uploads
@@ -231,7 +231,7 @@ def server_info(settings, instances) -> ServerInfo:
     Built here so MCP and REST return the identical payload, and so the "no
     secret ever leaves" property is enforced in one place: this reads only the
     booleans, statuses, versions, and counts — never proxy_password,
-    cloakbrowser_license_key, notion_api_token, or typesafe_openrouter_api_key.
+    cloakbrowser_license_key, notion_api_token, or openrouter_api_key.
     """
     from .capacity import detect_capacity
 
@@ -262,10 +262,10 @@ def server_info(settings, instances) -> ServerInfo:
         notion=NotionInfo(connected=settings.notion_configured()),
         # From the saved verdict, like the proxy's: no live call to OpenRouter
         # on a status read, and never the key.
-        typesafe=TypeSafeInfo(
-            configured=settings.typesafe_configured(),
-            status=settings.typesafe_status(),
-            model=settings.typesafe_model,
+        decision_api=DecisionApiInfo(
+            configured=settings.decision_api_configured(),
+            status=settings.decision_api_status(),
+            model=settings.decision_api_model,
         ),
     )
 

@@ -411,7 +411,7 @@ def build(app) -> MCPServer:
             a single listing. BizBuySell search results and broker profiles
             (bizbuysell.com/business-broker/…) are read natively. Any other site's
             listings page is read by finding the list of businesses on it, which
-            needs the TypeSafe Classifier (e.g. Jev) key saved in the server's
+            needs the Decision API key saved in the server's
             Settings; without it such a URL fails with a message saying so. Listings
             from other sites carry the site (e.g. "websiteclosers.com") as `source`
             and an empty `listing_id`. For a search, use the URL with the filters
@@ -433,8 +433,8 @@ def build(app) -> MCPServer:
             stopped it and why (the job still completes). A BizBuySell page other than a search
             or a broker profile is refused; to save one listing's page, use
             archive_page. How a site's page is read is decided anew by every sweep; if
-            a site keeps being read wrong, the fix is a site override a person
-            saves in the server's Settings, not an argument here. If you don't have
+            a site keeps being read wrong, the fix is in the server's code, not an
+            argument here — tell the user which site. If you don't have
             a listings URL, either ask the user for it, OR get one yourself:
             create_instance a browser, use agent_browser to run the search on the
             site (navigate, fill the search box, apply filters), read the resulting
@@ -466,7 +466,7 @@ def build(app) -> MCPServer:
             Criteria Version where those columns exist or are mapped under Settings.
             A REVIEW row also gets its detail page's Source Content appended (as
             archive_page does), so there is no need to call archive_page for them.
-            Needs sync=true and the TypeSafe Classifier (e.g. Jev) key in the
+            Needs sync=true and the Decision API key in the
             server's Settings; without either, or if the key fails its check or the
             database has no Bot Triage column, the call is refused before anything
             starts. The collected result's `triage` holds the counts, the earlier
@@ -489,14 +489,14 @@ def build(app) -> MCPServer:
             and reads run two or three at a time (as many as the server's
             browser pool gives tasks), so 100 reads adds roughly 35–50 minutes
             before the sweep completes.
-        classifier_parallel: how many requests to the TypeSafe Classifier (e.g.
-            Jev) this sweep has in flight at once — the one request per new
-            listing that asks whether it is for sale now (and, with a
-            triage_prompt, REVIEW or REJECT on its card). Default 5; allowed 1 to
-            20. Higher gets through a page of many new listings sooner; lower is
-            gentler on OpenRouter's rate limit. The server holds all classifier
-            requests together to 20 at once, so sweeps running at the same time
-            share that. Without the classifier key it has no effect.
+        classifier_parallel: how many requests to the Decision API this sweep
+            has in flight at once — the one request per new listing that asks
+            whether it is for sale now (and, with a triage_prompt, REVIEW or
+            REJECT on its card). Default 5; allowed 1 to 20. Higher gets through
+            a page of many new listings sooner; lower is gentler on OpenRouter's
+            rate limit. The server holds all Decision API requests together to
+            20 at once, so sweeps running at the same time share that. Without
+            the Decision API key it has no effect.
 
         A max_detail_reads or classifier_parallel outside its range is refused
         before the sweep starts, with the allowed range in the message — it is
@@ -543,7 +543,7 @@ def build(app) -> MCPServer:
         has a Source Content section gets nothing appended, so calling this again
         for the same page is safe. If Notion refuses part of a long page, what was
         already written is deleted again (or, if that fails, the error says to
-        delete the partial section by hand). When a TypeSafe Classifier (e.g. Jev) key is
+        delete the partial section by hand). When a Decision API key is
         set, a page that turns out to be a login wall, error, removed listing or
         anti-bot page is not written, and the result says so.
         """
@@ -804,14 +804,14 @@ def build(app) -> MCPServer:
     # Closed-world: proxy status comes from saved settings, not a live probe.
     @tool(annotations=READ_ONLY)
     async def server_info() -> ServerInfo:
-        """How this server is set up: proxy, browser, pool, Notion, and TypeSafe status.
+        """How this server is set up: proxy, browser, pool, Notion, and Decision API status.
 
         Read-only, and carries no secrets — status and versions only. Useful to
         check before a sweep or a browser launch: whether the optional residential
         proxy is direct/configured/working, whether the selected CloakBrowser build
         is public, resolved Pro, or has an unverified Pro key, how many browser slots
-        are free, whether Notion is connected, and whether the optional TypeSafe
-        Classifier (e.g. Jev) has a key and passed its last test.
+        are free, whether Notion is connected, and whether the optional Decision
+        API has a key and passed its last test.
         """
         from .services.views import server_info as build_server_info
 

@@ -37,7 +37,7 @@ DETAIL = "https://www.bizbuysell.com/business-opportunity/premier-restoration/25
 # Sites with no adapter of their own.
 WC = "https://www.websiteclosers.com/businesses-for-sale/"
 DEALONOMY = "https://www.dealonomy.com/s"
-KEY_HINT = "add an OpenRouter key under Settings → TypeSafe Classifier (e.g. Jev)"
+KEY_HINT = "add an OpenRouter key under Settings → Decision API"
 
 
 def _listing(listing_id: str, source: str = "bizbuysell_serp") -> Listing:
@@ -1268,7 +1268,7 @@ class TestPageFailures:
     ):
         """The generic reader's classifier going down on page 3 (or finding no
         list there) costs page 3, not pages 1 and 2."""
-        down = "Could not read the listings on page 3: the TypeSafe Classifier did not answer."
+        down = "Could not read the listings on page 3: the Decision API did not answer."
         source = _ScriptedSource([CardPage([_gen(1)]), CardPage([_gen(2)]),
                                   CardPage([], error=down, retry=False)])
         monkeypatch.setattr("app.sources.for_url", lambda url: source)
@@ -1284,7 +1284,7 @@ class TestPageFailures:
         assert "stopped at page 3 and kept the 2 listing(s) from pages 1–2: " + down \
             in result.error
         assert (CONFIG.evidence_dir / job.id / "source-01"
-                / "page-03-could-not-read-the-listings-on-page-3-the-typesafe").is_dir()
+                / "page-03-could-not-read-the-listings-on-page-3-the-decision").is_dir()
 
     @pytest.mark.asyncio
     async def test_a_later_page_stop_under_sync_still_saves_the_earlier_pages(
@@ -1372,7 +1372,7 @@ class TestPageFailures:
         assert fake.calls == 0, "no key saved: the code checks alone decide"
         assert res["error"] is None and "eligibility" not in res["data"]["legibility"][0]
 
-        settings.update(typesafe_openrouter_api_key="sk-or-test")
+        settings.update(openrouter_api_key="sk-or-test")
         res, _, _ = await _once(svc, _job(jobs, max_pages=1), _PlainSource([CardPage(cards)]),
                                 tmp_path)
         assert fake.calls == 3, "one request per card"
@@ -1392,9 +1392,9 @@ class TestPageFailures:
             async def ask(self, state, questions):
                 Down.calls += 1
                 await asyncio.sleep(0)  # in flight, as a real request is
-                raise TypeSafeUnavailable("The TypeSafe Classifier did not answer.")
+                raise TypeSafeUnavailable("The Decision API did not answer.")
 
-        settings.update(typesafe_openrouter_api_key="sk-or-test")
+        settings.update(openrouter_api_key="sk-or-test")
         svc = self._svc(settings, jobs, None, typesafe=Down())
         res, _, _ = await _once(svc, _job(jobs, max_pages=1),
                                 _PlainSource([CardPage([_gen(i) for i in range(8)])]), tmp_path)
@@ -1417,10 +1417,10 @@ class TestPageFailures:
         class Picky:
             async def ask(self, state, questions):
                 if state["title"] == "Business 2":
-                    raise TypeSafeError("The TypeSafe Classifier refused this request (HTTP 400).")
+                    raise TypeSafeError("The Decision API refused this request (HTTP 400).")
                 return {"eligible": Noul(0.9)}
 
-        settings.update(typesafe_openrouter_api_key="sk-or-test")
+        settings.update(openrouter_api_key="sk-or-test")
         svc = self._svc(settings, jobs, None, typesafe=Picky())
         res, _, _ = await _once(svc, _job(jobs, max_pages=1),
                                 _PlainSource([CardPage([_gen(i) for i in range(4)])]), tmp_path)
@@ -1481,7 +1481,7 @@ class TestWhoMayDropCards:
                 return json.dumps({"title": "Businesses For Sale", "blocked": False,
                                    "cards": cards})
 
-        settings.update(typesafe_openrouter_api_key="sk-or-test")
+        settings.update(openrouter_api_key="sk-or-test")
         judge = _TitleJudge({"Laundromat — Owner Retiring", "Coin Op Car Wash"})
         svc = ScrapeService(instances=None, jobs=jobs, settings=settings, typesafe=judge)
         res, _, _ = await _once(svc, _job(jobs, max_pages=1), BizBuySellSerp(), tmp_path,
@@ -1505,7 +1505,7 @@ class TestWhoMayDropCards:
         source = _ScriptedSource([CardPage(cards)])
         source.chooses_cards = True
         monkeypatch.setattr("app.sources.for_url", lambda url: source)
-        settings.update(typesafe_openrouter_api_key="sk-or-test")
+        settings.update(openrouter_api_key="sk-or-test")
         svc = ScrapeService(instances=_FakeInstances(), jobs=jobs, settings=settings,
                             store_factory=FakeStore, task_profiles=_Pool(),
                             typesafe=_TitleJudge({"Sell Your Business", "Pizzeria – Sold"}))
@@ -1531,7 +1531,7 @@ class TestWhoMayDropCards:
         source = _ScriptedSource([CardPage(cards)])
         source.chooses_cards = True
         monkeypatch.setattr("app.sources.for_url", lambda url: source)
-        settings.update(typesafe_openrouter_api_key="sk-or-test")
+        settings.update(openrouter_api_key="sk-or-test")
         judge = _TitleJudge({f"Sold {i}" for i in range(4)})
         instances = _FakeInstances()
         svc = ScrapeService(instances=instances, jobs=jobs, settings=settings,
@@ -1555,7 +1555,7 @@ class TestWhoMayDropCards:
                                   CardPage([_gen(4)])])
         source.chooses_cards = True
         monkeypatch.setattr("app.sources.for_url", lambda url: source)
-        settings.update(typesafe_openrouter_api_key="sk-or-test")
+        settings.update(openrouter_api_key="sk-or-test")
         svc = ScrapeService(instances=_FakeInstances(), jobs=jobs, settings=settings,
                             store_factory=FakeStore, task_profiles=_Pool(),
                             typesafe=_TitleJudge({s.title for s in sold}))
@@ -1580,7 +1580,7 @@ class TestWhoMayDropCards:
                                   CardPage([*sold, _gen(4)]), CardPage([_gen(5)])])
         source.chooses_cards = True
         monkeypatch.setattr("app.sources.for_url", lambda url: source)
-        settings.update(typesafe_openrouter_api_key="sk-or-test")
+        settings.update(openrouter_api_key="sk-or-test")
         svc = ScrapeService(instances=_FakeInstances(), jobs=jobs, settings=settings,
                             store_factory=FakeStore, task_profiles=_Pool(),
                             typesafe=_TitleJudge({s.title for s in sold}))
@@ -1624,7 +1624,7 @@ class FakeTypeSafe:
 def generic_service(settings, jobs, *, typesafe=None, key=True, sweep=None):
     """A service whose `_sweep` records which source each URL was given."""
     if key:
-        settings.update(typesafe_openrouter_api_key="sk-or-test")
+        settings.update(openrouter_api_key="sk-or-test")
     svc = ScrapeService(instances=None, jobs=jobs, settings=settings,
                         store_factory=FakeStore, typesafe=typesafe or FakeTypeSafe())
     svc.swept = {}
@@ -1716,13 +1716,18 @@ class TestWhichSourceReadsAUrl:
         assert list(svc.swept) == [SERP], "refused URLs never reach the browser"
 
     @pytest.mark.asyncio
-    async def test_the_longest_matching_override_is_handed_to_the_reader(self, settings, jobs):
-        settings.update(site_overrides_json="""[
-          {"match": "websiteclosers.com", "next_page": "none"},
-          {"match": "https://www.websiteclosers.com/businesses-for-sale",
-           "next_page": "https://www.websiteclosers.com/businesses-for-sale/page/{page}/"},
-          {"match": "dealonomy.com", "drop_status": ["sold"]}
-        ]""")
+    async def test_the_longest_matching_override_in_code_is_handed_to_the_reader(
+        self, settings, jobs, monkeypatch,
+    ):
+        import app.services.scrape as scrape_module
+        from app.sources.overrides import SiteOverride
+
+        monkeypatch.setattr(scrape_module, "SITE_OVERRIDES", (
+            SiteOverride(match="websiteclosers.com", next_page="none"),
+            SiteOverride(match="https://www.websiteclosers.com/businesses-for-sale",
+                         next_page="https://www.websiteclosers.com/businesses-for-sale/page/{page}/"),
+            SiteOverride(match="dealonomy.com", drop_status=["sold"]),
+        ))
         svc = generic_service(settings, jobs)
         svc.start([WC, "https://www.websiteclosers.com/other/", "https://example.org/list"])
         await _drain(svc)
@@ -1730,44 +1735,6 @@ class TestWhichSourceReadsAUrl:
         assert svc.swept[WC].override.next_page.endswith("/page/{page}/")
         assert svc.swept["https://www.websiteclosers.com/other/"].override.next_page == "none"
         assert svc.swept["https://example.org/list"].override is None
-
-    @pytest.mark.asyncio
-    async def test_unreadable_overrides_refuse_generic_urls_only(self, settings, jobs):
-        """A bad document must not stop BizBuySell sweeps — or the app booting."""
-        settings.update(site_overrides_json='[{"match": "a.com"\n  "next_page": "none"}]')
-        svc = generic_service(settings, jobs)
-        job = svc.start([SERP, WC])
-        await _drain(svc)
-
-        assert list(svc.swept) == [SERP]
-        error = svc.result(job.id).error
-        assert "Site overrides" in error and "Line 2, column 3" in error
-
-        with pytest.raises(UnsupportedURL) as exc:
-            svc.start([WC])
-        assert "Settings → Site overrides can't be read" in str(exc.value)
-
-    @pytest.mark.asyncio
-    async def test_overrides_are_parsed_once_per_edit(self, settings, jobs, monkeypatch):
-        import app.services.scrape as scrape_module
-
-        calls = []
-        real = scrape_module.parse_overrides
-
-        def counting(text):
-            calls.append(text)
-            return real(text)
-
-        monkeypatch.setattr(scrape_module, "parse_overrides", counting)
-        settings.update(site_overrides_json='[{"match": "websiteclosers.com"}]')
-        svc = generic_service(settings, jobs)
-        svc.start([WC])
-        svc.start([WC, DEALONOMY])
-        assert len(calls) == 1
-        settings.update(site_overrides_json="")
-        svc.start([WC])
-        assert len(calls) == 2
-        await _drain(svc)
 
     def test_a_generic_sweep_is_labelled_by_its_site(self):
         one = SweepTask(id="g1", source="generic", urls=[WC])
@@ -1807,7 +1774,7 @@ class TestPreflight:
                               "whole.", False),
         ("TypeSafeCreditError", "The key works, but the OpenRouter account is out of credits "
                                 "(HTTP 402).", False),
-        ("TypeSafeUnavailable", "The TypeSafe Classifier could not answer; try again in a "
+        ("TypeSafeUnavailable", "The Decision API could not answer; try again in a "
                                 "few minutes.", True),
     ])
     async def test_a_failed_check_refuses_a_call_that_is_all_generic(
@@ -1841,7 +1808,7 @@ class TestPreflight:
         result = svc.result(job.id)
         assert result.status == "completed"
         assert "1 of 2 source(s) failed" in result.error
-        assert "www.websiteclosers.com (needs the TypeSafe Classifier (e.g. Jev)" in result.error
+        assert "www.websiteclosers.com (needs the Decision API" in result.error
         assert "OpenRouter rejected the key (HTTP 401)." in result.error
         assert job.decisions[1]["adapter"] is None
 
@@ -1987,8 +1954,8 @@ from app.stores.base import DedupeIndex, TriageTarget, TriageUnavailable  # noqa
 from app.services.typesafe import TYPESAFE_PARALLEL, Noul  # noqa: E402
 
 PROMPT = "Reject restaurants.\nReject if the asking price is below $1M."
-OUTAGE = "The TypeSafe Classifier did not answer after 4 attempts (HTTP 503)."
-REFUSED = "The TypeSafe Classifier refused this request (HTTP 400: state too large)."
+OUTAGE = "The Decision API did not answer after 4 attempts (HTTP 503)."
+REFUSED = "The Decision API refused this request (HTTP 400: state too large)."
 
 
 def _tl(n: int, title: str) -> Listing:
@@ -2200,7 +2167,7 @@ class Rig:
         if notion:
             settings.update(notion_api_token="ntn_x", notion_db_id="db-1")
         if key:
-            settings.update(typesafe_openrouter_api_key="sk-or-test")
+            settings.update(openrouter_api_key="sk-or-test")
         self.events: list[tuple] = []
         self.jobs = jobs
         self.listings = listings
@@ -2786,7 +2753,7 @@ class TestPerCallLimits:
         """A per-sweep limit is per sweep: two running at once with
         classifier_parallel=2 each have four requests in flight — two of each,
         and no more — rather than sharing one gate of two."""
-        settings.update(typesafe_openrouter_api_key="sk-or-test")
+        settings.update(openrouter_api_key="sk-or-test")
         held = _HeldClassifier()
         svc = ScrapeService(instances=None, jobs=jobs, settings=settings, typesafe=held)
         _cards_by_url(svc, {SERP: [_tl(i, f"A {i}") for i in range(1, 11)],
@@ -2831,7 +2798,7 @@ class TestPerCallLimits:
                 "model": "typesafe/jev-test",
                 "answers": {"eligible": {"type": "noul", "noul": 0.95}}})
 
-        settings.update(typesafe_openrouter_api_key="sk-or-test")
+        settings.update(openrouter_api_key="sk-or-test")
         client = TypeSafeClient(lambda: "sk-or-test", lambda: "jev-latest")
         svc = ScrapeService(instances=None, jobs=jobs, settings=settings, typesafe=client)
         _cards_by_url(svc, {SERP: [_tl(i, f"A {i}") for i in range(1, 31)],
@@ -3064,14 +3031,14 @@ class TestTriageRefusals:
         rig = Rig(settings, jobs, [_tl(1, "x")], key=False)
         exc = await self._refused(rig)
         assert "no OpenRouter key is saved" in str(exc)
-        assert "Add one under Settings → TypeSafe Classifier (e.g. Jev)" in str(exc)
+        assert "Add one under Settings → Decision API" in str(exc)
         assert rig.classifier.checks == 0
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("error,transient", [
         (TypeSafeAuthError("OpenRouter rejected the key (HTTP 401)."), False),
         (TypeSafeCreditError("The OpenRouter account is out of credits (HTTP 402)."), False),
-        (TypeSafeUnavailable("The TypeSafe Classifier could not answer."), True),
+        (TypeSafeUnavailable("The Decision API could not answer."), True),
     ])
     async def test_a_key_that_fails_its_check_even_for_bizbuysell_only(
         self, settings, jobs, error, transient,

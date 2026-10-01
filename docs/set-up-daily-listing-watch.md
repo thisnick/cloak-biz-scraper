@@ -41,7 +41,7 @@ flowchart LR
 ```
 
 > **Who decides:** the scraper does, with the
-> [TypeSafe Classifier (e.g. Jev)](advanced-controls.md#typesafe-classifier-eg-jev), when
+> [Decision API](advanced-controls.md#decision-api), when
 > `scrape_listings` is given your criteria as `triage_prompt`. It records the decision on
 > the row and appends each REVIEW listing's detail page to it as a Source Content section.
 > The scheduled AI only starts the sweeps, waits for them, and reports. See
@@ -55,8 +55,8 @@ This workflow builds on a working Cloak Biz Scraper connection.
 2. Run its harmless connection test. Do not continue until your agent can call
    `server_info`, `create_instance`, and `agent_browser`, and the server reports a
    verified Pro browser and working residential proxy.
-3. Save a [TypeSafe Classifier (e.g. Jev)](advanced-controls.md#typesafe-classifier-eg-jev)
-   key under **Settings → TypeSafe Classifier (e.g. Jev)**. Triage needs it; a sweep asked
+3. Save a [Decision API](advanced-controls.md#decision-api)
+   key under **Settings → Decision API**. Triage needs it; a sweep asked
    to triage without a working key is refused before it starts.
 4. Create or choose a [Notion](https://www.notion.com/) workspace where you can create an
    internal integration and databases.
@@ -179,7 +179,7 @@ The existing setup looks like this. Each row is one reusable search, and `Active
 The built-in sweep reads BizBuySell search-results pages and BizBuySell broker profile
 pages with its own adapter. Listings pages on other sites — a broker's own site, or a
 marketplace such as WebsiteClosers or Dealonomy — can be seeds too once a
-[TypeSafe Classifier (e.g. Jev) key](advanced-controls.md#typesafe-classifier-eg-jev) is
+[Decision API key](advanced-controls.md#decision-api) is
 saved in Settings; without one, those seeds fail with a message pointing there. A seed must
 be a page that lists many businesses: a single listing's page fails with "found no list of
 businesses for sale" (on BizBuySell it is refused outright).

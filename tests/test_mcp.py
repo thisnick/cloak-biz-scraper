@@ -157,7 +157,7 @@ class TestStateless:
             "scrape_listings"]["description"]
         assert "BizBuySell only" not in description
         assert "read natively" in description
-        assert "TypeSafe Classifier (e.g. Jev)" in description
+        assert "Decision API" in description
         flat = " ".join(description.split())
         assert "found no list of businesses for sale" in flat
         assert "read as business listings currently for sale" in flat
@@ -165,7 +165,7 @@ class TestStateless:
         assert "BizBuySell's cards are always kept" in flat
         assert "The same on a LATER page stops that URL's paging there: the pages before it " \
                "are kept and returned" in flat
-        assert "site override" in description and "Settings" in description
+        assert "the fix is in the server's code" in flat
         assert "archive_page" in description
 
     def test_the_sweep_describes_triage(self, client):
@@ -176,7 +176,7 @@ class TestStateless:
         description = " ".join(tool["description"].split())
         assert "triage_prompt" in description
         assert "Needs sync=true" in description
-        assert "TypeSafe Classifier (e.g. Jev)" in description
+        assert "Decision API" in description
         for column in ("Bot Triage", "Triage Reason", "Triaged At", "Criteria Version"):
             assert column in description
         assert "never re-triaged" in description
@@ -214,7 +214,7 @@ class TestStateless:
         description = " ".join({t["name"]: t for t in rpc(client, "tools/list").json()[
             "result"]["tools"]}["archive_page"]["description"].split())
         assert "already has a Source Content section gets nothing appended" in description
-        assert "TypeSafe Classifier (e.g. Jev)" in description
+        assert "Decision API" in description
         assert "login wall, error, removed listing or anti-bot page is not written" in description
 
     def test_money_is_advertised_as_a_string_not_a_number(self, client):
@@ -426,7 +426,7 @@ class TestSweepRefusalsReachBothDoors:
     def test_a_rejected_key_is_the_tool_s_answer_and_a_409(self, client, keyed, monkeypatch):
         from app.services.typesafe import TypeSafeAuthError
 
-        keyed.update(typesafe_openrouter_api_key="sk-or-test")
+        keyed.update(openrouter_api_key="sk-or-test")
         self._check_fails(monkeypatch, TypeSafeAuthError("OpenRouter rejected the key (HTTP 401)."))
         result = self._mcp_call(client, [self.WC])
         assert result["isError"] is True
@@ -439,21 +439,21 @@ class TestSweepRefusalsReachBothDoors:
     def test_an_outage_is_a_503_over_rest(self, client, keyed, monkeypatch):
         from app.services.typesafe import TypeSafeUnavailable
 
-        keyed.update(typesafe_openrouter_api_key="sk-or-test")
-        self._check_fails(monkeypatch, TypeSafeUnavailable("The TypeSafe Classifier could not answer."))
+        keyed.update(openrouter_api_key="sk-or-test")
+        self._check_fails(monkeypatch, TypeSafeUnavailable("The Decision API could not answer."))
         r = client.post("/api/scrape", json={"urls": [self.WC]})
         assert r.status_code == 503 and "could not answer" in r.json()["detail"]
         assert "could not answer" in self._mcp_call(client, [self.WC])["content"][0]["text"]
 
     def test_without_a_key_both_say_where_it_goes(self, client, keyed):
-        hint = "add an OpenRouter key under Settings → TypeSafe Classifier (e.g. Jev)"
+        hint = "add an OpenRouter key under Settings → Decision API"
         result = self._mcp_call(client, [self.WC])
         assert result["isError"] is True and hint in result["content"][0]["text"]
         r = client.post("/api/scrape", json={"urls": [self.WC]})
         assert r.status_code == 422 and hint in r.json()["detail"]
 
     def test_a_bizbuysell_listing_page_is_refused_even_with_a_key(self, client, keyed):
-        keyed.update(typesafe_openrouter_api_key="sk-or-test")
+        keyed.update(openrouter_api_key="sk-or-test")
         detail = "https://www.bizbuysell.com/business-opportunity/premier-restoration/2515728/"
         text = self._mcp_call(client, [detail])["content"][0]["text"]
         assert "bizbuysell.com is read by this app's own adapter" in text
@@ -532,7 +532,7 @@ class TestTriageRefusalsReachBothDoors:
 
         settings = SettingsService(tmp_path / "settings.json", tmp_path / ".dek")
         settings.update(notion_api_token="ntn_test", notion_db_id="db-test",
-                        typesafe_openrouter_api_key="sk-or-test")
+                        openrouter_api_key="sk-or-test")
         monkeypatch.setattr(app.state.scrape, "_settings", settings)
         return settings
 
@@ -581,7 +581,7 @@ class TestTriageRefusalsReachBothDoors:
         assert all("triage_plan" not in kw and not kw.get("triage_prompt") for kw in started)
 
     def test_no_key(self, client, configured):
-        configured.update(typesafe_openrouter_api_key="")
+        configured.update(openrouter_api_key="")
         text, rest = self._both(client, {"urls": [SERP], "sync": True,
                                          "triage_prompt": "Reject restaurants."})
         assert "no OpenRouter key is saved" in text
@@ -599,7 +599,7 @@ class TestTriageRefusalsReachBothDoors:
     def test_an_outage_is_a_503_over_rest(self, client, configured, monkeypatch):
         from app.services.typesafe import TypeSafeUnavailable
 
-        self._check(monkeypatch, TypeSafeUnavailable("The TypeSafe Classifier could not answer."))
+        self._check(monkeypatch, TypeSafeUnavailable("The Decision API could not answer."))
         text, rest = self._both(client, {"urls": [SERP], "sync": True,
                                          "triage_prompt": "Reject restaurants."})
         assert "could not answer" in text

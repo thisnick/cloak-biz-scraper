@@ -167,8 +167,8 @@ async def lifespan(app: FastAPI):
     # a key saved in Settings applies to the next question without a restart,
     # and a swapped settings store (tests) is never left behind.
     app.state.typesafe = TypeSafeClient(
-        key_getter=lambda: app.state.settings.load().typesafe_openrouter_api_key,
-        model_getter=lambda: app.state.settings.load().typesafe_model,
+        key_getter=lambda: app.state.settings.load().openrouter_api_key,
+        model_getter=lambda: app.state.settings.load().decision_api_model,
     )
     # The same job store the sweeps use: one Tasks list, one retention policy,
     # one place a run's evidence is reachable from. The classifier goes in for
@@ -193,13 +193,13 @@ async def lifespan(app: FastAPI):
     # watches, and the activity/files it hears from agent_browser.
     app.state.live_view = LiveViewService(app.state.instances, app.state.agent_browser)
     logger.info(
-        "ready: secret=%s license=%s proxy=%s notion=%s typesafe=%s pool max=%d reserve=%d "
+        "ready: secret=%s license=%s proxy=%s notion=%s decision_api=%s pool max=%d reserve=%d "
         "jobs=%d interrupted=%d oauth_clients=%d",
         "set" if secret else "MISSING",
         "pro-key-saved" if settings.cloakbrowser_license_key else "public",
         settings.proxy_status(),
         "set" if settings.notion_configured() else "MISSING",
-        settings.typesafe_status(),
+        settings.decision_api_status(),
         settings.max_instances,
         settings.interactive_reserve,
         len(jobs.all()),
