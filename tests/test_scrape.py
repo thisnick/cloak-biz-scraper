@@ -1033,20 +1033,53 @@ class TestPagingHooks:
         assert source.reads == 1
 
     @pytest.mark.asyncio
-    async def test_the_page_limit_of_a_longer_list_is_said(self, settings, jobs, tmp_path):
-        """FCBB's list runs past page 20; a limit of 6 read 6 and said nothing."""
+    async def test_the_page_limit_of_a_longer_list_is_noted_not_an_error(
+        self, settings, jobs, tmp_path,
+    ):
+        """FCBB's list runs past page 20; its first 6 pages are the ones wanted."""
         source = _ScriptedSource([CardPage([_gen(1)]), CardPage([_gen(2)]), CardPage([_gen(3)])],
                                  advance_to="https://example.com/x")
         source.has_next_page = lambda: True
         svc = ScrapeService(instances=None, jobs=jobs, settings=settings)
         res, _, _ = await _once(svc, _job(jobs, max_pages=2), source, tmp_path)
 
-        assert res["error"] is None
-        assert res["warning"] == (
-            "read 2 page(s), the most this call asked for (max_pages=2), and the site has "
-            "more — the listings on them were not read")
+        assert res["error"] is None and "warning" not in res
+        assert res["more_pages"] is True
         assert len(res["data"]["listings"]) == 2
         assert _meta(tmp_path / "ev" / "final")["reason"] == "page limit"
+
+    @pytest.mark.asyncio
+    async def test_a_sweep_names_the_urls_not_fully_crawled(self, settings, jobs, monkeypatch):
+        source = _ScriptedSource([CardPage([_gen(1)]), CardPage([_gen(2)]), CardPage([_gen(3)])],
+                                 advance_to="https://example.com/x")
+        source.has_next_page = lambda: True
+        monkeypatch.setattr("app.sources.for_url", lambda url: source)
+        svc = ScrapeService(instances=_FakeInstances(), jobs=jobs, settings=settings,
+                            task_profiles=_Pool())
+        job = svc.start([LIST], max_pages=2)
+        await _drain(svc)
+
+        result = svc.result(job.id)
+        assert result.status == "completed" and result.error is None
+        assert result.not_fully_crawled == [LIST]
+        host = LIST.split("/")[2]
+        assert f"not fully crawled (more pages than max_pages=2): {host}" in result.summary
+        assert "stopped early" not in result.summary
+        assert svc._jobs.get(job.id).decisions[0]["not_fully_crawled"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_list_read_to_its_end_is_not_named(self, settings, jobs, monkeypatch):
+        source = _ScriptedSource([CardPage([_gen(1)]), CardPage([_gen(2)])],
+                                 advance_to="https://example.com/x")
+        source.has_next_page = lambda: False
+        monkeypatch.setattr("app.sources.for_url", lambda url: source)
+        svc = ScrapeService(instances=_FakeInstances(), jobs=jobs, settings=settings,
+                            task_profiles=_Pool())
+        job = svc.start([LIST], max_pages=2)
+        await _drain(svc)
+
+        result = svc.result(job.id)
+        assert result.not_fully_crawled == [] and "not fully crawled" not in result.summary
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("more", [False, None])
@@ -1059,7 +1092,7 @@ class TestPagingHooks:
             source.has_next_page = lambda: more
         svc = ScrapeService(instances=None, jobs=jobs, settings=settings)
         res, _, _ = await _once(svc, _job(jobs, max_pages=2), source, tmp_path)
-        assert res["error"] is None and "warning" not in res
+        assert res["error"] is None and "warning" not in res and "more_pages" not in res
 
     @pytest.mark.asyncio
     async def test_a_list_that_ended_before_the_limit_is_silent(self, settings, jobs, tmp_path):
@@ -1069,7 +1102,7 @@ class TestPagingHooks:
         source.has_next_page = lambda: True
         svc = ScrapeService(instances=None, jobs=jobs, settings=settings)
         res, _, _ = await _once(svc, _job(jobs, max_pages=3), source, tmp_path)
-        assert res["error"] is None and "warning" not in res
+        assert res["error"] is None and "warning" not in res and "more_pages" not in res
         assert source.reads == 2
 
     @pytest.mark.asyncio

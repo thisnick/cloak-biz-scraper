@@ -685,6 +685,8 @@ class ScrapeService:
             )
             listings, pages, ok, failures, warnings = self._merge(targets, outcomes)
             job.decisions = self._decisions(targets, outcomes)
+            job.not_fully_crawled = [t.url for t, res in zip(targets, outcomes)
+                                     if res.get("more_pages")]
             job.listings = listings
             job.pages_crawled = pages
             if ok == 0:
@@ -885,6 +887,8 @@ class ScrapeService:
                 entry["error"] = error
             elif res.get("warning"):
                 entry["warning"] = res["warning"]
+            if res.get("more_pages"):
+                entry["not_fully_crawled"] = True
             entries.append(entry)
         return entries
 
@@ -922,6 +926,10 @@ class ScrapeService:
         # whole find, not only the new ones.
         pages = f"{job.pages_crawled} page{'s' if job.pages_crawled != 1 else ''}"
         parts = [f"{ok} of {total} source(s) swept · {found} listing(s) across {pages}"]
+        if job.not_fully_crawled:
+            hosts = ", ".join(urlparse(u).hostname or u for u in job.not_fully_crawled)
+            parts.append(f"not fully crawled (more pages than max_pages={job.max_pages}): "
+                         f"{hosts}")
         if left_out:
             # Cards left out one by one: judged not a business for sale now (a
             # sold tile, a menu link read as a card, an ad in the list) on the
@@ -1223,20 +1231,19 @@ class ScrapeService:
                 break
         else:
             # Every page the call allowed was read. A source that can tell
-            # whether the last one led further says so: the listings past the
-            # limit were never seen, and "read 6 pages" is not "read them all"
-            # (FCBB's list runs past page 20 behind a limit of 6).
+            # whether the last one led further says so — not as an error (the
+            # call asked for that many pages; FCBB's list runs past page 20 and
+            # its first 6 are the ones wanted), but so the result never reads
+            # as the whole list.
             more = getattr(source, "has_next_page", None)
             if more is not None and more():
-                warning = (f"read {pages_done} page(s), the most this call asked for "
-                           f"(max_pages={job.max_pages}), and the site has more — the "
-                           f"listings on them were not read")
                 await capture(page, evidence / "final",
                               {"url": url, "page_url": page.url, "reason": "page limit",
                                "found": len(listings), "pages_crawled": pages_done,
                                "legibility": checks, "proxy_ip": inst.proxy_ip})
-                logger.warning("job %s: %s %s", job.id, url, warning)
-                return {"blocked": False, "error": None, "warning": warning, "data": data()}
+                logger.info("job %s: %s has more pages than max_pages=%d", job.id, url,
+                            job.max_pages)
+                return {"blocked": False, "error": None, "more_pages": True, "data": data()}
 
         await capture(page, evidence / "final",
                       {"url": url, "page_url": page.url, "reason": "success",
