@@ -365,15 +365,25 @@ class TestWhatTheAnswersDo:
         assert result.record["not_eligible"] == 2 and result.record["dropped"] == 0
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("drop", [True, False])
-    async def test_a_page_where_fewer_than_half_are_for_sale_fails(self, drop):
-        cards = _page(2, "Login", "Sell", "FAQ", "Bakery")
+    @pytest.mark.parametrize("drop, n", [(True, 1), (False, 1), (False, 2)])
+    async def test_a_page_where_fewer_than_half_are_for_sale_fails(self, drop, n):
+        cards = _page(n, "Login", "Sell", "FAQ", "Bakery")
         fake = FakeClassifier({"Login": 0.1, "Sell": 0.2, "FAQ": 0.3})
-        result = await ListingCheck(fake).page(cards, page=2, drop=drop)
+        result = await ListingCheck(fake).page(cards, page=n, drop=drop)
         assert not result.ok and result.listings == []
         assert result.reason == (
-            "Only 1 of 4 cards on page 2 read as business listings currently for sale (at "
+            f"Only 1 of 4 cards on page {n} read as business listings currently for sale (at "
             "least half should) — nothing from this page was kept.")
+
+    @pytest.mark.asyncio
+    async def test_a_later_page_of_a_chosen_list_keeps_its_cards_for_sale(self):
+        """Read with the first page's card shape, it is that list: mostly sold
+        (Dealonomy's page 2) is listings no longer for sale, not a wrong list."""
+        cards = _page(2, "Sold A", "Sold B", "Sold C", "Bakery")
+        fake = FakeClassifier({"Sold A": 0.1, "Sold B": 0.1, "Sold C": 0.1})
+        result = await ListingCheck(fake).page(cards, page=2, drop=True)
+        assert result.ok and [c.title for c in result.listings] == ["Bakery"]
+        assert result.record["not_eligible"] == 3 and result.record["dropped"] == 3
 
     @pytest.mark.asyncio
     async def test_exactly_half_is_enough(self):

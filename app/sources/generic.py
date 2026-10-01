@@ -69,7 +69,7 @@ from ..services import extract
 from ..services.blocker import text_contains_blocker
 from ..services.typesafe import Choice, Noul, TypeSafeError, TypeSafeNotConfigured
 from . import GENERIC_LABEL, GENERIC_NAME
-from .base import CardPage
+from .base import CardPage, PageNotReached
 from .overrides import MONEY_ROLES, ROLES, SiteOverride
 from .urls import listing_url, normalize_url
 
@@ -132,13 +132,19 @@ _JS_SCROLL_TOP = "() => window.scrollTo(0, 0)"
 # sweep.
 PROBE_TIMEOUT_S = 30.0
 # After a next-page click, how long to wait for the page to show something new
-# (more links, a taller document, another address) before reading it anyway.
+# (more links, a taller document, another address, different links) before
+# clicking once more, and then before reading it anyway.
 CLICK_SETTLE_S = 10.0
 CLICK_POLL_MS = 250
+# The links' count, the document's height, the address, and a hash of every
+# link's address: a pager that swaps ten cards for ten others in place changes
+# none of the first three.
 _JS_PAGE_SIZE = (
-    "() => [document.querySelectorAll('a[href]').length, Math.max("
+    "() => { let h = 0; for (const a of document.querySelectorAll('a[href]')) {"
+    " const s = a.href; for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0; }"
+    " return [document.querySelectorAll('a[href]').length, Math.max("
     "document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0), "
-    "location.href]"
+    "location.href, h]; }"
 )
 
 _GROUP_EXAMPLE_CHARS = 260
@@ -922,6 +928,11 @@ class GenericSource:
         self.decisions: list[dict[str, Any]] = []
         self._page = 1
         self._next: _Next | None = None
+        # The control clicked to reach the page being read (None when it was
+        # reached by its address), and the listings the page before showed:
+        # a click the site ignored leaves the same listings in front of us.
+        self._clicked: str | None = None
+        self._last_urls: frozenset[str] = frozenset()
         # Reused by the later pages of this attempt, never kept past it.
         self._decided: _Decided | None = None
         self._known_fields: dict[str, dict[str, Any]] = {}
@@ -932,6 +943,8 @@ class GenericSource:
         """Forget the last attempt: back to page 1, nothing decided."""
         self._page = 1
         self._next = None
+        self._clicked = None
+        self._last_urls = frozenset()
         self.decisions = []
         self._forget()
 
@@ -950,26 +963,51 @@ class GenericSource:
         """Page 1 is the URL as given; later pages are reached by `advance`."""
         return url
 
+    def has_next_page(self) -> bool:
+        """Whether the page just read showed a way to the next one."""
+        return self._next is not None
+
     async def advance(self, page, n: int) -> bool:
-        """Go to page `n` the way the previous page said to: a URL, or a click."""
+        """Go to page `n` the way the previous page said to: a URL, or a click.
+
+        False when the previous page showed no next page. A control that was
+        there and cannot be clicked raises PageNotReached: the pages after it
+        exist and were not read, and the sweep has to say so.
+        """
         step, self._next = self._next, None
+        self._clicked = None
         if step is None:
             return False
         if step.kind == "goto":
             await page.goto(step.target, wait_until="domcontentloaded", timeout=120_000)
         else:
+            control = ", ".join(step.appears_as) or step.target
             before = await _page_size(page)
             how = await self._click(page, n, step)
             record = self.decisions[-1].get("next_page") if self.decisions else None
             if isinstance(record, dict):
                 record["clicked_by"] = how or "nothing"
             if how is None:
-                return False
-            try:
-                await page.wait_for_load_state("domcontentloaded", timeout=30_000)
-            except Exception:  # noqa: BLE001 — a click that loads in place never fires it
-                pass
-            await _settle(page, before, self.url)
+                raise PageNotReached(
+                    f"the next-page control on page {n - 1} ({control}) could not be clicked")
+            await _loaded(page)
+            if not await _settle(page, before, self.url):
+                # A click the page ignored. FCBB's "4" once did nothing for the
+                # whole wait; page 3 was read again, looked like the end, and
+                # pages 4-6 were never read. Once more, but only by the mark:
+                # it is on the element the probe saw, so while it is there the
+                # page has not been redrawn — a "Next" found again by its
+                # selector on a page that did move would skip one.
+                again = None
+                if step.target.startswith("[data-cbs-next=") and await _unchanged(page, before):
+                    again = "mark" if await _try_click(page, step.target, self.url) else None
+                if isinstance(record, dict):
+                    record["clicked_again_by"] = again or "nothing"
+                if again is not None:
+                    logger.info("generic: clicked the next-page control on %s again", self.url)
+                    await _loaded(page)
+                    await _settle(page, before, self.url)
+            self._clicked = control
         self._page = n
         return True
 
@@ -1016,6 +1054,7 @@ class GenericSource:
     async def cards(self, page) -> CardPage:
         n = self._page
         self._next = None
+        clicked, self._clicked = self._clicked, None
         record: dict[str, Any] = {"page": n, "url": getattr(page, "url", "") or self.url}
         self.decisions.append(record)
 
@@ -1047,7 +1086,7 @@ class GenericSource:
             record["blocked"] = True
             return CardPage(listings=[], blocked=True, title=title)
         try:
-            return await self._read(probe, n, title, record)
+            return await self._read(probe, n, title, record, clicked)
         except TypeSafeError as exc:
             record["error"] = str(exc)
             return CardPage(
@@ -1064,7 +1103,8 @@ class GenericSource:
             )
         return await self._classifier.ask(state, questions)
 
-    async def _read(self, probe: dict, n: int, title: str, record: dict) -> CardPage:
+    async def _read(self, probe: dict, n: int, title: str, record: dict,
+                    clicked: str | None = None) -> CardPage:
         groups = [g for g in probe.get("groups") or [] if isinstance(g, dict)]
         chosen = await self._choose_groups(groups, n, title, record)
         if not chosen:
@@ -1078,6 +1118,16 @@ class GenericSource:
             return CardPage(listings=[], title=title, error=message, retry=False)
 
         cards = _cards_of(chosen)
+        urls = frozenset(c.url for c in cards)
+        if clicked and urls and urls == self._last_urls:
+            # The click did not take: this is the page before, read again.
+            # Taken for the end of the list it would end paging with nothing
+            # said, and every page after it would go unread.
+            message = (f"Page {n} showed the same {len(urls)} listings as page {n - 1}: "
+                       f"clicking the next-page control ({clicked}) did not change the page.")
+            record["error"] = message
+            return CardPage(listings=[], title=title, error=message, retry=False)
+        self._last_urls = urls
         listing_hrefs = {c.href for c in cards} | {c.url for c in cards}
         fields_task = self._decide_fields(cards, title, record)
         next_task = self._decide_next(probe, n, title, listing_hrefs, record)
@@ -1540,17 +1590,46 @@ async def _try_click(page, selector: str, url: str, *, exactly_one: bool = False
 
 
 async def _page_size(page) -> list | None:
-    """(links on the page, document height, address) — None when it cannot be read."""
+    """(links on the page, document height, address, a hash of the links) —
+    None when it cannot be read."""
     try:
         size = await page.evaluate(_JS_PAGE_SIZE)
     except Exception:  # noqa: BLE001 — then there is nothing to wait on
         return None
-    return size if isinstance(size, list) and len(size) == 3 else None
+    return size if isinstance(size, list) and len(size) >= 3 else None
+
+
+def _moved(before: list, now: Any) -> bool:
+    """Whether the page shows more, or other, than it did at `before`."""
+    if not (isinstance(now, list) and len(now) >= 3):
+        return False
+    return (now[0] > before[0] or now[1] > before[1] or now[2] != before[2]
+            or (len(now) > 3 and len(before) > 3 and now[3] != before[3]))
+
+
+async def _unchanged(page, before: list | None) -> bool:
+    """True only when the page can be measured and shows what it did at `before`."""
+    if before is None:
+        return False
+    try:
+        now = await page.evaluate(_JS_PAGE_SIZE)
+    except Exception:  # noqa: BLE001 — navigating: the page is not the one measured
+        return False
+    return isinstance(now, list) and len(now) >= 3 and not _moved(before, now)
+
+
+async def _loaded(page) -> None:
+    """Wait for a navigation a click started; one that loads in place never fires it."""
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=30_000)
+    except Exception:  # noqa: BLE001 — a click that loads in place never fires it
+        pass
 
 
 async def _settle(page, before: list | None, url: str) -> bool:
     """After a click, wait (at most CLICK_SETTLE_S) for the page to show more:
-    more links, a taller document, or another address. True when it did.
+    more links, a taller document, another address or other links. True when
+    it did.
 
     A "Load more" fetches its cards after the click returns; reading the page
     before they arrive would find only the cards already seen, which ends
@@ -1565,8 +1644,7 @@ async def _settle(page, before: list | None, url: str) -> bool:
             now = await page.evaluate(_JS_PAGE_SIZE)
         except Exception:  # noqa: BLE001 — the click navigated: the page is new
             return True
-        if isinstance(now, list) and len(now) == 3 and (
-                now[0] > before[0] or now[1] > before[1] or now[2] != before[2]):
+        if _moved(before, now):
             return True
     logger.info("generic: nothing new appeared on %s within %.0f s of the next-page click",
                 url, CLICK_SETTLE_S)

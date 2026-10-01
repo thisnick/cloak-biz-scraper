@@ -222,6 +222,8 @@ class SweepTask(TaskBase):
     # only), and `error` when the source failed. For a person diagnosing a run
     # (/runs/{id}); deliberately not in ScrapeResult, which an agent polls.
     decisions: list[dict] = Field(default_factory=list)
+    # The swept URLs whose list went on past max_pages (see ScrapeResult).
+    not_fully_crawled: list[str] = Field(default_factory=list)
     # Set when the sweep was given a triage prompt (None otherwise), from the
     # moment the job is written, so a record interrupted mid-run still says
     # triage was asked for (JobStore.adopt words its message on that).
@@ -284,6 +286,14 @@ class ScrapeResult(BaseModel):
     synced: SyncResult | None = None
     listings: list[Listing] = Field(default_factory=list)
     triage: TriageSummary | None = None
+    # Not an error: the call asked for that many pages. Said so that "read the
+    # first 6 pages" is never reported as "read the site".
+    not_fully_crawled: list[str] = Field(
+        default_factory=list,
+        description="The swept URLs whose list has more pages than max_pages: their first "
+        "max_pages pages were read and the rest were not. Only sites other than BizBuySell "
+        "can tell; empty when every list ended within max_pages.",
+    )
     # Where this sweep's screenshots and page snapshots were written. A sweep
     # that finds nothing is the failure users hit first, and "it didn't work and
     # you can't see why" is where they give up: the pictures of the blocked page
@@ -303,6 +313,7 @@ class ScrapeResult(BaseModel):
             synced=job.synced,
             listings=job.listings,
             triage=job.triage,
+            not_fully_crawled=job.not_fully_crawled,
             evidence_dir=str(CONFIG.evidence_dir / job.id),
         )
 
