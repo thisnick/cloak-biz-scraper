@@ -80,6 +80,20 @@ that should not be placed in an AI prompt:
 5. Select **Release control** when finished.
 6. Tell the agent what changed and ask it to take a fresh `snapshot -i` before continuing.
 
+### Copy and paste
+
+While you have control, the clipboard works in both directions:
+
+- **Into the browser:** copy text on your computer, click into the live view, and press
+  Ctrl+V (⌘V on a Mac).
+- **Out of the browser:** select text in the live view and press Ctrl+C (⌘C on a Mac). It
+  lands on your computer's clipboard. If your browser refuses that (Safari, or a dashboard
+  opened over plain `http://` on a LAN address), a **Copy from browser** button appears
+  above the view. Click it.
+
+On a Mac, ⌘ acts as Ctrl inside the remote browser, so ⌘A, ⌘F and ⌘L work too. Only text is
+copied, up to 1 MB per paste. A view-only browser has no clipboard.
+
 Example handoff prompt:
 
 ```text
