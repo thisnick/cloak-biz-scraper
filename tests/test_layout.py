@@ -468,6 +468,26 @@ class TestClipboard:
         # Ctrl is already held in the browser (noVNC sent it), so only V follows.
         assert page.evaluate("() => window.__keyLog") == [[0x76, "KeyV", None]]
 
+    def test_a_paste_reaches_the_browser_when_page_text_is_selected(self, measured):
+        """The live failure: text copied from this page stays selected, and the
+        browser aims its paste event at that selection, not at the live view, so
+        the clipboard never left. A real Ctrl+V here, not a synthetic event."""
+        page = measured["page"]
+        _take_control(page)
+        page.context.grant_permissions(["clipboard-read", "clipboard-write"], origin="https://dash.test")
+        # Through the prototype: another test swaps writeText for a fake.
+        page.evaluate("t => Clipboard.prototype.writeText.call(navigator.clipboard, t)", self.TEXT)
+        page.evaluate("""() => {
+          const r = document.createRange();
+          r.selectNodeContents(document.querySelector('[data-section=browsers] .page-h'));
+          getSelection().removeAllRanges(); getSelection().addRange(r);
+          document.querySelector('#browser-i1 .pane canvas').focus();
+        }""")
+        page.keyboard.press("Control+v")
+        page.wait_for_function("() => window.__keyLog.length > 0", timeout=5000)
+        assert page.evaluate("() => window.__pasteLog") == [_wire(self.TEXT)]
+        assert page.evaluate("() => window.__keyLog") == [[0x76, "KeyV", None]]
+
     def test_a_paste_with_no_shortcut_presses_ctrl_v_itself(self, measured):
         """A phone's paste menu on the Keyboard field: no key was held."""
         page = measured["page"]
