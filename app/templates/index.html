@@ -1370,32 +1370,46 @@
       if(IS_APPLE && cmdKeydown(pane, e)) return;
       if(!isPasteKey(e)) return;
       // Keep noVNC off this key but let the browser's own paste happen: the
-      // paste event below is how a page reads the clipboard without a prompt.
+      // paste event (caught on the document, below) is how a page reads the
+      // clipboard without a prompt.
       e.stopPropagation();
       var replay = e.key === 'Insert' ? {keysym: 0xFF63, code: 'Insert'} : {keysym: 0x76, code: 'KeyV'};
-      clearTimeout(pane._pasteTimer);
-      pane._pasteReplay = replay;
-      // No paste event (nothing textual on this computer's clipboard): press the
-      // key anyway, so the browser pastes whatever it copied itself.
-      pane._pasteTimer = setTimeout(function(){
-        pane._pasteReplay = null; deliverPaste(pane, '', replay);
-      }, 300);
+      if(pasting) clearTimeout(pasting.timer);
+      // No paste event: either nothing textual is on this computer's clipboard,
+      // or this browser fires none here. Ask for the clipboard where the browser
+      // allows it, and press the key either way, so at least the browser pastes
+      // whatever it copied itself.
+      pasting = {pane: pane, replay: replay, timer: setTimeout(function(){
+        pasting = null;
+        var read = navigator.clipboard && navigator.clipboard.readText
+          ? navigator.clipboard.readText() : Promise.reject();
+        read.then(function(text){ deliverPaste(pane, text, replay); },
+                  function(){ deliverPaste(pane, '', replay); });
+      }, 300)};
     }, true);
     pane.addEventListener('keyup', function(e){
       if(!IS_APPLE || !pane.classList.contains('controlling') || e.target.tagName !== 'CANVAS') return;
       if(e.code === 'MetaLeft' || e.code === 'MetaRight'){ e.stopPropagation(); e.preventDefault(); releaseCmd(pane); }
       else if(e.metaKey && !MODIFIERS[e.key]) e.stopPropagation();   // already sent as press-and-release
     }, true);
-    pane.addEventListener('paste', function(e){
-      if(!pane.classList.contains('controlling')) return;
-      e.preventDefault();
-      var replay = pane._pasteReplay;
-      pane._pasteReplay = null; clearTimeout(pane._pasteTimer);
-      deliverPaste(pane, e.clipboardData ? e.clipboardData.getData('text/plain') : '', replay);
-    });
     pane.addEventListener('focusout', function(){ releaseCmd(pane); });
   }
   document.querySelectorAll('.pane[data-instance]').forEach(wireClipboard);
+  // The paste event goes to the page's text selection when there is one, not to
+  // the focused live view: text copied from this page stays selected, and noVNC
+  // keeps a click on the pane from clearing it. So it is caught for the whole
+  // document and routed to the pane whose shortcut started it, or else the pane
+  // holding focus (a phone's paste menu on the Keyboard field).
+  var pasting = null;   // {pane, replay, timer} between a paste shortcut and its event
+  document.addEventListener('paste', function(e){
+    var pane = pasting ? pasting.pane
+      : (document.activeElement && document.activeElement.closest('.pane[data-instance]'));
+    if(!pane || !pane.classList.contains('controlling')) return;
+    e.preventDefault();
+    var replay = pasting ? pasting.replay : null;
+    if(pasting){ clearTimeout(pasting.timer); pasting = null; }
+    deliverPaste(pane, e.clipboardData ? e.clipboardData.getData('text/plain') : '', replay);
+  }, true);
   window.addEventListener('blur', function(){
     document.querySelectorAll('.pane[data-instance]').forEach(releaseCmd);
   });
