@@ -222,6 +222,100 @@ class TestTaskBrowsersAreWatchableButNotTouchable:
         assert out == update_request, "the message after a dropped one must survive intact"
 
 
+def cut_text(payload: bytes) -> bytes:
+    return struct.pack(">BxxxI", 6, len(payload)) + payload
+
+
+def kasm_server_clipboard(*items: tuple[bytes, bytes]) -> bytes:
+    out = struct.pack(">BB", 180, len(items))
+    for clip_id, (mime, data) in enumerate(items):
+        out += struct.pack(">IB", clip_id, len(mime)) + mime + struct.pack(">I", len(data)) + data
+    return out
+
+
+def frames(data: bytes, size: int) -> list[bytes]:
+    return [data[i:i + size] for i in range(0, len(data), size)]
+
+
+class TestClipboardCrossesTheProxy:
+    """Copy and paste between the dashboard pane and the browser.
+
+    KasmVNC 1.3.3 takes only its own BinaryClipboard (180) and noVNC speaks
+    standard cut text, so the proxy translates both ways — as UTF-8, because the
+    ’, — and 中 on a listing page do not survive the standard's Latin-1.
+    """
+
+    TEXT = "Owner’s cash flow — 中文 ✓"
+    UPDATE = struct.pack(">BBHHHH", 3, 0, 0, 0, 800, 600)
+
+    def test_a_paste_reaches_kasmvnc_as_its_own_clipboard_message(self):
+        out = rfb.filter_client_messages(cut_text(self.TEXT.encode()), view_only=False)
+        assert out == rfb.build_kasmvnc_clipboard(self.TEXT)
+        assert out[:13] == b"\xb4\x01\x0atext/plain"
+
+    def test_a_viewer_cannot_paste(self):
+        out = rfb.filter_client_messages(cut_text(b"hi") + self.UPDATE, view_only=True)
+        assert out == self.UPDATE
+
+    def test_a_latin1_paste_from_a_standard_client_is_kept_readable(self):
+        out = rfb.filter_client_messages(cut_text("café".encode("latin-1")), view_only=False)
+        assert out == rfb.build_kasmvnc_clipboard("café")
+
+    def test_a_paste_split_across_frames_arrives_whole(self):
+        """noVNC flushes every 10 KiB. Filtering frame by frame read the rest of a
+        long paste as fresh messages; here bytes that look like a KeyEvent sit
+        at the start of every frame, and none may come out as one."""
+        text = "\x04\x01" + "x" * 10238
+        msg = cut_text((text * 3).encode())
+        stream = rfb.ClientStream(view_only=False)
+        out = b"".join(stream.feed(f) for f in frames(msg, 10240))
+        assert out == rfb.build_kasmvnc_clipboard(text * 3)
+
+    def test_the_message_after_a_split_paste_survives(self):
+        stream = rfb.ClientStream(view_only=False)
+        msg = cut_text(b"y" * 15000) + self.UPDATE
+        out = b"".join(stream.feed(f) for f in frames(msg, 10240))
+        assert out == rfb.build_kasmvnc_clipboard("y" * 15000) + self.UPDATE
+
+    def test_a_split_paste_is_still_dropped_for_a_viewer(self):
+        stream = rfb.ClientStream(view_only=True)
+        msg = cut_text(b"\x04" * 25000) + self.UPDATE
+        out = b"".join(stream.feed(f) for f in frames(msg, 10240))
+        assert out == self.UPDATE
+
+    def test_an_oversized_paste_is_skipped_without_losing_sync(self):
+        stream = rfb.ClientStream(view_only=False)
+        msg = cut_text(b"z" * (rfb.MAX_CUT_TEXT + 1)) + self.UPDATE
+        out = b"".join(stream.feed(f) for f in frames(msg, 10240))
+        assert out == self.UPDATE
+
+    def test_a_copy_reaches_the_pane_as_utf8(self):
+        """Chromium's copy carries text/html too, and it can come first."""
+        msg = kasm_server_clipboard((b"text/html", b"<b>x</b>"), (b"text/plain", self.TEXT.encode()))
+        out = rfb.ServerClipboard().feed(msg)
+        assert out == [rfb.build_server_cut_text(self.TEXT)]
+        assert out[0][:1] == b"\x03" and out[0][8:].decode("utf-8") == self.TEXT
+
+    def test_a_copy_split_across_frames_is_held_until_whole(self):
+        """A 220 KB copy arrived in pieces; passing the later ones on made noVNC
+        drop the connection ("Unexpected server message")."""
+        text = "’" * 80_000
+        clip = rfb.ServerClipboard()
+        out = [o for f in frames(kasm_server_clipboard((b"text/plain", text.encode())), 65536)
+               for o in clip.feed(f)]
+        assert out == [rfb.build_server_cut_text(text)]
+
+    def test_what_follows_a_copy_in_its_frame_is_passed_on(self):
+        tail = b"\x00\x00\x00\x00"
+        out = rfb.ServerClipboard().feed(kasm_server_clipboard((b"text/plain", b"hi")) + tail)
+        assert out == [rfb.build_server_cut_text("hi"), tail]
+
+    def test_other_server_frames_pass_untouched(self):
+        clip = rfb.ServerClipboard()
+        update = b"\x00\x00\x00\x01" + b"\x07" * 40
+        assert clip.feed(update) == [update]
+
+
 class TestViewOnlyIsTheFloor:
     """Who is allowed to *drive* a browser over VNC, not just watch it.
 

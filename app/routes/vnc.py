@@ -109,6 +109,7 @@ async def _pump(ws: WebSocket, upstream, *, view_only: bool) -> None:
         # three exchanges, and it carries no input events — so it passes
         # untouched even for a view-only viewer.
         handshake = 0
+        stream = rfb.ClientStream(view_only=view_only)
         try:
             while True:
                 msg = await ws.receive()
@@ -121,24 +122,23 @@ async def _pump(ws: WebSocket, upstream, *, view_only: bool) -> None:
                 if handshake <= 3:
                     await upstream.send(data)
                     continue
-                filtered = rfb.filter_client_messages(data, view_only=view_only)
-                if filtered and filtered[0] in rfb.RFB_MSG_SIZE:
-                    await upstream.send(filtered)
+                filtered = stream.feed(data)
+                # In pieces no bigger than noVNC's own frames: KasmVNC closed the
+                # connection on a 260 KB paste sent as one frame.
+                for start in range(0, len(filtered), rfb.MAX_UPSTREAM_FRAME):
+                    await upstream.send(filtered[start:start + rfb.MAX_UPSTREAM_FRAME])
         except (WebSocketDisconnect, Exception):  # noqa: B014
             pass
 
     async def browser_to_client():
+        # KasmVNC's BinaryClipboard (180) is an extension noVNC does not speak;
+        # it is translated into ServerCutText (UTF-8, see services/rfb.py).
+        clipboard = rfb.ServerClipboard()
         try:
             async for msg in upstream:
-                # KasmVNC's BinaryClipboard (180) is an extension noVNC does not
-                # speak; translate it into the standard ServerCutText.
-                if isinstance(msg, bytes) and msg and msg[0] == 180:
-                    text = rfb.parse_kasmvnc_clipboard(msg)
-                    if text:
-                        await ws.send_bytes(rfb.build_server_cut_text(text))
-                    continue
                 if isinstance(msg, bytes):
-                    await ws.send_bytes(msg)
+                    for out in clipboard.feed(msg):
+                        await ws.send_bytes(out)
                 else:
                     await ws.send_text(msg)
         except (WebSocketDisconnect, Exception):  # noqa: B014
