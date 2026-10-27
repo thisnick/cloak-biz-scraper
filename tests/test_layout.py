@@ -411,6 +411,19 @@ class TestBrowsersPage:
         assert m["infoTop"] >= m["paneBottom"], f"the details go below the screen: {m}"
         assert abs(m["ratio"] - 1.6) < 0.02, f"16/10, the browser's display: {m}"
 
+    def test_the_page_keeps_the_same_content_width_as_the_others(self, measured):
+        """Full width means the content column, not the window: Browsers is as
+        wide as Overview or Settings."""
+        page = measured["page"]
+        page.set_viewport_size({"width": 1600, "height": 900})
+        widths = {}
+        for nav in ("overview", "browsers", "settings"):
+            page.evaluate(f"document.querySelector('[data-nav={nav}]').click()")
+            page.wait_for_timeout(60)
+            widths[nav] = page.evaluate("() => document.querySelector('.content').getBoundingClientRect().width")
+        page.set_viewport_size({"width": 1280, "height": 900})
+        assert len(set(widths.values())) == 1, f"every page has one content width: {widths}"
+
 
 def _take_control(page):
     page.set_viewport_size({"width": 1280, "height": 900})
@@ -453,6 +466,26 @@ class TestClipboard:
         page.evaluate(_PASTE, ["v", self.TEXT])
         assert page.evaluate("() => window.__pasteLog") == [_wire(self.TEXT)]
         # Ctrl is already held in the browser (noVNC sent it), so only V follows.
+        assert page.evaluate("() => window.__keyLog") == [[0x76, "KeyV", None]]
+
+    def test_a_paste_reaches_the_browser_when_page_text_is_selected(self, measured):
+        """The live failure: text copied from this page stays selected, and the
+        browser aims its paste event at that selection, not at the live view, so
+        the clipboard never left. A real Ctrl+V here, not a synthetic event."""
+        page = measured["page"]
+        _take_control(page)
+        page.context.grant_permissions(["clipboard-read", "clipboard-write"], origin="https://dash.test")
+        # Through the prototype: another test swaps writeText for a fake.
+        page.evaluate("t => Clipboard.prototype.writeText.call(navigator.clipboard, t)", self.TEXT)
+        page.evaluate("""() => {
+          const r = document.createRange();
+          r.selectNodeContents(document.querySelector('[data-section=browsers] .page-h'));
+          getSelection().removeAllRanges(); getSelection().addRange(r);
+          document.querySelector('#browser-i1 .pane canvas').focus();
+        }""")
+        page.keyboard.press("Control+v")
+        page.wait_for_function("() => window.__keyLog.length > 0", timeout=5000)
+        assert page.evaluate("() => window.__pasteLog") == [_wire(self.TEXT)]
         assert page.evaluate("() => window.__keyLog") == [[0x76, "KeyV", None]]
 
     def test_a_paste_with_no_shortcut_presses_ctrl_v_itself(self, measured):
