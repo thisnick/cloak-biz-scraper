@@ -196,10 +196,11 @@
         </dialog>
         <div class="acc browsers">
           {% for i in instances %}
-          {# Open the first row — or, arriving from the in-chat live view's "Take
-             control" link, the browser it named, marked so it is easy to find. #}
+          {# Every browser starts open: a folded one hides the very screen this page
+             is for. Arriving from the in-chat live view's "Take control" link, the
+             browser it named is marked so it is easy to find. #}
           {% set focused = focus_instance and i.instance_id == focus_instance %}
-          <div class="acc-item{{ ' open' if focused or (not focus_instance and loop.first) }}{{ ' focused' if focused }}" id="browser-{{ i.instance_id }}">
+          <div class="acc-item open{{ ' focused' if focused }}" id="browser-{{ i.instance_id }}">
             <button class="acc-head">
               <svg class="chev" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M9 6l6 6-6 6"/></svg>
               <span class="h-title">{{ 'Task Browser' if i.origin=='task' else 'Manual browser' }}</span>
@@ -215,6 +216,10 @@
                 {% if i.origin != 'task' and i.vnc_url %}
                 <button class="btn ctl-btn" type="button" data-control-for="{{ i.instance_id }}">Take control</button>
                 <button class="btn kbd-btn" type="button" data-keyboard-for="{{ i.instance_id }}" hidden>⌨ Keyboard</button>
+                {# Shown only when the browser copied something and this page could
+                   not put it on your clipboard by itself (e.g. Safari, or http on a
+                   LAN address): a click is the user gesture that lets it. #}
+                <button class="btn clip-btn" type="button" data-clip-for="{{ i.instance_id }}" hidden>⧉ Copy from browser</button>
                 {% endif %}
                 {% if i.vnc_url %}
                 <button class="btn fs-btn" type="button" data-fs-for="{{ i.instance_id }}">⛶ Full screen</button>
@@ -223,6 +228,7 @@
                   <button class="btn danger" type="submit">Close</button>
                 </form>
               </div>
+              {# The live view takes the full width; the details sit below it. #}
               <div class="pane-row">
                 {# Live view-only noVNC pane. The token is NOT in this markup: the
                    pane's JS fetches a fresh one from an authed endpoint at connect
@@ -1182,6 +1188,7 @@
     return res.json();
   }
   function teardown(pane){
+    releaseCmd(pane);
     if(pane._rfb){ try{ pane._rfb.disconnect(); }catch(e){} pane._rfb = null; }
     pane.classList.remove('controlling');
   }
@@ -1201,6 +1208,7 @@
     rfb.background = '#0b0f14';
     rfb.addEventListener('connect', function(){ setMsg(pane, ''); });
     rfb.addEventListener('disconnect', function(){ setMsg(pane, 'Live view ended.'); });
+    rfb.addEventListener('clipboard', function(e){ onRemoteCopy(pane, e.detail.text); });
     pane._rfb = rfb;
     pane.classList.toggle('controlling', !!control);
   }
@@ -1260,6 +1268,138 @@
   }
   document.querySelectorAll('.pane[data-instance]').forEach(wireKeyboard);
 
+  // ── clipboard (copy and paste between this computer and the browser) ─────
+  // Only while driving: the proxy drops a viewer's paste anyway, and a viewer's
+  // clipboard should not change because a sweep selected something. Text crosses
+  // the proxy as UTF-8 bytes packed one per character: noVNC's cut-text calls
+  // move Latin-1 strings, which would turn ’, — and 中 into garbage (the proxy
+  // speaks the same packing on its side, see services/rfb.py).
+  function toWire(text){
+    var bytes = new TextEncoder().encode(text), out = '';
+    for(var i=0;i<bytes.length;i+=0x8000) out += String.fromCharCode.apply(null, bytes.subarray(i, i+0x8000));
+    return out;
+  }
+  function fromWire(wire){
+    var bytes = new Uint8Array(wire.length);
+    for(var i=0;i<wire.length;i++) bytes[i] = wire.charCodeAt(i);
+    return new TextDecoder().decode(bytes);
+  }
+  function clipButtonNear(pane){
+    var body = pane.closest('.acc-body');
+    return body ? body.querySelector('[data-clip-for]') : null;
+  }
+  // The browser copied something: put it on this computer's clipboard. That
+  // needs focus (Chrome) or a recent keypress (Firefox), both true right after a
+  // Ctrl/⌘+C in the pane; where it is refused (Safari, or plain http on a LAN
+  // address) the toolbar offers a button, since a click is always allowed to.
+  function onRemoteCopy(pane, wire){
+    if(!pane.classList.contains('controlling')) return;
+    var text = fromWire(wire), btn = clipButtonNear(pane);
+    pane._copied = text;
+    if(btn) btn.hidden = true;
+    var offer = function(){ if(btn) btn.hidden = false; };
+    if(navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(text).catch(offer);
+    } else { offer(); }
+  }
+  function copyBySelection(text){
+    var ta = document.createElement('textarea');
+    ta.value = text; ta.setAttribute('readonly', '');
+    ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0';
+    document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); } finally { document.body.removeChild(ta); }
+  }
+  document.querySelectorAll('[data-clip-for]').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      var pane = paneNear(btn);
+      if(!pane || pane._copied == null) return;
+      var text = pane._copied;
+      if(navigator.clipboard && navigator.clipboard.writeText){
+        navigator.clipboard.writeText(text).catch(function(){ copyBySelection(text); });
+      } else { copyBySelection(text); }
+      btn.hidden = true;
+      if(pane._rfb) pane._rfb.focus();
+    });
+  });
+
+  var IS_APPLE = /Mac|iPhone|iPad|iPod/.test(navigator.platform || '');
+  var XK_CONTROL_L = 0xFFE3;
+  var MODIFIERS = {Shift:1, Control:1, Alt:1, AltGraph:1, CapsLock:1, Meta:1};
+  function isPasteKey(e){
+    return (e.key === 'v' || e.key === 'V') && (IS_APPLE ? e.metaKey : e.ctrlKey) && !e.altKey
+        || e.key === 'Insert' && e.shiftKey;
+  }
+  // Paste: send this computer's clipboard to the browser, then the key that
+  // pastes it. `replay` is that key when a shortcut started the paste — its
+  // modifier is already held in the browser. With no shortcut behind it (a
+  // phone's paste menu on the Keyboard field) press Ctrl+V for it.
+  function deliverPaste(pane, text, replay){
+    var rfb = pane._rfb;
+    if(!rfb) return;
+    if(text) rfb.clipboardPasteFrom(toWire(text));
+    if(replay){ rfb.sendKey(replay.keysym, replay.code); return; }
+    rfb.sendKey(XK_CONTROL_L, 'ControlLeft', true);
+    rfb.sendKey(0x76, 'KeyV');
+    rfb.sendKey(XK_CONTROL_L, 'ControlLeft', false);
+  }
+  // On a Mac ⌘ is the shortcut key, but the browser runs on Linux, where that is
+  // Ctrl — and noVNC sends ⌘ as Alt. So while driving, ⌘ goes over as Ctrl and
+  // ⌘C, ⌘V, ⌘A, ⌘F, ⌘L do what they say. A key pressed with ⌘ held is sent as
+  // press-and-release at once, because macOS never reports its key-up.
+  function releaseCmd(pane){
+    if(!pane._cmd) return;
+    pane._cmd = false;
+    if(pane._rfb) pane._rfb.sendKey(XK_CONTROL_L, 'ControlLeft', false);
+  }
+  function cmdKeydown(pane, e){
+    if(e.code === 'MetaLeft' || e.code === 'MetaRight'){
+      e.stopPropagation(); e.preventDefault();
+      if(!pane._cmd && pane._rfb){ pane._cmd = true; pane._rfb.sendKey(XK_CONTROL_L, 'ControlLeft', true); }
+      return true;
+    }
+    if(!e.metaKey || MODIFIERS[e.key] || isPasteKey(e)) return false;
+    e.stopPropagation(); e.preventDefault();
+    var keysym = e.key === 'Backspace' ? 0xFF08 : SPECIAL[e.key];
+    press(pane, keysym != null ? keysym : (e.key.length === 1 ? keysymForChar(e.key) : null), e.code);
+    return true;
+  }
+  function wireClipboard(pane){
+    // Capture phase on the pane runs before noVNC's own listener on its canvas.
+    pane.addEventListener('keydown', function(e){
+      if(!pane.classList.contains('controlling') || e.target.tagName !== 'CANVAS') return;
+      if(IS_APPLE && cmdKeydown(pane, e)) return;
+      if(!isPasteKey(e)) return;
+      // Keep noVNC off this key but let the browser's own paste happen: the
+      // paste event below is how a page reads the clipboard without a prompt.
+      e.stopPropagation();
+      var replay = e.key === 'Insert' ? {keysym: 0xFF63, code: 'Insert'} : {keysym: 0x76, code: 'KeyV'};
+      clearTimeout(pane._pasteTimer);
+      pane._pasteReplay = replay;
+      // No paste event (nothing textual on this computer's clipboard): press the
+      // key anyway, so the browser pastes whatever it copied itself.
+      pane._pasteTimer = setTimeout(function(){
+        pane._pasteReplay = null; deliverPaste(pane, '', replay);
+      }, 300);
+    }, true);
+    pane.addEventListener('keyup', function(e){
+      if(!IS_APPLE || !pane.classList.contains('controlling') || e.target.tagName !== 'CANVAS') return;
+      if(e.code === 'MetaLeft' || e.code === 'MetaRight'){ e.stopPropagation(); e.preventDefault(); releaseCmd(pane); }
+      else if(e.metaKey && !MODIFIERS[e.key]) e.stopPropagation();   // already sent as press-and-release
+    }, true);
+    pane.addEventListener('paste', function(e){
+      if(!pane.classList.contains('controlling')) return;
+      e.preventDefault();
+      var replay = pane._pasteReplay;
+      pane._pasteReplay = null; clearTimeout(pane._pasteTimer);
+      deliverPaste(pane, e.clipboardData ? e.clipboardData.getData('text/plain') : '', replay);
+    });
+    pane.addEventListener('focusout', function(){ releaseCmd(pane); });
+  }
+  document.querySelectorAll('.pane[data-instance]').forEach(wireClipboard);
+  window.addEventListener('blur', function(){
+    document.querySelectorAll('.pane[data-instance]').forEach(releaseCmd);
+  });
+
   // Arrived from the in-chat live view: bring the browser it named into view.
   var focused = document.querySelector('.acc-item.focused');
   if (focused) focused.scrollIntoView({block: 'start'});
@@ -1290,6 +1430,8 @@
       // The Keyboard button is meaningful only while driving.
       var kb = keyboardButtonFor(id);
       if(kb){ kb.hidden = !taking; }
+      var clip = clipButtonNear(pane);
+      if(clip && !taking){ clip.hidden = true; }
       if(!taking){ var input = pane.querySelector('.pane-kbd'); if(input) input.blur(); }
     });
   });

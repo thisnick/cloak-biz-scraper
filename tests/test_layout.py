@@ -44,11 +44,18 @@ export default class RFB {
     // the target element and the viewOnly it was set to.
     this._rec = {target, viewOnly: null};
     (window.__rfbLog = window.__rfbLog || []).push(this._rec);
+    // noVNC draws into a focusable canvas it adds to the target; key events
+    // reach the pane from there.
+    this._canvas = document.createElement('canvas');
+    this._canvas.tabIndex = -1;
+    target.appendChild(this._canvas);
   }
-  disconnect(){}
-  focus(){}
+  disconnect(){ this._canvas.remove(); }
+  focus(){ this._canvas.focus(); }
   blur(){}
-  sendKey(){}
+  sendKey(keysym, code, down){ (window.__keyLog = window.__keyLog || []).push([keysym, code, down]); }
+  clipboardPasteFrom(text){ (window.__pasteLog = window.__pasteLog || []).push(text); }
+  emit(t, detail){ (this._l[t] || []).forEach(f => f({detail})); }
   addEventListener(t,f){ (this._l[t]=this._l[t]||[]).push(f); }
   set viewOnly(v){ this._rec.viewOnly = v; }
   set scaleViewport(v){} set background(v){}
@@ -375,6 +382,157 @@ class TestControlLandsOnTheRightPane:
         assert all(e["section"] == "browsers" and not e["preview"] for e in control), (
             f"control attached to the wrong pane — the Overview preview, not Browsers. log={log}"
         )
+
+
+class TestBrowsersPage:
+    """The live view is the page: every browser open, its screen full width."""
+
+    def test_every_browser_starts_open(self, measured):
+        page = measured["page"]
+        rows = page.evaluate("() => [...document.querySelectorAll('.acc.browsers .acc-item')]"
+                             ".map(r => r.classList.contains('open'))")
+        assert len(rows) == 2 and all(rows), f"a folded browser hides its screen: {rows}"
+
+    def test_the_screen_spans_the_card_with_its_details_below(self, measured):
+        page = measured["page"]
+        page.set_viewport_size({"width": 1280, "height": 900})
+        page.evaluate("document.querySelector('[data-nav=browsers]').click()")
+        page.wait_for_timeout(80)
+        m = page.evaluate("""() => {
+          const body = document.querySelector('#browser-i1 .acc-body');
+          const pane = body.querySelector('.pane').getBoundingClientRect();
+          const info = body.querySelector('.bctrl').getBoundingClientRect();
+          const cs = getComputedStyle(body);
+          return {inner: body.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight),
+                  pane: pane.width, paneBottom: pane.bottom, infoTop: info.top,
+                  ratio: pane.width / pane.height};
+        }""")
+        assert m["pane"] >= m["inner"] - 1, f"the screen should fill the card: {m}"
+        assert m["infoTop"] >= m["paneBottom"], f"the details go below the screen: {m}"
+        assert abs(m["ratio"] - 1.6) < 0.02, f"16/10, the browser's display: {m}"
+
+
+def _take_control(page):
+    page.set_viewport_size({"width": 1280, "height": 900})
+    page.evaluate("document.querySelector('[data-nav=browsers]').click()")
+    page.wait_for_timeout(80)
+    page.evaluate("""() => {
+      const btn = document.querySelector('[data-control-for="i1"]');
+      if (!btn.closest('.acc-body').querySelector('.pane').classList.contains('controlling')) btn.click();
+    }""")
+    page.wait_for_function("""() => { const c = document.querySelector('#browser-i1 .pane canvas');
+      return c && document.querySelector('#browser-i1 .pane').classList.contains('controlling'); }""",
+                           timeout=15000)
+    page.evaluate("() => { window.__keyLog = []; window.__pasteLog = []; }")
+
+
+def _wire(text: str) -> str:
+    """What the pane hands noVNC: UTF-8 bytes, one per character."""
+    return "".join(chr(b) for b in text.encode("utf-8"))
+
+
+_PASTE = """([key, text]) => {
+  const canvas = document.querySelector('#browser-i1 .pane canvas');
+  canvas.focus();
+  const mod = navigator.platform.startsWith('Mac') ? {metaKey: true} : {ctrlKey: true};
+  canvas.dispatchEvent(new KeyboardEvent('keydown', {key, code: 'KeyV', bubbles: true, cancelable: true, ...mod}));
+  const dt = new DataTransfer(); dt.setData('text/plain', text);
+  canvas.dispatchEvent(new ClipboardEvent('paste', {clipboardData: dt, bubbles: true, cancelable: true}));
+}"""
+
+
+class TestClipboard:
+    """Copy and paste while driving. The real round trip through KasmVNC is
+    covered by hand against a live browser; this pins the page's half."""
+
+    TEXT = "Owner’s cash flow — 中文 ✓"
+
+    def test_ctrl_v_sends_this_computers_clipboard_then_the_paste_key(self, measured):
+        page = measured["page"]
+        _take_control(page)
+        page.evaluate(_PASTE, ["v", self.TEXT])
+        assert page.evaluate("() => window.__pasteLog") == [_wire(self.TEXT)]
+        # Ctrl is already held in the browser (noVNC sent it), so only V follows.
+        assert page.evaluate("() => window.__keyLog") == [[0x76, "KeyV", None]]
+
+    def test_a_paste_with_no_shortcut_presses_ctrl_v_itself(self, measured):
+        """A phone's paste menu on the Keyboard field: no key was held."""
+        page = measured["page"]
+        _take_control(page)
+        page.evaluate("""(text) => {
+          const input = document.querySelector('#browser-i1 .pane-kbd');
+          const dt = new DataTransfer(); dt.setData('text/plain', text);
+          input.dispatchEvent(new ClipboardEvent('paste', {clipboardData: dt, bubbles: true, cancelable: true}));
+        }""", self.TEXT)
+        assert page.evaluate("() => window.__pasteLog") == [_wire(self.TEXT)]
+        assert page.evaluate("() => window.__keyLog") == [
+            [0xFFE3, "ControlLeft", True], [0x76, "KeyV", None], [0xFFE3, "ControlLeft", False]]
+
+    def test_a_copy_in_the_browser_lands_on_this_computers_clipboard(self, measured):
+        page = measured["page"]
+        _take_control(page)
+        page.evaluate("""() => { window.__written = [];
+          navigator.clipboard.writeText = t => { __written.push(t); return Promise.resolve(); }; }""")
+        page.evaluate("(w) => document.querySelector('#browser-i1 .pane')._rfb.emit('clipboard', {text: w})",
+                      _wire(self.TEXT))
+        assert page.evaluate("() => window.__written") == [self.TEXT]
+        assert page.evaluate("() => document.querySelector('[data-clip-for=\"i1\"]').hidden")
+
+    def test_a_refused_copy_offers_a_button(self, measured):
+        """Safari, or http on a LAN address: the page may not write by itself."""
+        page = measured["page"]
+        _take_control(page)
+        page.evaluate("""() => { navigator.clipboard.writeText = () => Promise.reject(new Error('no')); }""")
+        page.evaluate("(w) => document.querySelector('#browser-i1 .pane')._rfb.emit('clipboard', {text: w})",
+                      _wire(self.TEXT))
+        page.wait_for_function("() => !document.querySelector('[data-clip-for=\"i1\"]').hidden", timeout=5000)
+
+    def test_a_viewer_neither_pastes_nor_receives_copies(self, measured):
+        page = measured["page"]
+        _take_control(page)
+        page.evaluate("document.querySelector('[data-control-for=\"i1\"]').click()")  # release
+        page.wait_for_function(
+            "() => !document.querySelector('#browser-i1 .pane').classList.contains('controlling')", timeout=5000)
+        page.evaluate("""() => { window.__keyLog = []; window.__pasteLog = []; window.__written = [];
+          navigator.clipboard.writeText = t => { __written.push(t); return Promise.resolve(); }; }""")
+        page.wait_for_function("() => document.querySelector('#browser-i1 .pane canvas')", timeout=15000)
+        page.evaluate(_PASTE, ["v", self.TEXT])
+        page.evaluate("() => document.querySelector('#browser-i1 .pane')._rfb.emit('clipboard', {text: 'x'})")
+        assert page.evaluate("() => [__pasteLog, __keyLog, __written]") == [[], [], []]
+
+
+def test_cmd_is_sent_as_ctrl_on_a_mac(measured):
+    """On a Mac ⌘ is the shortcut key; the browser is on Linux, where it is Ctrl,
+    and noVNC alone would send it as Alt. Keys pressed with ⌘ held go as
+    press-and-release, since macOS never reports their key-up."""
+    html = _render_dashboard()
+    # A page of its own in the shared browser: the platform is read at load.
+    page = measured["page"].context.browser.new_page(viewport={"width": 1280, "height": 900})
+    page.add_init_script("Object.defineProperty(Navigator.prototype, 'platform', {get: () => 'MacIntel'})")
+    page.route(PAGE_URL, lambda r: r.fulfill(status=200, content_type="text/html", body=html))
+    page.route("**/novnc/core/rfb.js", lambda r: r.fulfill(
+        status=200, content_type="text/javascript", body=STUB_RFB))
+    page.route("**/sessions/instances/**", lambda r: r.fulfill(
+        status=200, content_type="application/json", body='{"token":"t","path":"/instances/i1/vnc"}'))
+    try:
+        page.goto(PAGE_URL, wait_until="networkidle")
+        _take_control(page)
+        page.evaluate("""() => {
+          const c = document.querySelector('#browser-i1 .pane canvas'); c.focus();
+          const k = (type, key, code, metaKey) => c.dispatchEvent(new KeyboardEvent(type,
+            {key, code, metaKey, bubbles: true, cancelable: true}));
+          k('keydown', 'Meta', 'MetaLeft', true);
+          k('keydown', 'c', 'KeyC', true);       // no keyup: macOS sends none while ⌘ is held
+          k('keyup', 'Meta', 'MetaLeft', false);
+        }""")
+        assert page.evaluate("() => window.__keyLog") == [
+            [0xFFE3, "ControlLeft", True], [0x63, "KeyC", None], [0xFFE3, "ControlLeft", False]]
+        page.evaluate("() => { window.__keyLog = []; }")
+        page.evaluate(_PASTE, ["v", "hi"])
+        assert page.evaluate("() => window.__pasteLog") == [_wire("hi")]
+        assert page.evaluate("() => window.__keyLog") == [[0x76, "KeyV", None]]
+    finally:
+        page.close()
 
 
 class TestLicenceVerifySubmission:
