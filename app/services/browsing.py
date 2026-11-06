@@ -89,8 +89,9 @@ def first_page(inst):
     return inst.context.pages[0] if inst.context.pages else None
 
 
-async def open_instance(instances, profile: str, owner: str, wait_ms: int,
-                        warmup_url: str | None, on_launch=None):
+async def open_instance(instances, profile: str, owner: str, on_launch=None):
+    """Launch a task browser. Only the launch: the warmup is part of the attempt,
+    so a homepage that will not load is retried like any other failed page."""
     inst = await instances.launch(
         InstanceCreate(profile=profile, headed=True, humanize=True),
         origin="task", owner=owner, wait=True,
@@ -100,10 +101,7 @@ async def open_instance(instances, profile: str, owner: str, wait_ms: int,
     # the warmup, which itself takes real time on the page.
     if on_launch is not None:
         on_launch(inst)
-    page = first_page(inst) or await inst.context.new_page()
-    if warmup_url:
-        await warmup(page, wait_ms, warmup_url)
-    return inst, page
+    return inst
 
 
 async def scrape_with_retry(instances, *, profile: str, owner: str, wait_ms: int,
@@ -117,7 +115,8 @@ async def scrape_with_retry(instances, *, profile: str, owner: str, wait_ms: int
     IP is the lever that matters — retrying on the same one just spends time.
     Rotating keeps the profile's cookies and warmth; only the exit changes. An
     errored result carrying `retry: False` is the exception: it is returned at
-    once, with no rotation.
+    once, with no rotation. The warmup (`warmup_url`) belongs to the attempt, so
+    a homepage that times out is an errored attempt like any other.
 
     A launch that fails with a resource-exhaustion signature (the container out
     of threads/processes) is treated as a *transient capacity* failure, not a
@@ -132,9 +131,7 @@ async def scrape_with_retry(instances, *, profile: str, owner: str, wait_ms: int
             instances.profiles.rotate_session(profile)
             await asyncio.sleep(min(10, 3 * (attempt - 1)))
         try:
-            inst, page = await open_instance(
-                instances, profile, owner, wait_ms, warmup_url, on_launch,
-            )
+            inst = await open_instance(instances, profile, owner, on_launch)
         except Exception as exc:  # noqa: BLE001
             if _RESOURCE_EXHAUSTION.search(str(exc)) and attempt < max(1, attempts):
                 # Out of OS resources: this slot could not be launched, but a
@@ -149,6 +146,13 @@ async def scrape_with_retry(instances, *, profile: str, owner: str, wait_ms: int
                 continue
             raise
         try:
+            page = first_page(inst) or await inst.context.new_page()
+            if warmup_url:
+                # The homepage is a page like any other: one that times out
+                # (a dead or slow exit IP) fails this attempt, and the next one
+                # gets a fresh exit IP. It must not fail the source outright,
+                # nor leave this browser running.
+                await warmup(page, wait_ms, warmup_url)
             res = await scrape_once(inst, page)
         except Exception as exc:  # noqa: BLE001 — an attempt failing is not the sweep failing
             logger.warning("attempt %d for %s failed: %s", attempt, profile, exc)

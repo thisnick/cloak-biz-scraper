@@ -461,6 +461,10 @@ class TestMultiUrlFanOut:
         # The failure is surfaced, not swallowed.
         assert "1 of 2 source(s) failed" in result.error
         assert "1 source(s) failed" in result.summary
+        # ...and names WHICH of the two same-site sources failed, not just the site.
+        assert ("www.bizbuysell.com/california/san-francisco-bay-area-businesses-for-sale "
+                "(blocked by the site)") in result.error
+        assert "sacramento" not in result.error
 
     @pytest.mark.asyncio
     async def test_all_sources_failing_fails_the_job(self, settings, jobs):
@@ -528,7 +532,7 @@ class TestMultiUrlFanOut:
         assert [l.listing_id for l in result.listings] == ["kept"]
         assert "1 of 2 source(s) failed" in result.error
         # The URL's own reason, not a generic "not supported".
-        assert f"abc.xyz ({sources_hint()})" in result.error
+        assert f"abc.xyz/nope ({sources_hint()})" in result.error
         assert "not a supported listings page" not in result.error
 
 
@@ -1250,7 +1254,8 @@ class TestPageFailures:
         result = svc.result(job.id)
         assert result.status == "completed"
         assert [l.url for l in result.listings] == [_gen(1).url, _gen(2).url]
-        assert result.error.startswith("1 of 1 source(s) stopped early: example.com (stopped "
+        assert result.error.startswith("1 of 1 source(s) stopped early: "
+                                       "example.com/businesses-for-sale (stopped "
                                        "at page 2 and kept the 2 listing(s) from page 1: ")
         assert "0 of 5 cards on page 2" in result.error
         assert "1 source(s) stopped early (earlier pages kept)" in result.summary
@@ -1709,9 +1714,10 @@ class TestWhichSourceReadsAUrl:
 
         error = svc.result(job.id).error
         assert "3 of 4 source(s) failed" in error
-        assert "www.bizbuysell.com (on bizbuysell.com, only these pages are swept: " in error
-        assert "files.example (not a web address — it must start with http:// or https://)" in error
-        assert f"www.websiteclosers.com ({sources_hint()})" in error
+        assert ("www.bizbuysell.com/business-opportunity/premier-restoration/2515728 "
+                "(on bizbuysell.com, only these pages are swept: ") in error
+        assert "files.example/x (not a web address — it must start with http:// or https://)" in error
+        assert f"www.websiteclosers.com/businesses-for-sale ({sources_hint()})" in error
         assert "not a supported listings page" not in error
         assert list(svc.swept) == [SERP], "refused URLs never reach the browser"
 
@@ -1808,7 +1814,7 @@ class TestPreflight:
         result = svc.result(job.id)
         assert result.status == "completed"
         assert "1 of 2 source(s) failed" in result.error
-        assert "www.websiteclosers.com (needs the Decision API" in result.error
+        assert "www.websiteclosers.com/businesses-for-sale (needs the Decision API" in result.error
         assert "OpenRouter rejected the key (HTTP 401)." in result.error
         assert job.decisions[1]["adapter"] is None
 
