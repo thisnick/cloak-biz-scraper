@@ -876,8 +876,8 @@ class ScrapeService:
         if failures:
             bits = []
             for url, reason in failures:
-                host = urlparse(url).hostname or url
-                bits.append(f"{host} ({'blocked by the site' if reason == 'blocked' else reason})")
+                bits.append(f"{_where(url)} "
+                            f"({'blocked by the site' if reason == 'blocked' else reason})")
             text = f"{len(failures)} of {total} source(s) failed: " + "; ".join(bits) + "."
             if any(reason == "blocked" for _, reason in failures):
                 text += (
@@ -887,7 +887,7 @@ class ScrapeService:
                 )
             parts.append(text)
         if warnings:
-            bits = [f"{urlparse(url).hostname or url} ({warning})" for url, warning in warnings]
+            bits = [f"{_where(url)} ({warning})" for url, warning in warnings]
             parts.append(f"{len(warnings)} of {total} source(s) stopped early: "
                          + "; ".join(bits) + ".")
         return " ".join(parts) or None
@@ -1268,6 +1268,22 @@ def _site(url: str) -> str:
     except ValueError:
         return ""
     return host[4:] if host.startswith("www.") else host
+
+
+def _where(url: str, limit: int = 120) -> str:
+    """Which source a job's error means: host and path, no scheme or query.
+
+    The host alone cannot tell apart several sources on one site (a sweep of
+    many brokers' profiles on one marketplace), so the path stays in."""
+    try:
+        p = urlparse((url or "").strip())
+    except ValueError:
+        return url
+    if not p.hostname:
+        return url
+    path = p.path.rstrip("/")
+    where = p.hostname + path
+    return where if len(where) <= limit else where[: limit - 1] + "…"
 
 
 def _diagnostics(source) -> dict:

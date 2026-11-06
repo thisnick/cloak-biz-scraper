@@ -127,6 +127,74 @@ class TestOnLaunchCallback:
         assert seen == ["inst-1"], "the caller is told when the browser is obtained"
 
 
+class _WarmPage:
+    """A page whose homepage goto fails on the scripted attempts."""
+
+    def __init__(self, fail: bool):
+        self.fail = fail
+        self.gotos: list[str] = []
+
+    async def goto(self, url, **_k):
+        self.gotos.append(url)
+        if self.fail:
+            raise TimeoutError(f"Page.goto: net::ERR_TIMED_OUT at {url}")
+
+    async def wait_for_timeout(self, _ms):
+        return None
+
+    @property
+    def mouse(self):
+        raise RuntimeError("no mouse in the fake")  # gesture() swallows this
+
+
+class TestWarmupFailure:
+    """A homepage that times out is an attempt failing, not the source: the
+    browser is stopped, the exit IP rotated, and the next attempt warms up again."""
+
+    def _instances(self, fails: list[bool]):
+        insts = _Instances([None] * len(fails))
+        pages = [_WarmPage(f) for f in fails]
+        launch = insts.launch
+
+        async def launch_with_page(req, **kw):
+            inst = await launch(req, **kw)
+            inst.context.pages = [pages[insts.launches - 1]]
+            return inst
+
+        insts.launch = launch_with_page
+        return insts, pages
+
+    @pytest.mark.asyncio
+    async def test_a_warmup_timeout_is_retried_on_a_new_exit_ip(self):
+        insts, pages = self._instances([True, False])
+        scraped = []
+
+        async def once(inst, page):
+            scraped.append(inst.id)
+            return await _ok(inst, page)
+
+        res = await scrape_with_retry(
+            insts, profile="task-1", owner="job:x", wait_ms=0, attempts=3,
+            scrape_once=once, warmup_url="https://www.example.com/",
+        )
+        assert res["error"] is None and res["attempts_used"] == 2
+        assert insts.profiles.rotations == 1, "the second attempt got a new exit IP"
+        assert scraped == ["inst-2"], "the scrape ran only after a warmup that loaded"
+        assert pages[1].gotos == ["https://www.example.com/"]
+        assert insts.stopped == ["inst-1", "inst-2"], "the failed browser was stopped"
+
+    @pytest.mark.asyncio
+    async def test_warmup_timeouts_on_every_attempt_fail_the_source_with_the_reason(self):
+        insts, _ = self._instances([True, True, True])
+        res = await scrape_with_retry(
+            insts, profile="task-1", owner="job:x", wait_ms=0, attempts=3,
+            scrape_once=_ok, warmup_url="https://www.example.com/",
+        )
+        assert "ERR_TIMED_OUT" in res["error"]
+        assert res["attempts_used"] == 3 and insts.launches == 3
+        assert insts.stopped == ["inst-1", "inst-2", "inst-3"]
+
+
 class TestRetryFlag:
     """An errored attempt that says a new exit IP cannot help is final."""
 
