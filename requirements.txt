@@ -34,4 +34,7 @@ websockets==14.1
 # [geoip] pulls geoip2 — without it, geoip=True raises at launch and the browser's
 # timezone would contradict its exit IP.
 cloakbrowser[geoip]==0.4.8
+# cloakbrowser leaves Playwright unpinned, so each image build took the newest
+# driver; 1.65 silently needed libatomic1 (see Dockerfile). Pin it and bump on purpose.
+playwright==1.65.0
 cryptography==44.0.1

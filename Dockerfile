@@ -25,7 +25,10 @@ FROM python:3.12-slim-bookworm
 # If a bookworm point release ever retires this exact version and the build fails
 # to find it, that is the signal to vendor a known noVNC release instead — the
 # same call the CloakBrowser pin taught us to make deliberately.
+# libatomic1: Playwright's bundled Node driver links it from 1.65 on; without it
+# every browser launch dies with "Connection closed while reading from the driver".
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    libatomic1 \
     libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
     libdbus-1-3 libdrm2 libxkbcommon0 libatspi2.0-0 libxcomposite1 \
     libxdamage1 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 \
