@@ -91,10 +91,11 @@ class ProfileStore:
     ) -> Profile:
         udd = self.root / f"{_safe(name)}-{secrets.token_hex(4)}"
         udd.mkdir(parents=True, exist_ok=True)
+        country, region = proxy.resolve_geo(country, region, default_country, default_region)
         profile = Profile(
             name=name,
-            country=country or default_country,
-            region=region or default_region,
+            country=country,
+            region=region,
             session_token=proxy.new_session_token(),
             fingerprint_seed=secrets.randbelow(2_000_000_000) + 1,
             user_data_dir=str(udd),
@@ -213,6 +214,11 @@ class ProfileStore:
                 profile.name = target_name
                 self._cache[target_name] = profile
             if country is not None:
+                # A region belongs to its country: moving the profile to another
+                # country without naming a region drops the old one rather than
+                # pairing it with the new country.
+                if region is None and country != profile.country:
+                    profile.region = ""
                 profile.country = country
             if region is not None:
                 profile.region = region

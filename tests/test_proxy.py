@@ -9,6 +9,7 @@ from app.services.proxy import (
     build_proxy_url,
     masked,
     new_session_token,
+    resolve_geo,
 )
 from app.services.settings import Settings
 
@@ -51,6 +52,38 @@ def test_empty_geo_omits_the_segments_entirely():
         user="u", password="pw", host="h.evomi.com", port="1000", country="US", region=""
     ))
     assert "_country-US_session-" in one and "_region-" not in one
+
+
+class TestGeoIsOneLocation:
+    """Country and region are a pair: a region only means something inside its
+    own country, so a profile's country must never pick up the default region."""
+
+    @pytest.mark.parametrize(
+        ("country", "region", "expected"),
+        [
+            ("GB", None, ("GB", "")),            # a country alone: anywhere in it
+            ("GB", "", ("GB", "")),
+            ("GB", "london", ("GB", "london")),  # a full pair replaces the default
+            (None, "texas", ("US", "texas")),    # a region alone narrows the default country
+            ("", "texas", ("US", "texas")),
+            (None, None, ("US", "california")),  # nothing set: the default location
+            ("", "", ("US", "california")),
+        ],
+    )
+    def test_resolution(self, country, region, expected):
+        assert resolve_geo(country, region, "US", "california") == expected
+
+    def test_missing_defaults_resolve_to_empty_strings(self):
+        assert resolve_geo(None, None, None, None) == ("", "")
+        assert resolve_geo(None, "texas", None, None) == ("", "texas")
+
+    def test_profile_country_does_not_borrow_the_default_region(self):
+        url = build_proxy_url("TOK", ProxyParts.from_settings(FULL), country="GB", region="")
+        assert "_country-GB_session-TOK_" in url and "_region-" not in url
+
+    def test_profile_region_alone_stays_in_the_default_country(self):
+        url = build_proxy_url("TOK", ProxyParts.from_settings(FULL), region="texas")
+        assert "_country-US_region-texas_session-TOK_" in url
 
 
 def test_session_tokens_are_unique_and_evomi_shaped():

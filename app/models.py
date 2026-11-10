@@ -336,8 +336,15 @@ class ArchiveResult(BaseModel):
 
 class InstanceCreate(BaseModel):
     profile: str = Field(description="Persistent profile name (created if new).")
-    country: str | None = None
-    region: str | None = None
+    country: str | None = Field(
+        default=None,
+        description="Proxy exit country, used only when this call creates the profile.",
+    )
+    region: str | None = Field(
+        default=None,
+        description="Proxy exit region within the country, used only when this call "
+        "creates the profile.",
+    )
     owner: str | None = None  # optional label for interactive callers (agent id, etc.)
     headed: bool = True
     geoip: bool = Field(

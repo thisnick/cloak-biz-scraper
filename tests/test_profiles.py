@@ -319,6 +319,29 @@ class TestEnsureDefault:
         assert first.user_data_dir == again.user_data_dir        # second call is a no-op
 
 
+class TestCreateGeo:
+    """New profiles combine their geography with the server default as one
+    location; a country never inherits the default country's region."""
+
+    def test_a_country_alone_has_no_region(self, tmp_path):
+        p = _make(store(tmp_path), "uk", country="GB")
+        assert p.country == "GB" and p.region == ""
+
+    def test_a_region_alone_uses_the_default_country(self, tmp_path):
+        p = _make(store(tmp_path), "tx", region="texas")
+        assert p.country == "US" and p.region == "texas"
+
+    def test_neither_uses_the_default_location(self, tmp_path):
+        p = _make(store(tmp_path), "plain")
+        assert p.country == "US" and p.region == "california"
+
+    def test_explicit_create_follows_the_same_rule(self, tmp_path):
+        p = store(tmp_path).create(
+            "uk", default_country="US", default_region="california", country="GB"
+        )
+        assert p.country == "GB" and p.region == ""
+
+
 class TestSetGeo:
     def test_updates_country_and_region(self, tmp_path):
         s = store(tmp_path)
@@ -326,6 +349,26 @@ class TestSetGeo:
         s.set_geo("p", country="GB", region="london")
         p = {x.name: x for x in s.all()}["p"]
         assert p.country == "GB" and p.region == "london"
+
+    def test_a_new_country_without_a_region_clears_the_old_region(self, tmp_path):
+        s = store(tmp_path)
+        _make(s, "p")  # US / california
+        s.update("p", country="GB")
+        p = s.get("p")
+        assert p.country == "GB" and p.region == ""
+
+    def test_the_same_country_keeps_its_region(self, tmp_path):
+        s = store(tmp_path)
+        _make(s, "p")
+        s.update("p", country="US")
+        assert s.get("p").region == "california"
+
+    def test_a_region_alone_keeps_the_country(self, tmp_path):
+        s = store(tmp_path)
+        _make(s, "p")
+        s.update("p", region="texas")
+        p = s.get("p")
+        assert p.country == "US" and p.region == "texas"
 
     def test_persists_across_reload(self, tmp_path):
         s = store(tmp_path)
