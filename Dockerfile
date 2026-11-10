@@ -8,7 +8,10 @@
 #     /data/.cloakbrowser on first launch (CLOAKBROWSER_CACHE_DIR).
 #   * Any build secret. Nothing here needs a license key, so `docker build`
 #     works for a stranger with no credentials at all.
-#   * Windows fonts. They are proprietary and cannot ship publicly.
+#   * Windows fonts. They are proprietary and cannot ship publicly. The free
+#     fonts a stock Linux desktop has stand in for them: Noto CJK (Chinese,
+#     Japanese, Korean — without it CJK text renders as empty boxes), Noto Color
+#     Emoji, and Liberation (metric-compatible Arial/Times/Courier). ~100 MB.
 #
 # System-lib list adapted from CloakBrowser-Manager (MIT).
 
@@ -38,6 +41,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgdk-pixbuf-2.0-0 libxss1 libxtst6 \
     libgl1-mesa-dri libegl-mesa0 \
     xvfb fontconfig procps ca-certificates wget "novnc=1:1.3.0-1" \
+    fonts-noto-cjk fonts-noto-color-emoji fonts-liberation2 \
     && rm -rf /var/lib/apt/lists/*
 
 # KasmVNC — Xvnc: an X server that also serves its framebuffer over a websocket,
