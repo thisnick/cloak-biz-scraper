@@ -80,6 +80,28 @@ class ProxyParts:
         )
 
 
+def resolve_geo(
+    country: str | None,
+    region: str | None,
+    default_country: str | None,
+    default_region: str | None,
+) -> tuple[str, str]:
+    """Combine a profile's geography with the server default as one location.
+
+    Country and region are a pair, not independent fields: a region only means
+    something inside its own country. So a country replaces the default location
+    as a whole, keeping its own region or none — borrowing the default region
+    would produce targets such as ``country-GB_region-california``. A region
+    given without a country narrows the default country, and with neither the
+    default location applies unchanged.
+    """
+    if country:
+        return country, region or ""
+    if region:
+        return default_country or "", region
+    return default_country or "", default_region or ""
+
+
 def build_proxy_url(
     session: str,
     parts: ProxyParts,
@@ -91,10 +113,10 @@ def build_proxy_url(
     """Compose the full proxy URL for a given sticky session token.
 
     Country/region are included only when set: an empty value would otherwise
-    emit a bare ``_country-_region-``, which is not valid Evomi targeting.
+    emit a bare ``_country-_region-``, which is not valid Evomi targeting. They
+    combine with the configured defaults as one location; see ``resolve_geo``.
     """
-    c = country or parts.country
-    r = region or parts.region
+    c, r = resolve_geo(country, region, parts.country, parts.region)
     pw = parts.password
     if c:
         pw += f"_country-{c}"

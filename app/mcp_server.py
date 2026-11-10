@@ -271,7 +271,10 @@ def build(app) -> MCPServer:
             profile ("Default") for continuity; use a NEW name only when you
             deliberately want a clean, logged-out identity. Each profile keeps a
             stable fingerprint and, when a proxy is configured, a sticky exit IP.
-        country/region: where the optional proxy should exit; ignored in direct mode.
+        country/region: where the optional proxy should exit when this call
+            creates the profile. An existing profile keeps its own location;
+            change it with update_profile. A country without a region means
+            anywhere in that country. Ignored in direct mode.
         geoip: with a proxy, match the browser's timezone and locale to the exit
             IP. Leave true unless proxy geo resolution is failing. Direct mode
             does not probe or geolocate the server, so these fields remain unknown.
@@ -570,7 +573,10 @@ def build(app) -> MCPServer:
         name: unique profile name passed later to create_instance.
         country/region: optional proxy exit target. They are stored even in
             direct mode but only take effect when a residential proxy is
-            configured. Omitted values use the server's proxy geography defaults.
+            configured. They form one location: a country without a region
+            means anywhere in that country (the server's default region is not
+            borrowed), a region alone narrows the server's default country, and
+            with neither the server's proxy geography defaults apply.
 
         This does not launch a browser. It returns safe status and never exposes
         the new fingerprint seed, proxy session token, or cookie directory.
@@ -590,7 +596,9 @@ def build(app) -> MCPServer:
     ) -> ProfileView:
         """Rename a profile and/or change its future proxy exit geography.
 
-        Omitted fields stay unchanged. A rename keeps cookies, logins, and the
+        Omitted fields stay unchanged, except that a new country given without a
+        region clears the old region, which belonged to the old country. A rename
+        keeps cookies, logins, and the
         stable fingerprint, but is refused while a browser is queued, opening,
         open, or closing on the profile. Geography changes apply to the next
         proxied launch and may be made while the current browser is open. Default
